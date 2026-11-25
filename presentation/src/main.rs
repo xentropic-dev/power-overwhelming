@@ -7,7 +7,10 @@ mod status_bar;
 mod terminal_view;
 
 use anyhow::{Context, Result};
-use application::{PublishArtifact, StartSession};
+use application::{
+    PublishArtifact, StartSession,
+    skills::{GetSkill, ListSkills, SkillOutput, SkillSelection},
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use domain::session::Agent;
 use infrastructure::{
@@ -19,9 +22,10 @@ use infrastructure::{
     },
     daemon,
     shell::Shell,
+    skills::EmbeddedSkillCatalog,
 };
 use serde_json::{Value, json};
-use std::{ffi::OsString, path::PathBuf, time::Duration};
+use std::{ffi::OsString, io::Write as _, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(about = "Persistent agent terminals and artifact previews")]
@@ -64,6 +68,11 @@ enum Action {
     Dag {
         #[command(subcommand)]
         command: DagAction,
+    },
+    /// Read skills bundled with this Power release.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsAction,
     },
 }
 
@@ -125,6 +134,31 @@ enum ArtifactAction {
     },
 }
 
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// List bundled skills and their descriptions.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a skill's guide or select its references.
+    #[command(visible_alias = "show")]
+    Get {
+        name: String,
+        /// Print one reference by its name or path.
+        #[arg(long, value_name = "R", conflicts_with_all = ["references", "full"])]
+        reference: Option<String>,
+        /// List the skill's reference names.
+        #[arg(long, conflicts_with = "full")]
+        references: bool,
+        /// Print the guide and all its references.
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::try_parse().unwrap_or_else(|error| {
         let mut args = std::env::args_os().skip(1);
@@ -159,12 +193,10 @@ fn main() -> Result<()> {
             println!("{uri}");
             Ok(())
         }
+        Some(Action::Skills { command }) => run_skills(command),
         Some(Action::Dag {
             command: DagAction::Guide,
-        }) => {
-            print!("{}", infrastructure::shell::DAG_SKILL);
-            Ok(())
-        }
+        }) => print_skill("power-dag", SkillSelection::Full, false),
         Some(Action::Session { command }) => {
             client::ensure_daemon()?;
             match command {
@@ -318,7 +350,7 @@ enum AgentAction {
 
 #[derive(Subcommand)]
 enum DagAction {
-    /// Print the bundled DAG orchestration skill.
+    /// Print the bundled DAG orchestration guide and all its references.
     Guide,
     Create {
         #[arg(long)]
@@ -436,8 +468,73 @@ fn parse_event_kind(value: &str) -> Result<RunEventKind, serde_json::Error> {
 }
 
 fn print_json(value: Value) -> Result<()> {
-    use std::io::Write as _;
     writeln!(std::io::stdout().lock(), "{value}")?;
+    Ok(())
+}
+
+fn run_skills(command: SkillsAction) -> Result<()> {
+    match command {
+        SkillsAction::List { json } => {
+            let skills = ListSkills::execute(&EmbeddedSkillCatalog)?;
+            if json {
+                let skills: Vec<_> = skills
+                    .into_iter()
+                    .map(|skill| json!({"name": skill.name, "description": skill.description}))
+                    .collect();
+                return print_json(json!({"skills": skills}));
+            }
+            let mut stdout = std::io::stdout().lock();
+            for skill in skills {
+                writeln!(stdout, "{}\t{}", skill.name, skill.description)?;
+            }
+            Ok(())
+        }
+        SkillsAction::Get {
+            name,
+            reference,
+            references,
+            full,
+            json,
+        } => {
+            let selection = if let Some(reference) = reference.as_deref() {
+                SkillSelection::Reference(reference)
+            } else if references {
+                SkillSelection::References
+            } else if full {
+                SkillSelection::Full
+            } else {
+                SkillSelection::Kernel
+            };
+            print_skill(&name, selection, json)
+        }
+    }
+}
+
+fn print_skill(name: &str, selection: SkillSelection<'_>, json: bool) -> Result<()> {
+    let output = GetSkill { name, selection }.execute(&EmbeddedSkillCatalog)?;
+    if json {
+        return print_json(match output {
+            SkillOutput::Guide { markdown, full } => {
+                json!({"name": name, "full": full, "markdown": markdown})
+            }
+            SkillOutput::Reference {
+                name: reference,
+                markdown,
+            } => json!({"name": name, "reference": reference, "markdown": markdown}),
+            SkillOutput::References(references) => json!({"name": name, "references": references}),
+        });
+    }
+    let mut stdout = std::io::stdout().lock();
+    match output {
+        SkillOutput::Guide { markdown, .. } | SkillOutput::Reference { markdown, .. } => {
+            stdout.write_all(markdown.as_bytes())?;
+        }
+        SkillOutput::References(references) => {
+            for reference in references {
+                writeln!(stdout, "{reference}")?;
+            }
+        }
+    }
     Ok(())
 }
 
