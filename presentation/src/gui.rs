@@ -363,7 +363,7 @@ impl Workspace {
         let rc = shell.and_then(Shell::rc_file);
         let mut lines = vec![
             "Power can wrap claude and codex in its terminals, so agents you start from a \
-             shell get instructions for publishing artifacts."
+             shell get the list of bundled Power skills."
                 .to_owned(),
         ];
         let rows = match (shell, &rc) {

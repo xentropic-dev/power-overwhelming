@@ -1,8 +1,9 @@
 //! Shell integration: agent wrappers that interactive shells in Power terminals pick up,
 //! and the one-line rc hook that onboarding installs.
 
-use crate::skills::ARTIFACTS_GUIDE;
+use crate::skills::EmbeddedSkillCatalog;
 use anyhow::{Context, Result, bail};
+use application::skills::ListSkills;
 use domain::session::Agent;
 use std::{
     ffi::OsString,
@@ -158,18 +159,18 @@ fn has_marker(path: &Path) -> bool {
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
 pub(crate) fn instruction_args(agent: Agent, user: &[OsString]) -> Result<Vec<OsString>> {
-    let artifact_instructions = ARTIFACTS_GUIDE.trim();
-    let instructions = format!(
-        "{artifact_instructions}\n\n{}",
-        concat!(
-            "When you understand the user's objective, run ",
-            "`power session task 'Short task label'` from this terminal. ",
-            "Use a short, concrete label and update it when the objective changes.\n\n",
-            "Power can coordinate a DAG of background workers. ",
-            "Run `power dag guide` to load the full guide before coordinating. ",
-            "If `POWER_TASK` is set, you are a DAG worker and must report with `power dag report`.",
-        )
-    );
+    let mut instructions = String::from(concat!(
+        "You are running inside Power Overwhelming. ",
+        "Power skills, load with `power skills get <name>` when relevant:\n",
+    ));
+    for skill in ListSkills::execute(&EmbeddedSkillCatalog)? {
+        instructions.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+    }
+    instructions.push_str(concat!(
+        "\nWhen you understand the user's objective, run ",
+        "`power session task 'Short task label'` from this terminal. ",
+        "Use a short, concrete label and update it when the objective changes.",
+    ));
     let has = |needle: &str| {
         user.iter()
             .any(|arg| arg.to_string_lossy().contains(needle))
@@ -248,13 +249,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let claude = instruction_args(Agent::Claude, &["fix the bug".into()]).unwrap();
-        assert_eq!(claude[0], "--append-system-prompt");
-        let instructions = claude[1].to_str().unwrap();
-        assert!(instructions.starts_with(ARTIFACTS_GUIDE.trim()));
-        assert!(instructions.contains("run `power session task 'Short task label'`"));
-        assert!(instructions.contains("Run `power dag guide`"));
-        assert!(instructions.contains("must report with `power dag report`"));
         assert!(
             instruction_args(
                 Agent::Codex,
@@ -262,6 +256,46 @@ mod tests {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn launch_instructions_list_every_catalog_skill() {
+        let claude = instruction_args(Agent::Claude, &["fix the bug".into()]).unwrap();
+        assert_eq!(claude[0], "--append-system-prompt");
+        let instructions = claude[1].to_str().unwrap();
+        let mut lines = instructions.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "You are running inside Power Overwhelming. Power skills, load with `power skills get <name>` when relevant:"
+            )
+        );
+        for skill in ListSkills::execute(&EmbeddedSkillCatalog).unwrap() {
+            let entry = format!("- {}: {}", skill.name, skill.description);
+            assert_eq!(lines.next(), Some(entry.as_str()));
+        }
+        assert_eq!(lines.next(), Some(""));
+        assert_eq!(
+            lines.next(),
+            Some(concat!(
+                "When you understand the user's objective, run ",
+                "`power session task 'Short task label'` from this terminal. ",
+                "Use a short, concrete label and update it when the objective changes.",
+            ))
+        );
+        assert_eq!(lines.next(), None);
+
+        let codex = instruction_args(Agent::Codex, &["fix the bug".into()]).unwrap();
+        assert_eq!(codex[0], "-c");
+        let encoded = codex[1]
+            .to_str()
+            .unwrap()
+            .strip_prefix("developer_instructions=")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<String>(encoded).unwrap(),
+            instructions
         );
     }
 

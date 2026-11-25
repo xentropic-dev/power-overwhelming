@@ -51,6 +51,19 @@ fn json_stdout(args: &[&str]) -> Value {
 }
 
 #[test]
+fn help_points_agents_to_the_skill_catalog() {
+    let footer = concat!(
+        "Are you an AI? Use these resources ONLY IF your task asks you to:\n",
+        "  Use Power (artifacts, DAG workers, sessions):\n",
+        "    SKIP if a Power skill is already in your context. Otherwise run: power skills list",
+    );
+    for args in [&["--help"][..], &["skills", "--help"], &["dag", "--help"]] {
+        let help = stdout(args);
+        assert!(help.trim_end().ends_with(footer), "{args:?}: {help}");
+    }
+}
+
+#[test]
 fn lists_skills_and_descriptions() {
     let output = stdout(&["skills", "list"]);
     let entries: Vec<_> = output

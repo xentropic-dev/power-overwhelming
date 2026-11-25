@@ -15,7 +15,7 @@ Run `power` or `power gui` from any directory. Enter a Git checkout path in the 
 
 ## Shell integration
 
-On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines `claude` and `codex` shell functions. When you start an agent by hand, it then gets the same artifact-publishing instructions as an agent launched from the app. Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Power restores the last open box and its active tab when you relaunch with the daemon still running.
+On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines `claude` and `codex` shell functions. Agents started through these functions or from the app receive a list of bundled Power skills and can load a guide with `power skills get <name>`. Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Power restores the last open box and its active tab when you relaunch with the daemon still running.
 
 Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
 
@@ -85,7 +85,7 @@ The key sections are `prefix`, `box`, `tab`, `picker`, `dialog` (pickers without
 
 Click a local PNG, JPEG, WebP, MP4, WebM, or HTML link in the terminal, or open it from the keyboard. Ctrl+S then `o` numbers up to nine links on screen, newest output first. Press `1`–`9` to open one, or Esc to back out. Ctrl+S then `o` then `s` searches this box's published artifacts, newest first, along with any other links on screen. Ctrl+S then `v` moves focus to the preview pane: `h`/`l` switch previews, `x` closes one, space plays or pauses video, `,`/`.` seek, `j`/`k` scroll a page, `r` reloads it, `i` types into it, and Esc returns to the terminal. Loopback URLs such as `http://localhost:3000/` open in the same pane. Shift-drag selects text when the terminal app is handling mouse events. Ctrl-Shift-C and Ctrl-Shift-V copy and paste.
 
-Agents launched from the app receive instructions to publish an artifact and include the returned link in their reply. From any Power terminal, you can do the same.
+Run `power skills get power-artifacts` for the full guide to publishing artifacts and sharing their links. From any Power terminal, you can publish a file or a running server.
 
 ```sh
 power artifact publish './out/my video.mp4' --title 'Demo'

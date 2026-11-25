@@ -566,6 +566,10 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         "Prerequisite result",
         "/worktree",
         "power dag report success",
+        "power dag report failed",
+        "power dag report needs-input",
+        "power dag report working",
+        "Full worker contract: `power skills get power-dag --reference worker-contract`.",
     ] {
         assert!(prompt.contains(expected), "{prompt}");
     }

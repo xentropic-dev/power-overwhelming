@@ -2,8 +2,6 @@ use anyhow::{Context, Result, bail, ensure};
 use application::skills::SkillCatalog;
 use domain::skill::{Skill, SkillReference, SkillSummary};
 
-pub(crate) const ARTIFACTS_GUIDE: &str = include_str!("../../skills/power-artifacts/guide.md");
-
 struct EmbeddedSkill {
     stub: &'static str,
     guide: &'static str,
@@ -13,7 +11,7 @@ struct EmbeddedSkill {
 const SKILLS: &[EmbeddedSkill] = &[
     EmbeddedSkill {
         stub: include_str!("../../skills/power-artifacts/SKILL.md"),
-        guide: ARTIFACTS_GUIDE,
+        guide: include_str!("../../skills/power-artifacts/guide.md"),
         references: &[],
     },
     EmbeddedSkill {
