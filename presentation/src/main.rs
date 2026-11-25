@@ -27,8 +27,17 @@ use infrastructure::{
 use serde_json::{Value, json};
 use std::{ffi::OsString, io::Write as _, path::PathBuf, time::Duration};
 
+const AGENT_HELP_FOOTER: &str = concat!(
+    "Are you an AI? Use these resources ONLY IF your task asks you to:\n",
+    "  Use Power (artifacts, DAG workers, sessions):\n",
+    "    SKIP if a Power skill is already in your context. Otherwise run: power skills list",
+);
+
 #[derive(Parser)]
-#[command(about = "Persistent agent terminals and artifact previews")]
+#[command(
+    about = "Persistent agent terminals and artifact previews",
+    after_help = AGENT_HELP_FOOTER
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Action>,
@@ -65,11 +74,13 @@ enum Action {
         #[command(subcommand)]
         command: AgentAction,
     },
+    #[command(after_help = AGENT_HELP_FOOTER)]
     Dag {
         #[command(subcommand)]
         command: DagAction,
     },
     /// Read skills bundled with this Power release.
+    #[command(after_help = AGENT_HELP_FOOTER)]
     Skills {
         #[command(subcommand)]
         command: SkillsAction,

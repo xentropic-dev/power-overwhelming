@@ -725,6 +725,7 @@ fn worker_prompt(run: &Run, task: &Task, worktree: &Path) -> String {
         "If you need user input, run `power dag report needs-input --summary \"question\"`, ",
         "wait for the user's answer in this terminal, then run ",
         "`power dag report working --summary \"resolved\"` before continuing.\n",
+        "Full worker contract: `power skills get power-dag --reference worker-contract`.\n",
     ));
     prompt
 }
