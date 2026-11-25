@@ -1,6 +1,7 @@
 //! Shell integration: agent wrappers that interactive shells in Power terminals pick up,
 //! and the one-line rc hook that onboarding installs.
 
+use crate::skills::ARTIFACTS_GUIDE;
 use anyhow::{Context, Result, bail};
 use domain::session::Agent;
 use std::{
@@ -11,8 +12,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SKILL: &str = include_str!("../../skills/publish-artifact/SKILL.md");
-pub const DAG_SKILL: &str = include_str!("../../skills/dag-orchestration/SKILL.md");
 const MARKER: &str = "# Power Overwhelming shell integration";
 const WRAPPED: [Agent; 2] = [Agent::Claude, Agent::Codex];
 
@@ -159,7 +158,7 @@ fn has_marker(path: &Path) -> bool {
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
 pub(crate) fn instruction_args(agent: Agent, user: &[OsString]) -> Result<Vec<OsString>> {
-    let artifact_instructions = SKILL.splitn(3, "---").nth(2).unwrap_or(SKILL).trim();
+    let artifact_instructions = ARTIFACTS_GUIDE.trim();
     let instructions = format!(
         "{artifact_instructions}\n\n{}",
         concat!(
@@ -252,6 +251,7 @@ mod tests {
         let claude = instruction_args(Agent::Claude, &["fix the bug".into()]).unwrap();
         assert_eq!(claude[0], "--append-system-prompt");
         let instructions = claude[1].to_str().unwrap();
+        assert!(instructions.starts_with(ARTIFACTS_GUIDE.trim()));
         assert!(instructions.contains("run `power session task 'Short task label'`"));
         assert!(instructions.contains("Run `power dag guide`"));
         assert!(instructions.contains("must report with `power dag report`"));

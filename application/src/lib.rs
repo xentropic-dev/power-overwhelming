@@ -1,6 +1,7 @@
 mod commands;
 pub mod dag;
 mod queries;
+pub mod skills;
 
 pub use commands::{ArtifactPublished, PublishArtifact, SessionOptions, StartSession};
 pub use queries::ResolveArtifact;
