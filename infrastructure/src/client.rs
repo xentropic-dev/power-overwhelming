@@ -1,0 +1,236 @@
+use crate::wire::{self, Request, Response};
+use anyhow::{Context, Result, bail};
+use application::{PublishArtifact, ResolveArtifact, StartSession};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use domain::{
+    artifact::{LEGACY_URI_PREFIX, ResolvedArtifact, URI_PREFIX, artifact_id},
+    session::{Geometry, Session},
+};
+use std::{
+    fs::{DirBuilder, OpenOptions},
+    io::BufReader,
+    os::unix::{
+        fs::{DirBuilderExt, OpenOptionsExt},
+        net::UnixStream,
+        process::CommandExt,
+    },
+    path::PathBuf,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
+
+pub fn list_sessions() -> Result<Vec<Session>> {
+    match wire::request(&Request::List)? {
+        Response::Sessions { sessions } => Ok(sessions.into_iter().map(Into::into).collect()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn list_worktrees(directory: PathBuf) -> Result<Vec<PathBuf>> {
+    match wire::request(&Request::Worktrees { directory })? {
+        Response::Worktrees { worktrees } => Ok(worktrees),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn start_session(command: StartSession) -> Result<Session> {
+    match wire::request(&Request::Launch {
+        worktree: command.worktree,
+        agent: command.agent.into(),
+    })? {
+        Response::Launched { session } => Ok(session.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn end_session(session: String) -> Result<()> {
+    expect_ok(&Request::End { session })
+}
+
+pub fn publish_artifact(command: PublishArtifact) -> Result<String> {
+    match wire::request(&Request::Publish {
+        session: command.session,
+        cwd: command.cwd,
+        target: command.target,
+        title: command.title,
+    })? {
+        Response::Published { uri } => {
+            let id = artifact_id(&uri).context("Daemon returned an invalid artifact URI")?;
+            Ok(format!("{URI_PREFIX}{id}"))
+        }
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn resolve_artifact(query: ResolveArtifact) -> Result<ResolvedArtifact> {
+    // Terminals can remain connected to a daemon that only accepts this prefix.
+    let target = artifact_id(&query.target)
+        .map(|id| format!("{LEGACY_URI_PREFIX}{id}"))
+        .unwrap_or(query.target);
+    match wire::request(&Request::Resolve {
+        session: query.session,
+        target,
+    })? {
+        Response::Resolved { target, title } => Ok(ResolvedArtifact {
+            target: target.into(),
+            title,
+        }),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub enum TerminalControl {
+    Input(Vec<u8>),
+    Resize(Geometry),
+}
+
+pub fn control_terminal(session: &str, control: TerminalControl) -> Result<()> {
+    let session = session.to_owned();
+    let request = match control {
+        TerminalControl::Input(bytes) => Request::Input {
+            session,
+            data: STANDARD.encode(bytes),
+        },
+        TerminalControl::Resize(geometry) => Request::Resize {
+            session,
+            geometry: geometry.into(),
+        },
+    };
+    expect_ok(&request)
+}
+
+fn expect_ok(request: &Request) -> Result<()> {
+    match wire::request(request)? {
+        Response::Ok => Ok(()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub enum TerminalEvent {
+    Snapshot { data: Vec<u8>, exited: bool },
+    Output(Vec<u8>),
+    Geometry(Geometry),
+    Exit,
+    Status(String),
+}
+
+pub fn follow_terminal(
+    session: &str,
+    is_closed: impl Fn() -> bool,
+    deliver: impl Fn(TerminalEvent) -> bool,
+) {
+    while !is_closed() {
+        match subscribe(session, &is_closed, &deliver) {
+            Ok(()) => break,
+            Err(error) => {
+                if !deliver(TerminalEvent::Status(format!("Reconnecting… {error}"))) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(700));
+            }
+        }
+    }
+}
+
+fn subscribe(
+    session: &str,
+    is_closed: &impl Fn() -> bool,
+    deliver: &impl Fn(TerminalEvent) -> bool,
+) -> Result<()> {
+    let mut socket = UnixStream::connect(wire::socket_path())?;
+    socket.set_read_timeout(Some(Duration::from_secs(15)))?;
+    wire::send(
+        &mut socket,
+        &Request::Subscribe {
+            session: session.to_owned(),
+        },
+    )?;
+    let mut reader = BufReader::new(socket);
+    let mut sequence = None;
+    while !is_closed() {
+        let response: Response = wire::receive(&mut reader)?.context("Daemon disconnected")?;
+        match &response {
+            Response::Snapshot {
+                sequence: value, ..
+            } => sequence = Some(*value),
+            Response::Output {
+                sequence: value, ..
+            }
+            | Response::Geometry {
+                sequence: value, ..
+            } => {
+                if sequence.map(|previous| previous + 1) != Some(*value) {
+                    bail!("Terminal output was interrupted");
+                }
+                sequence = Some(*value);
+            }
+            _ => {}
+        }
+        let event = match response {
+            Response::Snapshot { data, exited, .. } => TerminalEvent::Snapshot {
+                data: STANDARD.decode(data)?,
+                exited,
+            },
+            Response::Output { data, .. } => TerminalEvent::Output(STANDARD.decode(data)?),
+            Response::Geometry { geometry, .. } => TerminalEvent::Geometry(geometry.into()),
+            Response::Exit => TerminalEvent::Exit,
+            Response::Error { message } => {
+                deliver(TerminalEvent::Status(message));
+                break;
+            }
+            Response::Ok => continue,
+            _ => bail!("Unexpected daemon response"),
+        };
+        if !deliver(event) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_daemon() -> Result<()> {
+    if list_sessions().is_ok() {
+        return Ok(());
+    }
+    let socket = wire::socket_path();
+    if let Some(parent) = socket.parent() {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    let log_path = socket.with_extension("log");
+    let log = OpenOptions::new()
+        .mode(0o600)
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log);
+    // Detach the daemon from the original controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut daemon = command.spawn()?;
+    for _ in 0..100 {
+        if list_sessions().is_ok() {
+            thread::spawn(move || {
+                let _ = daemon.wait();
+            });
+            return Ok(());
+        }
+        let _ = daemon.try_wait();
+        thread::sleep(Duration::from_millis(30));
+    }
+    bail!("Power daemon failed to start. See {}", log_path.display())
+}

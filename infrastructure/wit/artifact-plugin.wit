@@ -1,0 +1,26 @@
+package power:plugins@0.1.0;
+
+interface artifacts {
+    enum target-kind {
+        image,
+        video,
+        html,
+        loopback,
+    }
+
+    record artifact {
+        title: string,
+        kind: target-kind,
+        location: string,
+    }
+
+    /// Resolve the artifact for the current notification.
+    resolve-published: func() -> result<artifact, string>;
+}
+
+world artifact-plugin {
+    import artifacts;
+
+    /// Best-effort notification delivered after an artifact has been saved.
+    export on-artifact-published: func(uri: string);
+}

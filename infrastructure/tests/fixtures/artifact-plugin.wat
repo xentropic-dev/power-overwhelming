@@ -1,0 +1,56 @@
+(component
+  (type $artifacts (instance
+    (type $kind (enum "image" "video" "html" "loopback"))
+    (export "target-kind" (type $target-kind (eq $kind)))
+    (type $value (record
+      (field "title" string)
+      (field "kind" $target-kind)
+      (field "location" string)
+    ))
+    (export "artifact" (type $artifact (eq $value)))
+    (type $resolve (func (result (result $artifact (error string)))))
+    (export "resolve-published" (func (type $resolve)))
+  ))
+  (import "power:plugins/artifacts@0.1.0" (instance $artifacts (type $artifacts)))
+  (alias export $artifacts "resolve-published" (func $resolve))
+
+  (core module $allocator
+    (memory (export "memory") 1)
+    (global $next (mut i32) (i32.const 256))
+    (func (export "realloc") (param i32 i32 i32) (param $size i32) (result i32)
+      (local $start i32)
+      (local.set $start (global.get $next))
+      (global.set $next (i32.add (local.get $start) (local.get $size)))
+      (local.get $start)
+    )
+  )
+  (core instance $allocator (instantiate $allocator))
+  (alias core export $allocator "memory" (core memory $memory))
+  (alias core export $allocator "realloc" (core func $realloc))
+  (core func $resolve-lowered
+    (canon lower (func $resolve) (memory $memory) (realloc $realloc))
+  )
+
+  (core module $plugin
+    (import "" "memory" (memory 1))
+    (import "" "resolve" (func $resolve (param i32)))
+    (func (export "handle") (param $uri i32) (param $length i32)
+      ;; The result uses byte 0 as its discriminant and stores the record at offset 4.
+      (call $resolve (i32.const 0))
+      (if (i32.load8_u (i32.const 0)) (then unreachable))
+      (if (i32.eqz (i32.load (i32.const 8))) (then unreachable))
+      (if (i32.eqz (i32.load (i32.const 20))) (then unreachable))
+      (if (i32.ne (i32.load8_u (local.get $uri)) (i32.const 112)) (then unreachable))
+    )
+  )
+  (core instance $imports
+    (export "memory" (memory $memory))
+    (export "resolve" (func $resolve-lowered))
+  )
+  (core instance $plugin (instantiate $plugin (with "" (instance $imports))))
+  (alias core export $plugin "handle" (core func $handle))
+  (type $handler (func (param "uri" string)))
+  (func (export "on-artifact-published") (type $handler)
+    (canon lift (core func $handle) (memory $memory) (realloc $realloc))
+  )
+)
