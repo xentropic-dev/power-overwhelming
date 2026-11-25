@@ -1,8 +1,9 @@
-use super::{HostMessage, WorkerReply};
+use super::{ActiveView, HostMessage, WorkerReply};
 use crate::{terminal::PtyRuntime, wire};
 use anyhow::{Context, Result, bail};
 use application::{Application, ArtifactPublished, ResolveArtifact};
 use std::{
+    collections::BTreeMap,
     env,
     io::BufReader,
     os::{fd::OwnedFd, unix::net::UnixStream},
@@ -45,7 +46,7 @@ impl Plugins {
                 }
                 let result = (|| {
                     if worker.is_none() {
-                        worker = Some(Worker::start(Path::new(&directory))?);
+                        worker = Some(Worker::start(Path::new(&directory), false)?);
                     }
                     worker.as_mut().unwrap().dispatch(event, &application)
                 })();
@@ -71,8 +72,24 @@ struct Worker {
     connection: BufReader<UnixStream>,
 }
 
+pub struct StatusBarPlugins(Worker);
+
+impl StatusBarPlugins {
+    pub fn start(directory: &Path) -> Result<Self> {
+        Ok(Self(Worker::start(directory, true)?))
+    }
+
+    pub fn fields(&mut self, view: ActiveView) -> Result<BTreeMap<String, String>> {
+        wire::send(self.0.connection.get_ref(), &HostMessage::ActiveView(view))?;
+        match wire::receive(&mut self.0.connection)? {
+            Some(WorkerReply::StatusFields(fields)) => Ok(fields),
+            _ => bail!("Missing status fields from plugin host"),
+        }
+    }
+}
+
 impl Worker {
-    fn start(directory: &Path) -> Result<Self> {
+    fn start(directory: &Path, status_bar: bool) -> Result<Self> {
         let started_at = Instant::now();
         let executable = env::current_exe()?.with_file_name("power-plugin-host");
         let (daemon, worker) = UnixStream::pair()?;
@@ -80,8 +97,12 @@ impl Worker {
         daemon.set_write_timeout(Some(Duration::from_secs(3)))?;
         let input = OwnedFd::from(worker.try_clone()?);
         let output = OwnedFd::from(worker);
-        let child = Command::new(&executable)
-            .arg(directory)
+        let mut command = Command::new(&executable);
+        command.arg(directory);
+        if status_bar {
+            command.arg("--status-bar");
+        }
+        let child = command
             .stdin(Stdio::from(input))
             .stdout(Stdio::from(output))
             .spawn()
@@ -146,7 +167,9 @@ impl Worker {
                     )?;
                 }
                 Some(WorkerReply::Finished) => return Ok(()),
-                Some(WorkerReply::Ready) => bail!("Unexpected plugin host message"),
+                Some(WorkerReply::Ready | WorkerReply::StatusFields(_)) => {
+                    bail!("Unexpected plugin host message")
+                }
                 None => bail!("Plugin host disconnected"),
             }
         }

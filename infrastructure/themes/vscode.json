@@ -1,0 +1,72 @@
+[
+  {
+    "metadata": {
+      "name": "VS Code Dark",
+      "aliases": [
+        "Dark 2026"
+      ]
+    },
+    "colors": {
+      "background": "#191A1B",
+      "foreground": "#CCCCCC",
+      "cursor_bg": "#BFBFBF",
+      "ansi": [
+        "#000000",
+        "#cd3131",
+        "#0DBC79",
+        "#e5e510",
+        "#2472c8",
+        "#bc3fbc",
+        "#11a8cd",
+        "#e5e5e5"
+      ],
+      "brights": [
+        "#666666",
+        "#f14c4c",
+        "#23d18b",
+        "#f5f543",
+        "#3b8eea",
+        "#d670d6",
+        "#29b8db",
+        "#e5e5e5"
+      ],
+      "selection_bg": "#3994BC33",
+      "indexed": {}
+    }
+  },
+  {
+    "metadata": {
+      "name": "VS Code Light",
+      "aliases": [
+        "Light 2026"
+      ]
+    },
+    "colors": {
+      "background": "#FAFAFD",
+      "foreground": "#333333",
+      "cursor_bg": "#202020",
+      "ansi": [
+        "#000000",
+        "#cd3131",
+        "#107C10",
+        "#949800",
+        "#0451a5",
+        "#bc05bc",
+        "#0598bc",
+        "#555555"
+      ],
+      "brights": [
+        "#666666",
+        "#f14c4c",
+        "#14CE14",
+        "#b5ba00",
+        "#3b8eea",
+        "#d670d6",
+        "#29b8db",
+        "#a5a5a5"
+      ],
+      "selection_bg": "#0069CC26",
+      "indexed": {}
+    }
+  }
+]

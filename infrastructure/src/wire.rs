@@ -15,11 +15,52 @@ pub enum Agent {
     Claude,
 }
 
+/// A published artifact in history or in a publish event.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Artifact {
+    pub session: String,
+    pub uri: String,
+    pub title: String,
+}
+
+impl From<application::RecentArtifact> for Artifact {
+    fn from(value: application::RecentArtifact) -> Self {
+        Self {
+            session: value.session,
+            uri: value.uri,
+            title: value.title,
+        }
+    }
+}
+
+impl From<Artifact> for application::RecentArtifact {
+    fn from(value: Artifact) -> Self {
+        Self {
+            session: value.session,
+            uri: value.uri,
+            title: value.title,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Session {
     pub id: String,
     pub worktree: PathBuf,
     pub agent: Agent,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SessionMetadata {
+    pub task: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataField {
+    Task,
+    Model,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -43,8 +84,19 @@ pub enum Target {
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     List,
+    SetColorScheme {
+        name: String,
+    },
     Worktrees {
         directory: PathBuf,
+    },
+    WorkingDirectory {
+        session: String,
+    },
+    SetMetadata {
+        session: String,
+        field: MetadataField,
+        value: String,
     },
     Launch {
         worktree: PathBuf,
@@ -71,8 +123,18 @@ pub enum Request {
         session: String,
         target: String,
     },
+    /// Artifacts published from these sessions, newest first.
+    RecentArtifacts {
+        sessions: Vec<String>,
+        limit: usize,
+    },
+    /// Stream an `artifact_published` event for every publish.
+    WatchArtifacts,
     End {
         session: String,
+    },
+    Dag {
+        dag: DagRequest,
     },
 }
 
@@ -88,6 +150,9 @@ pub enum Response {
     },
     Worktrees {
         worktrees: Vec<PathBuf>,
+    },
+    WorkingDirectory {
+        directory: Option<PathBuf>,
     },
     Launched {
         session: Session,
@@ -106,12 +171,27 @@ pub enum Response {
         geometry: Geometry,
     },
     Exit,
+    Agent {
+        agent: Agent,
+    },
+    Metadata {
+        metadata: SessionMetadata,
+    },
     Published {
         uri: String,
+    },
+    RecentArtifacts {
+        artifacts: Vec<Artifact>,
+    },
+    ArtifactPublished {
+        artifact: Artifact,
     },
     Resolved {
         target: Target,
         title: String,
+    },
+    Dag {
+        dag: DagResponse,
     },
 }
 
@@ -235,4 +315,455 @@ impl From<artifact::Target> for Target {
             artifact::Target::Loopback(value) => Self::Loopback(value),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DAG orchestration contract. Boxes, managed agents, runs, tasks and attempts.
+// ---------------------------------------------------------------------------
+
+/// A saved box as the daemon sees it in the box registry.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct BoxInfo {
+    pub id: String,
+    /// Folder name of the repository, for display and `--box` selection.
+    pub name: String,
+    pub repository: PathBuf,
+    pub checkout: PathBuf,
+    pub shortcut: Option<u8>,
+    /// False when the box is detached from the strip.
+    pub open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Codex,
+    Claude,
+    /// Runs the given argv directly. Used for deterministic worker fixtures.
+    Command,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Running,
+    Exited,
+}
+
+/// A Claude Code, Codex, or fixture process managed by Power. Tab attachment is tracked by the
+/// desktop, independently of this record.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ManagedAgent {
+    pub id: String,
+    pub box_id: String,
+    pub worktree: PathBuf,
+    pub provider: Provider,
+    /// The delegating Power agent, if any.
+    pub parent: Option<String>,
+    /// The daemon terminal session, while it has one.
+    pub session: Option<String>,
+    pub run: Option<String>,
+    pub task: Option<String>,
+    pub attempt: Option<String>,
+    pub state: AgentState,
+    /// Short label, the task title for DAG workers.
+    pub label: String,
+    /// Unix seconds.
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Coordinator {
+    /// A Power agent, such as a managed Claude Code or Codex session in a box.
+    Agent { agent: String },
+    /// A coordinator outside Power, such as a Herdr pane. The label is opaque.
+    External { label: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// Some prerequisite has not completed successfully.
+    Waiting,
+    Ready,
+    Working,
+    NeedsInput,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptState {
+    Active,
+    NeedsInput,
+    Succeeded,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Attempt {
+    pub id: String,
+    /// 1 for the first dispatch of a task.
+    pub number: u32,
+    pub agent: String,
+    pub session: Option<String>,
+    pub worktree: PathBuf,
+    pub provider: Provider,
+    pub state: AttemptState,
+    /// Result summary from the worker's final report.
+    pub summary: Option<String>,
+    /// Outstanding request for input, while state is `needs_input`.
+    pub blocker: Option<String>,
+    /// Daemon-supplied context, such as why an attempt was interrupted.
+    pub detail: Option<String>,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+}
+
+/// A task as the coordinator defines it.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct TaskSpec {
+    /// Stable ID, unique within the run, matching `[a-z0-9][a-z0-9_-]{0,63}`.
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub deps: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub instructions: String,
+    pub deps: Vec<String>,
+    /// Derived by the daemon from persisted attempts and prerequisite states.
+    pub state: TaskState,
+    pub current_attempt: Option<String>,
+    /// Oldest first.
+    pub attempts: Vec<Attempt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct Run {
+    pub id: String,
+    pub box_id: String,
+    pub title: String,
+    pub coordinator: Coordinator,
+    pub created_at: u64,
+    /// In insertion order.
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportStatus {
+    Success,
+    Failed,
+    NeedsInput,
+    /// Clears an outstanding input request and continues the attempt.
+    Working,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEventKind {
+    RunCreated,
+    TaskAdded,
+    TaskReady,
+    AttemptStarted,
+    AttemptSucceeded,
+    AttemptFailed,
+    NeedsInput,
+    InputResolved,
+    /// The worker exited without a result, or its session could not be recovered.
+    AttemptInterrupted,
+    /// A report from an attempt that is no longer current. Recorded, not applied.
+    StaleReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct RunEvent {
+    /// Daemon-wide, strictly increasing, persisted.
+    pub seq: u64,
+    pub run: String,
+    pub box_id: String,
+    pub kind: RunEventKind,
+    pub task: Option<String>,
+    pub attempt: Option<String>,
+    /// Result summary, blocker text, or interruption context.
+    pub summary: Option<String>,
+    pub at: u64,
+}
+
+/// A box with at least one outstanding request for input.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct BoxAttention {
+    pub box_id: String,
+    /// Sessions of workers that need input, for tab highlights.
+    pub sessions: Vec<String>,
+    /// Agents that need input, including those without a session view.
+    pub agents: Vec<String>,
+}
+
+/// DAG requests. They travel inside `Request::Dag`, so existing clients are unaffected.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DagRequest {
+    ListBoxes,
+    /// `box_sel` accepts a box ID, a unique ID prefix, a shortcut digit, or a unique repo name.
+    /// `caller` is the caller's POWER_SESSION and selects its box when `box_sel` is absent.
+    ListAgents {
+        box_sel: Option<String>,
+        caller: Option<String>,
+    },
+    StartAgent {
+        box_sel: Option<String>,
+        caller: Option<String>,
+        provider: Provider,
+        worktree: PathBuf,
+        parent: Option<String>,
+        label: String,
+        prompt: Option<String>,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    CreateRun {
+        box_sel: Option<String>,
+        caller: Option<String>,
+        title: String,
+        /// External coordinator label. When absent, `caller` must be a Power session and
+        /// becomes the coordinating agent.
+        coordinator: Option<String>,
+    },
+    ListRuns {
+        box_sel: Option<String>,
+        caller: Option<String>,
+    },
+    GetRun {
+        run: String,
+    },
+    /// Adds tasks atomically. References may point at tasks in this batch or already in the
+    /// run. Unknown references, duplicate IDs, and cycles reject the whole batch.
+    AddTasks {
+        run: String,
+        tasks: Vec<TaskSpec>,
+    },
+    AddDependency {
+        run: String,
+        task: String,
+        dep: String,
+    },
+    Dispatch {
+        run: String,
+        task: String,
+        provider: Provider,
+        worktree: PathBuf,
+        /// Required to start a new attempt after a failed or interrupted one.
+        #[serde(default)]
+        retry: bool,
+        /// Extra provider arguments, or the argv for `Provider::Command`.
+        #[serde(default)]
+        args: Vec<String>,
+        caller: Option<String>,
+    },
+    Report {
+        run: String,
+        task: String,
+        attempt: String,
+        status: ReportStatus,
+        summary: String,
+    },
+    /// Events with `seq > since`. Blocks up to `wait_ms` when none match yet.
+    Events {
+        run: String,
+        since: u64,
+        #[serde(default)]
+        wait_ms: u64,
+        /// Empty means every kind.
+        #[serde(default)]
+        kinds: Vec<RunEventKind>,
+    },
+    Attention,
+    /// Streams `DagResponse::Event` for every run event in the selected box, or all boxes.
+    Watch {
+        box_sel: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DagResponse {
+    Boxes { boxes: Vec<BoxInfo> },
+    Agents { agents: Vec<ManagedAgent> },
+    Agent { agent: ManagedAgent },
+    Run { run: Run },
+    Runs { runs: Vec<Run> },
+    Dispatched { attempt: Attempt, agent: ManagedAgent },
+    Reported { applied: bool, reason: Option<String> },
+    Events { events: Vec<RunEvent>, cursor: u64 },
+    Attention { boxes: Vec<BoxAttention> },
+    Event { event: RunEvent },
+}
+
+// Domain entities do not depend on serde. These conversions keep the transport
+// fields, enum spellings, and optional values independent of the use cases.
+mod dag_dto {
+    use super::*;
+    use domain::dag;
+
+    macro_rules! enum_dto {
+        ($name:ident { $($variant:ident),+ $(,)? }) => {
+            impl From<dag::$name> for $name {
+                fn from(value: dag::$name) -> Self {
+                    match value { $(dag::$name::$variant => Self::$variant),+ }
+                }
+            }
+            impl From<$name> for dag::$name {
+                fn from(value: $name) -> Self {
+                    match value { $($name::$variant => Self::$variant),+ }
+                }
+            }
+        };
+        ($name:ident { $($variant:ident { $field:ident }),+ $(,)? }) => {
+            impl From<dag::$name> for $name {
+                fn from(value: dag::$name) -> Self {
+                    match value { $(dag::$name::$variant { $field } => Self::$variant { $field }),+ }
+                }
+            }
+            impl From<$name> for dag::$name {
+                fn from(value: $name) -> Self {
+                    match value { $($name::$variant { $field } => Self::$variant { $field }),+ }
+                }
+            }
+        };
+    }
+
+    macro_rules! struct_dto {
+        ($name:ident { $($field:ident),+ $(,)? } $(lists { $($list:ident),+ $(,)? })?) => {
+            impl From<dag::$name> for $name {
+                fn from(value: dag::$name) -> Self {
+                    Self {
+                        $($field: value.$field.into(),)+
+                        $($($list: value.$list.into_iter().map(Into::into).collect(),)+)?
+                    }
+                }
+            }
+            impl From<$name> for dag::$name {
+                fn from(value: $name) -> Self {
+                    Self {
+                        $($field: value.$field.into(),)+
+                        $($($list: value.$list.into_iter().map(Into::into).collect(),)+)?
+                    }
+                }
+            }
+        };
+    }
+
+    enum_dto!(Provider {
+        Codex,
+        Claude,
+        Command
+    });
+    enum_dto!(AgentState { Running, Exited });
+    enum_dto!(Coordinator { Agent { agent }, External { label } });
+    enum_dto!(TaskState {
+        Waiting,
+        Ready,
+        Working,
+        NeedsInput,
+        Completed,
+        Failed,
+        Interrupted
+    });
+    enum_dto!(AttemptState {
+        Active,
+        NeedsInput,
+        Succeeded,
+        Failed,
+        Interrupted
+    });
+    enum_dto!(ReportStatus {
+        Success,
+        Failed,
+        NeedsInput,
+        Working
+    });
+    enum_dto!(RunEventKind {
+        RunCreated,
+        TaskAdded,
+        TaskReady,
+        AttemptStarted,
+        AttemptSucceeded,
+        AttemptFailed,
+        NeedsInput,
+        InputResolved,
+        AttemptInterrupted,
+        StaleReport,
+    });
+
+    struct_dto!(BoxInfo {
+        id,
+        name,
+        repository,
+        checkout,
+        shortcut,
+        open
+    });
+    struct_dto!(ManagedAgent {
+        id,
+        box_id,
+        worktree,
+        provider,
+        parent,
+        session,
+        run,
+        task,
+        attempt,
+        state,
+        label,
+        created_at,
+    });
+    struct_dto!(Attempt {
+        id,
+        number,
+        agent,
+        session,
+        worktree,
+        provider,
+        state,
+        summary,
+        blocker,
+        detail,
+        started_at,
+        ended_at,
+    });
+    struct_dto!(TaskSpec {
+        id,
+        title,
+        instructions,
+        deps
+    });
+    struct_dto!(Task { id, title, instructions, deps, state, current_attempt } lists { attempts });
+    struct_dto!(Run { id, box_id, title, coordinator, created_at } lists { tasks });
+    struct_dto!(RunEvent {
+        seq,
+        run,
+        box_id,
+        kind,
+        task,
+        attempt,
+        summary,
+        at
+    });
+    struct_dto!(BoxAttention {
+        box_id,
+        sessions,
+        agents
+    });
 }

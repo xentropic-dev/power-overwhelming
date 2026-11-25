@@ -1,13 +1,27 @@
 mod gui;
+mod keymap;
+mod picker;
 mod preview;
+mod settings;
+mod status_bar;
 mod terminal_view;
 
 use anyhow::{Context, Result};
 use application::{PublishArtifact, StartSession};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use domain::session::Agent;
-use infrastructure::{client, daemon};
-use std::path::PathBuf;
+use infrastructure::{
+    client::{
+        self,
+        protocol::{
+            DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec, TaskState,
+        },
+    },
+    daemon,
+    shell::Shell,
+};
+use serde_json::{Value, json};
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(about = "Persistent agent terminals and artifact previews")]
@@ -18,10 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    Gui {
-        #[arg(default_value = ".")]
-        directory: PathBuf,
-    },
+    Gui,
     Daemon,
     Session {
         #[command(subcommand)]
@@ -31,6 +42,35 @@ enum Action {
         #[command(subcommand)]
         command: ArtifactAction,
     },
+    /// Install the shell hook that wraps claude and codex inside Power terminals.
+    Setup {
+        /// Print what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print shell code for Power terminals. The installed hook runs this.
+    ShellInit {
+        #[arg(value_parser = ["bash", "zsh", "fish"])]
+        shell: String,
+    },
+    Box {
+        #[command(subcommand)]
+        command: BoxAction,
+    },
+    Agent {
+        #[command(subcommand)]
+        command: AgentAction,
+    },
+    Dag {
+        #[command(subcommand)]
+        command: DagAction,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum WrappedAgent {
+    Codex,
+    Claude,
 }
 
 #[derive(Subcommand)]
@@ -45,6 +85,14 @@ enum SessionAction {
         agent: AgentChoice,
         #[arg(default_value = ".")]
         directory: PathBuf,
+    },
+    /// Set this terminal's active agent task. Pass an empty label to clear it.
+    Task {
+        label: String,
+    },
+    /// Report this terminal's active model from a provider integration.
+    Model {
+        name: String,
     },
     End {
         id: String,
@@ -78,7 +126,24 @@ enum ArtifactAction {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        let mut args = std::env::args_os().skip(1);
+        let command = args.next();
+        let dag_command = match command.as_deref().and_then(|arg| arg.to_str()) {
+            Some("box" | "dag") => true,
+            Some("agent") => !matches!(
+                args.next().as_deref().and_then(|arg| arg.to_str()),
+                Some("codex" | "claude")
+            ),
+            _ => false,
+        };
+        if error.use_stderr() && dag_command {
+            let _ = error.print();
+            std::process::exit(1);
+        }
+        error.exit()
+    });
+    match cli.command {
         Some(Action::Daemon) => daemon::serve(),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
@@ -92,6 +157,12 @@ fn main() -> Result<()> {
                 title,
             })?;
             println!("{uri}");
+            Ok(())
+        }
+        Some(Action::Dag {
+            command: DagAction::Guide,
+        }) => {
+            print!("{}", infrastructure::shell::DAG_SKILL);
             Ok(())
         }
         Some(Action::Session { command }) => {
@@ -120,17 +191,454 @@ fn main() -> Result<()> {
                     println!("{}", session.id);
                 }
                 SessionAction::End { id } => client::end_session(id)?,
+                SessionAction::Task { label } => client::set_task(
+                    std::env::var("POWER_SESSION").context("Set a task from a Power terminal")?,
+                    label,
+                )?,
+                SessionAction::Model { name } => client::set_model(
+                    std::env::var("POWER_SESSION").context("Set a model from a Power terminal")?,
+                    name,
+                )?,
             }
             Ok(())
         }
-        command => {
-            let directory = match command {
-                Some(Action::Gui { directory }) => directory,
-                _ => std::env::current_dir()?,
-            };
-            client::ensure_daemon()?;
-            gui::run(directory.canonicalize()?);
+        Some(Action::Setup { dry_run }) => {
+            let shell = Shell::detect().context(
+                "Shell integration supports bash, zsh and fish. Set SHELL to one of them.",
+            )?;
+            let rc = shell
+                .rc_file()
+                .context("Set HOME to install shell integration")?;
+            if shell.installed() {
+                println!("Shell integration is already in {}", rc.display());
+            } else if dry_run {
+                println!("Would append to {}:\n{}", rc.display(), shell.hook());
+            } else {
+                shell.install()?;
+                println!("Added shell integration to {}", rc.display());
+            }
             Ok(())
         }
+        Some(Action::ShellInit { shell }) => {
+            print!("{}", Shell::parse(&shell).unwrap().init_script());
+            Ok(())
+        }
+        Some(Action::Box {
+            command: BoxAction::List,
+        }) => {
+            client::ensure_daemon()?;
+            print_json(json!({"boxes": protocol_boxes()?}))
+        }
+        Some(Action::Agent { command }) => match command {
+            AgentAction::Codex { args } => infrastructure::shell::exec_agent(Agent::Codex, args),
+            AgentAction::Claude { args } => infrastructure::shell::exec_agent(Agent::Claude, args),
+            AgentAction::List { box_sel } => {
+                client::ensure_daemon()?;
+                print_json(json!({"agents": protocol_agents(box_sel)?}))
+            }
+            AgentAction::Start {
+                box_sel,
+                provider,
+                worktree,
+                parent,
+                label,
+                prompt,
+                args,
+            } => {
+                client::ensure_daemon()?;
+                let (provider, name) = match provider {
+                    WrappedAgent::Codex => (Provider::Codex, "Codex"),
+                    WrappedAgent::Claude => (Provider::Claude, "Claude"),
+                };
+                dag_reply(
+                    DagRequest::StartAgent {
+                        box_sel,
+                        caller: caller_session(),
+                        provider,
+                        worktree: worktree.canonicalize().context("Open worktree")?,
+                        parent,
+                        label: label.unwrap_or_else(|| name.into()),
+                        prompt,
+                        args,
+                    },
+                    Duration::from_secs(10),
+                )
+            }
+        },
+        Some(Action::Dag { command }) => {
+            client::ensure_daemon()?;
+            run_dag(command)
+        }
+        None | Some(Action::Gui) => {
+            gui::run();
+            Ok(())
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BoxAction {
+    List,
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    List {
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+    },
+    Start {
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+        #[arg(long, value_enum)]
+        provider: WrappedAgent,
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Start an agent with Power's instructions. The shell wrappers call this.
+    #[command(hide = true)]
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    #[command(hide = true)]
+    Claude {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DagAction {
+    /// Print the bundled DAG orchestration skill.
+    Guide,
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+        #[arg(long)]
+        coordinator: Option<String>,
+    },
+    List {
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+    },
+    Show {
+        run: String,
+    },
+    AddTask {
+        run: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, conflicts_with = "instructions_file")]
+        instructions: Option<String>,
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+        #[arg(long = "after")]
+        deps: Vec<String>,
+    },
+    Apply {
+        run: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    AddDep {
+        run: String,
+        task: String,
+        dep: String,
+    },
+    Ready {
+        run: String,
+    },
+    Dispatch {
+        #[command(flatten)]
+        launch: DispatchArgs,
+        #[arg(long)]
+        retry: bool,
+    },
+    Retry(DispatchArgs),
+    Report {
+        #[arg(value_enum)]
+        status: ReportChoice,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    Events(EventArgs),
+    Wait {
+        #[command(flatten)]
+        events: EventArgs,
+        #[arg(long, default_value_t = 600, value_name = "SECS")]
+        timeout: u64,
+    },
+}
+
+#[derive(Args)]
+struct DispatchArgs {
+    run: String,
+    task: String,
+    #[arg(long, value_enum)]
+    provider: ProviderChoice,
+    #[arg(long)]
+    worktree: PathBuf,
+    #[arg(last = true)]
+    args: Vec<String>,
+}
+
+#[derive(Args)]
+struct EventArgs {
+    run: String,
+    #[arg(long, default_value_t = 0)]
+    since: u64,
+    #[arg(long = "kind", value_parser = parse_event_kind)]
+    kinds: Vec<RunEventKind>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProviderChoice {
+    Codex,
+    Claude,
+    Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ReportChoice {
+    Success,
+    Failed,
+    NeedsInput,
+    Working,
+}
+
+fn caller_session() -> Option<String> {
+    std::env::var("POWER_SESSION")
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+fn parse_event_kind(value: &str) -> Result<RunEventKind, serde_json::Error> {
+    serde_json::from_value(Value::String(value.replace('-', "_")))
+}
+
+fn print_json(value: Value) -> Result<()> {
+    use std::io::Write as _;
+    writeln!(std::io::stdout().lock(), "{value}")?;
+    Ok(())
+}
+
+fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
+    let with_link = matches!(
+        request,
+        DagRequest::CreateRun { .. } | DagRequest::GetRun { .. }
+    );
+    let response = match client::dag(request, timeout)? {
+        DagResponse::Agent { agent } => json!({"agent": agent}),
+        DagResponse::Run { run } if with_link => {
+            json!({"link": domain::link::dag_uri(&run.id), "run": run})
+        }
+        DagResponse::Run { run } => json!({"run": run}),
+        DagResponse::Runs { runs } => {
+            let links: serde_json::Map<String, Value> = runs
+                .iter()
+                .map(|run| (run.id.clone(), json!(domain::link::dag_uri(&run.id))))
+                .collect();
+            json!({"runs": runs, "links": links})
+        }
+        DagResponse::Dispatched { attempt, agent } => json!({"attempt": attempt, "agent": agent}),
+        DagResponse::Reported { applied, reason } => json!({"applied": applied, "reason": reason}),
+        DagResponse::Events { events, cursor } => json!({"events": events, "cursor": cursor}),
+        _ => anyhow::bail!("Unexpected daemon response"),
+    };
+    print_json(response)
+}
+
+fn report_arg(value: Option<String>, env: &str, flag: &str) -> Result<String> {
+    value
+        .or_else(|| std::env::var(env).ok().filter(|value| !value.is_empty()))
+        .with_context(|| format!("Specify --{flag} or set {env}"))
+}
+
+fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
+    Ok(DagRequest::Dispatch {
+        run: launch.run,
+        task: launch.task,
+        provider: match launch.provider {
+            ProviderChoice::Codex => Provider::Codex,
+            ProviderChoice::Claude => Provider::Claude,
+            ProviderChoice::Command => Provider::Command,
+        },
+        worktree: launch.worktree.canonicalize().context("Open worktree")?,
+        retry,
+        args: launch.args,
+        caller: caller_session(),
+    })
+}
+
+fn run_dag(command: DagAction) -> Result<()> {
+    let timeout = Duration::from_secs(10);
+    let request = match command {
+        DagAction::Guide => unreachable!("The guide is printed without the daemon"),
+        DagAction::Create {
+            title,
+            box_sel,
+            coordinator,
+        } => DagRequest::CreateRun {
+            box_sel,
+            caller: caller_session(),
+            title,
+            coordinator,
+        },
+        DagAction::List { box_sel } => DagRequest::ListRuns {
+            box_sel,
+            caller: caller_session(),
+        },
+        DagAction::Show { run } => DagRequest::GetRun { run },
+        DagAction::AddTask {
+            run,
+            id,
+            title,
+            instructions,
+            instructions_file,
+            deps,
+        } => {
+            let instructions = match instructions_file {
+                Some(file) => std::fs::read_to_string(&file)
+                    .with_context(|| format!("Read instructions from {}", file.display()))?,
+                None => instructions.unwrap_or_default(),
+            };
+            DagRequest::AddTasks {
+                run,
+                tasks: vec![TaskSpec {
+                    id,
+                    title,
+                    instructions,
+                    deps,
+                }],
+            }
+        }
+        DagAction::Apply { run, file } => {
+            let bytes = std::fs::read(&file)
+                .with_context(|| format!("Read tasks from {}", file.display()))?;
+            let value = match serde_json::from_slice(&bytes)? {
+                Value::Object(mut envelope) => {
+                    envelope.remove("tasks").context("Missing tasks array")?
+                }
+                value => value,
+            };
+            DagRequest::AddTasks {
+                run,
+                tasks: serde_json::from_value(value)?,
+            }
+        }
+        DagAction::AddDep { run, task, dep } => DagRequest::AddDependency { run, task, dep },
+        DagAction::Ready { run } => {
+            let tasks: Vec<_> = protocol_run(run)?
+                .tasks
+                .into_iter()
+                .filter(|task| task.state == TaskState::Ready)
+                .collect();
+            return print_json(json!({"tasks": tasks}));
+        }
+        DagAction::Dispatch { launch, retry } => dispatch_request(launch, retry)?,
+        DagAction::Retry(launch) => dispatch_request(launch, true)?,
+        DagAction::Report {
+            status,
+            summary,
+            run,
+            task,
+            attempt,
+        } => DagRequest::Report {
+            run: report_arg(run, "POWER_RUN", "run")?,
+            task: report_arg(task, "POWER_TASK", "task")?,
+            attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
+            summary,
+            status: match status {
+                ReportChoice::Success => ReportStatus::Success,
+                ReportChoice::Failed => ReportStatus::Failed,
+                ReportChoice::NeedsInput => ReportStatus::NeedsInput,
+                ReportChoice::Working => ReportStatus::Working,
+            },
+        },
+        DagAction::Events(EventArgs { run, since, kinds }) => DagRequest::Events {
+            run,
+            since,
+            kinds,
+            wait_ms: 0,
+        },
+        DagAction::Wait {
+            events:
+                EventArgs {
+                    run,
+                    since,
+                    mut kinds,
+                },
+            timeout: seconds,
+        } => {
+            use RunEventKind::*;
+            if kinds.is_empty() {
+                kinds = vec![
+                    AttemptSucceeded,
+                    AttemptFailed,
+                    NeedsInput,
+                    InputResolved,
+                    AttemptInterrupted,
+                    TaskReady,
+                ];
+            }
+            return dag_reply(
+                DagRequest::Events {
+                    run,
+                    since,
+                    kinds,
+                    wait_ms: seconds
+                        .checked_mul(1000)
+                        .context("Wait timeout is too large")?,
+                },
+                Duration::from_secs(seconds) + timeout,
+            );
+        }
+    };
+    dag_reply(request, timeout)
+}
+
+const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
+    match client::dag(DagRequest::ListBoxes, PROTOCOL_TIMEOUT)? {
+        DagResponse::Boxes { boxes } => Ok(boxes),
+        _ => anyhow::bail!("Unexpected daemon response"),
+    }
+}
+
+fn protocol_agents(box_sel: Option<String>) -> Result<Vec<client::protocol::ManagedAgent>> {
+    let request = DagRequest::ListAgents {
+        box_sel,
+        caller: caller_session(),
+    };
+    match client::dag(request, PROTOCOL_TIMEOUT)? {
+        DagResponse::Agents { agents } => Ok(agents),
+        _ => anyhow::bail!("Unexpected daemon response"),
+    }
+}
+
+fn protocol_run(run: String) -> Result<client::protocol::Run> {
+    match client::dag(DagRequest::GetRun { run }, PROTOCOL_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run),
+        _ => anyhow::bail!("Unexpected daemon response"),
     }
 }

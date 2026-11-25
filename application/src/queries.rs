@@ -17,8 +17,16 @@ impl<T: TerminalRuntime> Application<T> {
             .lock()
             .unwrap()
             .values()
-            .map(|live| live.session.clone())
+            .map(|live| self.current(live))
             .collect()
+    }
+
+    pub fn recent_artifacts(
+        &self,
+        sessions: &[String],
+        limit: usize,
+    ) -> Result<Vec<crate::RecentArtifact>> {
+        self.artifacts.recent(sessions, limit)
     }
 
     pub fn list_worktrees(&self, directory: &Path) -> Result<Vec<PathBuf>> {

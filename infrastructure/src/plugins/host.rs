@@ -15,7 +15,7 @@ use wasmtime::{
 };
 
 wasmtime::component::bindgen!({
-    path: "wit",
+    path: "wit/artifact-plugin.wit",
     world: "artifact-plugin",
 });
 
@@ -24,9 +24,9 @@ use power::plugins::artifacts::{Artifact, Host, TargetKind};
 const MAX_PLUGINS: usize = 8;
 const MAX_COMPONENT_SIZE: u64 = 8 * 1024 * 1024;
 const EPOCH_INTERVAL: Duration = Duration::from_millis(10);
-const CALL_EPOCHS: u64 = 10;
+pub(super) const CALL_EPOCHS: u64 = 10;
 
-pub fn run_host(directory: PathBuf) -> Result<()> {
+pub(super) fn engine() -> Result<(Engine, mpsc::Sender<()>)> {
     let mut config = Config::new();
     config
         .wasm_component_model(true)
@@ -39,8 +39,6 @@ pub fn run_host(directory: PathBuf) -> Result<()> {
         Err(error) => eprintln!("Could not configure the plugin compilation cache. {error:#}"),
     }
     let engine = Engine::new(&config)?;
-    let mut linker = Linker::new(&engine);
-    ArtifactPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
     let clock = engine.clone();
     let (execution, ticks) = mpsc::channel();
     thread::spawn(move || {
@@ -51,7 +49,13 @@ pub fn run_host(directory: PathBuf) -> Result<()> {
             }
         }
     });
+    Ok((engine, execution))
+}
 
+pub fn run_host(directory: PathBuf) -> Result<()> {
+    let (engine, execution) = engine()?;
+    let mut linker = Linker::new(&engine);
+    ArtifactPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
     let connection = Arc::new(Mutex::new(Connection {
         reader: BufReader::new(io::stdin()),
         writer: io::stdout(),
@@ -73,7 +77,7 @@ pub fn run_host(directory: PathBuf) -> Result<()> {
         let message = wire::receive(&mut connection.lock().unwrap().reader)?;
         let uri = match message {
             Some(HostMessage::ArtifactPublished { uri }) => uri,
-            Some(HostMessage::ArtifactResolved(_)) => bail!("Unexpected artifact response"),
+            Some(_) => bail!("Unexpected artifact response"),
             None => return Ok(()),
         };
         connection.lock().unwrap().active = true;
@@ -100,7 +104,7 @@ pub fn run_host(directory: PathBuf) -> Result<()> {
     }
 }
 
-fn components(directory: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn components(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(directory).with_context(|| format!("Read {}", directory.display()))? {
         let entry = entry?;
@@ -117,6 +121,28 @@ fn components(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+pub(super) fn load_component(path: &Path, engine: &Engine) -> Result<Component> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_COMPONENT_SIZE + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_COMPONENT_SIZE,
+        "Plugin exceeds the file size limit"
+    );
+    Ok(Component::from_binary(engine, &bytes)?)
+}
+
+pub(super) fn store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(16 * 1024 * 1024)
+        .memories(2)
+        .tables(4)
+        .table_elements(4_096)
+        .instances(4)
+        .build()
+}
+
 struct Plugin {
     path: PathBuf,
     store: Store<HostState>,
@@ -130,27 +156,13 @@ impl Plugin {
         linker: &Linker<HostState>,
         connection: Arc<Mutex<Connection>>,
     ) -> Result<Self> {
-        let mut bytes = Vec::new();
-        File::open(path)?
-            .take(MAX_COMPONENT_SIZE + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_COMPONENT_SIZE,
-            "Plugin exceeds the file size limit"
-        );
-        let component = Component::from_binary(engine, &bytes)?;
+        let component = load_component(path, engine)?;
         let mut store = Store::new(
             engine,
             HostState {
                 connection,
                 queried: false,
-                limits: StoreLimitsBuilder::new()
-                    .memory_size(16 * 1024 * 1024)
-                    .memories(2)
-                    .tables(4)
-                    .table_elements(4_096)
-                    .instances(4)
-                    .build(),
+                limits: store_limits(),
             },
         );
         store.limiter(|state| &mut state.limits);

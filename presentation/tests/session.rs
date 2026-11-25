@@ -2,13 +2,34 @@ use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Daemon(Child);
+
+impl Daemon {
+    fn start(root: &Path) -> (Self, PathBuf) {
+        let socket = root.join("power.sock");
+        let daemon = Self(
+            Command::new(env!("CARGO_BIN_EXE_power"))
+                .arg("daemon")
+                .env("POWER_SOCKET", &socket)
+                .env("POWER_STATE_DIR", root.join("state"))
+                .env("SHELL", "/bin/sh")
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&socket).is_err() {
+            assert!(Instant::now() < deadline, "Daemon did not start");
+            thread::sleep(Duration::from_millis(20));
+        }
+        (daemon, socket)
+    }
+}
 
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -35,6 +56,86 @@ fn event(stream: &mut impl BufRead) -> Value {
 }
 
 #[test]
+fn changing_theme_recolors_existing_terminal_and_preserves_its_session() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use ghostty_vt::snapshot::Decoder;
+    use infrastructure::theme;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let (_daemon, socket) = Daemon::start(root);
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"shell"}),
+    ));
+    let id = &launched["session"]["id"];
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":id}));
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    let input = |command: &str| {
+        assert_eq!(
+            event(&mut request(
+                &socket,
+                json!({
+                    "request":"input", "session":id, "data":STANDARD.encode(command),
+                })
+            ))["event"],
+            "ok"
+        );
+    };
+    let wait_for = |attached: &mut BufReader<UnixStream>, marker: &[u8]| {
+        let mut output = Vec::new();
+        loop {
+            let message = event(attached);
+            if message["event"] == "output" {
+                output.extend(STANDARD.decode(message["data"].as_str().unwrap()).unwrap());
+                if output.windows(marker.len()).any(|part| part == marker) {
+                    break;
+                }
+            }
+        }
+        output
+    };
+    input("saved=still_here; printf '\\033[31mBEFORE\\033[0m\\n'\n");
+    wait_for(&mut attached, b"\x1b[31mBEFORE");
+
+    let scheme = theme::find("Catppuccin Latte").unwrap();
+    assert_eq!(
+        event(&mut request(
+            &socket,
+            json!({
+                "request":"set_color_scheme", "name":scheme.name,
+            })
+        ))["event"],
+        "ok"
+    );
+    input("printf '\\033[0m%s\\n' \"$saved\"\n");
+    wait_for(&mut attached, b"\x1b[0mstill_here");
+    let snapshot = event(&mut request(
+        &socket,
+        json!({"request":"subscribe", "session":id}),
+    ));
+    assert_eq!(snapshot["exited"], false);
+    let data = STANDARD.decode(snapshot["data"].as_str().unwrap()).unwrap();
+    let terminal = Decoder::from_slice(&data).decode().unwrap();
+    let background = terminal.bg_color().unwrap().unwrap();
+    assert_eq!(
+        u32::from_be_bytes([0, background.r, background.g, background.b]),
+        scheme.colors.background
+    );
+    assert_eq!(
+        u32::from_be_bytes({
+            let c = terminal.color_palette().unwrap().0[1];
+            [0, c.r, c.g, c.b]
+        }),
+        scheme.colors.indexed[1]
+    );
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":id}),
+    ));
+}
+
+#[test]
 fn reattachment_preserves_terminal_and_published_artifact() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use ghostty_vt::{
@@ -44,23 +145,8 @@ fn reattachment_preserves_terminal_and_published_artifact() {
 
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let socket = root.join("power.sock");
+    let (_daemon, socket) = Daemon::start(root);
     let binary = env!("CARGO_BIN_EXE_power");
-    let _daemon = Daemon(
-        Command::new(binary)
-            .arg("daemon")
-            .env("POWER_SOCKET", &socket)
-            .env("POWER_STATE_DIR", root.join("state"))
-            .env("SHELL", "/bin/sh")
-            .spawn()
-            .unwrap(),
-    );
-    for _ in 0..100 {
-        if UnixStream::connect(&socket).is_ok() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
     let launched = event(&mut request(
         &socket,
         json!({
@@ -144,4 +230,300 @@ fn reattachment_preserves_terminal_and_published_artifact() {
         &socket,
         json!({"request":"end", "session":id}),
     ));
+}
+
+#[test]
+fn live_directory_does_not_change_the_session_worktree() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let directory = tempfile::tempdir().unwrap();
+    let worktree = directory.path().canonicalize().unwrap();
+    let subdirectory = worktree.join("live cwd");
+    std::fs::create_dir(&subdirectory).unwrap();
+    let (_daemon, socket) = Daemon::start(&worktree);
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":worktree, "agent":"shell"}),
+    ));
+    let session = &launched["session"]["id"];
+    event(&mut request(
+        &socket,
+        json!({
+            "request":"input", "session":session,
+            "data":STANDARD.encode("cd 'live cwd'\n"),
+        }),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = event(&mut request(
+            &socket,
+            json!({"request":"working_directory", "session":session}),
+        ));
+        if response["directory"] == json!(subdirectory) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Live directory remained {response}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let listed = event(&mut request(&socket, json!({"request":"list"})));
+    assert_eq!(listed["sessions"][0]["worktree"], json!(worktree));
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}
+
+#[test]
+fn shell_tracks_an_agent_started_inside_it() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let agent = root.join("claude");
+    std::fs::write(&agent, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_daemon, socket) = Daemon::start(&root);
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"shell"}),
+    ));
+    let session = &launched["session"]["id"];
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    assert_eq!(event(&mut attached)["agent"], "shell");
+    let input = |data: &str| {
+        event(&mut request(
+            &socket,
+            json!({"request":"input", "session":session, "data":STANDARD.encode(data)}),
+        ));
+    };
+    let wait_for = |attached: &mut BufReader<UnixStream>, agent: &str| loop {
+        let message = event(attached);
+        if message["event"] == "agent" {
+            assert_eq!(message["agent"], agent);
+            break;
+        }
+    };
+
+    input("./claude\n");
+    wait_for(&mut attached, "claude");
+    let listed = event(&mut request(&socket, json!({"request":"list"})));
+    assert_eq!(listed["sessions"][0]["agent"], "claude");
+
+    input("\x03");
+    wait_for(&mut attached, "shell");
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}
+
+#[test]
+fn agent_task_and_model_follow_the_run_and_survive_reattachment() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let agent = root.join("codex");
+    std::fs::write(
+        &agent,
+        r#"#!/bin/sh
+set -e
+power session task "Initial task"
+power session model "Provider model"
+power session task "Revised task"
+read finish
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_daemon, socket) = Daemon::start(root);
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"shell"}),
+    ));
+    let session = &launched["session"]["id"];
+    let subscribe = || request(&socket, json!({"request":"subscribe", "session":session}));
+    let mut attached = subscribe();
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    assert_eq!(event(&mut attached)["agent"], "shell");
+    let input = |data: &str| {
+        event(&mut request(
+            &socket,
+            json!({"request":"input", "session":session, "data":STANDARD.encode(data)}),
+        ));
+    };
+    let wait_for_metadata = |attached: &mut BufReader<UnixStream>| loop {
+        let message = event(attached);
+        if message["event"] == "metadata" {
+            break message["metadata"].clone();
+        }
+    };
+    input("./codex\n");
+    assert_eq!(wait_for_metadata(&mut attached)["task"], "Initial task");
+    assert_eq!(wait_for_metadata(&mut attached)["model"], "Provider model");
+    assert_eq!(wait_for_metadata(&mut attached)["task"], "Revised task");
+
+    let mut reattached = subscribe();
+    assert_eq!(event(&mut reattached)["event"], "snapshot");
+    assert_eq!(event(&mut reattached)["agent"], "codex");
+    assert_eq!(
+        wait_for_metadata(&mut reattached),
+        json!({
+            "task":"Revised task", "model":"Provider model",
+        })
+    );
+    let mut outsider = request(
+        &socket,
+        json!({
+            "request":"set_metadata", "session":session, "field":"task", "value":"Wrong run",
+        }),
+    );
+    let mut response = String::new();
+    outsider.read_line(&mut response).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["event"],
+        "error"
+    );
+
+    input("\n");
+    assert_eq!(
+        wait_for_metadata(&mut reattached),
+        json!({"task":null, "model":null})
+    );
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}
+
+#[test]
+fn shell_hook_gives_hand_started_agents_instructions() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fake = bin.join("claude");
+    std::fs::write(&fake, "#!/bin/sh\necho \"ARGS:$1\"\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let setup = Command::new(env!("CARGO_BIN_EXE_power"))
+        .arg("setup")
+        .env("HOME", &root)
+        .env("SHELL", "/bin/bash")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let socket = root.join("power.sock");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let _daemon = Daemon(
+        Command::new(env!("CARGO_BIN_EXE_power"))
+            .arg("daemon")
+            .env("POWER_SOCKET", &socket)
+            .env("POWER_STATE_DIR", root.join("state"))
+            .env("HOME", &root)
+            .env("SHELL", "/bin/bash")
+            .env("PATH", path)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while UnixStream::connect(&socket).is_err() {
+        assert!(Instant::now() < deadline, "Daemon did not start");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"shell"}),
+    ));
+    let session = &launched["session"]["id"];
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    event(&mut request(
+        &socket,
+        json!({"request":"input", "session":session, "data":STANDARD.encode("claude hi\n")}),
+    ));
+    let mut output = Vec::new();
+    while !String::from_utf8_lossy(&output).contains("ARGS:--append-system-prompt") {
+        let message = event(&mut attached);
+        if let Some(data) = message["data"].as_str() {
+            output.extend(STANDARD.decode(data).unwrap());
+        }
+    }
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}
+
+#[test]
+fn publishing_streams_an_event_and_lists_history_newest_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (_daemon, socket) = Daemon::start(&root);
+    let launch = || {
+        event(&mut request(
+            &socket,
+            json!({"request":"launch", "worktree":root, "agent":"shell"}),
+        ))["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (first, other) = (launch(), launch());
+    let mut watch = request(&socket, json!({"request":"watch_artifacts"}));
+    // The watch registers before the first publish once the daemon has read the request.
+    thread::sleep(Duration::from_millis(200));
+    let publish = |session: &str, file: &str| {
+        std::fs::write(root.join(file), b"fixture").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_power"))
+            .args(["artifact", "publish", file, "--title", file])
+            .current_dir(&root)
+            .env("POWER_SOCKET", &socket)
+            .env("POWER_SESSION", session)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let older = publish(&first, "older.png");
+    let published = loop {
+        let message = event(&mut watch);
+        if message["event"] == "artifact_published" {
+            break message;
+        }
+    };
+    assert_eq!(published["artifact"]["uri"], older);
+    assert_eq!(published["artifact"]["session"], first);
+    assert_eq!(published["artifact"]["title"], "older.png");
+    let newer = publish(&first, "newer.png");
+    publish(&other, "elsewhere.png");
+
+    let recent = event(&mut request(
+        &socket,
+        json!({"request":"recent_artifacts", "sessions":[first], "limit":10}),
+    ));
+    let uris: Vec<_> = recent["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| artifact["uri"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(uris, [newer, older]);
 }

@@ -1,0 +1,102 @@
+package power:terminal-ui@0.1.0;
+
+interface types {
+    record active-view {
+        session: string,
+        worktree-name: string,
+        worktree-path: string,
+        repository-path: option<string>,
+        agent-type: string,
+        agent-task: option<string>,
+        agent-model: option<string>,
+        home: option<string>,
+    }
+
+    record field {
+        name: string,
+        value: string,
+    }
+
+    enum overflow {
+        path,
+        text,
+        keep,
+    }
+
+    record segment {
+        text: string,
+        fg: option<string>,
+        bg: option<string>,
+        bold: bool,
+        italic: bool,
+        overflow: overflow,
+    }
+
+    record choice {
+        title: string,
+        detail: string,
+        copy-text: string,
+    }
+
+    record action-menu {
+        title: string,
+        choices: list<choice>,
+    }
+
+    record row {
+        /// Unicode text or a Powerline join glyph. Joins take on the adjacent segment backgrounds.
+        separator: string,
+        left: list<segment>,
+        right: list<segment>,
+        actions: option<action-menu>,
+    }
+
+    record plugin-settings {
+        key: string,
+        defaults-json: string,
+    }
+}
+
+/// A single contribution to the terminal.bottom slot.
+world terminal-bottom {
+    use types.{active-view, field, plugin-settings, row};
+
+    /// Optional Lua configuration table name and its defaults.
+    export settings: func() -> option<plugin-settings>;
+
+    /// Prepare settings supplied as JSON. Return a strftime format to request local clock updates.
+    export configure: func(config-json: string) -> result<option<string>, string>;
+
+    /// The host renders the returned row and executes declared effects on user selection.
+    export render: func(view: active-view, fields: list<field>, local-time: option<string>) -> result<option<row>, string>;
+}
+
+interface palette {
+    /// Colors are packed 0xRRGGBB. Indexed colors follow terminal palette order.
+    record colors {
+        scheme: string,
+        foreground: u32,
+        background: u32,
+        cursor: u32,
+        /// Selection colors are packed 0xRRGGBBAA. An omitted foreground keeps cell ink.
+        selection-background: u32,
+        selection-foreground: option<u32>,
+        indexed: list<u32>,
+        accent: u32,
+        muted: u32,
+        surface: u32,
+        raised: u32,
+        border: u32,
+        link: u32,
+        error: u32,
+    }
+
+    /// The active scheme for the current render. Returns none outside render.
+    get-palette: func() -> option<colors>;
+}
+
+/// The same bottom-row exports with an opt-in palette lookup.
+world terminal-bottom-with-palette {
+    include terminal-bottom;
+    import palette;
+}

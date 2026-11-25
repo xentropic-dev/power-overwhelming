@@ -1,7 +1,7 @@
 use crate::wire;
 use anyhow::{Context, Result};
-use application::ArtifactStore;
-use domain::artifact::{ArtifactRecord, ResolvedArtifact};
+use application::{ArtifactStore, RecentArtifact};
+use domain::artifact::{ArtifactRecord, ResolvedArtifact, URI_PREFIX};
 use rusqlite::{Connection, params};
 use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf, sync::Mutex};
 
@@ -9,7 +9,7 @@ pub struct SqliteArtifacts(Mutex<Connection>);
 
 impl SqliteArtifacts {
     pub fn open() -> Result<Self> {
-        let db_path = state_path()?;
+        let db_path = state_directory()?.join("artifacts.sqlite3");
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -57,17 +57,39 @@ impl ArtifactStore for SqliteArtifacts {
             target: serde_json::from_str::<wire::Target>(&json)?.into(),
         })
     }
+
+    fn recent(&self, sessions: &[String], limit: usize) -> Result<Vec<RecentArtifact>> {
+        if sessions.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; sessions.len()].join(", ");
+        // Rows are never updated, so rowid order is publish order.
+        let query = format!(
+            "SELECT id, session, title FROM artifacts WHERE session IN ({placeholders})
+             ORDER BY rowid DESC LIMIT {limit}"
+        );
+        let db = self.0.lock().unwrap();
+        let mut statement = db.prepare(&query)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(sessions), |row| {
+            Ok(RecentArtifact {
+                uri: format!("{URI_PREFIX}{}", row.get::<_, String>(0)?),
+                session: row.get(1)?,
+                title: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
-fn state_path() -> Result<PathBuf> {
+pub(crate) fn state_directory() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("POWER_STATE_DIR") {
-        return Ok(PathBuf::from(path).join("artifacts.sqlite3"));
+        return Ok(PathBuf::from(path));
     }
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .context("Set XDG_STATE_HOME or HOME")?;
-    Ok(base.join("power-overwhelming/artifacts.sqlite3"))
+    Ok(base.join("power-overwhelming"))
 }
 
 #[cfg(test)]

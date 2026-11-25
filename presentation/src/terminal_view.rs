@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 use domain::{
     artifact::artifact_id,
-    session::{Geometry, Session},
+    link::{DAG_URI_PREFIX, dag_run_id},
+    session::{Agent, Geometry, Session},
 };
 use ghostty_vt::{
     Terminal,
@@ -12,9 +13,13 @@ use ghostty_vt::{
     terminal::{Mode, Options, Point as VtPoint, PointCoordinate, ScrollViewport},
 };
 use gpui::{prelude::*, *};
-use infrastructure::client::{self, TerminalControl, TerminalEvent};
+use infrastructure::{
+    client::{self, SessionMetadata, TerminalControl, TerminalEvent},
+    theme::{Scheme, blend},
+};
 use regex::Regex;
 use std::{
+    path::PathBuf,
     sync::{Arc, LazyLock},
     thread,
 };
@@ -22,12 +27,23 @@ use std::{
 const WIDTH: f32 = 8.;
 const HEIGHT: f32 = 18.;
 const PAD: f32 = 6.;
-const LINK_COLOR: u32 = 0x8fbaff;
-const LINK_HOVER_COLOR: u32 = 0xc4ddff;
-const LINK_PRESSED_COLOR: u32 = 0x6495e8;
+
+pub(crate) fn terminal_font_family(cx: &App) -> &'static str {
+    let fonts = cx.text_system().all_font_names();
+    ["JetBrainsMono Nerd Font Mono", "JetBrains Mono"]
+        .into_iter()
+        .find(|family| fonts.iter().any(|name| name == family))
+        .unwrap_or("monospace")
+}
 
 pub struct OpenLink(pub String);
 impl EventEmitter<OpenLink> for TerminalView {}
+
+pub struct AgentChanged(pub Agent);
+impl EventEmitter<AgentChanged> for TerminalView {}
+
+pub struct BarContextChanged;
+impl EventEmitter<BarContextChanged> for TerminalView {}
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct CellPosition {
@@ -55,6 +71,8 @@ struct Frame {
 pub struct TerminalView {
     pub session: Session,
     pub focus: FocusHandle,
+    pub metadata: SessionMetadata,
+    scheme: &'static Scheme,
     font: Font,
     terminal: Terminal,
     renderer: RenderState,
@@ -63,6 +81,9 @@ pub struct TerminalView {
     selection: Option<(CellPosition, CellPosition)>,
     pointer: Option<Point<Pixels>>,
     pressed_link: Option<Arc<str>>,
+    /// Numbered link labels shown while the user picks a link by keyboard.
+    hints: Vec<(CellPosition, Arc<str>)>,
+    hint_footer: Option<String>,
     dragging: bool,
     reporting_mouse: bool,
     exited: bool,
@@ -71,10 +92,16 @@ pub struct TerminalView {
     encoder: key::Encoder,
     mouse: mouse::Encoder,
     commands: async_channel::Sender<TerminalControl>,
+    _follow: Task<()>,
 }
 
 impl TerminalView {
-    pub fn new(session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Session,
+        scheme: &'static Scheme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (commands, requests) = async_channel::bounded(128);
         let id = session.id.clone();
         thread::spawn(move || {
@@ -93,14 +120,22 @@ impl TerminalView {
                 |event| tx.send_blocking(event).is_ok(),
             );
         });
-        cx.spawn_in(window, async move |view, cx| {
+        let follow = cx.spawn_in(window, async move |view, cx| {
             while let Ok(first) = rx.recv().await {
                 if view
                     .update_in(cx, |view, _, cx| {
+                        let agent = view.session.agent;
+                        let metadata = view.metadata.clone();
                         view.apply(first);
                         for _ in 0..127 {
                             let Ok(event) = rx.try_recv() else { break };
                             view.apply(event);
+                        }
+                        if view.session.agent != agent {
+                            cx.emit(AgentChanged(view.session.agent));
+                        }
+                        if view.session.agent != agent || view.metadata != metadata {
+                            cx.emit(BarContextChanged);
                         }
                         view.refresh();
                         cx.notify();
@@ -110,24 +145,26 @@ impl TerminalView {
                     break;
                 }
             }
-        })
-        .detach();
-        let font_names = cx.text_system().all_font_names();
-        let family = ["JetBrainsMono Nerd Font Mono", "JetBrains Mono"]
-            .into_iter()
-            .find(|family| font_names.iter().any(|name| name == family))
-            .unwrap_or("monospace");
+        });
+        let mut terminal = Terminal::new(Options::default()).expect("allocate Ghostty terminal");
+        scheme
+            .apply_to(&mut terminal)
+            .expect("apply bundled terminal palette");
         Self {
             session,
             focus: cx.focus_handle(),
-            font: font(family),
-            terminal: Terminal::new(Options::default()).expect("allocate Ghostty terminal"),
+            metadata: SessionMetadata::default(),
+            scheme,
+            font: font(terminal_font_family(cx)),
+            terminal,
             renderer: RenderState::new().expect("allocate render state"),
             frame: Arc::default(),
             bounds: Bounds::default(),
             selection: None,
             pointer: None,
             pressed_link: None,
+            hints: Vec::new(),
+            hint_footer: None,
             dragging: false,
             reporting_mouse: false,
             exited: false,
@@ -136,6 +173,62 @@ impl TerminalView {
             encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             commands,
+            _follow: follow,
+        }
+    }
+
+    pub fn set_scheme(&mut self, scheme: &'static Scheme, cx: &mut Context<Self>) {
+        self.scheme = scheme;
+        if let Err(error) = scheme.apply_to(&mut self.terminal) {
+            self.status = Some(format!("Could not apply color scheme. {error:#}"));
+        }
+        self.refresh();
+        cx.notify();
+    }
+
+    /// Numbers up to nine links on screen, newest output first, with a footer built from
+    /// the number of hints.
+    pub fn show_hints(&mut self, footer: impl FnOnce(usize) -> String) {
+        self.hints = hint_positions(&self.frame);
+        self.hint_footer = Some(footer(self.hints.len()));
+    }
+
+    pub fn clear_hints(&mut self) {
+        self.hints.clear();
+        self.hint_footer = None;
+    }
+
+    /// The link labelled `number`, counting from 1.
+    pub fn hint(&self, number: usize) -> Option<String> {
+        let (_, link) = self.hints.get(number.checked_sub(1)?)?;
+        Some(link.to_string())
+    }
+
+    /// Links on screen, top to bottom and without repeats, for keyboard link picking.
+    pub fn visible_links(&self) -> Vec<String> {
+        let mut links: Vec<String> = Vec::new();
+        for link in self
+            .frame
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter_map(|cell| cell.link.as_deref())
+        {
+            if links.last().map(String::as_str) != Some(link)
+                && !links.iter().any(|seen| seen == link)
+            {
+                links.push(link.to_owned());
+            }
+        }
+        links
+    }
+
+    pub fn reported_directory(&self) -> Option<PathBuf> {
+        let pwd = self.terminal.pwd().ok()?;
+        if pwd.starts_with('/') {
+            Some(PathBuf::from(pwd))
+        } else {
+            url::Url::parse(pwd).ok()?.to_file_path().ok()
         }
     }
 
@@ -143,10 +236,13 @@ impl TerminalView {
         let result = (|| -> Result<()> {
             match response {
                 TerminalEvent::Snapshot { data, exited } => {
-                    self.terminal = snapshot::Decoder::from_slice(&data).decode()?;
+                    let mut terminal = snapshot::Decoder::from_slice(&data).decode()?;
+                    self.scheme.apply_to(&mut terminal)?;
+                    self.terminal = terminal;
                     self.exited = exited;
                     self.status = None;
                     self.selection = None;
+                    self.metadata = SessionMetadata::default();
                 }
                 TerminalEvent::Output(data) => {
                     self.terminal.vt_write(&data);
@@ -162,7 +258,12 @@ impl TerminalView {
                     self.terminal.events().for_each(drop);
                     self.selection = None;
                 }
-                TerminalEvent::Exit => self.exited = true,
+                TerminalEvent::Exit => {
+                    self.exited = true;
+                    self.metadata = SessionMetadata::default();
+                }
+                TerminalEvent::Agent(agent) => self.session.agent = agent,
+                TerminalEvent::Metadata(metadata) => self.metadata = metadata,
                 TerminalEvent::Status(message) => bail!("{message}"),
             }
             Ok(())
@@ -173,7 +274,8 @@ impl TerminalView {
     }
 
     fn refresh(&mut self) {
-        match frame(&mut self.renderer, &self.terminal) {
+        let foreground = self.scheme.terminal_ink(&self.terminal).0;
+        match frame(&mut self.renderer, &self.terminal, foreground) {
             Ok(frame) => self.frame = Arc::new(frame),
             Err(error) => self.status = Some(error.to_string()),
         }
@@ -386,7 +488,7 @@ fn terminal_modifiers(modifiers: Modifiers) -> key::Mods {
     mods
 }
 
-fn frame(renderer: &mut RenderState, terminal: &Terminal) -> Result<Frame> {
+fn frame(renderer: &mut RenderState, terminal: &Terminal, foreground: u32) -> Result<Frame> {
     let state = renderer.update(terminal)?;
     let cursor = state
         .cursor_viewport()?
@@ -441,7 +543,7 @@ fn frame(renderer: &mut RenderState, terminal: &Terminal) -> Result<Frame> {
                 text: grapheme,
                 fg: cell
                     .fg_color()?
-                    .map_or(rgb(0xdbe3ee).into(), |c| rgba_color(c.r, c.g, c.b)),
+                    .map_or(rgb(foreground).into(), |c| rgba_color(c.r, c.g, c.b)),
                 bg: cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b)),
                 link: osc_link.clone(),
             });
@@ -470,6 +572,9 @@ static PATH: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn candidate(value: &str) -> bool {
+    if value.starts_with(DAG_URI_PREFIX) {
+        return dag_run_id(value).is_some();
+    }
     let value = value.to_ascii_lowercase();
     artifact_id(&value).is_some()
         || value.starts_with("file://")
@@ -604,6 +709,10 @@ impl Render for TerminalView {
         let terminal = cx.entity();
         let pointer_owner = terminal.downgrade();
         let frame = self.frame.clone();
+        let scheme = self.scheme;
+        let colors = &scheme.colors;
+        let (_, background, cursor_color) = scheme.terminal_ink(&self.terminal);
+        let selection_background = Hsla::from(rgba(scheme.selection_background));
         let terminal_font = self.font.clone();
         let hovered_link = self.hovered_link().cloned();
         let pressed_link = self.pressed_link.as_ref().and_then(|pressed| {
@@ -621,7 +730,7 @@ impl Render for TerminalView {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(0x101722))
+            .bg(rgb(background))
             .when(hovered_link.is_some(), |terminal| terminal.cursor_pointer())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
@@ -792,14 +901,16 @@ impl Render for TerminalView {
                                         start <= position && position <= end
                                     });
                                     let cursor = frame.cursor == Some(position);
-                                    if let Some(color) = if selected {
-                                        Some(rgb(0x304b6f).into())
-                                    } else {
-                                        cell.bg
-                                    } {
+                                    if let Some(color) = cell.bg {
                                         window.paint_quad(fill(
                                             Bounds::new(origin, size(px(WIDTH), px(HEIGHT))),
                                             color,
+                                        ));
+                                    }
+                                    if selected {
+                                        window.paint_quad(fill(
+                                            Bounds::new(origin, size(px(WIDTH), px(HEIGHT))),
+                                            selection_background,
                                         ));
                                     }
                                     if cursor {
@@ -807,7 +918,7 @@ impl Render for TerminalView {
                                             origin + point(px(0.), px(HEIGHT - 2.)),
                                             size(px(WIDTH), px(2.)),
                                         );
-                                        window.paint_quad(fill(bar, rgb(0x8fbaff)));
+                                        window.paint_quad(fill(bar, rgb(cursor_color)));
                                     }
                                     let mut fg = cell.fg;
                                     if let Some(link) = &cell.link {
@@ -815,14 +926,14 @@ impl Render for TerminalView {
                                             .as_ref()
                                             .is_some_and(|pressed| Arc::ptr_eq(link, pressed))
                                         {
-                                            LINK_PRESSED_COLOR
+                                            blend(colors.link, background, 15)
                                         } else if hovered_link
                                             .as_ref()
                                             .is_some_and(|hovered| Arc::ptr_eq(link, hovered))
                                         {
-                                            LINK_HOVER_COLOR
+                                            blend(colors.link, colors.foreground, 35)
                                         } else {
-                                            LINK_COLOR
+                                            colors.link
                                         };
                                         fg = rgb(color).into();
                                         let underline = Bounds::new(
@@ -830,6 +941,9 @@ impl Render for TerminalView {
                                             size(px(WIDTH), px(1.)),
                                         );
                                         window.paint_quad(fill(underline, fg));
+                                    }
+                                    if selected && let Some(color) = scheme.selection_foreground {
+                                        fg = rgba(color).into();
                                     }
                                     if cell.text.trim().is_empty() {
                                         continue;
@@ -860,6 +974,34 @@ impl Render for TerminalView {
                 .right(px(PAD))
                 .bottom(px(PAD)),
             )
+            .children(self.hints.iter().enumerate().map(|(index, (position, _))| {
+                div()
+                    .absolute()
+                    .top(px(PAD + position.row as f32 * HEIGHT))
+                    .left(px(PAD + position.column as f32 * WIDTH))
+                    .h(px(HEIGHT))
+                    .px(px(3.))
+                    .flex()
+                    .items_center()
+                    .bg(rgb(colors.accent))
+                    .text_color(rgb(colors.contrast(colors.accent)))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::BOLD)
+                    .child((index + 1).to_string())
+            }))
+            .when_some(self.hint_footer.clone(), |this, footer| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_1()
+                        .left_2()
+                        .bg(rgb(colors.raised))
+                        .text_color(rgb(colors.foreground))
+                        .px_2()
+                        .text_xs()
+                        .child(footer),
+                )
+            })
             .when_some(
                 self.status
                     .clone()
@@ -870,7 +1012,8 @@ impl Render for TerminalView {
                             .absolute()
                             .bottom_1()
                             .right_2()
-                            .bg(rgb(0x26354b))
+                            .bg(rgb(colors.raised))
+                            .text_color(rgb(colors.foreground))
                             .px_2()
                             .text_xs()
                             .child(status),
@@ -880,11 +1023,52 @@ impl Render for TerminalView {
     }
 }
 
+/// The first cell of each distinct link, scanning from the bottom row up, at most nine.
+fn hint_positions(frame: &Frame) -> Vec<(CellPosition, Arc<str>)> {
+    let mut hints: Vec<(CellPosition, Arc<str>)> = Vec::new();
+    for (row, line) in frame.rows.iter().enumerate().rev() {
+        let mut previous: Option<&Arc<str>> = None;
+        for (column, cell) in line.cells.iter().enumerate() {
+            if let Some(link) = &cell.link
+                && previous != Some(link)
+                && !hints.iter().any(|(_, seen)| seen == link)
+            {
+                hints.push((CellPosition { row, column }, link.clone()));
+                if hints.len() == 9 {
+                    return hints;
+                }
+            }
+            previous = cell.link.as_ref();
+        }
+    }
+    hints
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RenderState, Terminal, frame, links};
+    use super::{RenderState, Terminal, candidate, frame, hint_positions, links};
     use ghostty_vt::terminal::Options;
     use std::sync::Arc;
+
+    #[test]
+    fn existing_indexed_cells_follow_the_scheme_and_truecolor_cells_keep_their_color() {
+        use gpui::{Hsla, rgb};
+        use infrastructure::theme;
+
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        let mut renderer = RenderState::new().unwrap();
+        let dark = theme::default_scheme();
+        let light = theme::find("Catppuccin Latte").unwrap();
+        dark.apply_to(&mut terminal).unwrap();
+        terminal.vt_write(b"\x1b[31mA\x1b[38;2;12;34;56mB");
+        for scheme in [dark, light] {
+            scheme.apply_to(&mut terminal).unwrap();
+            let rendered = frame(&mut renderer, &terminal, scheme.colors.foreground).unwrap();
+            let cells = &rendered.rows[0].cells;
+            assert_eq!(cells[0].fg, Hsla::from(rgb(scheme.colors.indexed[1])));
+            assert_eq!(cells[1].fg, Hsla::from(rgb(0x0c2238)));
+        }
+    }
 
     #[test]
     fn detects_agent_paths_and_artifact_tokens() {
@@ -903,12 +1087,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_plain_and_markdown_dag_links() {
+        let text = "See pwr://dag/run-123. [Open graph](pwr://dag/Run-456)";
+        let detected: Vec<_> = links(text).into_iter().map(|(_, value)| value).collect();
+        assert_eq!(detected, ["pwr://dag/Run-456", "pwr://dag/run-123"]);
+        assert!(!candidate("pwr://dag/"));
+        assert!(!candidate("pwr://dag/another/file"));
+        assert!(!candidate("pwr://dag/report.html"));
+    }
+
+    #[test]
     fn clickable_cells_share_their_link_span() {
         let mut terminal = Terminal::new(Options::default()).unwrap();
         terminal.vt_write(
             b"\x1b]8;;pwr://artifact/one\x1b\\First link\x1b]8;;\x1b\\ pwr://artifact/two \x1b]8;;https://example.com\x1b\\Remote\x1b]8;;\x1b\\",
         );
-        let frame = frame(&mut RenderState::new().unwrap(), &terminal).unwrap();
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap();
         let cells = &frame.rows[0].cells;
         let first = cells[0].link.as_ref().unwrap();
         let second = cells[11].link.as_ref().unwrap();
@@ -918,5 +1112,48 @@ mod tests {
         assert_eq!(second.as_ref(), "pwr://artifact/two");
         assert!(Arc::ptr_eq(second, cells[28].link.as_ref().unwrap()));
         assert!(cells[30..36].iter().all(|cell| cell.link.is_none()));
+    }
+
+    #[test]
+    fn hints_number_the_newest_links_first_without_repeats() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(
+            b"old pwr://artifact/a\r\nnew pwr://artifact/b and pwr://artifact/c\r\nagain pwr://artifact/a\r\n",
+        );
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap();
+        let hints: Vec<_> = hint_positions(&frame)
+            .into_iter()
+            .map(|(position, link)| (position.row, link.to_string()))
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                (2, "pwr://artifact/a".to_owned()),
+                (1, "pwr://artifact/b".to_owned()),
+                (1, "pwr://artifact/c".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn both_plain_and_osc_dag_links_are_clickable_and_numbered() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal
+            .vt_write(b"\x1b]8;;pwr://dag/osc-1\x1b\\Open graph\x1b]8;;\x1b\\ pwr://dag/plain-2.");
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap();
+        let cells = &frame.rows[0].cells;
+        assert_eq!(cells[0].link.as_deref(), Some("pwr://dag/osc-1"));
+        assert_eq!(
+            cells["Open graph ".len()].link.as_deref(),
+            Some("pwr://dag/plain-2")
+        );
+        let hints: Vec<_> = hint_positions(&frame)
+            .into_iter()
+            .map(|(_, link)| link)
+            .collect();
+        assert_eq!(
+            hints.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            ["pwr://dag/osc-1", "pwr://dag/plain-2"]
+        );
     }
 }

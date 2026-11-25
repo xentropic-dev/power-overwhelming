@@ -27,6 +27,19 @@ use url::Url;
 
 const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/power-webkit"));
 
+/// Keyboard actions on the active preview. Each applies to the preview types it fits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PreviewAction {
+    TogglePlay,
+    /// Seek by this many seconds.
+    Seek(i32),
+    /// Scroll by this many lines; positive scrolls down.
+    Scroll(f32),
+    Reload,
+    /// Send keyboard input to a web page.
+    Interact,
+}
+
 pub enum Preview {
     Image(Arc<RenderImage>),
     Video(Entity<VideoView>),
@@ -72,7 +85,7 @@ impl Preview {
         opened.unwrap_or_else(|error| Self::Error(format!("{error:#}")))
     }
 
-    pub fn render(&self) -> AnyElement {
+    pub fn render(&self, colors: &infrastructure::theme::Colors) -> AnyElement {
         match self {
             Self::Image(image) => img(image.clone())
                 .size_full()
@@ -82,10 +95,33 @@ impl Preview {
             Self::Web(view) => view.clone().into_any_element(),
             Self::Error(message) => div()
                 .p_4()
-                .text_color(rgb(0xf4b2aa))
+                .text_color(rgb(colors.error))
                 .child(message.clone())
                 .into_any_element(),
         }
+    }
+
+    /// Applies a keyboard action. Returns false when it does not fit this preview.
+    pub fn act(&self, action: PreviewAction, window: &mut Window, cx: &mut App) -> bool {
+        match (self, action) {
+            (Self::Video(view), PreviewAction::TogglePlay) => {
+                view.update(cx, |view, cx| view.toggle_play(cx));
+            }
+            (Self::Video(view), PreviewAction::Seek(seconds)) => {
+                view.update(cx, |view, cx| view.seek_by(seconds, cx));
+            }
+            (Self::Web(view), PreviewAction::Scroll(lines)) => view.update(cx, |view, _| {
+                let center = view.bounds.size / 2.;
+                view.send(json!({"cmd":"scroll","x":f32::from(center.width),
+                    "y":f32::from(center.height),"dx":0.,"dy":lines,"mods":0}));
+            }),
+            (Self::Web(view), PreviewAction::Reload) => {
+                view.update(cx, |view, _| view.send(json!({"cmd":"reload"})));
+            }
+            (Self::Web(view), PreviewAction::Interact) => view.read(cx).focus.focus(window),
+            _ => return false,
+        }
+        true
     }
 
     pub fn set_active(&self, active: bool, cx: &mut App) {
@@ -155,23 +191,41 @@ impl VideoView {
     }
 }
 
+impl VideoView {
+    fn seek_by(&mut self, seconds: i32, cx: &mut Context<Self>) {
+        let position = self.video.position().as_secs_f64();
+        let target = (position + f64::from(seconds)).clamp(0., self.video.duration().as_secs_f64());
+        self.seek_error = self
+            .video
+            .seek(Duration::from_secs_f64(target), true)
+            .err()
+            .map(|error| error.to_string());
+        cx.notify();
+    }
+
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        let ended = self.video.eos();
+        let paused = self.video.paused();
+        if ended {
+            self.seek_error = self
+                .video
+                .seek(Duration::ZERO, true)
+                .err()
+                .map(|error| error.to_string());
+        }
+        self.video.set_paused(!paused && !ended);
+        cx.notify();
+    }
+}
+
 impl Render for VideoView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = crate::gui::colors(cx);
         let paused = self.video.paused() || self.video.eos();
         let position = self.video.position();
         let duration = self.video.duration();
-        let seek = |direction: i32| {
-            cx.listener(move |view: &mut Self, _: &ClickEvent, _, cx| {
-                let position = view.video.position().as_secs_f64();
-                let target = (position + f64::from(direction * 5))
-                    .clamp(0., view.video.duration().as_secs_f64());
-                view.seek_error = view
-                    .video
-                    .seek(Duration::from_secs_f64(target), true)
-                    .err()
-                    .map(|error| error.to_string());
-                cx.notify();
-            })
+        let seek = |seconds: i32| {
+            cx.listener(move |view: &mut Self, _: &ClickEvent, _, cx| view.seek_by(seconds, cx))
         };
         let error = self
             .error
@@ -191,7 +245,7 @@ impl Render for VideoView {
                     .child(video(self.video.clone()).id("preview-video")),
             )
             .when_some(error, |this, message| {
-                this.child(div().px_2().text_color(rgb(0xf4b2aa)).child(message))
+                this.child(div().px_2().text_color(rgb(colors.error)).child(message))
             })
             .child(
                 div()
@@ -199,25 +253,14 @@ impl Render for VideoView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(crate::gui::button("back", "−5 s").on_click(seek(-1)))
+                    .child(crate::gui::button(colors, "back", "−5 s").on_click(seek(-5)))
                     .child(
-                        crate::gui::button("play", if paused { "Play" } else { "Pause" }).on_click(
-                            cx.listener(|view, _: &ClickEvent, _, cx| {
-                                let ended = view.video.eos();
-                                let paused = view.video.paused();
-                                if ended {
-                                    view.seek_error = view
-                                        .video
-                                        .seek(Duration::ZERO, true)
-                                        .err()
-                                        .map(|error| error.to_string());
-                                }
-                                view.video.set_paused(!paused && !ended);
-                                cx.notify();
-                            }),
-                        ),
+                        crate::gui::button(colors, "play", if paused { "Play" } else { "Pause" })
+                            .on_click(
+                                cx.listener(|view, _: &ClickEvent, _, cx| view.toggle_play(cx)),
+                            ),
                     )
-                    .child(crate::gui::button("forward", "+5 s").on_click(seek(1)))
+                    .child(crate::gui::button(colors, "forward", "+5 s").on_click(seek(5)))
                     .child(format!("{} / {}", clock(position), clock(duration))),
             )
     }
@@ -476,9 +519,10 @@ impl Drop for WebView {
 
 impl Render for WebView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = crate::gui::colors(cx);
         let entity = cx.entity();
         let frame = self.frame.clone();
-        div().id("web-preview").relative().size_full().overflow_hidden().bg(rgb(0x101722))
+        div().id("web-preview").relative().size_full().overflow_hidden().bg(rgb(colors.background))
             .track_focus(&self.focus)
             .child(canvas(move |bounds, _, cx| entity.update(cx, |view, _| view.set_bounds(bounds)),
                 move |bounds, (), window, _| {
@@ -488,8 +532,8 @@ impl Render for WebView {
                 }).absolute().size_full())
             .when(self.frame.is_none() && self.error.is_none(), |this| this.child(div().p_3().child("Loading preview…")))
             .when_some(self.error.clone(), |this, error| this.child(div().absolute().top_0().left_0().right_0()
-                .p_3().bg(rgb(0x3c232b)).child(error)
-                .child(crate::gui::button("retry", "Reload").on_click(cx.listener(|view, _: &ClickEvent, _, _| {
+                .p_3().bg(rgb(colors.surface)).text_color(rgb(colors.error)).child(error)
+                .child(crate::gui::button(colors, "retry", "Reload").on_click(cx.listener(|view, _: &ClickEvent, _, _| {
                     view.send(json!({"cmd":"reload"}));
                 })))))
             .on_mouse_down(MouseButton::Left, cx.listener(|view, event: &MouseDownEvent, window, _| {

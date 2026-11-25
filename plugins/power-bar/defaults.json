@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "theme": "terminal",
+  "icons": true,
+  "separator": "",
+  "clock": { "format": "%H:%M" },
+  "params": {},
+  "agent_colors": {
+    "Shell": "accent",
+    "Codex": "bright-blue",
+    "Claude": "bright-yellow"
+  },
+  "left": [
+    { "icon": "▣", "text": "{repo.name}", "fg": "contrast", "bg": "accent", "bold": true },
+    { "icon": "", "text": "{worktree.name}", "bg": "raised" }
+  ],
+  "right": [
+    { "text": "{agent.task}", "bg": "surface" },
+    { "text": "{agent.type}", "fg": "contrast", "bg": "agent", "bold": true }
+  ]
+}

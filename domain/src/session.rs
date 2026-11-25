@@ -15,6 +15,14 @@ impl Agent {
             Self::Claude => "Claude",
         }
     }
+
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

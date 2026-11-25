@@ -1,0 +1,25 @@
+package power:status-bar@0.1.0;
+
+interface types {
+    record active-view {
+        session: string,
+        worktree-name: string,
+        worktree-path: string,
+        repository-path: option<string>,
+        agent-type: string,
+        agent-task: option<string>,
+        agent-model: option<string>,
+    }
+
+    record field {
+        name: string,
+        value: string,
+    }
+}
+
+world status-bar-plugin {
+    use types.{active-view, field};
+
+    /// Contribute values available to Lua templates as {custom.<name>}.
+    export on-active-view: func(view: active-view) -> list<field>;
+}

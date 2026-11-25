@@ -1,0 +1,22 @@
+[tasks.release]
+description = "Build the optimized Power binary"
+run = "mise exec zig@0.17.1 -- cargo build --release --locked"
+
+[tasks.dev]
+description = "Rebuild Power, restart its daemon, and launch the GUI"
+depends = ["release"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+# Restarting the daemon ends every session it hosts, including the tab this may run in.
+pattern='(^|/)power daemon$'
+if pkill -f "$pattern"; then
+  for _ in $(seq 50); do
+    pgrep -f "$pattern" >/dev/null || break
+    sleep 0.1
+  done
+  pkill -9 -f "$pattern" || true
+fi
+# The GUI starts a fresh daemon from this binary when none is listening.
+exec ./target/release/power
+"""

@@ -4,11 +4,18 @@ use domain::{
     artifact::{ArtifactRecord, ResolvedArtifact, URI_PREFIX},
     session::{Agent, Session},
 };
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 pub struct StartSession {
     pub worktree: PathBuf,
     pub agent: Agent,
+}
+
+#[derive(Default)]
+pub struct SessionOptions {
+    pub argv: Vec<OsString>,
+    pub env: Vec<(OsString, Option<OsString>)>,
+    pub initial_prompt: Option<OsString>,
 }
 
 pub struct PublishArtifact {
@@ -21,16 +28,25 @@ pub struct PublishArtifact {
 pub struct ArtifactPublished {
     pub session: String,
     pub uri: String,
+    pub title: String,
 }
 
 impl<T: TerminalRuntime> Application<T> {
     pub fn start_session(&self, command: StartSession) -> Result<Session> {
+        self.start_session_with(command, SessionOptions::default())
+    }
+
+    pub fn start_session_with(
+        &self,
+        command: StartSession,
+        options: SessionOptions,
+    ) -> Result<Session> {
         let session = Session {
             id: (self.new_id)(),
             worktree: self.workspace.open_worktree(&command.worktree)?,
             agent: command.agent,
         };
-        let terminal = self.runtime.start(&session)?;
+        let terminal = self.runtime.start(&session, options)?;
         self.sessions.lock().unwrap().insert(
             session.id.clone(),
             Live {
@@ -60,18 +76,20 @@ impl<T: TerminalRuntime> Application<T> {
         let target = self.resolve_target(&command.target, &command.cwd)?;
         let id = (self.new_id)();
         let uri = format!("{URI_PREFIX}{id}");
+        let title = command.title.unwrap_or_else(|| target.title());
         self.artifacts.insert(ArtifactRecord {
             id,
             session: session.id,
             worktree: session.worktree,
             artifact: ResolvedArtifact {
-                title: command.title.unwrap_or_else(|| target.title()),
+                title: title.clone(),
                 target,
             },
         })?;
         Ok(ArtifactPublished {
             session: command.session,
             uri,
+            title,
         })
     }
 }
