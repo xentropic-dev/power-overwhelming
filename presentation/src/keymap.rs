@@ -50,6 +50,7 @@ pub enum Command {
     AgentCollapse,
     AgentExpand,
     ToggleFinished,
+    EndWorker,
     DagUp,
     DagDown,
     DagLeft,
@@ -230,6 +231,7 @@ const TABLE: &[Entry] = &[
     entry(S::AgentTree, "collapse", C::AgentCollapse, &["ctrl-h"], "Collapse branch or select parent"),
     entry(S::AgentTree, "expand", C::AgentExpand, &["ctrl-l"], "Expand branch or select child"),
     entry(S::AgentTree, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide exited and done agents"),
+    entry(S::AgentTree, "end", C::EndWorker, &["ctrl-x"], "End the selected worker's terminal session"),
     entry(S::Runs, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide completed runs"),
     entry(S::Dag, "up", C::DagUp, &["up", "k"], "Select task above"),
     entry(S::Dag, "down", C::DagDown, &["down", "j"], "Select task below"),
@@ -568,6 +570,7 @@ mod tests {
             (Scope::AgentTree, "enter", C::PickerSelect),
             (Scope::AgentTree, "escape", C::PickerCancel),
             (Scope::AgentTree, "ctrl-f", C::ToggleFinished),
+            (Scope::AgentTree, "ctrl-x", C::EndWorker),
             (Scope::Runs, "ctrl-f", C::ToggleFinished),
             (Scope::Runs, "enter", C::PickerSelect),
             (Scope::Dag, "up", C::DagUp),
@@ -591,6 +594,8 @@ mod tests {
         assert_eq!(keymap.command(Scope::AgentTree, &stroke("left")), None);
         assert_eq!(keymap.command(Scope::Picker, &stroke("ctrl-f")), None);
         assert_eq!(keymap.command(Scope::Runs, &stroke("f")), None);
+        assert_eq!(keymap.command(Scope::Runs, &stroke("ctrl-x")), None);
+        assert_eq!(keymap.command(Scope::Picker, &stroke("ctrl-x")), None);
         let help = keymap.help();
         for (description, binding) in [
             ("Open DAG runs", "Ctrl+B then d"),
@@ -610,6 +615,10 @@ mod tests {
                 "In the agent tree: Ctrl+F",
             ),
             ("Show or hide completed runs", "In the run picker: Ctrl+F"),
+            (
+                "End the selected worker's terminal session",
+                "In the agent tree: Ctrl+X",
+            ),
         ] {
             assert!(
                 help.iter()
@@ -624,7 +633,7 @@ mod tests {
             "tab": { "next": ["n", "j"] },
             "box": { "runs": "g" },
             "dag": { "open": "space", "artifact": "a" },
-            "agent_tree": { "expand": "ctrl-e" },
+            "agent_tree": { "expand": "ctrl-e", "end": "ctrl-d" },
             "runs": { "show_finished": "ctrl-g" },
             "prefix": { "tab": "ctrl-a" },
         }))
@@ -659,6 +668,11 @@ mod tests {
             Some(C::ToggleFinished)
         );
         assert_eq!(keymap.command(Scope::Runs, &stroke("ctrl-f")), None);
+        assert_eq!(
+            keymap.command(Scope::AgentTree, &stroke("ctrl-d")),
+            Some(C::EndWorker)
+        );
+        assert_eq!(keymap.command(Scope::AgentTree, &stroke("ctrl-x")), None);
         assert_eq!(
             keymap.command(Scope::AgentTree, &stroke("ctrl-f")),
             Some(C::ToggleFinished)
