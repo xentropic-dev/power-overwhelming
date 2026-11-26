@@ -149,6 +149,9 @@ mod tests {
         fn recent(&self, _: &[String], _: usize) -> Result<Vec<RecentArtifact>> {
             bail!("unused")
         }
+        fn published(&self, _: &[String]) -> Result<Vec<crate::SessionArtifact>> {
+            bail!("unused")
+        }
     }
 
     struct PassThrough;

@@ -468,6 +468,7 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
         started_at: row.get(10)?,
         ended_at: row.get(11)?,
         model: row.get(12)?,
+        artifacts: Vec::new(),
     })
 }
 

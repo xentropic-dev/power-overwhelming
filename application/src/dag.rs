@@ -2,9 +2,9 @@ use crate::{Application, SessionOptions, StartSession, TerminalRuntime};
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
-        AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, ManagedAgent,
-        Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind, Task, TaskSpec,
-        TaskState, can_dispatch, report_transition, validate_batch,
+        AgentState, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo, Coordinator,
+        ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind, Task,
+        TaskSpec, TaskState, can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeRequest},
@@ -207,17 +207,54 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     pub fn list_runs(&self, selection: BoxSelection) -> Result<Vec<Run>> {
-        self.store.read(|db| {
+        let mut runs = self.store.read(|db| {
             let mut runs = db.list_runs(self.resolve_box(db, &selection)?.as_deref())?;
             for run in &mut runs {
                 run.derive_task_states();
             }
             Ok(runs)
-        })
+        })?;
+        for run in &mut runs {
+            self.attach_artifacts(run)?;
+        }
+        Ok(runs)
     }
 
     pub fn run(&self, id: &str) -> Result<Run> {
-        self.store.read(|db| load_run(db, id))
+        let mut run = self.store.read(|db| load_run(db, id))?;
+        self.attach_artifacts(&mut run)?;
+        Ok(run)
+    }
+
+    /// Fills each attempt's artifacts from the artifact store, with one lookup for the run.
+    fn attach_artifacts(&self, run: &mut Run) -> Result<()> {
+        let mut sessions: Vec<String> = run
+            .tasks
+            .iter()
+            .flat_map(|task| &task.attempts)
+            .filter_map(|attempt| attempt.session.clone())
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut by_session: BTreeMap<String, Vec<AttemptArtifact>> = BTreeMap::new();
+        for published in self.application.artifacts.published(&sessions)? {
+            by_session
+                .entry(published.session)
+                .or_default()
+                .push(published.artifact);
+        }
+        for attempt in run.tasks.iter_mut().flat_map(|task| &mut task.attempts) {
+            attempt.artifacts = attempt
+                .session
+                .as_ref()
+                .and_then(|session| by_session.get(session))
+                .cloned()
+                .unwrap_or_default();
+        }
+        Ok(())
     }
 
     pub fn create_run(
@@ -448,6 +485,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     detail: None,
                     started_at: agent.created_at,
                     ended_at: None,
+                    artifacts: Vec::new(),
                 };
                 db.insert_attempt(&run, &task, &attempt)?;
                 db.event(

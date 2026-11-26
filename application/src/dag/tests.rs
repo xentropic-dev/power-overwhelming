@@ -1,12 +1,12 @@
 use super::*;
 use crate::{
-    ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact, Workspace,
-    WorktreeStatus, agents::AgentProfileRegistry,
+    ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact, SessionArtifact,
+    Workspace, WorktreeStatus, agents::AgentProfileRegistry,
 };
 use anyhow::bail;
 use domain::{
     agent::{AgentProfile, Injection},
-    artifact::{ArtifactRecord, ResolvedArtifact},
+    artifact::{ArtifactRecord, ResolvedArtifact, Target},
     session::Session,
 };
 use std::{
@@ -341,11 +341,14 @@ impl Workspace for FakeWorkspace {
     }
 }
 
-struct FakeArtifacts;
+/// Records published artifacts in insertion order, which stands for publish order.
+#[derive(Default)]
+struct FakeArtifacts(Mutex<Vec<ArtifactRecord>>);
 
 impl ArtifactStore for FakeArtifacts {
-    fn insert(&self, _: ArtifactRecord) -> Result<()> {
-        bail!("Unexpected artifact operation")
+    fn insert(&self, record: ArtifactRecord) -> Result<()> {
+        self.0.lock().unwrap().push(record);
+        Ok(())
     }
 
     fn find(&self, _: &str) -> Result<ResolvedArtifact> {
@@ -354,6 +357,23 @@ impl ArtifactStore for FakeArtifacts {
 
     fn recent(&self, _: &[String], _: usize) -> Result<Vec<RecentArtifact>> {
         bail!("Unexpected artifact operation")
+    }
+
+    fn published(&self, sessions: &[String]) -> Result<Vec<SessionArtifact>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| sessions.contains(&record.session))
+            .map(|record| SessionArtifact {
+                session: record.session.clone(),
+                artifact: AttemptArtifact {
+                    id: record.id.clone(),
+                    title: record.artifact.title.clone(),
+                },
+            })
+            .collect())
     }
 }
 
@@ -450,7 +470,7 @@ fn application() -> Arc<Application<FakeTerminal>> {
         })
         .collect();
     Arc::new(Application::new(
-        FakeArtifacts,
+        FakeArtifacts::default(),
         Arc::new(MemorySessions::default()),
         FakeWorkspace,
         FakeTerminal::default(),
@@ -517,6 +537,72 @@ fn concurrent_dispatch_launches_once() -> Result<()> {
     let task = &dag.run(&run)?.tasks[0];
     assert_eq!(task.state, TaskState::Working);
     assert_eq!(task.attempts.len(), 1);
+    Ok(())
+}
+
+fn publish(dag: &TestDag, id: &str, session: &str, title: &str) -> Result<()> {
+    dag.application.artifacts.insert(ArtifactRecord {
+        id: id.into(),
+        session: session.into(),
+        worktree: "/worktree".into(),
+        artifact: ResolvedArtifact {
+            title: title.into(),
+            target: Target::Loopback("http://localhost:3000/".into()),
+        },
+    })
+}
+
+#[test]
+fn attempts_list_their_sessions_artifacts_in_publish_order() -> Result<()> {
+    let (dag, run) = setup()?;
+    let first = dag.dispatch(command(&run, false))?;
+    let first_session = first.agent.session.unwrap();
+    dag.session_exited(&first_session, "worker exited")?;
+    let second = dag.dispatch(command(&run, true))?;
+    let second_session = second.agent.session.unwrap();
+
+    publish(&dag, "b-first", &first_session, "First report")?;
+    publish(&dag, "x-other", "unrelated-session", "Elsewhere")?;
+    publish(&dag, "c-retry", &second_session, "Retry screenshot")?;
+    publish(&dag, "a-later", &first_session, "Late report")?;
+
+    let artifact = |id: &str, title: &str| AttemptArtifact {
+        id: id.into(),
+        title: title.into(),
+    };
+    let expected = [
+        vec![
+            artifact("b-first", "First report"),
+            artifact("a-later", "Late report"),
+        ],
+        vec![artifact("c-retry", "Retry screenshot")],
+    ];
+    let shown = dag.run(&run)?;
+    let attempts: Vec<_> = shown.tasks[0]
+        .attempts
+        .iter()
+        .map(|attempt| attempt.artifacts.clone())
+        .collect();
+    assert_eq!(attempts, expected);
+    assert_eq!(
+        shown.tasks[0].attempts[0].artifacts[0].link(),
+        "pwr://artifact/b-first"
+    );
+
+    let listed = dag.list_runs(BoxSelection {
+        selector: Some("2".into()),
+        caller: None,
+    })?;
+    let listed = listed.iter().find(|listed| listed.id == run).unwrap();
+    assert_eq!(listed.tasks[0].attempts[0].artifacts, expected[0]);
+    // Artifacts are derived at read time, not stored with the run.
+    let stored = dag.store.read(|db| db.run(&run))?;
+    assert!(
+        stored.tasks[0]
+            .attempts
+            .iter()
+            .all(|attempt| attempt.artifacts.is_empty())
+    );
     Ok(())
 }
 

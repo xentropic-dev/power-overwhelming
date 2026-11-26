@@ -30,6 +30,15 @@ pub trait ArtifactStore: Send + Sync {
     fn find(&self, id: &str) -> Result<ResolvedArtifact>;
     /// Artifacts published from these sessions, newest first.
     fn recent(&self, sessions: &[String], limit: usize) -> Result<Vec<RecentArtifact>>;
+    /// Every artifact published from these sessions, in publish order, newest last.
+    fn published(&self, sessions: &[String]) -> Result<Vec<SessionArtifact>>;
+}
+
+/// A published artifact and the session it was published from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionArtifact {
+    pub session: String,
+    pub artifact: domain::dag::AttemptArtifact,
 }
 
 /// A published artifact as listed in history.
