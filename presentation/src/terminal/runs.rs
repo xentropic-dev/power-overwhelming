@@ -501,6 +501,42 @@ mod tests {
         }
     }
 
+    /// The same test with no system fonts, so the bundled font is the only face GPUI has and
+    /// none of its fallback stack resolves. Fontconfig is read once per process, so the test
+    /// reruns this binary with an empty configuration.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ligatures_shape_with_only_the_bundled_font() {
+        let root = std::env::temp_dir().join(format!("power-no-fonts-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("fonts")).unwrap();
+        let config = root.join("fonts.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "<fontconfig><dir>{0}/fonts</dir><cachedir>{0}/cache</cachedir></fontconfig>\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "terminal::runs::tests::ligatures_change_glyphs_without_moving_terminal_cells",
+                "--test-threads=1",
+            ])
+            .env("FONTCONFIG_FILE", &config)
+            .env_remove("FONTCONFIG_PATH")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn shape_on_the_terminal_font(cx: &mut gpui::App) {
         use crate::{
