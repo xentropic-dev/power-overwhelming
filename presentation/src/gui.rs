@@ -108,13 +108,19 @@ fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndW
     let Some(session) = agent.session.clone() else {
         return EndWorker::NoSession;
     };
-    let busy = matches!(agent.status, AgentStatus::Working | AgentStatus::NeedsInput);
-    if busy && armed != Some(agent.id.as_str()) {
-        return EndWorker::Confirm(format!(
-            "Worker is still working — press {key} again to end it."
-        ));
+    if armed == Some(agent.id.as_str()) {
+        return EndWorker::End(session);
     }
-    EndWorker::End(session)
+    match agent.status {
+        AgentStatus::Working | AgentStatus::NeedsInput => EndWorker::Confirm(format!(
+            "Worker is still working — press {key} again to end it."
+        )),
+        // Idle agents are interactive sessions such as coordinators, not finished workers.
+        AgentStatus::Idle => EndWorker::Confirm(format!(
+            "This agent has no task and may be in use — press {key} again to end its session."
+        )),
+        _ => EndWorker::End(session),
+    }
 }
 
 fn running_progress(run: &Run) -> Option<String> {
@@ -3221,7 +3227,13 @@ mod tests {
             ));
             assert_eq!(end_worker_step(&agent, Some("worker"), "Ctrl+X"), end);
         }
-        for status in [AgentStatus::Done, AgentStatus::Failed, AgentStatus::Idle] {
+        agent.status = AgentStatus::Idle;
+        assert!(matches!(
+            end_worker_step(&agent, None, "Ctrl+X"),
+            EndWorker::Confirm(_)
+        ));
+        assert_eq!(end_worker_step(&agent, Some("worker"), "Ctrl+X"), end);
+        for status in [AgentStatus::Done, AgentStatus::Failed] {
             agent.status = status;
             assert_eq!(end_worker_step(&agent, None, "Ctrl+X"), end);
         }
