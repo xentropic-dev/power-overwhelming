@@ -16,10 +16,13 @@ use std::{
     ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Condvar, Mutex},
 };
 
-pub(crate) struct SqliteDagStore(Mutex<Connection>);
+mod talk;
+
+#[derive(Clone)]
+pub(crate) struct SqliteDagStore(Arc<Mutex<Connection>>, Arc<Condvar>);
 
 impl SqliteDagStore {
     pub(crate) fn open() -> Result<Self> {
@@ -105,7 +108,8 @@ impl SqliteDagStore {
         if !has_archived_at {
             db.execute("ALTER TABLE runs ADD COLUMN archived_at INTEGER", [])?;
         }
-        Ok(Self(Mutex::new(db)))
+        talk::migrate(&db)?;
+        Ok(Self(Arc::new(Mutex::new(db)), Arc::new(Condvar::new())))
     }
 }
 
@@ -493,6 +497,14 @@ impl DagTransaction for DagDb<'_> {
     fn set_agent_exited(&self, id: &str) -> Result<()> {
         self.0
             .execute("UPDATE agents SET state = 'exited' WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    fn retire_agent(&self, id: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE agents SET state = 'exited', session = NULL WHERE id = ?1",
+            [id],
+        )?;
         Ok(())
     }
 

@@ -4,6 +4,8 @@ mod picker;
 mod preview;
 mod settings;
 mod status_bar;
+mod talk_cli;
+mod talk_dialog;
 mod terminal;
 
 use anyhow::{Context, Result};
@@ -102,6 +104,8 @@ enum Action {
         #[command(subcommand)]
         command: DagAction,
     },
+    /// Exchange messages with agents and the user.
+    Talk(talk_cli::TalkArgs),
     /// List and prune Power-managed Git worktrees.
     Worktree {
         #[command(subcommand)]
@@ -237,15 +241,15 @@ fn main() -> Result<()> {
     let cli = Cli::try_parse().unwrap_or_else(|error| {
         let mut args = std::env::args_os().skip(1);
         let command = args.next();
-        let dag_command = match command.as_deref().and_then(|arg| arg.to_str()) {
-            Some("box" | "dag") => true,
+        let command_uses_exit_one = match command.as_deref().and_then(|arg| arg.to_str()) {
+            Some("box" | "dag" | "talk") => true,
             Some("agent") => !matches!(
                 args.next().as_deref().and_then(|arg| arg.to_str()),
                 Some("codex" | "claude")
             ),
             _ => false,
         };
-        if error.use_stderr() && dag_command {
+        if error.use_stderr() && command_uses_exit_one {
             let _ = error.print();
             std::process::exit(1);
         }
@@ -255,8 +259,13 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
+            config::load_talk_policy(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load talk settings. {error:#}");
+                domain::talk::NoticePolicy::default()
+            }),
             LocalWorkerBudget::new(settings::Settings::defaults()),
         ),
+        Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
         }) => {

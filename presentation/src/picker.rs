@@ -1,5 +1,5 @@
 use crate::{gui::agent_tree::AgentTree, keymap::Shortcut};
-use domain::session::Session;
+use domain::{session::Session, talk::AgentTalkSummary};
 use gpui::{prelude::*, *};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use infrastructure::{
@@ -12,6 +12,7 @@ use nucleo_matcher::{
 };
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     ops::Range,
     path::{MAIN_SEPARATOR, Path, PathBuf, is_separator},
     sync::atomic::{AtomicUsize, Ordering},
@@ -48,6 +49,9 @@ pub enum Kind {
         tree: AgentTree,
     },
     StatusActions(String),
+    TalkDraft {
+        title: String,
+    },
     Sessions(String),
     End {
         session: String,
@@ -137,6 +141,7 @@ pub struct Picker {
     /// until the next attempt.
     pub run_notice: Option<String>,
     pub focus: FocusHandle,
+    pub agent_talk: HashMap<String, AgentTalkSummary>,
     query: String,
     cursor: usize,
     select_all: bool,
@@ -162,7 +167,7 @@ impl Kind {
             Self::Runs { .. } => "DAG runs",
             Self::RunLink => "Open DAG run",
             Self::Agents { .. } => "Agent tree",
-            Self::StatusActions(title) => title,
+            Self::StatusActions(title) | Self::TalkDraft { title } => title,
             Self::Sessions(_) => "Recover a session",
             Self::End { .. } => "End terminal session?",
             Self::Help(_) => "Keyboard shortcuts",
@@ -187,6 +192,7 @@ impl Kind {
             Self::Tabs => Some("Search by tab number or name"),
             Self::Runs { .. } => Some("Search runs"),
             Self::Agents { .. } => Some("Search agents"),
+            Self::TalkDraft { .. } => Some("Write a message"),
             Self::Sessions(_) => Some("Search sessions"),
             Self::Help(_) => Some("Search shortcuts"),
             Self::Links => Some("Search links"),
@@ -219,6 +225,7 @@ impl Picker {
             armed_end: None,
             run_notice: None,
             focus,
+            agent_talk: HashMap::new(),
             query: String::new(),
             cursor: 0,
             select_all: false,
@@ -411,7 +418,11 @@ impl Picker {
                         None => format!("{status} · {provider}"),
                     };
                     Row {
-                        label: format!("{indent}{marker} {}", agent.label),
+                        label: format!(
+                            "{indent}{marker} {}{}",
+                            agent.label,
+                            AgentTree::talk_detail(self.agent_talk.get(&agent.id))
+                        ),
                         detail: format!("{indent}{detail} · {}", agent.worktree.display()),
                         choice: Choice::Agent(agent.id.clone()),
                     }
@@ -625,6 +636,10 @@ impl Picker {
     }
 
     /// Whether the picker has a search field. Dialogs without one take plain-letter bindings.
+    pub fn text(&self) -> &str {
+        &self.query
+    }
+
     pub fn has_text_field(&self) -> bool {
         self.kind.placeholder().is_some()
     }
@@ -723,9 +738,12 @@ impl Picker {
             Kind::Help(shortcuts) => Some(shortcuts),
             _ => None,
         };
-        let branch_prompt = matches!(self.kind, Kind::NewWorktree { created: false, .. });
+        let text_prompt = matches!(
+            self.kind,
+            Kind::NewWorktree { created: false, .. } | Kind::TalkDraft { .. }
+        );
         let no_matches = visible.is_empty()
-            && !branch_prompt
+            && !text_prompt
             && self.help_matches.is_empty()
             && !self.query.is_empty()
             && self.message.is_none()
@@ -968,7 +986,7 @@ impl Picker {
                         !matches!(self.kind, Kind::ColorSchemes { .. })
                             && (help.is_some()
                                 || has_results
-                                || (!self.query.is_empty() && !branch_prompt)),
+                                || (!self.query.is_empty() && !text_prompt)),
                         |panel| {
                             panel.child(
                                 div()

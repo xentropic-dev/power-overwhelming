@@ -7,6 +7,9 @@ use std::{
     path::PathBuf,
 };
 
+pub mod talk;
+pub use talk::{TalkRequest, TalkResponse};
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
@@ -141,6 +144,9 @@ pub enum Request {
     End {
         session: String,
     },
+    Talk {
+        talk: TalkRequest,
+    },
     Dag {
         dag: DagRequest,
     },
@@ -200,6 +206,9 @@ pub enum Response {
     Resolved {
         target: Target,
         title: String,
+    },
+    Talk {
+        talk: TalkResponse,
     },
     Dag {
         dag: Box<DagResponse>,

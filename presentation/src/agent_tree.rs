@@ -1,3 +1,4 @@
+use domain::talk::AgentTalkSummary;
 use infrastructure::client::ManagedAgent;
 use nucleo_matcher::{
     Matcher, Utf32Str,
@@ -138,6 +139,20 @@ impl AgentTree {
             };
             (&self.agents[index], depth, marker)
         })
+    }
+
+    pub fn talk_detail(summary: Option<&AgentTalkSummary>) -> String {
+        let Some(summary) = summary else {
+            return String::new();
+        };
+        let mut detail = String::new();
+        if summary.unread > 0 {
+            detail.push_str(&format!(" · {} unread", summary.unread));
+        }
+        if summary.to_user > 0 {
+            detail.push_str(&format!(" · {} to you", summary.to_user));
+        }
+        detail
     }
 
     pub fn agent(&self, id: &str) -> Option<&ManagedAgent> {

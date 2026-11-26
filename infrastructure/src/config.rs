@@ -3,8 +3,9 @@
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
 use domain::{
-    agent::{AgentProfile, Injection, ModelCallback, Resume},
+    agent::{AgentProfile, Injection, ModelCallback, Resume, TurnHook},
     dag::WorkerBudget,
+    talk::NoticePolicy,
 };
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
 use serde::Deserialize;
@@ -13,11 +14,13 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
+pub const TALK_SECTION: &str = "talk";
 pub(crate) const WORKTREES_SECTION: &str = "worktrees";
 pub(crate) const DAG_SECTION: &str = "dag";
 
@@ -28,6 +31,9 @@ fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     });
     defaults
         .entry(AGENTS_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
+        .entry(TALK_SECTION.into())
         .or_insert_with(|| json!({}));
     defaults
         .entry(WORKTREES_SECTION.into())
@@ -105,6 +111,35 @@ pub(crate) fn load_worktree_root(defaults: Sections) -> Result<Option<PathBuf>> 
     worktree_root(&load(with_bundled_defaults(defaults))?)
 }
 
+pub fn load_talk_policy(defaults: Sections) -> Result<NoticePolicy> {
+    talk_policy(&load(with_bundled_defaults(defaults))?)
+}
+
+/// The fallback idle settings are expressed in seconds, with fractional values supported.
+pub fn talk_policy(sections: &Sections) -> Result<NoticePolicy> {
+    let mut policy = NoticePolicy::default();
+    let Some(value) = sections.get(TALK_SECTION) else {
+        return Ok(policy);
+    };
+    let table = value.as_object().context("talk must be a table")?;
+    for (key, value) in table {
+        let setting = match key.as_str() {
+            "idle_after" => &mut policy.idle_after_ms,
+            "user_quiet" => &mut policy.user_quiet_ms,
+            _ => bail!("talk.{key} is not a setting"),
+        };
+        *setting = value
+            .as_f64()
+            .filter(|seconds| *seconds >= 0.001)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .with_context(|| {
+                format!("talk.{key} must be a duration in seconds of at least 0.001")
+            })?;
+    }
+    Ok(policy)
+}
+
 /// Validate and expand the configured root without touching the filesystem.
 pub(crate) fn worktree_root(sections: &Sections) -> Result<Option<PathBuf>> {
     let Some(value) = sections.get(WORKTREES_SECTION) else {
@@ -169,6 +204,7 @@ struct ProfileConfig {
     skip_subcommands: Option<Vec<String>>,
     skip_if_args_contain: Option<Vec<String>>,
     model_callback: Option<ModelCallbackConfig>,
+    turn_hook: Option<TurnHookConfig>,
     skills_dir: Option<PathBuf>,
     resume: Option<ResumeConfig>,
     env: Option<std::collections::BTreeMap<String, String>>,
@@ -199,6 +235,14 @@ enum InjectionConfig {
 enum ModelCallbackConfig {
     ClaudeStatusLine,
     Args { args: Vec<String> },
+    None,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TurnHookConfig {
+    ClaudeSettings,
+    CodexNotify,
     None,
 }
 
@@ -241,6 +285,7 @@ fn read_agent_profile(
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: ModelCallback::None,
+            turn_hook: TurnHook::None,
             skills_dir: None,
             resume: None,
             env: Vec::new(),
@@ -267,6 +312,13 @@ fn read_agent_profile(
             ModelCallbackConfig::ClaudeStatusLine => ModelCallback::ClaudeStatusLine,
             ModelCallbackConfig::Args { args } => ModelCallback::Args { args },
             ModelCallbackConfig::None => ModelCallback::None,
+        };
+    }
+    if let Some(hook) = config.turn_hook {
+        profile.turn_hook = match hook {
+            TurnHookConfig::ClaudeSettings => TurnHook::ClaudeSettings,
+            TurnHookConfig::CodexNotify => TurnHook::CodexNotify,
+            TurnHookConfig::None => TurnHook::None,
         };
     }
     if let Some(skip) = config.skip_subcommands {
@@ -638,6 +690,44 @@ mod tests {
             let error = agent_profiles(&sections).err().unwrap();
             assert!(error.to_string().contains(id), "{error:#}");
         }
+    }
+
+    #[test]
+    fn talk_idle_settings_and_turn_hook_overrides_are_loaded() -> Result<()> {
+        let defaults = [
+            (TALK_SECTION.into(), json!({})),
+            (AGENTS_SECTION.into(), json!({})),
+        ]
+        .into();
+        let config = evaluate(
+            r#"
+            talk = { idle_after = 0.015, user_quiet = 0.025 }
+            agents.claude = { turn_hook = { kind = "none" } }
+            agents.grok = { turn_hook = { kind = "codex_notify" } }
+        "#,
+            Path::new("config.lua"),
+            defaults,
+        )?;
+        let timing = talk_policy(&config)?;
+        assert_eq!((timing.idle_after_ms, timing.user_quiet_ms), (15, 25));
+        let profiles = agent_profiles(&config)?;
+        assert_eq!(
+            profiles.resolve(&"claude".into())?.turn_hook,
+            TurnHook::None
+        );
+        assert_eq!(
+            profiles.resolve(&"grok".into())?.turn_hook,
+            TurnHook::CodexNotify
+        );
+        for value in [
+            json!({"idle_after": 0}),
+            json!({"user_quiet": -1}),
+            json!({"idle_after": "5"}),
+            json!({"idle_aftr": 5}),
+        ] {
+            assert!(talk_policy(&[(TALK_SECTION.into(), value)].into()).is_err());
+        }
+        Ok(())
     }
 
     #[test]

@@ -4,7 +4,7 @@ A dispatched worker starts with a prompt that names the run, the task ID and tit
 
 If `POWER_TASK` is set, report from your worker terminal. `power dag report` uses `POWER_RUN`, `POWER_TASK`, and `POWER_ATTEMPT` to identify your assigned attempt, so you never pass them yourself.
 
-If you need user input, report the question, wait for the user's answer in this terminal, then report that you are working again before continuing.
+If a question is for your coordinator, use `power talk send coordinator "Your question" --wait`. Reserve `needs-input` for decisions only the user can make. If you need user input, report the question, wait for the user's answer in this terminal, then report that you are working again before continuing.
 
 ```sh
 power dag report needs-input --summary "Which configuration should I use?"

@@ -46,6 +46,7 @@ pub struct AgentProfile {
     pub skip_subcommands: Vec<String>,
     pub skip_if_args_contain: Vec<String>,
     pub model_callback: ModelCallback,
+    pub turn_hook: TurnHook,
     pub skills_dir: Option<PathBuf>,
     pub resume: Option<Resume>,
     /// Environment variables set for each launch. Values may contain `{session}`, the
@@ -196,6 +197,15 @@ pub enum ModelCallback {
     None,
 }
 
+/// How a profile reports the end of a turn to Power.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TurnHook {
+    ClaudeSettings,
+    CodexNotify,
+    #[default]
+    None,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +302,7 @@ mod tests {
             env: vec![("SOCKET".into(), "{runtime}/agent-{session}.sock".into())],
             conversation_env: None,
             server_socket_env: None,
+            turn_hook: TurnHook::None,
         };
         assert_eq!(
             profile.launch_env("abc", "/run/user/1"),

@@ -5,6 +5,7 @@ use std::{
     process::{Command, Output},
 };
 
+const TALK_STUB: &str = include_str!("../../skills/power-talk/SKILL.md");
 const DAG_STUB: &str = include_str!("../../skills/power-dag/SKILL.md");
 const ARTIFACTS_STUB: &str = include_str!("../../skills/power-artifacts/SKILL.md");
 const FOREIGN: &str = "---\nname: power-dag\ndescription: A different DAG skill.\n---\n";
@@ -72,12 +73,16 @@ fn default_install_writes_all_stubs_and_reuses_them_on_rerun() {
     let again = fixture.json(&["install", "--json"]);
     let updates = fixture.json(&["update", "--json"]);
     assert_eq!(install["failed"], 0);
-    assert_eq!(install["locations"].as_array().unwrap().len(), 4);
+    assert_eq!(install["locations"].as_array().unwrap().len(), 6);
     assert_eq!(again, updates);
     for location in again["locations"].as_array().unwrap() {
         assert_eq!(location["action"], "no-change");
     }
-    for (name, stub) in [("power-artifacts", ARTIFACTS_STUB), ("power-dag", DAG_STUB)] {
+    for (name, stub) in [
+        ("power-artifacts", ARTIFACTS_STUB),
+        ("power-dag", DAG_STUB),
+        ("power-talk", TALK_STUB),
+    ] {
         let shared = fixture.shared(name);
         assert!(!shared.is_symlink());
         assert_eq!(fs::read_dir(&shared).unwrap().count(), 1);

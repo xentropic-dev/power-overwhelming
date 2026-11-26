@@ -308,6 +308,18 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
+    fn retire_agent(&self, id: &str) -> Result<()> {
+        let mut db = self.0.borrow_mut();
+        let agent = db
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == id)
+            .context("Unknown agent")?;
+        agent.state = AgentState::Exited;
+        agent.session = None;
+        Ok(())
+    }
+
     fn set_run_archived(&self, id: &str, archived_at: Option<u64>) -> Result<()> {
         self.0
             .borrow_mut()
@@ -713,6 +725,7 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume: Some(domain::agent::Resume {
                 resume_last: vec!["--continue".into()],

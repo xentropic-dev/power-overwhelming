@@ -7,6 +7,7 @@ use crate::{
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
+    talk_adapter::{self, DaemonTalk},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
     wire::{self, DagRequest, DagResponse, Request, Response},
@@ -15,7 +16,10 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use application::{Application, PublishArtifact, ResolveArtifact, StartSession, dag::EventScope};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::session::{Agent, Geometry};
+use domain::{
+    session::{Agent, Geometry},
+    talk::{HookState, NoticePolicy},
+};
 use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
@@ -28,7 +32,7 @@ use std::{
         },
     },
     sync::{
-        Arc, OnceLock, RwLock, Weak,
+        Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -71,11 +75,14 @@ struct Server {
     plugins: Option<Plugins>,
     scheme: ActiveScheme,
     dag: Arc<DaemonDag>,
+    talk: Arc<DaemonTalk>,
+    talk_wake: mpsc::SyncSender<()>,
 }
 
 pub fn serve(
     profiles: AgentProfiles,
     worktree_root: LocalWorktreeRoot,
+    talk_policy: NoticePolicy,
     budget: LocalWorkerBudget,
 ) -> Result<()> {
     let socket = wire::socket_path();
@@ -115,8 +122,10 @@ pub fn serve(
     let terminal_dag = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
     let exit_dag = terminal_dag.clone();
     let model_dag = terminal_dag.clone();
+    let foreground_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
+    let (talk_wake, talk_activity) = mpsc::sync_channel(1);
     let application = Arc::new(Application::new(
         artifacts,
         Arc::new(sessions),
@@ -125,6 +134,7 @@ pub fn serve(
             socket: socket.clone(),
             scheme: scheme.clone(),
             profiles: profiles.clone(),
+            talk_wake: talk_wake.clone(),
             on_exit: Arc::new(move |session, detail| {
                 if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
                     && let Err(error) = dag.session_exited(session, detail)
@@ -144,15 +154,27 @@ pub fn serve(
                 }
                 Ok(())
             }),
+            on_foreground_left: Arc::new(move |session, agent| {
+                if let Some(dag) = foreground_dag.get().and_then(Weak::upgrade)
+                    && let Err(error) = dag.foreground_left(session, agent)
+                {
+                    eprintln!("Could not end the foreground identity in {session}. {error:#}");
+                }
+            }),
             shutting_down: shutting_down.clone(),
         },
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
     let dag = Arc::new(
-        DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
-            .with_worktree_root(worktree_root)
-            .with_worker_budget(budget, ProcMemory),
+        DaemonDag::new(
+            application.clone(),
+            store.clone(),
+            BoxesFile,
+            IconFiles::open()?,
+        )
+        .with_worktree_root(worktree_root)
+        .with_worker_budget(budget, ProcMemory),
     );
     terminal_application
         .set(Arc::downgrade(&application))
@@ -161,26 +183,45 @@ pub fn serve(
     terminal_dag
         .set(Arc::downgrade(&dag))
         .expect("connect terminal callbacks to the DAG once");
-    dag.restore().context("Restore sessions")?;
-    handle_shutdown(application.clone(), shutting_down)?;
-    delay_bind_for_tests();
+    // Listen before restoring. A restored worker can finish its continuation turn while a
+    // later session is still restoring, and its turn-end report must not be lost.
+    delay_for_tests("POWER_TEST_BIND_DELAY_MS");
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let startup = Arc::new(Startup::default());
+    let acceptor = {
+        let listener = listener.try_clone()?;
+        let startup = startup.clone();
+        let application = application.clone();
+        thread::spawn(move || -> Result<()> {
+            for socket in listener.incoming() {
+                let socket = socket?;
+                let startup = startup.clone();
+                let application = application.clone();
+                thread::spawn(move || {
+                    let _ = accept(socket, &startup, &application);
+                });
+            }
+            Ok(())
+        })
+    };
+    dag.restore().context("Restore sessions")?;
+    let talk = talk_adapter::start(application.clone(), store, talk_policy, talk_activity);
+    handle_shutdown(application.clone(), shutting_down)?;
     start_queue(dag.clone(), &listener);
-    let server = Arc::new(Server {
+    // Lets a test hold startup open, as if a later session were still restoring.
+    delay_for_tests("POWER_TEST_RESTORE_DELAY_MS");
+    startup.open(Arc::new(Server {
         plugins: Plugins::start(application.clone()),
+        talk,
+        talk_wake,
         dag,
         application,
         scheme,
-    });
-    for socket in listener.incoming() {
-        let socket = socket?;
-        let server = server.clone();
-        thread::spawn(move || {
-            let _ = handle(socket, &server);
-        });
-    }
-    Ok(())
+    }));
+    acceptor
+        .join()
+        .unwrap_or_else(|_| bail!("The daemon's listener stopped"))
 }
 
 /// How long the queue waits for a run event before it checks the budget again, so memory
@@ -189,9 +230,9 @@ const QUEUE_RECHECK: Duration = Duration::from_secs(5);
 
 /// Holds the bind in debug builds, so tests can show that nothing a worker needs the
 /// socket for starts before the daemon listens.
-fn delay_bind_for_tests() {
+fn delay_for_tests(_variable: &str) {
     #[cfg(debug_assertions)]
-    if let Some(delay) = std::env::var("POWER_TEST_BIND_DELAY_MS")
+    if let Some(delay) = std::env::var(_variable)
         .ok()
         .and_then(|millis| millis.parse().ok())
     {
@@ -263,11 +304,103 @@ fn handle_shutdown(
     Ok(())
 }
 
-fn handle(mut socket: UnixStream, server: &Server) -> Result<()> {
-    let application = &server.application;
+/// Connections accepted while the daemon restores sessions. Turn reports are applied at
+/// once, or kept until their session is restored. Other requests wait for the server.
+#[derive(Default)]
+struct Startup {
+    server: Mutex<StartupState>,
+    opened: Condvar,
+}
+
+#[derive(Default)]
+struct StartupState {
+    server: Option<Arc<Server>>,
+    /// Turn reports from sessions that were not registered yet when they arrived.
+    turns: Vec<(String, HookState, bool)>,
+}
+
+impl Startup {
+    fn open(&self, server: Arc<Server>) {
+        let turns = {
+            let mut state = self.server.lock().unwrap();
+            state.server = Some(server.clone());
+            std::mem::take(&mut state.turns)
+        };
+        self.opened.notify_all();
+        for (session, hook, ready_only) in turns {
+            match server.application.terminal(&session) {
+                Ok(terminal) => terminal.report_turn(hook, ready_only),
+                Err(_) => eprintln!("Dropped a turn report from unrestored session {session}"),
+            }
+        }
+    }
+
+    fn server(&self) -> Arc<Server> {
+        let mut state = self.server.lock().unwrap();
+        loop {
+            if let Some(server) = &state.server {
+                return server.clone();
+            }
+            state = self.opened.wait(state).unwrap();
+        }
+    }
+
+    /// Applies a turn report during startup. Returns false once the server is running.
+    fn report_turn(
+        &self,
+        application: &Application<PtyRuntime>,
+        session: &str,
+        hook: HookState,
+        ready_only: bool,
+    ) -> bool {
+        let mut state = self.server.lock().unwrap();
+        if state.server.is_some() {
+            return false;
+        }
+        match application.terminal(session) {
+            Ok(terminal) => terminal.report_turn(hook, ready_only),
+            Err(_) => state.turns.push((session.into(), hook, ready_only)),
+        }
+        true
+    }
+}
+
+fn accept(
+    mut socket: UnixStream,
+    startup: &Startup,
+    application: &Application<PtyRuntime>,
+) -> Result<()> {
     socket.set_write_timeout(Some(Duration::from_secs(3)))?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
     let request = wire::receive(&mut BufReader::new(&socket))?.context("Missing request")?;
+    if let Request::Talk {
+        talk:
+            wire::TalkRequest {
+                session: Some(session),
+                command: wire::talk::TalkCommand::Turn { ready, ready_only },
+                ..
+            },
+    } = &request
+    {
+        let hook = if *ready {
+            HookState::Ready
+        } else {
+            HookState::Busy
+        };
+        if startup.report_turn(application, session, hook, *ready_only) {
+            return wire::send(
+                &mut socket,
+                &Response::Talk {
+                    talk: wire::talk::TalkResponse::Ok,
+                },
+            );
+        }
+    }
+    handle(socket, request, &startup.server())
+}
+
+fn handle(mut socket: UnixStream, request: Request, server: &Server) -> Result<()> {
+    let application = &server.application;
     match request {
         Request::WatchArtifacts => return stream(socket, &ARTIFACT_WATCHERS),
         Request::WatchBoxIcons => return stream(socket, &BOX_ICON_WATCHERS),
@@ -318,11 +451,35 @@ fn handle(mut socket: UnixStream, server: &Server) -> Result<()> {
         return Ok(());
     }
 
+    if let Request::Talk {
+        talk:
+            talk @ wire::TalkRequest {
+                command: wire::talk::TalkCommand::Watch,
+                ..
+            },
+    } = request
+    {
+        if let Err(error) = talk_adapter::watch(&server.talk, &server.dag, talk, &socket) {
+            wire::send(
+                socket,
+                &Response::Error {
+                    message: format!("{error:#}"),
+                },
+            )?;
+        }
+        return Ok(());
+    }
+
+    let is_talk = matches!(&request, Request::Talk { .. });
     let response =
         handle_request(request, server, &socket).unwrap_or_else(|error| Response::Error {
             message: format!("{error:#}"),
         });
-    wire::send(socket, &response)
+    wire::send(socket, &response)?;
+    if is_talk {
+        let _ = server.talk_wake.try_send(());
+    }
+    Ok(())
 }
 
 fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Result<Response> {
@@ -419,9 +576,12 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         }
         Request::Input { session, data } => {
             ensure!(data.len() <= 350_000, "Terminal input is too large");
-            application
-                .terminal(&session)?
-                .send(Command::Input(STANDARD.decode(data)?))?;
+            ensure!(
+                application
+                    .terminal(&session)?
+                    .input(STANDARD.decode(data)?, None)?,
+                "Terminal session has exited"
+            );
             Ok(Response::Ok)
         }
         Request::Resize { session, geometry } => {
@@ -478,6 +638,9 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+        }),
+        Request::Talk { talk } => Ok(Response::Talk {
+            talk: talk_adapter::request(&server.talk, &server.dag, talk)?,
         }),
         Request::Dag { dag } => {
             let dag = dag_adapter::request(&server.dag, dag)?;

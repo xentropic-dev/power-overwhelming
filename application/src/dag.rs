@@ -59,6 +59,9 @@ pub trait DagReader {
 pub trait DagTransaction: DagReader {
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()>;
     fn set_agent_exited(&self, id: &str) -> Result<()>;
+    /// Marks the agent exited and releases its session, so the session can host another
+    /// identity. Its messages stay readable under its ID.
+    fn retire_agent(&self, id: &str) -> Result<()>;
     fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()>;
     fn insert_run(&self, run: &Run) -> Result<()>;
     /// Sets or clears the run's archive time.
@@ -385,6 +388,68 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .info
             .id
             .clone())
+    }
+
+    pub fn box_for(&self, selection: BoxSelection) -> Result<Option<String>> {
+        self.store.read(|db| self.resolve_box(db, &selection))
+    }
+
+    /// Gives a live coding session without an agent row (one started with `power session
+    /// start`, or a provider running in a shell session's foreground) its peer identity in
+    /// its box. A plain shell session or an unknown session is left alone. The foreground is
+    /// resolved now, before the store lock, never from the terminal's periodic check.
+    pub fn register_coding_session(&self, session: &str) -> Result<Option<ManagedAgent>> {
+        let Some(live) = self.application.live_agent(session) else {
+            return Ok(None);
+        };
+        if live == Agent::Shell {
+            return Ok(None);
+        }
+        let Ok(info) = self.application.session(session) else {
+            return Ok(None);
+        };
+        self.write(|db| {
+            if let Some(agent) = db.session_agent(session)? {
+                if agent.speaks_for(&live) {
+                    return Ok(agent);
+                }
+                // A foreground identity whose coding process has left the shell.
+                db.retire_agent(&agent.id)?;
+            }
+            ensure!(
+                self.application.session_is_running(session)?,
+                "Caller session has exited"
+            );
+            // A session started outside the strip (`power session start`) has no view,
+            // so its box is the one whose repository holds its worktree.
+            let box_id = match self.view_box(session) {
+                Ok(id) => id,
+                Err(_) => self.worktree_box(&info.worktree)?,
+            };
+            self.insert_session_agent(db, session, &box_id, &live)
+        })
+        .map(Some)
+        .with_context(|| {
+            format!("Coding session {session:?} has no Power agent identity to send as")
+        })
+    }
+
+    /// A coding agent left the foreground of shell session `session`. The identity Power
+    /// derived from that foreground ends with it. A launched session's own agent, and a
+    /// command worker's row, are not foreground identities and are left alone.
+    pub fn foreground_left(&self, session: &str, agent: &Agent) -> Result<()> {
+        if self.application.launched_agent(session) != Some(Agent::Shell) {
+            return Ok(());
+        }
+        self.write(|db| {
+            if let Some(row) = db.session_agent(session)?
+                && matches!(row.provider, Provider::Agent(_))
+                && row.speaks_for(agent)
+            {
+                db.retire_agent(&row.id)?;
+            }
+            Ok(())
+        })
     }
 
     /// Sets the selected box's icon from an image on disk, or restores the identicon when
@@ -1066,10 +1131,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Reconciles like `reconcile`, and records `AttemptResumed` for each attempt in
     /// `resumed`, whose worker was told to continue.
     fn reconcile_restored(&self, restored: &[String], resumed: &[&OpenAttempt]) -> Result<()> {
+        let restored_ids = restored;
         let restored = |session: Option<&str>| {
             session.is_some_and(|session| restored.iter().any(|id| id == session))
         };
         let workspace = self.application.workspace.as_ref();
+        // A coding agent Power found in a restored shell's foreground ran in a process that
+        // the restart ended. Its identity ends with it; a resumed agent registers anew.
+        let shells: BTreeSet<&str> = restored_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| self.application.launched_agent(id) == Some(Agent::Shell))
+            .collect();
         self.write(|db| {
             interrupt(db, None, RESTART_DETAIL, &restored)?;
             for open in resumed {
@@ -1088,6 +1161,16 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 .collect();
             for agent in db.list_agents(None)? {
                 if agent.state != AgentState::Running {
+                    continue;
+                }
+                if matches!(agent.provider, Provider::Agent(_))
+                    && agent.task.is_none()
+                    && agent
+                        .session
+                        .as_deref()
+                        .is_some_and(|session| shells.contains(session))
+                {
+                    db.retire_agent(&agent.id)?;
                     continue;
                 }
                 let orphaned =
@@ -1166,6 +1249,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(None)
     }
 
+    fn worktree_box(&self, worktree: &Path) -> Result<String> {
+        let mut boxes = self.registry.boxes()?.into_iter().filter(|entry| {
+            self.application
+                .workspace
+                .validate_box_worktree(&entry.info.repository, worktree)
+                .is_ok()
+        });
+        match (boxes.next(), boxes.next()) {
+            (Some(entry), None) => Ok(entry.info.id),
+            (Some(_), Some(_)) => bail!("{} belongs to several boxes", worktree.display()),
+            (None, _) => bail!("{} does not belong to a Power box", worktree.display()),
+        }
+    }
+
     fn view_box(&self, session: &str) -> Result<String> {
         self.registry
             .boxes()?
@@ -1206,7 +1303,19 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             self.view_box(session)? == box_id,
             "Caller session is in another box"
         );
-        let session = self.application.session(session)?;
+        let agent = self.application.session(session)?.agent;
+        self.insert_session_agent(db, session, box_id, &agent)
+    }
+
+    fn insert_session_agent(
+        &self,
+        db: &dyn DagTransaction,
+        session: &str,
+        box_id: &str,
+        live: &Agent,
+    ) -> Result<ManagedAgent> {
+        let mut session = self.application.session(session)?;
+        session.agent = live.clone();
         let provider = match session.agent.clone() {
             Agent::Coding(id) => Provider::Agent(id),
             Agent::Shell => Provider::Command,

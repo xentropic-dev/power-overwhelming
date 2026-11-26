@@ -970,7 +970,7 @@ done
         write_config(
             root,
             &format!(
-                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
+                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }}, turn_hook = {{ kind = "none" }} }}"#,
                 program.to_str().unwrap(),
             ),
         );

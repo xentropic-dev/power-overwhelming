@@ -27,6 +27,7 @@ pub enum Command {
     BoxSetup,
     BoxRuns,
     BoxAgents,
+    BoxTalk,
     Reload,
     Quit,
     Help,
@@ -47,6 +48,9 @@ pub enum Command {
     PickerComplete,
     DialogUp,
     DialogDown,
+    AgentTalk,
+    TalkCompose,
+    TalkReply,
     AgentCollapse,
     AgentExpand,
     ToggleFinished,
@@ -97,6 +101,8 @@ pub enum Scope {
     Dialog,
     /// In the searchable agent tree, in addition to `Picker`.
     AgentTree,
+    /// In the talk thread list.
+    Talk,
     /// In the DAG run picker, in addition to `Picker`.
     Runs,
     /// On the task graph.
@@ -116,6 +122,7 @@ impl Scope {
             Self::Picker => "picker",
             Self::Dialog => "dialog",
             Self::AgentTree => "agent_tree",
+            Self::Talk => "talk",
             Self::Runs => "runs",
             Self::Dag => "dag",
             Self::Preview => "preview",
@@ -166,6 +173,7 @@ const TABLE: &[Entry] = &[
     entry(S::Box, "detach", C::BoxDetach, &["x"], "Detach box"),
     entry(S::Box, "runs", C::BoxRuns, &["d"], "Open DAG runs"),
     entry(S::Box, "agents", C::BoxAgents, &["a"], "Open agent tree"),
+    entry(S::Box, "talk", C::BoxTalk, &["m"], "Open your inbox"),
     entry(S::Box, "reload", C::Reload, &["r"], "Reload configuration"),
     entry(S::Box, "color_scheme", C::BoxColorScheme, &["t"], "Choose color scheme"),
     entry(S::Box, "setup", C::BoxSetup, &["i"], "Shell integration setup"),
@@ -233,6 +241,9 @@ const TABLE: &[Entry] = &[
     entry(S::AgentTree, "collapse", C::AgentCollapse, &["ctrl-h"], "Collapse branch or select parent"),
     entry(S::AgentTree, "expand", C::AgentExpand, &["ctrl-l"], "Expand branch or select child"),
     entry(S::AgentTree, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide exited and done agents"),
+    entry(S::AgentTree, "talk", C::AgentTalk, &["ctrl-t"], "Open talk for the selected agent"),
+    entry(S::Talk, "compose", C::TalkCompose, &["ctrl-n"], "Compose to the selected agent"),
+    entry(S::Talk, "reply", C::TalkReply, &["ctrl-r"], "Reply in the selected thread"),
     entry(S::AgentTree, "end", C::EndWorker, &["ctrl-x"], "End the selected worker's terminal session"),
     entry(S::Runs, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide completed and archived runs"),
     entry(S::Runs, "archive", C::ArchiveRun, &["ctrl-x"], "Archive or unarchive the selected run"),
@@ -243,6 +254,7 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "zoom_in", C::DagZoomIn, &["+"], "Zoom in"),
     entry(S::Dag, "zoom_out", C::DagZoomOut, &["-"], "Zoom out"),
     entry(S::Dag, "open", C::DagOpen, &["enter", "o"], "Open assigned worker terminal"),
+    entry(S::Dag, "talk", C::AgentTalk, &["t"], "Open talk for the selected task's agent"),
     entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
     entry(S::Dag, "start_now", C::DagStartNow, &["s"], "Start the selected queued task now, over the worker budget"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
@@ -453,6 +465,9 @@ impl Keymap {
             Scope::Dialog | Scope::AgentTree | Scope::Runs => {
                 find(Scope::Picker).or_else(|| find(scope))
             }
+            Scope::Talk => find(Scope::Talk)
+                .or_else(|| find(Scope::Picker))
+                .or_else(|| find(Scope::Dialog)),
             scope => find(scope),
         }
     }
@@ -509,6 +524,7 @@ impl Keymap {
                 Scope::Picker => format!("In pickers: {keys}"),
                 Scope::Dialog => format!("In dialogs without search: {keys}"),
                 Scope::AgentTree => format!("In the agent tree: {keys}"),
+                Scope::Talk => format!("In talk: {keys}"),
                 Scope::Runs => format!("In the run picker: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
@@ -556,6 +572,38 @@ mod tests {
         ] {
             assert_eq!(keymap.command(Scope::Preview, &stroke(key)), Some(command));
         }
+    }
+
+    #[test]
+    fn talk_bindings_support_keyboard_navigation_and_lua_overrides() -> Result<()> {
+        let defaults = [(SECTION.into(), super::defaults())];
+        let config = tempfile::NamedTempFile::new()?;
+        std::fs::write(config.path(), r#"keys.agent_tree.talk = "ctrl-y""#)?;
+        let keymap =
+            Keymap::from_sections(&infrastructure::config::load_from(config.path(), defaults)?)?;
+        for (scope, key, command) in [
+            (Scope::AgentTree, "ctrl-y", C::AgentTalk),
+            (Scope::Box, "m", C::BoxTalk),
+            (Scope::Dag, "t", C::AgentTalk),
+            (Scope::Talk, "ctrl-n", C::TalkCompose),
+            (Scope::Talk, "ctrl-r", C::TalkReply),
+            (Scope::Talk, "enter", C::PickerSelect),
+            (Scope::Talk, "escape", C::PickerCancel),
+            (Scope::Talk, "up", C::PickerUp),
+            (Scope::Talk, "down", C::PickerDown),
+            (Scope::Talk, "ctrl-k", C::PickerUp),
+            (Scope::Talk, "ctrl-j", C::PickerDown),
+            (Scope::Talk, "h", C::DialogUp),
+            (Scope::Talk, "j", C::DialogDown),
+            (Scope::Talk, "k", C::DialogUp),
+            (Scope::Talk, "l", C::DialogDown),
+            (Scope::Talk, "left", C::DialogUp),
+            (Scope::Talk, "right", C::DialogDown),
+        ] {
+            assert_eq!(keymap.command(scope, &stroke(key)), Some(command), "{key}");
+        }
+        assert_eq!(keymap.command(Scope::AgentTree, &stroke("ctrl-t")), None);
+        Ok(())
     }
 
     #[test]

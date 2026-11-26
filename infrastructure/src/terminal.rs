@@ -9,6 +9,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     agent::{AgentProfile, Injection},
     session::{Agent, Geometry, Session},
+    talk::{Activity, HookState},
 };
 use ghostty_vt::{
     Terminal,
@@ -39,6 +40,10 @@ type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send 
 /// Saves a session's foreground agent, its conversation and the shell's directory.
 type ForegroundChanged =
     Arc<dyn Fn(&str, &Agent, Option<&str>, Option<&Path>) -> Result<()> + Send + Sync>;
+/// A coding agent process left a shell session's foreground.
+type ForegroundLeft = Arc<dyn Fn(&str, &Agent) + Send + Sync>;
+/// How long a request waits for its terminal to resolve the foreground process.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often a shell session's working directory is checked for a restore.
 const CWD_INTERVAL: Duration = Duration::from_secs(3);
@@ -65,20 +70,31 @@ pub struct PtyRuntime {
     pub on_exit: ExitHandler,
     pub on_model_changed: ModelChanged,
     pub on_foreground_changed: ForegroundChanged,
+    pub on_foreground_left: ForegroundLeft,
     /// Set on daemon shutdown. Exits are then not reported and foreground state
     /// is only saved by an explicit flush, so a reboot cannot erase what a restore needs.
     pub shutting_down: Arc<AtomicBool>,
     pub profiles: Arc<dyn AgentProfileRegistry>,
+    pub(crate) talk_wake: SyncSender<()>,
 }
 
 struct Lifecycle {
+    input: Mutex<TerminalInput>,
+    talk_wake: SyncSender<()>,
     running: AtomicBool,
     session: String,
     on_exit: ExitHandler,
     foreground: Mutex<Foreground>,
     on_model_changed: ModelChanged,
     on_foreground_changed: ForegroundChanged,
+    on_foreground_left: ForegroundLeft,
     shutting_down: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct TerminalInput {
+    activity: Activity,
+    writer: Option<SyncSender<Vec<u8>>>,
 }
 
 struct Foreground {
@@ -87,10 +103,23 @@ struct Foreground {
 }
 
 impl Lifecycle {
+    /// Output never changes the reported turn state. A repaint after a ready report only
+    /// delays delivery for providers that need output quiet.
+    fn record_output(&self) {
+        let mut input = self.input.lock().unwrap();
+        let state = &mut input.activity;
+        let now = crate::talk_adapter::now_ms();
+        state.last_output = now;
+        state.active_since = now;
+        state.revision = state.revision.wrapping_add(1);
+    }
+
     fn notify_exit(&self, detail: &str) {
-        if self.running.swap(false, Ordering::AcqRel) && !self.shutting_down.load(Ordering::Acquire)
-        {
-            (self.on_exit)(&self.session, detail);
+        if self.running.swap(false, Ordering::AcqRel) {
+            self.input.lock().unwrap().writer.take();
+            if !self.shutting_down.load(Ordering::Acquire) {
+                (self.on_exit)(&self.session, detail);
+            }
         }
     }
 
@@ -140,6 +169,66 @@ impl Handle {
         self.commands.send(command)
     }
 
+    pub(crate) fn activity(&self) -> Activity {
+        self.lifecycle.input.lock().unwrap().activity
+    }
+
+    pub(crate) fn report_turn(&self, hook: HookState, ready_only: bool) {
+        let mut input = self.lifecycle.input.lock().unwrap();
+        let now = crate::talk_adapter::now_ms();
+        let state = &mut input.activity;
+        state.ready_only |= ready_only;
+        state.hook = hook;
+        state.reported_at = now;
+        if hook == HookState::Ready {
+            state.awaiting_turn_end = false;
+        }
+        if hook == HookState::Busy {
+            state.active_since = now;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let _ = self.lifecycle.talk_wake.try_send(());
+    }
+
+    pub(crate) fn input(&self, bytes: Vec<u8>, notice: Option<Activity>) -> Result<bool> {
+        let mut input = self.lifecycle.input.lock().unwrap();
+        if notice.is_some_and(|expected| expected != input.activity)
+            || !self.is_running()
+            || self.lifecycle.shutting_down.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let Some(writer) = &input.writer else {
+            return Ok(false);
+        };
+        match writer.try_send(bytes) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) if notice.is_some() => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let now = crate::talk_adapter::now_ms();
+        let state = &mut input.activity;
+        state.active_since = now;
+        if notice.is_some() {
+            state.last_notice = now;
+            // A notice submits a prompt, so a provider that reports turn starts is busy
+            // until it reports again. A notify-only provider reports only the turn's end.
+            if state.ready_only {
+                state.awaiting_turn_end = true;
+            } else if state.hook == HookState::Ready {
+                state.hook = HookState::Busy;
+                state.reported_at = now;
+            }
+        } else {
+            // User keystrokes may be navigation or a draft. They delay delivery until the
+            // user pauses but never make the turn busy.
+            state.last_input = now;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let _ = self.lifecycle.talk_wake.try_send(());
+        Ok(true)
+    }
+
     pub(crate) fn refresh_theme(&self) {
         // A full queue already guarantees another actor iteration.
         let _ = self.commands.try_send(Command::RefreshTheme);
@@ -178,12 +267,20 @@ impl TerminalRuntime for PtyRuntime {
             None
         }
     }
+
+    /// Asks the terminal to recheck its foreground process now. The periodic check runs
+    /// every 500 ms, so a coding agent that sends at once on launch would otherwise still
+    /// look like the shell.
+    fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        handle.send(Command::ResolveForeground(reply)).ok()?;
+        answer.recv_timeout(RESOLVE_TIMEOUT).ok()
+    }
 }
 
 pub enum Command {
     RefreshTheme,
     Attach(SyncSender<Response>),
-    Input(Vec<u8>),
     Resize(Geometry),
     WorkingDirectory(SyncSender<Option<PathBuf>>),
     SetMetadata {
@@ -204,6 +301,8 @@ pub enum Command {
     Relaunched(Option<u32>),
     /// Recheck which agent owns the foreground of a shell session.
     Poll,
+    /// Recheck the foreground now and reply with the agent that owns it.
+    ResolveForeground(SyncSender<Agent>),
     OutputClosed,
     ProcessExited(String),
     /// Save pending scrollback and foreground state, then acknowledge after the attempt.
@@ -225,6 +324,7 @@ fn launch(
         .clone()
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
+    let mut ready_only = false;
     // No process of this session runs now, so a server still listening on one of its
     // earlier launch sockets is an orphan of a previous daemon.
     crate::agent_socket::reclaim(&session.id, &runtime.socket);
@@ -241,7 +341,8 @@ fn launch(
         None => None,
     };
     let mut process = if let Some(profile) = profile {
-        let (command, id) = agent_command(profile, &session.worktree, &options.args)?;
+        let (command, id, notify_only) = agent_command(profile, &cwd, &options.args)?;
+        ready_only = notify_only;
         conversation = id;
         command
     } else if let Some((program, args)) = options.args.split_first() {
@@ -260,7 +361,7 @@ fn launch(
     // The fresh start never repeats the initial prompt.
     let fallback = match (profile, &options.fallback_args) {
         (Some(profile), Some(args)) => {
-            let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
+            let (mut command, conversation, _) = agent_command(profile, &cwd, args)?;
             // The fresh start gets its own server socket.
             configure(
                 &mut command,
@@ -280,7 +381,21 @@ fn launch(
     let mut writer = pair.master.take_writer()?;
     let process = pair.slave.spawn_command(process)?;
     let pid = process.process_id();
+    let started_at = crate::talk_adapter::now_ms();
+    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
     let lifecycle = Arc::new(Lifecycle {
+        input: Mutex::new(TerminalInput {
+            activity: Activity {
+                last_output: started_at,
+                active_since: started_at,
+                ready_only,
+                // The initial prompt (including a restore continuation) starts a turn.
+                awaiting_turn_end: ready_only && options.initial_prompt.is_some(),
+                ..Activity::default()
+            },
+            writer: Some(write_tx.clone()),
+        }),
+        talk_wake: runtime.talk_wake.clone(),
         running: AtomicBool::new(true),
         session: session.id.clone(),
         on_exit: runtime.on_exit.clone(),
@@ -290,6 +405,7 @@ fn launch(
         }),
         on_model_changed: runtime.on_model_changed.clone(),
         on_foreground_changed: runtime.on_foreground_changed.clone(),
+        on_foreground_left: runtime.on_foreground_left.clone(),
         shutting_down: runtime.shutting_down.clone(),
     });
     // A relaunch needs the slave, which also keeps the reader from seeing EOF between
@@ -316,7 +432,6 @@ fn launch(
     }
 
     let (tx, rx) = mpsc::sync_channel(128);
-    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
     let input_ready = Arc::new(InputReady::default());
     let typist = {
         let input_ready = input_ready.clone();
@@ -344,6 +459,7 @@ fn launch(
     });
 
     let reader_tx = tx.clone();
+    let output_lifecycle = lifecycle.clone();
     let reader_ready = input_ready.clone();
     thread::spawn(move || {
         let mut buffer = [0; 16 * 1024];
@@ -352,6 +468,7 @@ fn launch(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
+                    output_lifecycle.record_output();
                     reader_ready.observe(&mut tail, &buffer[..count]);
                     if reader_tx
                         .send(Command::Output(buffer[..count].to_vec()))
@@ -451,14 +568,16 @@ fn agent_command(
     profile: &AgentProfile,
     worktree: &Path,
     args: &[OsString],
-) -> Result<(CommandBuilder, Option<String>)> {
+) -> Result<(CommandBuilder, Option<String>, bool)> {
     let mut command = CommandBuilder::new(&profile.command);
     let installed = crate::skill_install::LocalInstalledSkills(worktree);
     command.args(crate::shell::instruction_args(profile, args, &installed)?);
+    let (callbacks, ready_only) = crate::shell::launch_callbacks(profile, args, worktree);
+    command.args(callbacks);
     let (assign, conversation) = crate::shell::assign_conversation(profile, args);
     command.args(assign);
     command.args(args);
-    Ok((command, conversation))
+    Ok((command, conversation, ready_only))
 }
 
 /// Sets the environment and directory every process in a Power terminal starts with.
@@ -789,6 +908,7 @@ fn terminal_actor(
                 command,
                 Command::Attach(_)
                     | Command::Poll
+                    | Command::ResolveForeground(_)
                     | Command::SetMetadata { .. }
                     | Command::SetConversation { .. }
             )
@@ -801,7 +921,7 @@ fn terminal_actor(
                 profiles,
             );
             if current != run {
-                run = current;
+                let left = std::mem::replace(&mut run, current);
                 let current = run
                     .as_ref()
                     .map_or(Agent::Shell, |(_, agent)| agent.clone());
@@ -836,7 +956,21 @@ fn terminal_actor(
                     metadata = next;
                     notify_metadata(&metadata, &mut clients);
                 }
+                if run.is_none() {
+                    let mut input = lifecycle.input.lock().unwrap();
+                    input.activity.ready_only = false;
+                    input.activity.awaiting_turn_end = false;
+                    input.activity.hook = HookState::Unknown;
+                    input.activity.revision = input.activity.revision.wrapping_add(1);
+                }
                 restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
+                // The process changed, so any identity derived from the old one ends. During
+                // a shutdown every process stops at once; the restore retires those.
+                if let Some((_, left)) = left
+                    && !lifecycle.shutting_down.load(Ordering::Acquire)
+                {
+                    (lifecycle.on_foreground_left)(&lifecycle.session, &left);
+                }
             }
         }
         match command {
@@ -862,11 +996,6 @@ fn terminal_actor(
                             .is_ok())
                 {
                     clients.push(client);
-                }
-            }
-            Command::Input(bytes) => {
-                if !exited {
-                    let _ = writer.try_send(bytes);
                 }
             }
             Command::Resize(next) if next != geometry && !exited => {
@@ -959,6 +1088,9 @@ fn terminal_actor(
                     });
                 }
             }
+            Command::ResolveForeground(reply) => {
+                let _ = reply.send(lifecycle.foreground.lock().unwrap().agent.clone());
+            }
             Command::Poll => {
                 if !exited {
                     restore.poll(run.is_none(), shell_pid, lifecycle);
@@ -997,6 +1129,12 @@ fn terminal_actor(
             }
             Command::Relaunched(pid) => {
                 shell_pid = pid;
+                // The fresh start never repeats the initial prompt, so no turn is running.
+                {
+                    let mut input = lifecycle.input.lock().unwrap();
+                    input.activity.awaiting_turn_end = false;
+                    input.activity.revision = input.activity.revision.wrapping_add(1);
+                }
                 if launched_agent != Agent::Shell {
                     run = pid.map(|pid| (pid, launched_agent.clone()));
                 }
@@ -1688,6 +1826,8 @@ mod tests {
     fn exits_during_shutdown_are_not_reported() {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
+            input: Mutex::default(),
+            talk_wake: mpsc::sync_channel(1).0,
             running: AtomicBool::new(true),
             session: "worker".into(),
             on_exit: {
@@ -1702,6 +1842,7 @@ mod tests {
             }),
             on_model_changed: Arc::new(|_, _, _| Ok(())),
             on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
+            on_foreground_left: Arc::new(|_, _| {}),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         // A reboot sets shutdown during the agent's exit grace period.
@@ -1865,6 +2006,7 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume: None,
             env: Vec::new(),
