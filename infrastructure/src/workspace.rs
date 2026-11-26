@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, ensure};
 use application::{BranchStatus, CreatedWorktree, Workspace, WorktreeRoot, WorktreeStatus};
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
+    fs,
     os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
-    process::Command,
+    path::{self, Path, PathBuf},
+    process::{Command, Output},
 };
 
 pub struct LocalWorkspace;
@@ -54,8 +55,7 @@ impl Checkout {
                 .arg(directory)
                 .args(["rev-parse", "--path-format=absolute", flag]);
             let output = git_output(command)?;
-            let path = OsStr::from_bytes(output.strip_suffix(b"\n").unwrap_or(&output));
-            Ok::<_, anyhow::Error>(Path::new(path).canonicalize()?)
+            Ok::<_, anyhow::Error>(Path::new(git_line(&output)).canonicalize()?)
         };
         Ok(Self {
             worktree: git_path("--show-toplevel")?,
@@ -128,30 +128,119 @@ impl Workspace for LocalWorkspace {
         Ok(worktree)
     }
 
-    fn head(&self, _worktree: &Path) -> Result<String> {
-        todo!()
+    fn head(&self, worktree: &Path) -> Result<String> {
+        resolve_commit(worktree, "HEAD")
     }
 
-    fn branch_exists(&self, _repository: &Path, _branch: &str) -> Result<BranchStatus> {
-        todo!()
+    fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus> {
+        let reference = format!("refs/heads/{branch}");
+        let branch_field = format!("branch {reference}");
+        let listing = worktree_output(git_in(repository))?;
+        let mut checked_out_at = None;
+        for field in listing.split(|byte| *byte == 0) {
+            if let Some(path) = field.strip_prefix(b"worktree ") {
+                checked_out_at = Some(PathBuf::from(OsStr::from_bytes(path)));
+            } else if field == branch_field.as_bytes() {
+                return Ok(BranchStatus::Exists { checked_out_at });
+            }
+        }
+        if ref_exists(repository, OsStr::new(&reference))? {
+            Ok(BranchStatus::Exists {
+                checked_out_at: None,
+            })
+        } else {
+            Ok(BranchStatus::Missing)
+        }
     }
 
     fn create_worktree(
         &self,
-        _repository: &Path,
-        _path: &Path,
-        _branch: &str,
-        _base: &str,
+        repository: &Path,
+        path: &Path,
+        branch: &str,
+        base: &str,
     ) -> Result<CreatedWorktree> {
-        todo!()
+        let base_commit = resolve_commit(repository, base)?;
+        let path = path::absolute(path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Create worktree parent directory {}", parent.display())
+            })?;
+        }
+        let mut command = git_in(repository);
+        command
+            .args(["worktree", "add", "-b", branch, "--"])
+            .arg(&path)
+            .arg(&base_commit);
+        git_output(command)?;
+        Ok(CreatedWorktree {
+            path: path.canonicalize()?,
+            base_commit,
+        })
     }
 
-    fn worktree_status(&self, _path: &Path) -> Result<WorktreeStatus> {
-        todo!()
+    fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus> {
+        let checkout = Checkout::discover(path)?;
+        let mut command = git_in(&checkout.worktree);
+        command.args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ]);
+        let dirty = !git_output(command)?.is_empty();
+        let merged_into_default = match (
+            symbolic_ref(&checkout.worktree, "HEAD")?,
+            default_branch(&checkout.repository)?,
+        ) {
+            (Some(branch), Some(default)) => {
+                let mut command = git_in(&checkout.worktree);
+                command
+                    .args(["merge-base", "--is-ancestor"])
+                    .arg(branch)
+                    .arg(default);
+                git_query(command)?.is_some()
+            }
+            _ => false,
+        };
+        Ok(WorktreeStatus {
+            dirty,
+            merged_into_default,
+        })
     }
 
-    fn remove_worktree(&self, _path: &Path, _delete_branch: bool) -> Result<()> {
-        todo!()
+    fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()> {
+        let checkout = Checkout::discover(path)?;
+        ensure!(
+            path.canonicalize()? == checkout.worktree,
+            "Choose an existing worktree root"
+        );
+        let branch = if delete_branch {
+            symbolic_ref(&checkout.worktree, "HEAD")?
+        } else {
+            None
+        };
+        let mut command = git_in(&checkout.repository);
+        command
+            .args(["worktree", "remove", "--"])
+            .arg(&checkout.worktree);
+        git_output(command)?;
+        if let Some(branch) = branch
+            .as_deref()
+            .and_then(|reference| reference.as_bytes().strip_prefix(b"refs/heads/"))
+        {
+            let mut command = git_in(&checkout.repository);
+            command
+                .args(["branch", "-d", "--"])
+                .arg(OsStr::from_bytes(branch));
+            git_output(command).map_err(|error| {
+                anyhow::anyhow!(
+                    "Removed worktree {}. Branch deletion failed. {error:#}",
+                    checkout.worktree.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn open_artifact_file(&self, path: &Path) -> Result<PathBuf> {
@@ -163,10 +252,58 @@ impl Workspace for LocalWorkspace {
     }
 
     fn list_worktrees(&self, directory: &Path) -> Result<Vec<PathBuf>> {
-        let mut command = git();
-        command.arg("-C").arg(directory);
-        worktree_listing(command)
+        worktree_listing(git_in(directory))
     }
+}
+
+fn resolve_commit(directory: &Path, revision: &str) -> Result<String> {
+    let mut command = git_in(directory);
+    command
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("{revision}^{{commit}}"));
+    Ok(git_line(&git_output(command)?)
+        .to_str()
+        .context("Read Git commit ID")?
+        .to_owned())
+}
+
+fn default_branch(repository: &Path) -> Result<Option<OsString>> {
+    // Use origin/HEAD to name the default branch. Prefer its local ref so local
+    // merges count, then its remote-tracking ref. With no usable origin/HEAD,
+    // fall back to the main Git directory's symbolic HEAD, including in a bare repo.
+    let origin_head = "refs/remotes/origin/HEAD";
+    if let Some(target) = symbolic_ref(repository, origin_head)? {
+        if let Some(name) = target.as_bytes().strip_prefix(b"refs/remotes/origin/") {
+            let mut local = OsString::from("refs/heads/");
+            local.push(OsStr::from_bytes(name));
+            if ref_exists(repository, &local)? {
+                return Ok(Some(local));
+            }
+        }
+        if ref_exists(repository, OsStr::new(origin_head))? {
+            return Ok(Some(OsString::from(origin_head)));
+        }
+    }
+    if let Some(main_branch) = symbolic_ref(repository, "HEAD")?
+        && ref_exists(repository, &main_branch)?
+    {
+        return Ok(Some(main_branch));
+    }
+    Ok(None)
+}
+
+fn symbolic_ref(directory: &Path, name: &str) -> Result<Option<OsString>> {
+    let mut command = git_in(directory);
+    command.args(["symbolic-ref", "--quiet", "--", name]);
+    Ok(git_query(command)?.map(|output| git_line(&output).to_owned()))
+}
+
+fn ref_exists(directory: &Path, reference: &OsStr) -> Result<bool> {
+    let mut command = git_in(directory);
+    command
+        .args(["show-ref", "--verify", "--quiet", "--"])
+        .arg(reference);
+    Ok(git_query(command)?.is_some())
 }
 
 fn git() -> Command {
@@ -175,6 +312,12 @@ fn git() -> Command {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR");
+    command
+}
+
+fn git_in(directory: &Path) -> Command {
+    let mut command = git();
+    command.arg("-C").arg(directory);
     command
 }
 
@@ -192,45 +335,65 @@ fn worktree_output(mut command: Command) -> Result<Vec<u8>> {
 }
 
 fn git_output(mut command: Command) -> Result<Vec<u8>> {
+    checked_git_stdout(command.output()?)
+}
+
+// The Git queries used here signal a negative answer with exit code 1 and no stderr.
+fn git_query(mut command: Command) -> Result<Option<Vec<u8>>> {
     let output = command.output()?;
-    ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    checked_git_stdout(output).map(Some)
+}
+
+fn checked_git_stdout(output: Output) -> Result<Vec<u8>> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        ensure!(!message.is_empty(), "Git exited with {}", output.status);
+        anyhow::bail!("{message}");
+    }
     Ok(output.stdout)
+}
+
+fn git_line(output: &[u8]) -> &OsStr {
+    OsStr::from_bytes(output.strip_suffix(b"\n").unwrap_or(output))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn git_at(directory: &Path, args: &[&OsStr]) -> Result<()> {
-        let mut command = git();
-        command.arg("-C").arg(directory).args(args);
+    fn git_at(directory: &Path, args: &[&str]) -> Result<()> {
+        let mut command = git_in(directory);
+        command.args(args);
         git_output(command)?;
         Ok(())
+    }
+
+    fn init_repository(root: &Path) -> Result<PathBuf> {
+        let repository = root.join("main checkout");
+        fs::create_dir(&repository)?;
+        git_at(&repository, &["init", "-q", "--initial-branch=main"])?;
+        git_at(&repository, &["config", "user.name", "Power Test"])?;
+        git_at(
+            &repository,
+            &["config", "user.email", "power@example.invalid"],
+        )?;
+        git_at(&repository, &["config", "commit.gpgSign", "false"])?;
+        fs::write(repository.join("tracked"), "Initial\n")?;
+        git_at(&repository, &["add", "tracked"])?;
+        git_at(&repository, &["commit", "-qm", "Initial"])?;
+        Ok(repository)
     }
 
     #[test]
     fn main_checkout_is_shared_by_linked_worktrees_and_absent_for_bare_repos() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
-        let run = |args: &[&str]| git_at(&root, &args.iter().map(OsStr::new).collect::<Vec<_>>());
-        run(&["init", "-q", "main checkout"])?;
-        run(&[
-            "-C",
-            "main checkout",
-            "-c",
-            "user.name=Power Test",
-            "-c",
-            "user.email=power@example.invalid",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "Initial",
-        ])?;
+        let main = init_repository(&root)?;
+        let run = |args: &[&str]| git_at(&root, args);
         run(&[
             "-C",
             "main checkout",
@@ -243,14 +406,8 @@ mod tests {
         let linked = root.join("linked checkout");
         let checkout = Checkout::discover(&linked)?;
         assert_eq!(checkout.worktree, linked);
-        assert_eq!(
-            main_checkout(&checkout.repository)?,
-            Some(root.join("main checkout"))
-        );
-        assert_eq!(
-            repository_worktrees(&checkout.repository)?,
-            [root.join("main checkout"), linked]
-        );
+        assert_eq!(main_checkout(&checkout.repository)?, Some(main.clone()));
+        assert_eq!(repository_worktrees(&checkout.repository)?, [main, linked]);
 
         run(&["clone", "-q", "--bare", "main checkout", "bare.git"])?;
         run(&[
@@ -264,6 +421,249 @@ mod tests {
         ])?;
         let checkout = Checkout::discover(&root.join("bare linked"))?;
         assert_eq!(main_checkout(&checkout.repository)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn creates_worktrees_from_explicit_bases_and_finds_local_branches() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let main = init_repository(&root)?;
+        let repository = Checkout::discover(&main)?.repository;
+        let initial = LocalWorkspace.head(&main)?;
+        let provisioned = root.join("provisioned");
+        let alias = root.join("alias");
+        fs::create_dir(&provisioned)?;
+        std::os::unix::fs::symlink(&provisioned, &alias)?;
+        let relative = "nested/first\ncheckout";
+        let first = provisioned.join(relative);
+        assert_eq!(
+            LocalWorkspace.create_worktree(
+                &repository,
+                &alias.join(relative),
+                "worker/first",
+                "main"
+            )?,
+            CreatedWorktree {
+                path: first.clone(),
+                base_commit: initial.clone()
+            }
+        );
+        assert_eq!(LocalWorkspace.head(&first)?, initial);
+        git_at(&first, &["commit", "-q", "--allow-empty", "-m", "Work"])?;
+        let first_head = LocalWorkspace.head(&first)?;
+        assert_ne!(first_head, initial);
+        let dependent = root.join("provisioned/dependent checkout");
+        let created =
+            LocalWorkspace.create_worktree(&first, &dependent, "worker/dependent", "HEAD")?;
+        assert_eq!(created.base_commit, first_head);
+        assert_eq!(LocalWorkspace.head(&dependent)?, first_head);
+
+        assert_eq!(
+            LocalWorkspace.branch_exists(&repository, "worker/first")?,
+            BranchStatus::Exists {
+                checked_out_at: Some(first)
+            }
+        );
+        git_at(&main, &["branch", "idle"])?;
+        assert_eq!(
+            LocalWorkspace.branch_exists(&dependent, "idle")?,
+            BranchStatus::Exists {
+                checked_out_at: None
+            }
+        );
+        git_at(&main, &["tag", "tag-only"])?;
+        assert_eq!(
+            LocalWorkspace.branch_exists(&repository, "tag-only")?,
+            BranchStatus::Missing
+        );
+
+        let unused = root.join("duplicate");
+        let error = LocalWorkspace
+            .create_worktree(&repository, &unused, "worker/first", "main")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("fatal:") && error.contains("worker/first"),
+            "{error}"
+        );
+        assert!(!unused.exists());
+        let error = LocalWorkspace
+            .create_worktree(&repository, &unused, "worker/invalid", "missing-base")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fatal:"), "{error}");
+        assert_eq!(
+            LocalWorkspace.branch_exists(&repository, "worker/invalid")?,
+            BranchStatus::Missing
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_checks_tracked_and_untracked_changes_and_git_ancestry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let main = init_repository(temp.path())?;
+        let path = temp.path().join("worker");
+        LocalWorkspace.create_worktree(&main, &path, "worker/status", "main")?;
+        let clean_and_merged = WorktreeStatus {
+            dirty: false,
+            merged_into_default: true,
+        };
+        assert_eq!(LocalWorkspace.worktree_status(&path)?, clean_and_merged);
+
+        git_at(&main, &["config", "status.showUntrackedFiles", "no"])?;
+        let untracked = path.join("untracked");
+        fs::write(&untracked, "Untracked\n")?;
+        assert!(LocalWorkspace.worktree_status(&path)?.dirty);
+        fs::remove_file(untracked)?;
+        fs::write(path.join("tracked"), "Edited\n")?;
+        assert!(LocalWorkspace.worktree_status(&path)?.dirty);
+        git_at(&path, &["add", "tracked"])?;
+        assert!(LocalWorkspace.worktree_status(&path)?.dirty);
+        git_at(&path, &["commit", "-qm", "Work"])?;
+        assert_eq!(
+            LocalWorkspace.worktree_status(&path)?,
+            WorktreeStatus {
+                dirty: false,
+                merged_into_default: false
+            }
+        );
+
+        git_at(&main, &["merge", "--ff-only", "worker/status"])?;
+        assert_eq!(LocalWorkspace.worktree_status(&path)?, clean_and_merged);
+        git_at(&path, &["switch", "--detach"])?;
+        assert!(!LocalWorkspace.worktree_status(&path)?.merged_into_default);
+        Ok(())
+    }
+
+    #[test]
+    fn origin_head_selects_the_default_branch_when_main_checkout_moves() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let main = init_repository(temp.path())?;
+        git_at(&main, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+        git_at(
+            &main,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )?;
+        git_at(&main, &["branch", "other"])?;
+        let path = temp.path().join("worker");
+        LocalWorkspace.create_worktree(&main, &path, "worker/origin", "main")?;
+        git_at(&path, &["commit", "-q", "--allow-empty", "-m", "Work"])?;
+        git_at(&main, &["merge", "--ff-only", "worker/origin"])?;
+        git_at(&main, &["switch", "other"])?;
+        assert!(LocalWorkspace.worktree_status(&path)?.merged_into_default);
+
+        git_at(&main, &["branch", "-m", "main", "renamed"])?;
+        assert!(!LocalWorkspace.worktree_status(&path)?.merged_into_default);
+        git_at(
+            &main,
+            &["update-ref", "refs/remotes/origin/main", "worker/origin"],
+        )?;
+        git_at(&main, &["switch", "--detach"])?;
+        assert!(LocalWorkspace.worktree_status(&path)?.merged_into_default);
+        git_at(
+            &main,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        )?;
+        assert!(!LocalWorkspace.worktree_status(&path)?.merged_into_default);
+        Ok(())
+    }
+
+    #[test]
+    fn removes_clean_worktrees_and_only_deletes_branches_on_request() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let main = init_repository(temp.path())?;
+        let path = temp.path().join("worker");
+        LocalWorkspace.create_worktree(&main, &path, "worker/keep", "main")?;
+        let subdirectory = path.join("subdirectory");
+        fs::create_dir(&subdirectory)?;
+        assert!(LocalWorkspace.remove_worktree(&subdirectory, true).is_err());
+        assert!(subdirectory.exists());
+        let untracked = path.join("untracked");
+        fs::write(&untracked, "Untracked\n")?;
+        let error = LocalWorkspace
+            .remove_worktree(&path, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fatal:"), "{error}");
+        assert!(untracked.exists());
+        fs::remove_file(untracked)?;
+        LocalWorkspace.remove_worktree(&path, false)?;
+        assert!(!path.exists());
+        assert_eq!(
+            LocalWorkspace.branch_exists(&main, "worker/keep")?,
+            BranchStatus::Exists {
+                checked_out_at: None
+            }
+        );
+
+        LocalWorkspace.create_worktree(&main, &path, "worker/delete", "main")?;
+        LocalWorkspace.remove_worktree(&path, true)?;
+        assert!(!path.exists());
+        assert_eq!(
+            LocalWorkspace.branch_exists(&main, "worker/delete")?,
+            BranchStatus::Missing
+        );
+
+        LocalWorkspace.create_worktree(&main, &path, "worker/unmerged", "main")?;
+        git_at(&path, &["commit", "-q", "--allow-empty", "-m", "Work"])?;
+        let error = LocalWorkspace
+            .remove_worktree(&path, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Removed worktree") && error.contains("worker/unmerged"),
+            "{error}"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            LocalWorkspace.branch_exists(&main, "worker/unmerged")?,
+            BranchStatus::Exists {
+                checked_out_at: None
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creates_and_removes_worktrees_from_a_bare_repository() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let main = init_repository(&root)?;
+        git_at(
+            &root,
+            &["clone", "-q", "--bare", "main checkout", "bare.git"],
+        )?;
+        let bare = root.join("bare.git");
+        let path = root.join("bare linked");
+        let created = LocalWorkspace.create_worktree(&bare, &path, "worker/bare", "main")?;
+        assert_eq!(created.path, path);
+        assert_eq!(created.base_commit, LocalWorkspace.head(&main)?);
+        assert_eq!(LocalWorkspace.head(&path)?, created.base_commit);
+        assert_eq!(
+            LocalWorkspace.branch_exists(&bare, "worker/bare")?,
+            BranchStatus::Exists {
+                checked_out_at: Some(path.clone())
+            }
+        );
+        assert_eq!(
+            LocalWorkspace.worktree_status(&path)?,
+            WorktreeStatus {
+                dirty: false,
+                merged_into_default: true
+            }
+        );
+        LocalWorkspace.remove_worktree(&path, true)?;
+        assert!(!path.exists());
+        assert_eq!(
+            LocalWorkspace.branch_exists(&bare, "worker/bare")?,
+            BranchStatus::Missing
+        );
         Ok(())
     }
 }
