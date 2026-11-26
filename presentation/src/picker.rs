@@ -32,6 +32,11 @@ pub enum Kind {
     },
     Boxes,
     Worktrees(String),
+    NewWorktree {
+        box_id: String,
+        from_session: String,
+        created: bool,
+    },
     Tabs,
     Runs {
         box_id: String,
@@ -73,6 +78,8 @@ pub enum Choice {
     Run(String),
     Agent(String),
     CopyText(String),
+    NewWorktree(String),
+    CreateWorktree(String),
     Worktree(PathBuf),
     Session(Session, PathBuf),
     /// Finish first-run setup, installing the shell hook when true.
@@ -143,6 +150,7 @@ impl Kind {
             Self::Repository { .. } => "New box",
             Self::Boxes => "Boxes",
             Self::Worktrees(_) => "New tab in a worktree",
+            Self::NewWorktree { .. } => "New worktree",
             Self::Tabs => "Tabs",
             Self::Runs { .. } => "DAG runs",
             Self::RunLink => "Open DAG run",
@@ -168,6 +176,7 @@ impl Kind {
             Self::Repository { .. } => Some("Repository or worktree path"),
             Self::Boxes => Some("Search boxes"),
             Self::Worktrees(_) => Some("Search worktrees"),
+            Self::NewWorktree { created, .. } => (!created).then_some("Branch name"),
             Self::Tabs => Some("Search by tab number or name"),
             Self::Runs { .. } => Some("Search runs"),
             Self::Agents { .. } => Some("Search agents"),
@@ -443,7 +452,23 @@ impl Picker {
     }
 
     pub fn selection(&self) -> Option<Choice> {
+        if let Kind::NewWorktree { created: false, .. } = &self.kind {
+            return (!self.query.is_empty()).then(|| Choice::CreateWorktree(self.query.clone()));
+        }
         self.choice(self.selected)
+    }
+
+    pub fn worktree_created(&mut self, path: PathBuf) {
+        if let Kind::NewWorktree { created, .. } = &mut self.kind {
+            *created = true;
+            self.query.clear();
+            self.cursor = 0;
+            self.rows = vec![Row {
+                label: "Open shell".into(),
+                detail: path.display().to_string(),
+                choice: Choice::Worktree(path),
+            }];
+        }
     }
 
     pub fn set_runs(&mut self, runs: Vec<Run>) {
@@ -666,7 +691,9 @@ impl Picker {
             Kind::Help(shortcuts) => Some(shortcuts),
             _ => None,
         };
+        let branch_prompt = matches!(self.kind, Kind::NewWorktree { created: false, .. });
         let no_matches = visible.is_empty()
+            && !branch_prompt
             && self.help_matches.is_empty()
             && !self.query.is_empty()
             && self.message.is_none()
@@ -907,7 +934,9 @@ impl Picker {
                     .children(theme_list)
                     .when(
                         !matches!(self.kind, Kind::ColorSchemes { .. })
-                            && (help.is_some() || has_results || !self.query.is_empty()),
+                            && (help.is_some()
+                                || has_results
+                                || (!self.query.is_empty() && !branch_prompt)),
                         |panel| {
                             panel.child(
                                 div()

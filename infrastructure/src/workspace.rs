@@ -80,6 +80,54 @@ pub fn repository_worktrees(repository: &Path) -> Result<Vec<PathBuf>> {
     worktree_listing(command)
 }
 
+pub struct ListedWorktree {
+    pub path: PathBuf,
+    pub head: Option<WorktreeHead>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum WorktreeHead {
+    Branch(String),
+    Detached,
+}
+
+pub fn repository_worktree_details(repository: &Path) -> Result<Vec<ListedWorktree>> {
+    let mut command = git();
+    command.arg("--git-dir").arg(repository);
+    worktree_details(command)
+}
+
+fn worktree_listing(command: Command) -> Result<Vec<PathBuf>> {
+    Ok(worktree_details(command)?
+        .into_iter()
+        .map(|worktree| worktree.path)
+        .collect())
+}
+
+fn worktree_details(command: Command) -> Result<Vec<ListedWorktree>> {
+    let listing = worktree_output(command)?;
+    let mut worktrees = Vec::<ListedWorktree>::new();
+    for field in listing.split(|&byte| byte == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            worktrees.push(ListedWorktree {
+                path: PathBuf::from(OsStr::from_bytes(path)),
+                head: None,
+            });
+        } else if let Some(worktree) = worktrees.last_mut() {
+            worktree.head = if let Some(branch) = field.strip_prefix(b"branch refs/heads/") {
+                Some(WorktreeHead::Branch(
+                    String::from_utf8_lossy(branch).into_owned(),
+                ))
+            } else if field == b"detached" {
+                Some(WorktreeHead::Detached)
+            } else {
+                continue;
+            };
+        }
+    }
+    Ok(worktrees)
+}
+
 pub fn main_checkout(repository: &Path) -> Result<Option<PathBuf>> {
     let mut command = git();
     command.arg("--git-dir").arg(repository);
@@ -359,14 +407,6 @@ fn git_in(directory: &Path) -> Command {
     command
 }
 
-fn worktree_listing(command: Command) -> Result<Vec<PathBuf>> {
-    Ok(worktree_output(command)?
-        .split(|byte| *byte == 0)
-        .filter_map(|field| field.strip_prefix(b"worktree "))
-        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
-        .collect())
-}
-
 fn worktree_output(mut command: Command) -> Result<Vec<u8>> {
     command.args(["worktree", "list", "--porcelain", "-z"]);
     git_output(command)
@@ -445,6 +485,18 @@ mod tests {
         let checkout = Checkout::discover(&linked)?;
         assert_eq!(checkout.worktree, linked);
         assert_eq!(main_checkout(&checkout.repository)?, Some(main.clone()));
+        let worktrees = repository_worktree_details(&checkout.repository)?;
+        let heads: Vec<_> = worktrees
+            .into_iter()
+            .map(|worktree| worktree.head)
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                Some(WorktreeHead::Branch("main".into())),
+                Some(WorktreeHead::Detached)
+            ]
+        );
         assert_eq!(repository_worktrees(&checkout.repository)?, [main, linked]);
 
         run(&["clone", "-q", "--bare", "main checkout", "bare.git"])?;
