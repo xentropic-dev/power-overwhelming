@@ -11,6 +11,7 @@ mod metrics;
 mod paint;
 mod runs;
 mod selection;
+mod sprites;
 mod typing;
 
 #[cfg(test)]
