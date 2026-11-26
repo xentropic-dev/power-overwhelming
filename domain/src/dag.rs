@@ -273,6 +273,8 @@ pub enum RunEventKind {
     InputResolved,
     /// The worker exited without a result, or its session could not be recovered.
     AttemptInterrupted,
+    /// A daemon restart resumed the worker's session, and the worker was told to continue.
+    AttemptResumed,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
     RunArchived,

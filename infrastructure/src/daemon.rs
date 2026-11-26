@@ -155,8 +155,7 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
     terminal_dag
         .set(Arc::downgrade(&dag))
         .expect("connect terminal callbacks to the DAG once");
-    let restored = application.restore_sessions().context("Restore sessions")?;
-    dag.reconcile(&restored).context("Reconcile DAG sessions")?;
+    dag.restore().context("Restore sessions")?;
     handle_shutdown(application.clone(), shutting_down)?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;

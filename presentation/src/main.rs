@@ -1097,6 +1097,7 @@ fn run_dag(command: DagAction) -> Result<()> {
                     NeedsInput,
                     InputResolved,
                     AttemptInterrupted,
+                    AttemptResumed,
                     TaskReady,
                 ];
             }
