@@ -1,5 +1,5 @@
 use application::agents::AgentProfileRegistry;
-use domain::agent::{AgentId, AgentProfile, Injection};
+use domain::agent::{AgentId, AgentProfile, Injection, Resume};
 
 #[derive(Clone)]
 pub struct AgentProfiles(pub(crate) Vec<AgentProfile>);
@@ -45,6 +45,23 @@ impl Default for AgentProfiles {
                 ],
                 &["--append-system-prompt"],
                 "~/.claude/skills",
+                resume(
+                    &["--session-id", "{id}"],
+                    &["--resume", "{id}"],
+                    &["--continue"],
+                    &[
+                        "--session-id",
+                        "--resume",
+                        "-r",
+                        "--continue",
+                        "-c",
+                        "--fork-session",
+                        "--from-pr",
+                        "--teleport",
+                        "-p",
+                        "--print",
+                    ],
+                ),
             ),
             builtin(
                 "codex",
@@ -56,6 +73,7 @@ impl Default for AgentProfiles {
                 &["developer_instructions"],
                 // Codex reads the shared folder natively.
                 "~/.agents/skills",
+                resume(&[], &[], &["resume", "--last"], &["resume", "fork"]),
             ),
             builtin(
                 "grok",
@@ -94,6 +112,20 @@ impl Default for AgentProfiles {
                 &["--rules"],
                 // Grok reads ~/.agents/skills (as well as ~/.grok and ~/.claude) natively.
                 "~/.agents/skills",
+                resume(
+                    &["--session-id", "{id}"],
+                    &["--resume", "{id}"],
+                    &["--continue"],
+                    &[
+                        "--session-id",
+                        "-s",
+                        "--resume",
+                        "-r",
+                        "--continue",
+                        "-c",
+                        "--fork-session",
+                    ],
+                ),
             ),
         ])
     }
@@ -105,6 +137,7 @@ fn builtin(
     skip_subcommands: &[&str],
     skip_if_args_contain: &[&str],
     skills_dir: &str,
+    resume: Resume,
 ) -> AgentProfile {
     AgentProfile {
         id: AgentId::from(id),
@@ -113,5 +146,16 @@ fn builtin(
         skip_subcommands: skip_subcommands.iter().map(|&arg| arg.into()).collect(),
         skip_if_args_contain: skip_if_args_contain.iter().map(|&arg| arg.into()).collect(),
         skills_dir: Some(skills_dir.into()),
+        resume: Some(resume),
+    }
+}
+
+fn resume(assign: &[&str], resume: &[&str], resume_last: &[&str], conflicts: &[&str]) -> Resume {
+    let strings = |args: &[&str]| args.iter().map(|&arg| arg.into()).collect();
+    Resume {
+        assign: strings(assign),
+        resume: strings(resume),
+        resume_last: strings(resume_last),
+        conflicts: strings(conflicts),
     }
 }

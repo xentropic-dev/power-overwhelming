@@ -806,6 +806,7 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             skills_dir: None,
+            resume: None,
         });
         assert_eq!(
             agent_for_program("/opt/agent/bin/assistant.mjs", &profiles),
