@@ -65,6 +65,12 @@ agents.grok = {
   skip_subcommands = { "login", "logout", "mcp", "update", "version" },
   skip_if_args_contain = { "--rules" },
   skills_dir = "~/.agents/skills",
+  resume = {
+    assign = { "--session-id", "{id}" },
+    resume = { "--resume", "{id}" },
+    resume_last = { "--continue" },
+    conflicts = { "--session-id", "-s", "--resume", "-r", "--continue", "-c", "--fork-session" },
+  },
 }
 ```
 
@@ -87,6 +93,8 @@ For a new profile, `command` defaults to the ID and `injection` defaults to `{ k
 Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings.
 
 `skills_dir` is the folder where the agent reads user skills natively; a leading `~` means your home directory. The same path relative to home is the project skill folder, so `~/.claude/skills` also means `.claude/skills` in the worktree and its parents. `power skills install` links skills into it, and launch instructions leave out skills already there. Set it to `~/.agents/skills` for an agent that reads the shared folder, and leave it out when the agent has no skill folder.
+
+The optional `resume` table describes how the agent accepts conversation IDs. `assign` supplies launch arguments that pin a new ID, and `resume` supplies arguments to reopen a known ID. Both replace `{id}` with the conversation ID. `resume_last` supplies fallback arguments when the ID is unknown or the `resume` list is empty. An exact argument match in `conflicts` skips assignment and lets Power pick up a conversation ID from a pair such as `--resume <id>`. Omitted lists inherit their built-in values, and an empty list `{}` clears the corresponding value. Codex uses `resume --last` to select the most recent conversation for the working directory.
 
 Open a new shell to pick up new wrapper names. Restart the daemon when you want profile changes to apply to daemon-launched agents.
 
