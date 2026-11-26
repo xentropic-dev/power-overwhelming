@@ -404,7 +404,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 })?;
             ensure!(
                 receive.recv_timeout(Duration::from_secs(3))?,
-                "Conversations must come from a process in this shell session"
+                "Conversations must come from a process in this session"
             );
             Ok(Response::Ok)
         }

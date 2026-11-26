@@ -349,6 +349,9 @@ mod tests {
             model_callback: domain::agent::ModelCallback::None,
             skills_dir: None,
             resume: None,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         }
     }
 

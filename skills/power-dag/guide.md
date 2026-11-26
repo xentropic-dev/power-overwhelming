@@ -37,7 +37,7 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 
 ## Dispatch and monitor
 
-1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Set `PROFILE` to an installed agent profile ID, such as `claude`, `codex`, `grok`, or a profile from `config.lua`. For test fixtures, `--provider command` runs the command supplied after `--`.
+1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Set `PROFILE` to an installed agent profile ID, such as `claude`, `codex`, `grok`, `jcode`, or a profile from `config.lua`. For test fixtures, `--provider command` runs the command supplied after `--`.
 2. Dispatch each ready task with the appropriate worktree.
 
    - For edits, run `power dag dispatch "$RUN" "$TASK" --provider "$PROFILE" --branch "$BRANCH"`. Power creates a worktree for the task on that branch, which is the default when `--worktree` is omitted. Choose a distinct, unused branch name for each task. Inside Power, the new branch starts at the coordinator's current HEAD. Pass `--base` with a branch or other commit-ish to override it. For a dependent task that builds on a prerequisite's commits, pass the prerequisite's branch, for example `--base docs/setup`. Outside Power, `--base` is required when creating a worktree.

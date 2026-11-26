@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use application::{SessionOptions, TerminalRuntime, agents::AgentProfileRegistry};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
-    agent::AgentProfile,
+    agent::{AgentProfile, Injection},
     session::{Agent, Geometry, Session},
 };
 use ghostty_vt::{
@@ -225,6 +225,21 @@ fn launch(
         .clone()
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
+    // No process of this session runs now, so a server still listening on one of its
+    // earlier launch sockets is an orphan of a previous daemon.
+    crate::agent_socket::reclaim(&session.id, &runtime.socket);
+    let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
+    // Profiles that take no prompt argument get the initial prompt typed with their
+    // instructions instead.
+    let typed = match profile {
+        Some(profile) => crate::shell::first_message(
+            profile,
+            &options.args,
+            options.initial_prompt.as_deref(),
+            &installed,
+        )?,
+        None => None,
+    };
     let mut process = if let Some(profile) = profile {
         let (command, id) = agent_command(profile, &session.worktree, &options.args)?;
         conversation = id;
@@ -236,16 +251,27 @@ fn launch(
     } else {
         CommandBuilder::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
     };
-    if let Some(prompt) = &options.initial_prompt {
+    if let Some(prompt) = &options.initial_prompt
+        && profile.is_none_or(|profile| profile.injection != Injection::FirstMessage)
+    {
         process.arg(prompt);
     }
-    configure(&mut process, runtime, session, &options, &cwd);
+    let server = configure(&mut process, runtime, session, &options, &cwd, profile);
     // The fresh start never repeats the initial prompt.
     let fallback = match (profile, &options.fallback_args) {
         (Some(profile), Some(args)) => {
             let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
-            configure(&mut command, runtime, session, &options, &cwd);
-            Some((command, conversation))
+            // The fresh start gets its own server socket.
+            configure(
+                &mut command,
+                runtime,
+                session,
+                &options,
+                &cwd,
+                profile.into(),
+            );
+            let typed = crate::shell::first_message(profile, args, None, &installed)?;
+            Some((command, conversation, typed))
         }
         _ => None,
     };
@@ -269,23 +295,46 @@ fn launch(
     // A relaunch needs the slave, which also keeps the reader from seeing EOF between
     // the two processes.
     let relaunch = match fallback {
-        Some((command, conversation)) => Some(Relaunch {
+        Some((command, conversation, fresh_typed)) => Some(Relaunch {
             command,
             conversation,
+            stale_server: server,
             slave: pair.slave,
             deadline: Instant::now() + RESUME_WINDOW,
+            typed: fresh_typed.as_deref().map(crate::shell::typed_message),
         }),
         None => {
             drop(pair.slave);
             None
         }
     };
+    // A resume that fails exits without reading its input, which would then reach the
+    // fresh start. Hold the message until the resume has outlived its window.
+    let mut typed = typed.as_deref().map(crate::shell::typed_message);
     if conversation.is_some() {
         lifecycle.record_foreground(&session.agent, conversation.as_deref(), None, false);
     }
 
     let (tx, rx) = mpsc::sync_channel(128);
     let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
+    let input_ready = Arc::new(InputReady::default());
+    let typist = {
+        let input_ready = input_ready.clone();
+        let writer = write_tx.clone();
+        move |input: Vec<u8>, seen: u64| {
+            let input_ready = input_ready.clone();
+            let writer = writer.clone();
+            thread::spawn(move || {
+                input_ready.wait_beyond(seen, INPUT_READY_TIMEOUT);
+                let _ = writer.send(input);
+            });
+        }
+    };
+    if relaunch.is_none()
+        && let Some(input) = typed.take()
+    {
+        typist(input, 0);
+    }
     thread::spawn(move || {
         for bytes in write_rx {
             if writer.write_all(&bytes).is_err() {
@@ -295,19 +344,22 @@ fn launch(
     });
 
     let reader_tx = tx.clone();
+    let reader_ready = input_ready.clone();
     thread::spawn(move || {
         let mut buffer = [0; 16 * 1024];
+        let mut tail = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count)
+                Ok(count) => {
+                    reader_ready.observe(&mut tail, &buffer[..count]);
                     if reader_tx
                         .send(Command::Output(buffer[..count].to_vec()))
-                        .is_err() =>
-                {
-                    break;
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -322,6 +374,11 @@ fn launch(
         let result = wait_process(
             process,
             relaunch,
+            PendingInput {
+                held: typed,
+                ready: &input_ready,
+                send: typist,
+            },
             &stop_rx,
             &waiter_lifecycle.shutting_down,
             |pid, conversation| {
@@ -331,9 +388,9 @@ fn launch(
                 );
                 let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
                 let _ = waiter_tx.send(Command::Relaunched(pid));
-                if conversation.is_some() {
-                    waiter_lifecycle.record_foreground(&launched, conversation, None, false);
-                }
+                // A fresh start without a preassigned ID clears the rejected one, so a
+                // later restore cannot return to it. The new ID is saved when it reports.
+                waiter_lifecycle.record_foreground(&launched, conversation, None, false);
             },
         );
         let detail = match result {
@@ -411,7 +468,14 @@ fn configure(
     session: &Session,
     options: &SessionOptions,
     cwd: &Path,
-) {
+    profile: Option<&AgentProfile>,
+) -> Option<PathBuf> {
+    let (env, server) = profile
+        .map(|profile| crate::shell::profile_env(profile, &session.id, &runtime.socket))
+        .unwrap_or_default();
+    for (name, value) in env {
+        process.env(name, value);
+    }
     for (name, value) in &options.env {
         match value {
             Some(value) => process.env(name, value),
@@ -438,6 +502,7 @@ fn configure(
             process.env("PATH", path);
         }
     }
+    server
 }
 
 type Child = Box<dyn portable_pty::Child + Send + Sync>;
@@ -447,17 +512,23 @@ struct Relaunch {
     command: CommandBuilder,
     /// Conversation the fresh start pins, if its profile can assign one.
     conversation: Option<String>,
+    /// The failed resume's server socket. Any server it started is stopped first.
+    stale_server: Option<PathBuf>,
     slave: Box<dyn portable_pty::SlavePty + Send>,
     /// An exit after this is a normal exit, not a failed resume.
     deadline: Instant,
+    /// Input typed into the fresh start once it runs.
+    typed: Option<Vec<u8>>,
 }
 
 /// Waits for the session's process, killing it when `stop` fires. If it exits before
 /// the relaunch deadline outside shutdown, its fresh start replaces it once, and
-/// `relaunched` gets the new PID and conversation.
+/// `relaunched` gets the new PID and conversation. The held input is sent once the
+/// process outlives the deadline. A fresh start gets its own input instead.
 fn wait_process(
     mut process: Child,
     mut relaunch: Option<Relaunch>,
+    mut input: PendingInput<'_, impl Fn(Vec<u8>, u64)>,
     stop: &Receiver<()>,
     shutting_down: &AtomicBool,
     relaunched: impl FnOnce(Option<u32>, Option<&str>),
@@ -473,11 +544,20 @@ fn wait_process(
                 else {
                     return Ok(status);
                 };
+                input.held = None;
+                if let Some(server) = &next.stale_server {
+                    crate::agent_socket::stop_listeners(server);
+                    let _ = std::fs::remove_file(server);
+                }
+                let seen = input.ready.count();
                 match next.slave.spawn_command(next.command) {
                     Ok(child) => {
                         process = child;
                         if let Some(relaunched) = relaunched.take() {
                             relaunched(process.process_id(), next.conversation.as_deref());
+                        }
+                        if let Some(typed) = next.typed {
+                            (input.send)(typed, seen);
                         }
                         continue;
                     }
@@ -493,9 +573,12 @@ fn wait_process(
         // Past the deadline, release the slave so the reader sees EOF at exit.
         if relaunch
             .as_ref()
-            .is_some_and(|next| Instant::now() >= next.deadline)
+            .is_none_or(|next| Instant::now() >= next.deadline)
         {
             relaunch = None;
+            if let Some(typed) = input.held.take() {
+                (input.send)(typed, 0);
+            }
         }
         match stop.recv_timeout(Duration::from_millis(100)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -504,6 +587,59 @@ fn wait_process(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+/// Input to type into a session's process once it can take it.
+struct PendingInput<'a, F: Fn(Vec<u8>, u64)> {
+    /// Input for the first process, held while a failed resume could still replace it.
+    held: Option<Vec<u8>>,
+    ready: &'a InputReady,
+    /// Sends input once the [`InputReady`] count exceeds the given value.
+    send: F,
+}
+
+/// How long typed input waits for the program to enable bracketed paste. A program that
+/// never does still gets the input after this.
+const INPUT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+
+/// Counts how often the program in a terminal enabled bracketed paste. A TUI does that
+/// once it has put the terminal in raw mode. Input typed before then goes through the
+/// terminal's line discipline, which turns a carriage return (Enter) into a line feed.
+#[derive(Default)]
+struct InputReady {
+    enabled: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl InputReady {
+    /// Counts the sequences in `bytes`. `tail` carries the end of the previous read, so a
+    /// sequence split across reads still counts once.
+    fn observe(&self, tail: &mut Vec<u8>, bytes: &[u8]) {
+        tail.extend_from_slice(bytes);
+        let found = tail
+            .windows(ENABLE_BRACKETED_PASTE.len())
+            .filter(|window| *window == ENABLE_BRACKETED_PASTE)
+            .count() as u64;
+        let keep = tail.len().min(ENABLE_BRACKETED_PASTE.len() - 1);
+        tail.drain(..tail.len() - keep);
+        if found > 0 {
+            *self.enabled.lock().unwrap() += found;
+            self.changed.notify_all();
+        }
+    }
+
+    fn count(&self) -> u64 {
+        *self.enabled.lock().unwrap()
+    }
+
+    /// Waits until the count exceeds `seen`, or until `timeout` passes.
+    fn wait_beyond(&self, seen: u64, timeout: Duration) {
+        let enabled = self.enabled.lock().unwrap();
+        let _ = self
+            .changed
+            .wait_timeout_while(enabled, timeout, |enabled| *enabled <= seen);
     }
 }
 
@@ -579,6 +715,8 @@ fn terminal_actor(
     let mut clients: Vec<SyncSender<Response>> = Vec::new();
     let mut sequence = 0;
     let mut exited = false;
+    // The conversation an agent session last reported, to skip saving repeats.
+    let mut reported: Option<String> = None;
     let mut run = if launched_agent == Agent::Shell {
         None
     } else {
@@ -832,13 +970,19 @@ fn terminal_actor(
                 conversation,
                 reply,
             } => {
-                // Only a shell session's own descendants may name its conversation.
+                // Only a session's own descendants may name its conversation: a wrapper
+                // in a shell session, or a command run by the agent of an agent session.
+                let descendant =
+                    shell_pid.is_some_and(|root| pid != root && descends_from(pid, root));
                 let accepted = !exited
-                    && launched_agent == Agent::Shell
-                    && shell_pid.is_some_and(|shell| pid != shell && descends_from(pid, shell));
-                if accepted {
+                    && descendant
+                    && (launched_agent == Agent::Shell || launched_agent == agent);
+                if accepted && launched_agent == Agent::Shell {
                     let foreground = run.as_ref().map(|(_, agent)| agent);
                     restore.set_conversation(agent, conversation, foreground, lifecycle);
+                } else if accepted && reported.as_ref() != Some(&conversation) {
+                    lifecycle.record_foreground(&agent, Some(&conversation), None, false);
+                    reported = Some(conversation);
                 }
                 let _ = reply.send(accepted);
             }
@@ -1326,7 +1470,7 @@ fn requested_model(
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Option<String> {
     let short_flag = match agent.as_str() {
-        "codex" | "grok" => true,
+        "codex" | "grok" | "jcode" => true,
         "claude" => false,
         _ => return None,
     };
@@ -1422,8 +1566,10 @@ mod tests {
         let relaunch = Relaunch {
             command: shell(fresh),
             conversation: Some("conv-1".into()),
+            stale_server: None,
             slave: pair.slave,
             deadline: Instant::now() + window,
+            typed: Some(b"fresh input".to_vec()),
         };
         let mut reader = pair.master.try_clone_reader()?;
         let output = thread::spawn(move || {
@@ -1433,14 +1579,25 @@ mod tests {
         });
         let (_stop, stop) = mpsc::channel();
         let mut reports = Vec::new();
+        let typed = Mutex::new(Vec::new());
         let status = wait_process(
             process,
             Some(relaunch),
+            PendingInput {
+                held: Some(b"resume input".to_vec()),
+                ready: &InputReady::default(),
+                send: |input, _| typed.lock().unwrap().push(input),
+            },
             &stop,
             &AtomicBool::new(shutting_down),
             |pid, conversation| reports.push((pid.is_some(), conversation.map(Into::into))),
         )?;
         drop(pair.master);
+        let typed = typed.into_inner().unwrap();
+        let typed = typed
+            .iter()
+            .map(|input| String::from_utf8_lossy(input).into_owned());
+        reports.extend(typed.map(|input| (false, Some(input))));
         Ok((status.exit_code(), reports, output.join().unwrap()))
     }
 
@@ -1452,9 +1609,16 @@ mod tests {
             RESUME_WINDOW,
             false,
         )?;
-        // The fresh start also exits at once, but there is no second retry.
+        // The fresh start also exits at once, but there is no second retry. It gets its own
+        // input, never the input held for the resume.
         assert_eq!(code, 3);
-        assert_eq!(reports, [(true, Some("conv-1".into()))]);
+        assert_eq!(
+            reports,
+            [
+                (true, Some("conv-1".into())),
+                (false, Some("fresh input".into()))
+            ]
+        );
         assert!(
             output.contains("resume") && output.contains("fresh"),
             "{output:?}"
@@ -1471,7 +1635,8 @@ mod tests {
             false,
         )?;
         assert_eq!(code, 1);
-        assert!(reports.is_empty());
+        // The resume outlived its window, so it gets the input held for it.
+        assert_eq!(reports, [(false, Some("resume input".into()))]);
         assert!(!output.contains("fresh"), "{output:?}");
         Ok(())
     }
@@ -1480,8 +1645,32 @@ mod tests {
     fn shutdown_never_relaunches_a_failed_resume() -> Result<()> {
         let (code, reports, _) = wait_with_relaunch("exit 1", "echo fresh", RESUME_WINDOW, true)?;
         assert_eq!(code, 1);
-        assert!(reports.is_empty());
+        assert!(reports.is_empty(), "{reports:?}");
         Ok(())
+    }
+
+    #[test]
+    fn input_waits_for_bracketed_paste_even_when_the_sequence_spans_reads() {
+        let ready = Arc::new(InputReady::default());
+        let mut tail = Vec::new();
+        ready.observe(&mut tail, b"starting\x1b[?20");
+        assert_eq!(ready.count(), 0);
+        let waiter = {
+            let ready = ready.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                ready.wait_beyond(0, Duration::from_secs(10));
+                started.elapsed()
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        ready.observe(&mut tail, b"04h\x1b[?2004h");
+        assert_eq!(ready.count(), 2);
+        assert!(waiter.join().unwrap() < Duration::from_secs(5));
+        // A program that never enables it still gets its input after the timeout.
+        let started = Instant::now();
+        ready.wait_beyond(2, Duration::from_millis(50));
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]
@@ -1678,6 +1867,9 @@ mod tests {
             model_callback: domain::agent::ModelCallback::None,
             skills_dir: None,
             resume: None,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         });
         assert_eq!(
             agent_for_program("/opt/agent/bin/assistant.mjs", &profiles),

@@ -1,6 +1,6 @@
 ## Example
 
-From outside Power, set `BOX` to your selector and `REPOSITORY` to the `repository` path from `power box list`. Set `WORKTREE` to the coordinator's checkout from `git -C "$REPOSITORY" worktree list`. This example uses `origin/main` as the starting point for the parallel edits. Set `PROFILE` to the agent profile ID of an installed agent, such as `codex`, `claude`, or `grok`.
+From outside Power, set `BOX` to your selector and `REPOSITORY` to the `repository` path from `power box list`. Set `WORKTREE` to the coordinator's checkout from `git -C "$REPOSITORY" worktree list`. This example uses `origin/main` as the starting point for the parallel edits. Set `PROFILE` to the agent profile ID of an installed agent, such as `codex`, `claude`, `grok`, or `jcode`.
 
 Inside Power, set `WORKTREE` to your current checkout. Omit `--box` and `--coordinator` on create, and omit `--base origin/main` if you want to start the parallel edits at your current HEAD.
 

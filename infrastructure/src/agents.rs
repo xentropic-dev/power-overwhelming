@@ -134,8 +134,75 @@ impl Default for AgentProfiles {
                     ],
                 ),
             ),
+            jcode(),
         ])
     }
+}
+
+/// jcode takes no instructions flag, no prompt argument and no session ID of Power's
+/// choosing, so Power types its instructions and the initial prompt as the first message.
+/// The TUI runs its agents in a `jcode serve` daemon, and the bash tool runs there too
+/// with the daemon's environment. A private socket per launch gives each agent its own
+/// daemon, started by that agent's TUI, so its commands see the worker's `POWER_*`
+/// variables. A restore gets a new daemon and stops the one its previous launch left. The bash tool exports
+/// `JCODE_SESSION_ID`, which `power session task` reports for a restore to resume.
+fn jcode() -> AgentProfile {
+    let mut profile = builtin(
+        "jcode",
+        Injection::FirstMessage,
+        &[
+            "acp",
+            "account",
+            "ambient",
+            "api-bridge",
+            "auth",
+            "auth-test",
+            "browser",
+            "cloud",
+            "companion",
+            "connect",
+            "debug",
+            "dictate",
+            "help",
+            "login",
+            "mcp",
+            "memory",
+            "menubar",
+            "mobile",
+            "model",
+            "pair",
+            "permissions",
+            "provider",
+            "provider-doctor",
+            "provider-test-coverage",
+            "repl",
+            "replay",
+            "restart",
+            "run",
+            "self-dev",
+            "serve",
+            "server",
+            "session",
+            "setup-hotkey",
+            "setup-launcher",
+            "telemetry",
+            "transcript",
+            "update",
+            "usage",
+            "version",
+        ],
+        // A resumed conversation already holds the instructions.
+        &["--resume"],
+        ModelCallback::None,
+        // jcode reads ~/.agents/skills (as well as ~/.jcode/skills) natively.
+        "~/.agents/skills",
+        // jcode resumes only by ID. Without a known ID a restore starts a new
+        // conversation rather than pick one from the session list.
+        resume(&[], &["--resume", "{id}"], &[], &["--resume"]),
+    );
+    profile.server_socket_env = Some("JCODE_SOCKET".into());
+    profile.conversation_env = Some("JCODE_SESSION_ID".into());
+    profile
 }
 
 fn builtin(
@@ -156,6 +223,9 @@ fn builtin(
         model_callback,
         skills_dir: Some(skills_dir.into()),
         resume: Some(resume),
+        env: Vec::new(),
+        conversation_env: None,
+        server_socket_env: None,
     }
 }
 

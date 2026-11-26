@@ -305,11 +305,18 @@ fn main() -> Result<()> {
                     println!("{}", session.id);
                 }
                 SessionAction::End { id } => client::end_session(id)?,
-                SessionAction::Task { label } => client::set_task(
-                    std::env::var("POWER_SESSION").context("Set a task from a Power terminal")?,
-                    label,
-                )?,
-                SessionAction::Model { name, .. } => report_model(name)?,
+                SessionAction::Task { label } => {
+                    report_conversation();
+                    client::set_task(
+                        std::env::var("POWER_SESSION")
+                            .context("Set a task from a Power terminal")?,
+                        label,
+                    )?
+                }
+                SessionAction::Model { name, .. } => {
+                    report_conversation();
+                    report_model(name)?
+                }
             }
             Ok(())
         }
@@ -689,6 +696,30 @@ fn caller_session() -> Option<String> {
     std::env::var("POWER_SESSION")
         .ok()
         .filter(|id| !id.is_empty())
+}
+
+/// Reports the conversation of an agent that exposes its ID to the commands it runs
+/// through its profile's `conversation_env`, so a restore can resume it. Best effort: a
+/// failed report leaves the command's own work to succeed or fail.
+fn report_conversation() {
+    let Some(session) = caller_session() else {
+        return;
+    };
+    for profile in configured_agents().profiles() {
+        let Some(conversation) = profile
+            .conversation_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|conversation| !conversation.is_empty())
+        else {
+            continue;
+        };
+        let _ = client::set_conversation(
+            session.clone(),
+            profile.id.as_str().to_owned(),
+            conversation,
+        );
+    }
 }
 
 fn report_model(name: Option<String>) -> Result<()> {
@@ -1091,18 +1122,21 @@ fn run_dag(command: DagAction) -> Result<()> {
             run,
             task,
             attempt,
-        } => DagRequest::Report {
-            run: report_arg(run, "POWER_RUN", "run")?,
-            task: report_arg(task, "POWER_TASK", "task")?,
-            attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
-            summary,
-            status: match status {
-                ReportChoice::Success => ReportStatus::Success,
-                ReportChoice::Failed => ReportStatus::Failed,
-                ReportChoice::NeedsInput => ReportStatus::NeedsInput,
-                ReportChoice::Working => ReportStatus::Working,
-            },
-        },
+        } => {
+            report_conversation();
+            DagRequest::Report {
+                run: report_arg(run, "POWER_RUN", "run")?,
+                task: report_arg(task, "POWER_TASK", "task")?,
+                attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
+                summary,
+                status: match status {
+                    ReportChoice::Success => ReportStatus::Success,
+                    ReportChoice::Failed => ReportStatus::Failed,
+                    ReportChoice::NeedsInput => ReportStatus::NeedsInput,
+                    ReportChoice::Working => ReportStatus::Working,
+                },
+            }
+        }
         DagAction::Events(EventArgs { run, since, kinds }) => DagRequest::Events {
             run,
             since,
