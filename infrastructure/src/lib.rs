@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod box_icons;
 pub mod boxes;
 pub mod client;
 #[cfg(feature = "lua-config")]

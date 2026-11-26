@@ -56,9 +56,13 @@ pub enum Command {
     DagZoomIn,
     DagZoomOut,
     DagOpen,
+    DagArtifact,
     DagClose,
     TabOpenLink,
     TabPreview,
+    TerminalZoomIn,
+    TerminalZoomOut,
+    TerminalZoomReset,
     PreviewPrevious,
     PreviewNext,
     PreviewClose,
@@ -184,6 +188,9 @@ const TABLE: &[Entry] = &[
     entry(S::Tab, "last", C::TabLast, &["l"], "Previously active tab"),
     entry(S::Tab, "open_link", C::TabOpenLink, &["o"], "Number the links on screen"),
     entry(S::Tab, "preview", C::TabPreview, &["v"], "Focus the preview pane"),
+    entry(S::Tab, "zoom_in", C::TerminalZoomIn, &["+", "="], "Bigger terminal text"),
+    entry(S::Tab, "zoom_out", C::TerminalZoomOut, &["-"], "Smaller terminal text"),
+    entry(S::Tab, "zoom_reset", C::TerminalZoomReset, &["0"], "Terminal text at its configured size"),
     entry(S::Tab, "help", C::Help, &["?"], "Keyboard shortcuts"),
     entry(
         S::Picker,
@@ -225,10 +232,11 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "zoom_in", C::DagZoomIn, &["+"], "Zoom in"),
     entry(S::Dag, "zoom_out", C::DagZoomOut, &["-"], "Zoom out"),
     entry(S::Dag, "open", C::DagOpen, &["enter", "o"], "Open assigned worker terminal"),
+    entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
-    entry(S::Preview, "close", C::PreviewClose, &["x"], "Close preview"),
+    entry(S::Preview, "close", C::PreviewClose, &["escape", "x"], "Close preview"),
     entry(S::Preview, "play", C::PreviewPlay, &["space"], "Play or pause video"),
     entry(S::Preview, "back", C::PreviewBack, &[","], "Back 5 seconds"),
     entry(S::Preview, "forward", C::PreviewForward, &["."], "Forward 5 seconds"),
@@ -236,7 +244,7 @@ const TABLE: &[Entry] = &[
     entry(S::Preview, "scroll_up", C::PreviewScrollUp, &["k", "up"], "Scroll page up"),
     entry(S::Preview, "reload", C::PreviewReload, &["r"], "Reload page"),
     entry(S::Preview, "interact", C::PreviewInteract, &["i"], "Type into the page"),
-    entry(S::Preview, "exit", C::PreviewExit, &["escape"], "Back to the terminal"),
+    entry(S::Preview, "exit", C::PreviewExit, &["tab"], "Back to the terminal"),
     entry(S::Hints, "search", C::HintSearch, &["s"], "Search links and published artifacts"),
     entry(S::Hints, "cancel", C::HintCancel, &["escape"], "Hide the numbers"),
 ];
@@ -526,6 +534,13 @@ mod tests {
             Some(C::PickerDown)
         );
         assert_eq!(keymap.command(Scope::Prefix, &stroke("ctrl-shift-s")), None);
+        for (key, command) in [
+            ("escape", C::PreviewClose),
+            ("x", C::PreviewClose),
+            ("tab", C::PreviewExit),
+        ] {
+            assert_eq!(keymap.command(Scope::Preview, &stroke(key)), Some(command));
+        }
     }
 
     #[test]
@@ -535,6 +550,10 @@ mod tests {
             (Scope::Box, "d", C::BoxRuns),
             (Scope::Box, "a", C::BoxAgents),
             (Scope::Tab, "d", C::TabDetach),
+            (Scope::Tab, "+", C::TerminalZoomIn),
+            (Scope::Tab, "=", C::TerminalZoomIn),
+            (Scope::Tab, "-", C::TerminalZoomOut),
+            (Scope::Tab, "0", C::TerminalZoomReset),
             (Scope::AgentTree, "ctrl-h", C::AgentCollapse),
             (Scope::AgentTree, "ctrl-l", C::AgentExpand),
             (Scope::AgentTree, "enter", C::PickerSelect),
@@ -551,6 +570,7 @@ mod tests {
             (Scope::Dag, "-", C::DagZoomOut),
             (Scope::Dag, "enter", C::DagOpen),
             (Scope::Dag, "o", C::DagOpen),
+            (Scope::Dag, "p", C::DagArtifact),
             (Scope::Dag, "escape", C::DagClose),
         ] {
             assert_eq!(keymap.command(scope, &stroke(key)), Some(command));
@@ -562,9 +582,14 @@ mod tests {
             ("Open DAG runs", "Ctrl+B then d"),
             ("Open agent tree", "Ctrl+B then a"),
             ("Detach tab and keep session running", "Ctrl+S then d"),
+            ("Bigger terminal text", "Ctrl+S then +/="),
             (
                 "Open assigned worker terminal",
                 "In the task graph: Enter/o",
+            ),
+            (
+                "Preview the selected task's artifact, then 1–9 to pick",
+                "In the task graph: p",
             ),
         ] {
             assert!(
@@ -579,7 +604,7 @@ mod tests {
         let keymap = Keymap::from_config(&json!({
             "tab": { "next": ["n", "j"] },
             "box": { "runs": "g" },
-            "dag": { "open": "space" },
+            "dag": { "open": "space", "artifact": "a" },
             "agent_tree": { "expand": "ctrl-f" },
             "prefix": { "tab": "ctrl-a" },
         }))
@@ -600,6 +625,11 @@ mod tests {
             Some(C::DagOpen)
         );
         assert_eq!(keymap.command(Scope::Dag, &stroke("o")), None);
+        assert_eq!(
+            keymap.command(Scope::Dag, &stroke("a")),
+            Some(C::DagArtifact)
+        );
+        assert_eq!(keymap.command(Scope::Dag, &stroke("p")), None);
         assert_eq!(
             keymap.command(Scope::AgentTree, &stroke("ctrl-f")),
             Some(C::AgentExpand)
@@ -624,6 +654,7 @@ mod tests {
                 json!({ "agent_tree": { "expand": "down" } }),
                 "bound to both",
             ),
+            (json!({ "dag": { "artifact": "o" } }), "bound to both"),
             (json!({ "tab": { "next": "hyper-j" } }), "Unknown modifier"),
             (json!({ "tab": { "next": 3 } }), "must be a key name"),
         ] {

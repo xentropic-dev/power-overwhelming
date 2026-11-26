@@ -484,7 +484,11 @@ fn legacy_agent_aliases_use_the_configured_profiles() {
     fs::write(
         config.join("config.lua"),
         r#"
-        agents.claude = { command = "/bin/echo", injection = { kind = "none" } }
+        agents.claude = {
+            command = "/bin/echo",
+            injection = { kind = "none" },
+            resume = { assign = {} },
+        }
         agents.codex = { command = "/bin/echo", injection = { kind = "none" } }
         "#,
     )
@@ -619,6 +623,86 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
 }
 
 #[test]
+fn worker_models_follow_reports_and_survive_restart() {
+    let mut fixture = Fixture::with_configure(|root| {
+        let program = root.join("codex");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+test "$1" = "--model=launch-model"
+fixture_dir="${POWER_SOCKET%/*}"
+for phase in update finish; do
+    for step in $(seq 400); do
+        test ! -f "$fixture_dir/$phase" || break
+        sleep 0.05
+    done
+    test -f "$fixture_dir/$phase"
+    case "$phase" in
+        update) printf '%s' '{"model":"actual-model"}' | "$POWER_BIN" session model --json ;;
+        finish) "$POWER_BIN" dag report success --summary "Done" ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            format!(
+                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
+                program.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    });
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "model");
+    let (attempt, agent) = dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "model",
+        "--provider",
+        "codex",
+        "--worktree",
+        fixture.worktrees[0].to_str().unwrap(),
+        "--",
+        "--model=launch-model",
+    ]));
+    assert_eq!(attempt.model.as_deref(), Some("launch-model"));
+    assert_eq!(agent.model, attempt.model);
+    fixture.release("update");
+    let updated = poll("the model change", || {
+        fixture
+            .events(&run, 0, &["agent_model_changed"])
+            .events
+            .pop()
+    });
+    assert_eq!(updated.attempt.as_deref(), Some(attempt.id.as_str()));
+    assert_eq!(updated.summary.as_deref(), Some("actual-model"));
+    assert_eq!(
+        task(&fixture.show(&run), "model").attempts[0]
+            .model
+            .as_deref(),
+        Some("actual-model")
+    );
+    assert_eq!(fixture.agents()[0].model.as_deref(), Some("actual-model"));
+    fixture.release("finish");
+    fixture.wait_for_state(&run, "model", TaskState::Completed);
+    fixture.restart();
+    assert_eq!(
+        task(&fixture.show(&run), "model").attempts[0]
+            .model
+            .as_deref(),
+        Some("actual-model")
+    );
+    assert_eq!(fixture.agents()[0].model.as_deref(), Some("actual-model"));
+}
+
+#[test]
 fn background_workers_unlock_dependent_task_only_after_both_succeed() {
     let fixture = Fixture::new();
     let boxes: Vec<BoxInfo> =
@@ -738,6 +822,61 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
             .count(),
         1,
     );
+}
+
+#[test]
+fn show_lists_artifacts_published_from_each_attempts_session() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "work");
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "work",
+        &fixture.worktrees[0],
+        false,
+        &["success", "finish", "done"],
+    ));
+    let session = agent.session.unwrap();
+    let publish = |session: &str, file: &str, title: &str| {
+        fs::write(fixture.worktrees[0].join(file), b"fixture").unwrap();
+        let published = output(
+            power(fixture.root())
+                .current_dir(&fixture.worktrees[0])
+                .args(["artifact", "publish", file, "--title", title])
+                .env("POWER_SESSION", session),
+        );
+        assert_success(&published);
+        String::from_utf8(published.stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let first = publish(&session, "first.png", "First screenshot");
+    let second = publish(&session, "second.png", "Second screenshot");
+    let shown = fixture.json(&["dag", "show", &run]);
+    let artifacts = &shown["run"]["tasks"][0]["attempts"][0]["artifacts"];
+    let listed: Vec<_> = artifacts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| {
+            let id = artifact["id"].as_str().unwrap();
+            assert_eq!(artifact["link"], format!("pwr://artifact/{id}"));
+            (
+                artifact["link"].as_str().unwrap().to_owned(),
+                artifact["title"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (first, "First screenshot".to_owned()),
+            (second, "Second screenshot".to_owned()),
+        ]
+    );
+    fixture.release("finish");
+    fixture.wait_for_state(&run, "work", TaskState::Completed);
 }
 
 #[test]
