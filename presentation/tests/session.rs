@@ -12,13 +12,21 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(root: &Path) -> (Self, PathBuf) {
+        Self::start_with(
+            root,
+            Command::new(env!("CARGO_BIN_EXE_power")).env("SHELL", "/bin/sh"),
+        )
+    }
+
+    fn start_with(root: &Path, command: &mut Command) -> (Self, PathBuf) {
         let socket = root.join("power.sock");
         let daemon = Self(
-            Command::new(env!("CARGO_BIN_EXE_power"))
+            command
                 .arg("daemon")
                 .env("POWER_SOCKET", &socket)
                 .env("POWER_STATE_DIR", root.join("state"))
-                .env("SHELL", "/bin/sh")
+                .env("XDG_RUNTIME_DIR", root.join("runtime"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
                 .spawn()
                 .unwrap(),
         );
@@ -320,6 +328,99 @@ fn shell_tracks_an_agent_started_inside_it() {
         &socket,
         json!({"request":"end", "session":session}),
     ));
+}
+
+#[test]
+fn restored_shell_resumes_agent_in_foreground_and_accepts_its_task() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use infrastructure::shell::Shell;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    for (shell, rc) in [
+        (Shell::Bash, ".bashrc"),
+        (Shell::Zsh, ".zshrc"),
+        (Shell::Fish, "config/fish/config.fish"),
+    ] {
+        let path = std::env::var_os("PATH").unwrap();
+        let Some(shell_path) = std::env::split_paths(&path)
+            .map(|dir| dir.join(shell.name()))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let rc = root.join(rc);
+        fs::create_dir_all(rc.parent().unwrap()).unwrap();
+        fs::write(rc, shell.hook()).unwrap();
+        let agent = root.join("claude");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+set -e
+task=initial
+for arg do
+    case "$arg" in
+        --continue|--resume)
+            set -- $(ps -o pgid=,tpgid=,sid= -p "$$")
+            task=resumed
+            if [ "$1" != "$2" ] || [ "$1" = "$3" ]; then
+                task="unexpected groups: pgid=$1 tpgid=$2 sid=$3"
+            fi
+            break
+            ;;
+    esac
+done
+"$POWER_BIN" session task "$task"
+read -r finish
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let (daemon, socket) = Daemon::start(root);
+        let session = event(&mut request(
+            &socket,
+            json!({"request":"launch", "worktree":root, "agent":"shell"}),
+        ))["session"]["id"]
+            .clone();
+        let wait_for_task = |task: &str| {
+            let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+            loop {
+                let message = event(&mut attached);
+                if let Some(reported) = message["metadata"]["task"].as_str() {
+                    assert_eq!(reported, task, "{shell:?}");
+                    break;
+                }
+            }
+            let listed = event(&mut request(&socket, json!({"request":"list"})));
+            assert_eq!(listed["sessions"][0]["agent"], "claude", "{shell:?}");
+        };
+        // Reproduce the shared process group from a shell without job control.
+        event(&mut request(
+            &socket,
+            json!({"request":"input", "session":session, "data":STANDARD.encode("set +m; ./claude\n")}),
+        ));
+        wait_for_task("initial");
+        drop(daemon);
+
+        let path = std::env::join_paths(
+            std::iter::once(root.to_owned()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        let (_restored, _) = Daemon::start_with(
+            root,
+            Command::new(env!("CARGO_BIN_EXE_power"))
+                .env("HOME", root)
+                .env("ZDOTDIR", root)
+                .env("SHELL", shell_path)
+                .env("PATH", path),
+        );
+        wait_for_task("resumed");
+        event(&mut request(
+            &socket,
+            json!({"request":"end", "session":session}),
+        ));
+    }
 }
 
 #[test]
