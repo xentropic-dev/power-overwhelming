@@ -910,9 +910,10 @@ impl Workspace {
         let picker = self.picker.as_ref()?;
         let include_finished = picker.show_finished;
         let query = match &picker.kind {
+            // The first load lists every run, so a box with finished runs never skips the list.
             Kind::Runs { box_id, .. } => DagQuery::Runs {
                 box_id: box_id.clone(),
-                include_finished,
+                include_finished: include_finished || picker.loading,
             },
             Kind::Agents { box_id, .. } => DagQuery::Agents {
                 box_id: box_id.clone(),
@@ -955,12 +956,15 @@ impl Workspace {
             let toggle = |scope| self.keymap.first(scope, Command::ToggleFinished);
             match result {
                 Ok(DagSnapshot::Runs(mut runs)) => {
-                    // Skip the list only when there is nothing else to pick.
+                    // Skip the list only when the box has no other run, finished or not.
                     if initial && runs.len() == 1 {
                         if let Some(run) = runs.pop() {
                             self.open_dag(run, window, cx);
                         }
                         return;
+                    }
+                    if !picker.show_finished {
+                        runs.retain(|run| !run.status().is_finished());
                     }
                     picker.message = runs.is_empty().then(|| {
                         empty_message(
