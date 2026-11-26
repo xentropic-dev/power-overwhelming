@@ -114,7 +114,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             })?;
             Reply::Dispatched {
                 attempt: result.attempt.into(),
-                agent: result.agent.into(),
+                agent: Box::new(result.agent.into()),
             }
         }
         DagRequest::Report {
@@ -175,9 +175,9 @@ pub(crate) fn watch(
             wire::send(
                 &mut *socket,
                 &Response::Dag {
-                    dag: DagResponse::Event {
+                    dag: Box::new(DagResponse::Event {
                         event: event.into(),
-                    },
+                    }),
                 },
             )?;
         }

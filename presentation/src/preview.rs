@@ -146,7 +146,7 @@ pub(crate) fn decode_image(path: &Path) -> Result<Arc<RenderImage>> {
         .into_rgba8();
     let (width, height) = image.dimensions();
     let mut data = image.into_raw();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     render_image(width, height, data).context("Invalid image size")
