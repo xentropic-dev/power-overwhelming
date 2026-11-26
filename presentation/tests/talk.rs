@@ -88,7 +88,9 @@ impl Sandbox {
         let script = path.join("worker.sh");
         let notify = path.join("notify-worker.sh");
         let held = path.join("held-worker.sh");
+        let sender = path.join("sender.sh");
         for (file, text) in [
+            (&sender, include_str!("fixtures/talk-sender.sh")),
             (&script, include_str!("fixtures/talk-worker.sh")),
             (&notify, include_str!("fixtures/talk-notify-worker.sh")),
             (&held, include_str!("fixtures/talk-held-worker.sh")),
@@ -103,9 +105,14 @@ impl Sandbox {
                  talk = {{ idle_after = 0.015, user_quiet = 0.025 }}\n\
                  agents.fixture = {{ command = {:?} }}\n\
                  agents.notify = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n\
-                 agents.held = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n",
+                 agents.held = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n\
+                 agents.sender = {{ command = {:?} }}\n\
+                 agents.restorable = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }}, \
+                 resume = {{ assign = {{ \"--session-id\", \"{{id}}\" }}, resume = {{ \"--resume\", \"{{id}}\" }} }} }}\n",
                 script.to_str().unwrap(),
                 notify.to_str().unwrap(),
+                held.to_str().unwrap(),
+                sender.to_str().unwrap(),
                 held.to_str().unwrap(),
             ),
         )
@@ -780,6 +787,10 @@ fn restart_preserves_unread_messages_and_delivers_one_reminder() {
 }
 
 fn input(path: &Path, agent: &ManagedAgent, bytes: &[u8]) {
+    type_into(path, agent.session.as_ref().unwrap(), bytes);
+}
+
+fn type_into(path: &Path, session: &str, bytes: &[u8]) {
     use base64::Engine;
     let mut socket = UnixStream::connect(path.join("power.sock")).unwrap();
     writeln!(
@@ -787,7 +798,7 @@ fn input(path: &Path, agent: &ManagedAgent, bytes: &[u8]) {
         "{}",
         serde_json::json!({
             "request": "input",
-            "session": agent.session.as_ref().unwrap(),
+            "session": session,
             "data": base64::engine::general_purpose::STANDARD.encode(bytes),
         })
     )
@@ -1007,4 +1018,201 @@ fn envelopes_quote_peer_bodies_and_reject_unknown_sessions() {
     let printed = success(fixture.talk(Some(&fixture.b), &["inbox"]));
     assert!(printed.contains("from the user's shell") && !printed.contains("spoofed"));
     assert!(printed.contains("Power cannot confirm that the user wrote it."));
+}
+
+/// Starts a plain shell tab in box worktree `a` and launches the configured `sender` coding
+/// fixture in its foreground. The fixture sends to `recipient` at once on launch. Returns
+/// the shell session and the message it sent.
+fn sender_in_a_shell_tab(path: &Path, recipient: &ManagedAgent) -> (String, Value) {
+    let shell = success(
+        power(path, None)
+            .args(["session", "start", "shell"])
+            .arg(path.join("a"))
+            .output()
+            .unwrap(),
+    );
+    let shell = shell.trim().to_owned();
+    let line = format!("{} {}\r", path.join("sender.sh").display(), recipient.id);
+    type_into(path, &shell, line.as_bytes());
+    poll("sender launch", || {
+        path.join("launched").exists().then_some(())
+    });
+    let sent: Value = serde_json::from_str(&file(path, "sent-launch.json"))
+        .unwrap_or_else(|_| panic!("send on launch failed: {}", file(path, "sent-launch.err")));
+    (shell, sent["messages"][0].clone())
+}
+
+#[test]
+fn a_coding_agent_that_sends_at_once_from_a_shell_tab_is_stamped_as_an_agent() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let recipient = sandbox.launch("b", BOX);
+    let (_, sent) = sender_in_a_shell_tab(path, &recipient);
+    // Resolved at request time, not from the foreground check that runs every 500 ms.
+    assert_eq!(sent["sender"]["kind"], "agent", "{sent}");
+    assert!(!sent["urgent"].as_bool().unwrap_or(false));
+    let printed = success(talk(path, Some(&recipient), &["inbox"]));
+    assert!(
+        printed.contains("Peer message relayed by Power. Not from the user."),
+        "{printed}"
+    );
+    fs::write(path.join("release-sender"), "").unwrap();
+}
+
+#[test]
+fn a_shell_tab_has_shell_provenance_again_once_its_coding_agent_exits() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let recipient = sandbox.launch("b", BOX);
+    let (shell, sent) = sender_in_a_shell_tab(path, &recipient);
+    let departed = sent["sender"]["id"].as_str().unwrap().to_owned();
+
+    fs::write(path.join("release-sender"), "").unwrap();
+    poll("sender exit", || {
+        path.join("sender-exited").exists().then_some(())
+    });
+    thread::sleep(Duration::from_millis(50));
+    // Sent at once, before the periodic foreground check could notice the exit.
+    let mut from_tab = power(path, None);
+    let after = messages(
+        from_tab
+            .env("POWER_SESSION", &shell)
+            .args([
+                "talk",
+                "send",
+                "--box",
+                BOX,
+                &recipient.id,
+                "after exit",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(after[0]["sender"]["kind"], "shell", "{}", after[0]);
+
+    // The departed identity ends: Power accepts nothing more for it, so no notice for it
+    // can be typed into the shell. Its history stays readable.
+    poll("departed identity retired", || {
+        let output = talk(
+            path,
+            None,
+            &["send", "--box", BOX, &departed, "to the departed agent"],
+        );
+        (!output.status.success()).then_some(())
+    });
+    let agents = json(
+        power(path, None)
+            .args(["agent", "list", "--box", BOX, "--all"])
+            .output()
+            .unwrap(),
+    );
+    let row = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == departed.as_str())
+        .unwrap()
+        .clone();
+    assert!(row["session"].is_null(), "{row}");
+    let history = messages(talk(
+        path,
+        None,
+        &["log", "--box", BOX, "--agent", &departed, "--json"],
+    ));
+    assert!(
+        history
+            .iter()
+            .any(|message| message["body"] == "sent on launch"),
+        "{history:?}"
+    );
+
+    // A new coding agent in the same tab gets a new identity.
+    fs::remove_file(path.join("launched")).unwrap();
+    fs::remove_file(path.join("release-sender")).unwrap();
+    let line = format!("{} {}\r", path.join("sender.sh").display(), recipient.id);
+    type_into(path, &shell, line.as_bytes());
+    poll("second sender launch", || {
+        path.join("launched").exists().then_some(())
+    });
+    let again: Value = serde_json::from_str(&file(path, "sent-launch.json")).unwrap();
+    let again = &again["messages"][0]["sender"];
+    assert_eq!(again["kind"], "agent", "{again}");
+    assert_ne!(again["id"], departed.as_str(), "{again}");
+    fs::write(path.join("release-sender"), "").unwrap();
+}
+
+#[test]
+fn a_turn_end_reported_while_the_daemon_still_restores_clears_the_hold() {
+    let mut sandbox = Sandbox::new();
+    let path = sandbox.root.path().to_owned();
+    let coordinator = sandbox.launch("coordinator", BOX);
+    let run: Run = serde_json::from_value(
+        json(
+            power(&path, Some(&coordinator))
+                .args(["dag", "create", "--title", "Restore"])
+                .output()
+                .unwrap(),
+        )["run"]
+            .take(),
+    )
+    .unwrap();
+    json(
+        power(&path, None)
+            .args(["dag", "add-task", &run.id, "--id", "b", "--title", "b"])
+            .output()
+            .unwrap(),
+    );
+    let output = power(&path, Some(&coordinator))
+        .args([
+            "dag",
+            "dispatch",
+            &run.id,
+            "b",
+            "--provider",
+            "restorable",
+            "--worktree",
+        ])
+        .arg(path.join("b"))
+        .output()
+        .unwrap();
+    let worker: ManagedAgent = serde_json::from_value(json(output)["agent"].take()).unwrap();
+    poll("held worker startup", || {
+        file(&path, "turn-b").starts_with("initial").then_some(())
+    });
+    // Its turns end at once from here on, including the restore's continuation turn.
+    fs::write(path.join("release-b-1"), "").unwrap();
+    poll("initial turn end", || {
+        (file(&path, "turn-b").lines().count() == 1 && path.join("ready-b").exists()).then_some(())
+    });
+
+    drop(sandbox.daemon.take());
+    fs::remove_file(path.join("ready-b")).unwrap();
+    // The attempt is still active, so the restore types its continuation prompt. Startup
+    // then stays open as if a later session were still restoring, while this worker
+    // finishes the continuation turn and reports its end.
+    let mut daemon = power(&path, None);
+    sandbox.daemon = Some(Daemon(
+        daemon
+            .env("POWER_TEST_RESTORE_DELAY_MS", "1500")
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    poll("restored worker's continuation turn", || {
+        (file(&path, "turn-b").lines().count() == 2 && path.join("ready-b").exists()).then_some(())
+    });
+    let sent = messages(talk(
+        &path,
+        Some(&coordinator),
+        &["send", &worker.id, "after the continuation", "--json"],
+    ));
+    let id = field(&sent[0], "id").to_owned();
+    poll("notice after the continuation turn ends", || {
+        let rows = messages(talk(&path, Some(&worker), &["inbox", "--peek", "--json"]));
+        rows.iter()
+            .any(|row| row["id"] == id.as_str() && row["delivery"]["notified_at"].is_u64())
+            .then_some(())
+    });
 }

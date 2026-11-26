@@ -125,6 +125,12 @@ pub trait TerminalRuntime: Send + Sync {
     fn model(&self, _handle: &Self::Handle, _agent: &Agent) -> Option<String> {
         None
     }
+    /// Rechecks the foreground process now, rather than trusting the last periodic check.
+    /// None when the terminal cannot answer. Never call it while holding a store lock: the
+    /// terminal may need that store to record the change it finds.
+    fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
+        self.agent(handle)
+    }
 }
 
 struct Live<H> {
@@ -172,17 +178,31 @@ impl<T: TerminalRuntime> Application<T> {
     }
 
     /// The agent of a running session: its launched coding agent, or for a shell session,
-    /// whichever agent holds its foreground. None if the session is unknown or has exited.
+    /// whichever agent holds its foreground at this moment (see
+    /// `TerminalRuntime::resolve_agent`). None if the session is unknown, has exited or its
+    /// foreground cannot be resolved. Do not call it while holding a store lock.
     pub fn live_agent(&self, id: &str) -> Option<Agent> {
-        let sessions = self.sessions.lock().unwrap();
-        let live = sessions.get(id)?;
-        if !self.runtime.is_running(&live.terminal) {
+        let (launched, terminal) = {
+            let sessions = self.sessions.lock().unwrap();
+            let live = sessions.get(id)?;
+            (live.session.agent.clone(), live.terminal.clone())
+        };
+        if !self.runtime.is_running(&terminal) {
             return None;
         }
-        Some(match &live.session.agent {
-            Agent::Coding(_) => live.session.agent.clone(),
-            Agent::Shell => self.current(live).agent,
-        })
+        match launched {
+            Agent::Coding(_) => Some(launched),
+            Agent::Shell => self.runtime.resolve_agent(&terminal),
+        }
+    }
+
+    /// The agent a session was launched with, regardless of its current foreground.
+    pub fn launched_agent(&self, id: &str) -> Option<Agent> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|live| live.session.agent.clone())
     }
 
     fn session_is_running(&self, id: &str) -> Result<bool> {

@@ -40,6 +40,10 @@ type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send 
 /// Saves a session's foreground agent, its conversation and the shell's directory.
 type ForegroundChanged =
     Arc<dyn Fn(&str, &Agent, Option<&str>, Option<&Path>) -> Result<()> + Send + Sync>;
+/// A coding agent process left a shell session's foreground.
+type ForegroundLeft = Arc<dyn Fn(&str, &Agent) + Send + Sync>;
+/// How long a request waits for its terminal to resolve the foreground process.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often a shell session's working directory is checked for a restore.
 const CWD_INTERVAL: Duration = Duration::from_secs(3);
@@ -66,6 +70,7 @@ pub struct PtyRuntime {
     pub on_exit: ExitHandler,
     pub on_model_changed: ModelChanged,
     pub on_foreground_changed: ForegroundChanged,
+    pub on_foreground_left: ForegroundLeft,
     /// Set on daemon shutdown. Exits are then not reported and foreground state
     /// is only saved by an explicit flush, so a reboot cannot erase what a restore needs.
     pub shutting_down: Arc<AtomicBool>,
@@ -82,6 +87,7 @@ struct Lifecycle {
     foreground: Mutex<Foreground>,
     on_model_changed: ModelChanged,
     on_foreground_changed: ForegroundChanged,
+    on_foreground_left: ForegroundLeft,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -261,6 +267,15 @@ impl TerminalRuntime for PtyRuntime {
             None
         }
     }
+
+    /// Asks the terminal to recheck its foreground process now. The periodic check runs
+    /// every 500 ms, so a coding agent that sends at once on launch would otherwise still
+    /// look like the shell.
+    fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        handle.send(Command::ResolveForeground(reply)).ok()?;
+        answer.recv_timeout(RESOLVE_TIMEOUT).ok()
+    }
 }
 
 pub enum Command {
@@ -286,6 +301,8 @@ pub enum Command {
     Relaunched(Option<u32>),
     /// Recheck which agent owns the foreground of a shell session.
     Poll,
+    /// Recheck the foreground now and reply with the agent that owns it.
+    ResolveForeground(SyncSender<Agent>),
     OutputClosed,
     ProcessExited(String),
     /// Save pending scrollback and foreground state, then acknowledge after the attempt.
@@ -362,6 +379,7 @@ fn launch(
         }),
         on_model_changed: runtime.on_model_changed.clone(),
         on_foreground_changed: runtime.on_foreground_changed.clone(),
+        on_foreground_left: runtime.on_foreground_left.clone(),
         shutting_down: runtime.shutting_down.clone(),
     });
     // A relaunch needs the slave, which also keeps the reader from seeing EOF between
@@ -752,6 +770,7 @@ fn terminal_actor(
                 command,
                 Command::Attach(_)
                     | Command::Poll
+                    | Command::ResolveForeground(_)
                     | Command::SetMetadata { .. }
                     | Command::SetConversation { .. }
             )
@@ -764,7 +783,7 @@ fn terminal_actor(
                 profiles,
             );
             if current != run {
-                run = current;
+                let left = std::mem::replace(&mut run, current);
                 let current = run
                     .as_ref()
                     .map_or(Agent::Shell, |(_, agent)| agent.clone());
@@ -807,6 +826,13 @@ fn terminal_actor(
                     input.activity.revision = input.activity.revision.wrapping_add(1);
                 }
                 restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
+                // The process changed, so any identity derived from the old one ends. During
+                // a shutdown every process stops at once; the restore retires those.
+                if let Some((_, left)) = left
+                    && !lifecycle.shutting_down.load(Ordering::Acquire)
+                {
+                    (lifecycle.on_foreground_left)(&lifecycle.session, &left);
+                }
             }
         }
         match command {
@@ -923,6 +949,9 @@ fn terminal_actor(
                             .is_ok()
                     });
                 }
+            }
+            Command::ResolveForeground(reply) => {
+                let _ = reply.send(lifecycle.foreground.lock().unwrap().agent.clone());
             }
             Command::Poll => {
                 if !exited {
@@ -1624,6 +1653,7 @@ mod tests {
             }),
             on_model_changed: Arc::new(|_, _, _| Ok(())),
             on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
+            on_foreground_left: Arc::new(|_, _| {}),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         // A reboot sets shutdown during the agent's exit grace period.

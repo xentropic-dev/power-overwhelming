@@ -1,4 +1,7 @@
-use crate::agent::{AgentId, display_name};
+use crate::{
+    agent::{AgentId, display_name},
+    session::Agent,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
@@ -175,6 +178,19 @@ pub struct ManagedAgent {
     pub label: String,
     /// Unix seconds.
     pub created_at: u64,
+}
+
+impl ManagedAgent {
+    /// Whether this row speaks for its session while the session runs `live`. A coding
+    /// agent found in a shell's foreground is that agent only while its process runs; the
+    /// shell behind it has shell provenance again. A command worker's row is set by its
+    /// dispatch and does not depend on the foreground.
+    pub fn speaks_for(&self, live: &Agent) -> bool {
+        match &self.provider {
+            Provider::Agent(id) => matches!(live, Agent::Coding(live) if live == id),
+            Provider::Command => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -659,6 +675,33 @@ impl WorkerBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_foreground_identity_speaks_only_while_its_agent_runs() {
+        let mut agent = ManagedAgent {
+            id: "agent".into(),
+            box_id: "box".into(),
+            worktree: ".".into(),
+            provider: Provider::Agent("claude".into()),
+            model: None,
+            parent: None,
+            session: Some("session".into()),
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            status: AgentStatus::Working,
+            label: "claude".into(),
+            created_at: 0,
+        };
+        assert!(agent.speaks_for(&Agent::Coding("claude".into())));
+        assert!(!agent.speaks_for(&Agent::Shell));
+        assert!(!agent.speaks_for(&Agent::Coding("codex".into())));
+        // A command worker's identity comes from its dispatch, not the foreground.
+        agent.provider = Provider::Command;
+        assert!(agent.speaks_for(&Agent::Shell));
+        assert!(agent.speaks_for(&Agent::Coding("claude".into())));
+    }
 
     #[test]
     fn budget_limits_in_order_and_unknown_memory_passes() {

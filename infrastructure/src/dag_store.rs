@@ -500,6 +500,14 @@ impl DagTransaction for DagDb<'_> {
         Ok(())
     }
 
+    fn retire_agent(&self, id: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE agents SET state = 'exited', session = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()> {
         self.0.execute(
             "UPDATE agents SET model = ?2 WHERE id = ?1",

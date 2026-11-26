@@ -39,8 +39,9 @@ pub trait TalkTransaction: TalkReader {
 pub trait SessionActivity: Send + Sync {
     /// None if the session is unknown or no longer running.
     fn activity(&self, session: &str) -> Option<Activity>;
-    /// The agent the running session hosts now (see `Application::live_agent`). None if
-    /// the session is unknown or no longer running.
+    /// The agent the running session hosts at this moment (see `Application::live_agent`),
+    /// resolved for the request, never from a cached foreground. None if the session is
+    /// unknown, no longer running or cannot be resolved. Never call it under a store lock.
     fn agent(&self, session: &str) -> Option<Agent>;
     /// `ready_only` marks a provider that reports turn ends but not turn starts.
     fn report_turn(&self, session: &str, state: HookState, ready_only: bool) -> Result<()>;
@@ -134,33 +135,31 @@ struct Actor<'a> {
 }
 
 impl<'a> Actor<'a> {
-    /// `live` resolves what a session without an agent row hosts right now.
-    fn new(
-        caller: &'a Caller,
-        directory: &'a Directory,
-        live: impl FnOnce(&str) -> Option<Agent>,
-    ) -> Result<Self> {
-        let agent = caller.session.as_deref().and_then(|session| {
-            directory
+    /// `live` is what the caller's session hosts, resolved for this request before any
+    /// store lock (see `Talk::live`). None means it could not be resolved.
+    fn new(caller: &'a Caller, directory: &'a Directory, live: Option<&Agent>) -> Result<Self> {
+        let mut agent = None;
+        if let Some(session) = caller.session.as_deref() {
+            // Authority comes from the live session. A stale or mistyped POWER_SESSION, or a
+            // session whose foreground cannot be resolved, never falls back to the user's.
+            let Some(live) = live else {
+                bail!(
+                    "Unknown Power session {session:?}, or Power could not tell what it runs. \
+                     Unset POWER_SESSION to send from this shell"
+                );
+            };
+            agent = directory
                 .agents
                 .iter()
-                .find(|agent| agent.session.as_deref() == Some(session))
-        });
-        if let Some(session) = caller.session.as_deref()
-            && agent.is_none()
-        {
-            // Authority comes from the live session. A stale or mistyped POWER_SESSION, or a
-            // coding session without a peer identity, must not fall back to the user's.
-            match live(session) {
-                Some(Agent::Shell) => {}
-                Some(Agent::Coding(id)) => bail!(
+                .find(|agent| agent.session.as_deref() == Some(session) && agent.speaks_for(live));
+            if agent.is_none()
+                && let Agent::Coding(id) = live
+            {
+                bail!(
                     "Coding session {session:?} ({}) has no Power agent identity. Talk \
                      treats coding sessions as peers, never as the user",
                     id.as_str()
-                ),
-                None => bail!(
-                    "Unknown Power session {session:?}. Unset POWER_SESSION to send from this shell"
-                ),
+                );
             }
         }
         Ok(Self {
@@ -268,15 +267,29 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         }
     }
 
-    fn actor<'a>(&self, caller: &'a Caller, directory: &'a Directory) -> Result<Actor<'a>> {
-        Actor::new(caller, directory, |session| self.activity.agent(session))
+    fn actor<'a>(
+        &self,
+        caller: &'a Caller,
+        directory: &'a Directory,
+        live: Option<&Agent>,
+    ) -> Result<Actor<'a>> {
+        Actor::new(caller, directory, live)
+    }
+
+    /// Resolves what the caller's session runs now. Call it before taking a store lock.
+    fn live(&self, caller: &Caller) -> Option<Agent> {
+        caller
+            .session
+            .as_deref()
+            .and_then(|session| self.activity.agent(session))
     }
 
     pub fn send(&self, command: SendMessage) -> Result<Vec<Message>> {
         validate_body(&command.body)?;
+        let live = self.live(&command.caller);
         self.store.write(|db| {
             let directory = db.directory()?;
-            let actor = self.actor(&command.caller, &directory)?;
+            let actor = self.actor(&command.caller, &directory, live.as_ref())?;
             let run = command.run.as_deref().or_else(|| actor.default_run());
             let recipients = resolve(
                 SenderContext {
@@ -340,9 +353,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
 
     pub fn reply(&self, command: Reply) -> Result<Message> {
         validate_body(&command.body)?;
+        let live = self.live(&command.caller);
         self.store.write(|db| {
             let directory = db.directory()?;
-            let actor = self.actor(&command.caller, &directory)?;
+            let actor = self.actor(&command.caller, &directory, live.as_ref())?;
             let parent = require_message(db, &command.message)?;
             let sender = actor.sender(parent.run.as_deref());
             let from_me = parent.sender.has_user_authority() && sender.has_user_authority()
@@ -417,9 +431,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     pub fn inbox(&self, caller: Caller, all: bool, peek: bool) -> Result<Vec<Message>> {
+        let live = self.live(&caller);
         let read = |db: &dyn TalkReader| {
             let directory = db.directory()?;
-            let actor = self.actor(&caller, &directory)?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
             db.inbox(&actor.recipient(), actor.box_id, all)
         };
         if peek {
@@ -434,9 +449,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     pub fn show(&self, caller: Caller, message: MessageId, read: bool) -> Result<Vec<Message>> {
+        let live = self.live(&caller);
         let show = |db: &dyn TalkReader| {
             let directory = db.directory()?;
-            let actor = self.actor(&caller, &directory)?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
             let selected = require_message(db, &message)?;
             ensure!(
                 actor.may_view(&selected),
@@ -488,9 +504,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     ) -> Result<Option<Message>> {
         ensure!(!threads.is_empty(), "Specify a talk thread");
         loop {
+            let live = self.live(&caller);
             let (reply, cursor) = self.store.read(|db| {
                 let directory = db.directory()?;
-                let actor = self.actor(&caller, &directory)?;
+                let actor = self.actor(&caller, &directory, live.as_ref())?;
                 let recipient = actor.recipient();
                 let sent = |message: &Message| recipient.matches_sender(&message.sender);
                 let mut replies = Vec::new();
@@ -534,9 +551,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     pub fn log(&self, caller: Caller, mut filter: LogFilter) -> Result<Vec<Message>> {
+        let live = self.live(&caller);
         self.store.read(|db| {
             let directory = db.directory()?;
-            let actor = self.actor(&caller, &directory)?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
             if actor.agent.is_some() {
                 let runs: Vec<_> = actor.coordinated_runs().map(str::to_owned).collect();
                 ensure!(
@@ -569,9 +587,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     pub fn summary(&self, caller: Caller) -> Result<Vec<AgentTalkSummary>> {
+        let live = self.live(&caller);
         self.store.read(|db| {
             let directory = db.directory()?;
-            let actor = self.actor(&caller, &directory)?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
             ensure!(
                 actor.agent.is_none(),
                 "Talk summaries are available to the user"
@@ -593,9 +612,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
 
     pub fn events(&self, caller: &Caller, after: u64, deadline: Instant) -> Result<Vec<TalkEvent>> {
         loop {
+            let live = self.live(caller);
             let (events, cursor) = self.store.read(|db| {
                 let directory = db.directory()?;
-                let actor = self.actor(caller, &directory)?;
+                let actor = self.actor(caller, &directory, live.as_ref())?;
                 ensure!(actor.agent.is_none(), "Talk watch is available to the user");
                 Ok((db.events(after, actor.box_id)?, db.cursor()?))
             })?;
@@ -613,16 +633,18 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         let deliverable = self.store.read(|db| {
             let mut deliverable = Vec::new();
             for id in db.pending_agents(remind_before)? {
-                if self.plan(db, &id)?.is_some() {
-                    deliverable.push(id);
+                if let Some(plan) = self.plan(db, &id, None)? {
+                    deliverable.push((id, plan.session));
                 }
             }
             Ok(deliverable)
         })?;
         let mut first_error = None;
-        for id in deliverable {
+        for (id, session) in deliverable {
+            // Resolved outside the store lock, since the terminal may need the store.
+            let live = self.activity.agent(&session);
             let result = self.store.write(|db| {
-                let Some(plan) = self.plan(db, &id)? else {
+                let Some(plan) = self.plan(db, &id, Some((&session, live.as_ref())))? else {
                     return Ok(());
                 };
                 let included: Vec<_> = plan.notify.iter().chain(&plan.remind).collect();
@@ -642,7 +664,15 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn plan(&self, db: &dyn TalkReader, id: &str) -> Result<Option<Plan>> {
+    /// With `live`, the plan also requires that the agent's session, as resolved for this
+    /// delivery, still runs the agent. A notice for a coding agent that has left a shell's
+    /// foreground is never typed into the shell.
+    fn plan(
+        &self,
+        db: &dyn TalkReader,
+        id: &str,
+        live: Option<(&str, Option<&Agent>)>,
+    ) -> Result<Option<Plan>> {
         let agent = db.agent(id)?;
         if agent.status == AgentStatus::Exited {
             return Ok(None);
@@ -650,6 +680,11 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         let Some(session) = agent.session.clone() else {
             return Ok(None);
         };
+        if let Some((resolved, live)) = live
+            && (resolved != session || !live.is_some_and(|live| agent.speaks_for(live)))
+        {
+            return Ok(None);
+        }
         let Some(activity) = self.activity.activity(&session) else {
             return Ok(None);
         };
