@@ -130,6 +130,8 @@ pub enum Request {
     },
     /// Stream an `artifact_published` event for every publish.
     WatchArtifacts,
+    /// Stream a `box_icon_changed` event whenever a box's icon is set or reset.
+    WatchBoxIcons,
     End {
         session: String,
     },
@@ -185,6 +187,9 @@ pub enum Response {
     },
     ArtifactPublished {
         artifact: Artifact,
+    },
+    BoxIconChanged {
+        box_id: String,
     },
     Resolved {
         target: Target,
@@ -616,6 +621,13 @@ pub enum DagRequest {
         kinds: Vec<RunEventKind>,
     },
     Attention,
+    /// Sets the box's icon from an image at an absolute path, or restores the identicon
+    /// when `path` is absent.
+    SetBoxIcon {
+        box_sel: Option<String>,
+        caller: Option<String>,
+        path: Option<PathBuf>,
+    },
     /// Streams `DagResponse::Event` for every run event in the selected box, or all boxes.
     Watch {
         box_sel: Option<String>,
@@ -657,6 +669,9 @@ pub enum DagResponse {
     },
     Event {
         event: RunEvent,
+    },
+    BoxIcon {
+        box_id: String,
     },
 }
 

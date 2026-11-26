@@ -308,6 +308,26 @@ fn main() -> Result<()> {
         Some(Action::ExecAgent { id, args }) => exec_agent(&id, args),
         Some(Action::Codex { args }) => exec_agent("codex", args),
         Some(Action::Claude { args }) => exec_agent("claude", args),
+        Some(Action::Box {
+            command:
+                BoxAction::Icon {
+                    path,
+                    reset: _,
+                    box_sel,
+                },
+        }) => {
+            // The daemon runs elsewhere, so resolve the path against this terminal's directory.
+            let path = path
+                .map(|path| {
+                    path.canonicalize()
+                        .with_context(|| format!("Icon is unavailable at {}", path.display()))
+                })
+                .transpose()?;
+            client::ensure_daemon()?;
+            let box_id =
+                client::set_box_icon(box_sel, std::env::var("POWER_SESSION").ok(), path)?;
+            print_json(json!({"box_id": box_id}))
+        }
         Some(Action::Agent { command }) => match command {
             AgentAction::Codex { args } => exec_agent("codex", args),
             AgentAction::Claude { args } => exec_agent("claude", args),
@@ -371,6 +391,19 @@ fn exec_agent(id: &str, args: Vec<OsString>) -> Result<()> {
 #[derive(Subcommand)]
 enum BoxAction {
     List,
+    /// Replace a box's generated icon with an image (PNG, JPEG, WebP, GIF, ...).
+    #[command(arg_required_else_help = true)]
+    Icon {
+        /// Image to use. Large images are scaled down to 64 px; the original is not kept.
+        #[arg(required_unless_present = "reset")]
+        path: Option<PathBuf>,
+        /// Restore the generated icon.
+        #[arg(long, conflicts_with = "path")]
+        reset: bool,
+        /// Box ID, ID prefix, shortcut digit or repo name. Defaults to this terminal's box.
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

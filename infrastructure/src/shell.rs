@@ -164,7 +164,8 @@ pub(crate) fn instruction_args(
     instructions.push_str(concat!(
         "\nWhen you understand the user's objective, run ",
         "`power session task 'Short task label'` from this terminal. ",
-        "Use a short, concrete label and update it when the objective changes.",
+        "Use a short, concrete label and update it when the objective changes.\n\n",
+        "To give this box a custom icon, run `power box icon <image-path>`.",
     ));
     Ok(match &profile.injection {
         Injection::Flag { flag } => vec![flag.into(), instructions.into()],
@@ -242,6 +243,8 @@ mod tests {
         "Use a short, concrete label and update it when the objective changes.",
     );
 
+    const ICON_LINE: &str = "To give this box a custom icon, run `power box icon <image-path>`.";
+
     fn launch_text(installed: &Installed) -> String {
         let profiles = AgentProfiles::default();
         let args = instruction_args(
@@ -265,7 +268,7 @@ mod tests {
         ));
         assert_eq!(
             text,
-            format!("You are running inside Power Overwhelming.\n\n{TASK_LINE}")
+            format!("You are running inside Power Overwhelming.\n\n{TASK_LINE}\n\n{ICON_LINE}")
         );
     }
 
@@ -330,6 +333,8 @@ mod tests {
         }
         assert_eq!(lines.next(), Some(""));
         assert_eq!(lines.next(), Some(TASK_LINE));
+        assert_eq!(lines.next(), Some(""));
+        assert_eq!(lines.next(), Some(ICON_LINE));
         assert_eq!(lines.next(), None);
 
         let codex = instruction_args(

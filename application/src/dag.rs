@@ -84,6 +84,14 @@ pub trait BoxRegistry: Send + Sync {
     fn boxes(&self) -> Result<Vec<RegisteredBox>>;
 }
 
+/// Custom images that replace a box's generated identicon.
+pub trait BoxIcons: Send + Sync {
+    /// Stores the image at `source`, an absolute path, as the box's icon.
+    fn set(&self, box_id: &str, source: &Path) -> Result<()>;
+    /// Restores the generated identicon. Succeeds when the box has no icon.
+    fn clear(&self, box_id: &str) -> Result<()>;
+}
+
 pub struct RegisteredBox {
     pub info: BoxInfo,
     pub sessions: Vec<String>,
@@ -124,10 +132,11 @@ pub struct ReportResult {
     pub reason: Option<String>,
 }
 
-pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry> {
+pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> {
     application: Arc<Application<T>>,
     store: S,
     registry: B,
+    icons: I,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
@@ -146,12 +155,13 @@ struct WorkerAttempt {
     number: u32,
 }
 
-impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
-    pub fn new(application: Arc<Application<T>>, store: S, registry: B) -> Self {
+impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplication<T, S, B, I> {
+    pub fn new(application: Arc<Application<T>>, store: S, registry: B, icons: I) -> Self {
         Self {
             application,
             store,
             registry,
+            icons,
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
@@ -171,6 +181,23 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             .info
             .id
             .clone())
+    }
+
+    /// Sets the selected box's icon from an image on disk, or restores the identicon when
+    /// `source` is absent. Returns the box ID.
+    pub fn set_box_icon(&self, selection: BoxSelection, source: Option<PathBuf>) -> Result<String> {
+        let box_id = self
+            .store
+            .read(|db| self.resolve_box(db, &selection))?
+            .context("Select a box with --box or run from a Power terminal")?;
+        match source {
+            Some(source) => {
+                ensure!(source.is_absolute(), "The icon path must be absolute");
+                self.icons.set(&box_id, &source)?;
+            }
+            None => self.icons.clear(&box_id)?,
+        }
+        Ok(box_id)
     }
 
     pub fn list_agents(&self, selection: BoxSelection) -> Result<Vec<ManagedAgent>> {

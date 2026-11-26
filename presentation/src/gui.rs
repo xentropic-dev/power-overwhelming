@@ -7,7 +7,7 @@ use self::{agent_tree::AgentTree, dag_view::DagView};
 use crate::{
     keymap::{Command, Keymap, Scope},
     picker::{Choice, Kind, Picker, Row},
-    preview::{Preview, PreviewAction},
+    preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, Previews, Settings},
     status_bar::{ConfigChanged, StatusBar},
     terminal_view::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
@@ -22,6 +22,7 @@ use domain::{
 use gpui::{prelude::*, *};
 use infrastructure::{
     agents::AgentProfiles,
+    box_icons::icon_path,
     boxes::{Layout, Registry, SavedBox, SavedView},
     client::{self, Run},
     plugins::ActiveView,
@@ -32,6 +33,7 @@ use infrastructure::{
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -91,6 +93,8 @@ struct PreviewTab {
 struct Workspace {
     registry: Option<Registry>,
     layout: Layout,
+    /// Custom icons set with `power box icon`, by box ID. Other boxes show an identicon.
+    box_icons: HashMap<String, Arc<RenderImage>>,
     sessions: HashMap<String, Session>,
     terminals: HashMap<String, TerminalTab>,
     tab_scroll: ScrollHandle,
@@ -169,14 +173,20 @@ impl Workspace {
         });
         let load = cx.background_executor().spawn(async {
             let (registry, layout) = Registry::open()?;
+            let icons = layout
+                .boxes
+                .iter()
+                .filter_map(|entry| Some((entry.id.clone(), load_box_icon(&entry.id)?)))
+                .collect::<HashMap<_, _>>();
             client::ensure_daemon()?;
-            Ok::<_, anyhow::Error>((registry, layout, client::list_sessions()?))
+            Ok::<_, anyhow::Error>((registry, layout, icons, client::list_sessions()?))
         });
         cx.spawn_in(window, async move |app, cx| {
             let result = load.await;
             let _ = app.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok((registry, layout, sessions)) => {
+                    Ok((registry, layout, icons, sessions)) => {
+                        this.box_icons = icons;
                         this.load(registry, layout, sessions, window, cx);
                     }
                     Err(error) => this.error = Some(format!("{error:#}")),
@@ -186,6 +196,7 @@ impl Workspace {
         })
         .detach();
         Self::watch_artifacts(window, cx);
+        Self::watch_box_icons(window, cx);
         let dag_refresh = Self::watch_dag(window, cx);
         let status_bar =
             cx.new(|cx| StatusBar::new(window, cx, Settings::defaults(), Settings::from_sections));
@@ -213,6 +224,7 @@ impl Workspace {
         Self {
             registry: None,
             layout: Layout::default(),
+            box_icons: HashMap::new(),
             sessions: HashMap::new(),
             terminals: HashMap::new(),
             tab_scroll: ScrollHandle::new(),
@@ -583,6 +595,36 @@ impl Workspace {
                 if app
                     .update_in(cx, |this, window, cx| {
                         this.artifact_published(artifact, window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Reloads a box's icon whenever an agent sets or resets it.
+    fn watch_box_icons(window: &mut Window, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded(16);
+        std::thread::spawn(move || {
+            client::watch_box_icons(|box_id| tx.send_blocking(box_id).is_ok());
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            while let Ok(box_id) = rx.recv().await {
+                let icon = cx.background_executor().spawn({
+                    let box_id = box_id.clone();
+                    async move { load_box_icon(&box_id) }
+                });
+                let icon = icon.await;
+                if app
+                    .update(cx, |this, cx| {
+                        match icon {
+                            Some(icon) => this.box_icons.insert(box_id, icon),
+                            None => this.box_icons.remove(&box_id),
+                        };
+                        cx.notify();
                     })
                     .is_err()
                 {
@@ -2338,6 +2380,12 @@ fn shortcut_digit(key: &str) -> Option<u8> {
     digit.is_ascii_digit().then(|| digit - b'0')
 }
 
+/// The icon stored for a box, or `None` when it has none or the file is unreadable.
+fn load_box_icon(box_id: &str) -> Option<Arc<RenderImage>> {
+    let path = icon_path(box_id).ok()?;
+    path.exists().then(|| decode_image(&path).ok()).flatten()
+}
+
 fn avatar(id: &str, colors: &Colors) -> impl IntoElement {
     let hash = id.bytes().fold(2_166_136_261_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
@@ -2422,7 +2470,13 @@ impl Render for Workspace {
                         .text_color(rgb(colors.contrast(background)))
                 })
                 .child(digit.to_string())
-                .child(avatar(&entry.id, colors))
+                .child(match self.box_icons.get(&entry.id) {
+                    Some(icon) => img(icon.clone())
+                        .flex_none()
+                        .size(px(17.))
+                        .into_any_element(),
+                    None => avatar(&entry.id, colors).into_any_element(),
+                })
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.activate_box(id.clone(), window, cx);
                 }))

@@ -395,7 +395,26 @@ impl BoxRegistry for FakeRegistry {
     }
 }
 
-type TestDag = DagApplication<FakeTerminal, MemoryStore, FakeRegistry>;
+/// Records icon changes as `(box_id, Some(path))` for a set and `(box_id, None)` for a reset.
+#[derive(Default)]
+struct FakeIcons(Mutex<Vec<(String, Option<PathBuf>)>>);
+
+impl BoxIcons for FakeIcons {
+    fn set(&self, box_id: &str, source: &Path) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((box_id.into(), Some(source.into())));
+        Ok(())
+    }
+
+    fn clear(&self, box_id: &str) -> Result<()> {
+        self.0.lock().unwrap().push((box_id.into(), None));
+        Ok(())
+    }
+}
+
+type TestDag = DagApplication<FakeTerminal, MemoryStore, FakeRegistry, FakeIcons>;
 
 struct FakeProfiles(Vec<AgentProfile>);
 
@@ -432,6 +451,7 @@ fn setup() -> Result<(TestDag, String)> {
         application(),
         MemoryStore::default(),
         FakeRegistry::default(),
+        FakeIcons::default(),
     );
     let run = dag.create_run(
         BoxSelection {
@@ -601,6 +621,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         application,
         MemoryStore::default(),
         FakeRegistry(vec![caller.id.clone()]),
+        FakeIcons::default(),
     );
     let selection = || BoxSelection {
         selector: None,
@@ -699,5 +720,45 @@ fn starting_an_agent_ignores_a_caller_session_this_daemon_does_not_host() -> Res
     })?;
     assert_eq!(agent.parent, None);
     assert!(agent.session.is_some());
+    Ok(())
+}
+
+#[test]
+fn box_icons_follow_the_caller_or_selector() -> Result<()> {
+    let dag = TestDag::new(
+        application(),
+        MemoryStore::default(),
+        FakeRegistry(vec!["view-session".into()]),
+        FakeIcons::default(),
+    );
+    let caller = || BoxSelection {
+        selector: None,
+        caller: Some("view-session".into()),
+    };
+    assert_eq!(
+        dag.set_box_icon(caller(), Some("/icons/robot.png".into()))?,
+        "box-id"
+    );
+    let selected = BoxSelection {
+        selector: Some("2".into()),
+        caller: Some("unknown-session".into()),
+    };
+    assert_eq!(dag.set_box_icon(selected, None)?, "box-id");
+    assert!(
+        dag.set_box_icon(caller(), Some("relative.png".into()))
+            .is_err()
+    );
+    let nobody = BoxSelection {
+        selector: None,
+        caller: None,
+    };
+    assert!(dag.set_box_icon(nobody, None).is_err());
+    assert_eq!(
+        *dag.icons.0.lock().unwrap(),
+        [
+            ("box-id".into(), Some("/icons/robot.png".into())),
+            ("box-id".into(), None),
+        ]
+    );
     Ok(())
 }

@@ -1,5 +1,6 @@
 use crate::{
     agents::AgentProfiles,
+    box_icons::IconFiles,
     boxes::BoxesFile,
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
@@ -7,7 +8,7 @@ use crate::{
     plugins::Plugins,
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
-    wire::{self, DagRequest, Request, Response},
+    wire::{self, DagRequest, DagResponse, Request, Response},
     workspace::LocalWorkspace,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -30,9 +31,35 @@ use std::{
     time::Duration,
 };
 
+type Watchers = std::sync::Mutex<Vec<mpsc::SyncSender<Response>>>;
+
 /// Clients streaming publish events. Senders whose client has gone are dropped on the next publish.
-static ARTIFACT_WATCHERS: std::sync::Mutex<Vec<mpsc::SyncSender<Response>>> =
-    std::sync::Mutex::new(Vec::new());
+static ARTIFACT_WATCHERS: Watchers = std::sync::Mutex::new(Vec::new());
+/// Clients streaming box icon changes, pruned the same way.
+static BOX_ICON_WATCHERS: Watchers = std::sync::Mutex::new(Vec::new());
+
+/// Streams every event sent to the watcher list until the client disconnects.
+fn stream(mut socket: UnixStream, watchers: &Watchers) -> Result<()> {
+    let (tx, rx) = mpsc::sync_channel(64);
+    watchers.lock().unwrap().push(tx);
+    // Keepalives let a closed reader surface as a write error while events are quiet.
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(event) => wire::send(&mut socket, &event)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => wire::send(&mut socket, &Response::Ok)?,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+fn broadcast(watchers: &Watchers, event: impl Fn() -> Response) {
+    watchers.lock().unwrap().retain(|watcher| {
+        !matches!(
+            watcher.try_send(event()),
+            Err(mpsc::TrySendError::Disconnected(_))
+        )
+    });
+}
 
 struct Server {
     application: Arc<Application<PtyRuntime>>,
@@ -94,7 +121,12 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
-    let dag = Arc::new(DaemonDag::new(application.clone(), store, BoxesFile));
+    let dag = Arc::new(DaemonDag::new(
+        application.clone(),
+        store,
+        BoxesFile,
+        IconFiles::open()?,
+    ));
     dag.reconcile().context("Reconcile DAG sessions")?;
     exit_handler
         .set(Arc::downgrade(&dag))
@@ -122,17 +154,10 @@ fn handle(mut socket: UnixStream, server: &Server) -> Result<()> {
     socket.set_write_timeout(Some(Duration::from_secs(3)))?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
     let request = wire::receive(&mut BufReader::new(&socket))?.context("Missing request")?;
-    if let Request::WatchArtifacts = request {
-        let (tx, rx) = mpsc::sync_channel(64);
-        ARTIFACT_WATCHERS.lock().unwrap().push(tx);
-        // Keepalives let a closed reader surface as a write error while publishing is quiet.
-        loop {
-            match rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(event) => wire::send(&mut socket, &event)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => wire::send(&mut socket, &Response::Ok)?,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-        }
+    match request {
+        Request::WatchArtifacts => return stream(socket, &ARTIFACT_WATCHERS),
+        Request::WatchBoxIcons => return stream(socket, &BOX_ICON_WATCHERS),
+        _ => {}
     }
     if let Request::Subscribe { session } = &request {
         let (tx, rx) = mpsc::sync_channel(64);
@@ -283,14 +308,8 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 uri: published.uri.clone(),
                 title: published.title.clone(),
             };
-            ARTIFACT_WATCHERS.lock().unwrap().retain(|watcher| {
-                let event = Response::ArtifactPublished {
-                    artifact: artifact.clone(),
-                };
-                !matches!(
-                    watcher.try_send(event),
-                    Err(mpsc::TrySendError::Disconnected(_))
-                )
+            broadcast(&ARTIFACT_WATCHERS, || Response::ArtifactPublished {
+                artifact: artifact.clone(),
             });
             let uri = if let Some(plugins) = &server.plugins {
                 let uri = published.uri.clone();
@@ -319,10 +338,18 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 .map(Into::into)
                 .collect(),
         }),
-        Request::Dag { dag } => Ok(Response::Dag {
-            dag: dag_adapter::request(&server.dag, dag)?,
-        }),
-        Request::WatchArtifacts => unreachable!("Artifact watches use the streaming handler"),
+        Request::Dag { dag } => {
+            let dag = dag_adapter::request(&server.dag, dag)?;
+            if let DagResponse::BoxIcon { box_id } = &dag {
+                broadcast(&BOX_ICON_WATCHERS, || Response::BoxIconChanged {
+                    box_id: box_id.clone(),
+                });
+            }
+            Ok(Response::Dag { dag })
+        }
+        Request::WatchArtifacts | Request::WatchBoxIcons => {
+            unreachable!("Watches use the streaming handler")
+        }
         Request::Subscribe { .. } => unreachable!("Subscriptions use the streaming handler"),
     }
 }

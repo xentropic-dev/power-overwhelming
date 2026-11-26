@@ -1,4 +1,5 @@
 use crate::{
+    box_icons::IconFiles,
     boxes::BoxesFile,
     dag_store::SqliteDagStore,
     terminal::PtyRuntime,
@@ -9,13 +10,26 @@ use application::dag::{BoxSelection, DagApplication, Dispatch, EventScope, Start
 use domain::worktree::WorktreeRequest;
 use std::{os::unix::net::UnixStream, time::Duration};
 
-pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile>;
+pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile, IconFiles>;
 
 pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<DagResponse> {
     use DagResponse as Reply;
     let response = match request {
         DagRequest::ListBoxes => Reply::Boxes {
             boxes: convert(application.boxes()?),
+        },
+        DagRequest::SetBoxIcon {
+            box_sel,
+            caller,
+            path,
+        } => Reply::BoxIcon {
+            box_id: application.set_box_icon(
+                BoxSelection {
+                    selector: box_sel,
+                    caller,
+                },
+                path,
+            )?,
         },
         DagRequest::ListAgents { box_sel, caller } => Reply::Agents {
             agents: convert(application.list_agents(BoxSelection {
