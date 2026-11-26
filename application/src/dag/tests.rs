@@ -568,6 +568,7 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
             injection: Injection::None,
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
+            model_callback: domain::agent::ModelCallback::None,
             skills_dir: None,
             resume: None,
         })

@@ -2,7 +2,7 @@
 
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
-use domain::agent::{AgentProfile, Injection, Resume};
+use domain::agent::{AgentProfile, Injection, ModelCallback, Resume};
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -100,6 +100,7 @@ struct ProfileConfig {
     injection: Option<InjectionConfig>,
     skip_subcommands: Option<Vec<String>>,
     skip_if_args_contain: Option<Vec<String>>,
+    model_callback: Option<ModelCallbackConfig>,
     skills_dir: Option<PathBuf>,
     resume: Option<ResumeConfig>,
 }
@@ -121,6 +122,14 @@ enum InjectionConfig {
     None,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ModelCallbackConfig {
+    ClaudeStatusLine,
+    Args { args: Vec<String> },
+    None,
+}
+
 fn read_agent_profile(
     id: &str,
     mut value: JsonValue,
@@ -135,6 +144,9 @@ fn read_agent_profile(
         "Use a lowercase shell function name starting with a letter or digit, excluding shell, command and power"
     );
     normalize_empty_lists(&mut value, &["skip_subcommands", "skip_if_args_contain"]);
+    if let Some(callback) = value.get_mut("model_callback") {
+        normalize_empty_lists(callback, &["args"]);
+    }
     if let Some(resume) = value.get_mut("resume") {
         normalize_empty_lists(resume, &["assign", "resume", "resume_last", "conflicts"]);
     }
@@ -150,6 +162,7 @@ fn read_agent_profile(
             injection: Injection::None,
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
+            model_callback: ModelCallback::None,
             skills_dir: None,
             resume: None,
         });
@@ -165,6 +178,13 @@ fn read_agent_profile(
             InjectionConfig::Flag { flag } => Injection::Flag { flag },
             InjectionConfig::ConfigValue { flag, key } => Injection::ConfigValue { flag, key },
             InjectionConfig::None => Injection::None,
+        };
+    }
+    if let Some(callback) = config.model_callback {
+        profile.model_callback = match callback {
+            ModelCallbackConfig::ClaudeStatusLine => ModelCallback::ClaudeStatusLine,
+            ModelCallbackConfig::Args { args } => ModelCallback::Args { args },
+            ModelCallbackConfig::None => ModelCallback::None,
         };
     }
     if let Some(skip) = config.skip_subcommands {
@@ -302,7 +322,10 @@ mod tests {
                 skip_subcommands = { "login" },
                 skip_if_args_contain = { "instructions=" },
                 skills_dir = "~/.custom/skills",
+                model_callback = { kind = "args", args = { "--hook", "{command}" } },
             }
+            agents.grok = { model_callback = { kind = "claude_status_line" } }
+            agents.bare = { model_callback = { kind = "args", args = {} } }
             "#,
         )?;
         let profiles = agent_profiles(&load_from(&path, [(AGENTS_SECTION.into(), json!({}))])?)?;
@@ -317,6 +340,15 @@ mod tests {
         );
         assert!(claude.skip_subcommands.is_empty());
         assert_eq!(claude.skip_if_args_contain, ["--append-system-prompt"]);
+        assert_eq!(claude.model_callback, ModelCallback::ClaudeStatusLine);
+        assert_eq!(
+            profiles.resolve(&"grok".into())?.model_callback,
+            ModelCallback::ClaudeStatusLine
+        );
+        assert_eq!(
+            profiles.resolve(&"bare".into())?.model_callback,
+            ModelCallback::Args { args: Vec::new() }
+        );
         assert_eq!(
             profiles.resolve(&"codex".into())?.injection,
             Injection::None
@@ -340,11 +372,17 @@ mod tests {
         assert_eq!(custom.skip_subcommands, ["login"]);
         assert_eq!(custom.skip_if_args_contain, ["instructions="]);
         assert_eq!(custom.skills_dir, Some("~/.custom/skills".into()));
+        assert_eq!(
+            custom.model_callback,
+            ModelCallback::Args {
+                args: vec!["--hook".into(), "{command}".into()]
+            }
+        );
         assert_eq!(custom.resume, None);
         let error = profiles.resolve(&"unknown".into()).unwrap_err().to_string();
         assert_eq!(
             error,
-            "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, custom"
+            "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, bare, custom"
         );
         Ok(())
     }

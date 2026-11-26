@@ -487,6 +487,7 @@ fn legacy_agent_aliases_use_the_configured_profiles() {
         agents.claude = {
             command = "/bin/echo",
             injection = { kind = "none" },
+            model_callback = { kind = "none" },
             resume = { assign = {} },
         }
         agents.codex = { command = "/bin/echo", injection = { kind = "none" } }

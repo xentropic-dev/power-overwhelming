@@ -8,7 +8,7 @@ use application::{
     agents::AgentProfileRegistry,
     skills::{InstalledSkills, LaunchSkills},
 };
-use domain::agent::{AgentProfile, Injection};
+use domain::agent::{AgentProfile, Injection, ModelCallback};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
@@ -238,18 +238,11 @@ pub(crate) fn assign_conversation(
     resume.launch(user, || uuid::Uuid::new_v4().to_string())
 }
 
-/// Arguments Power adds in front of the user's arguments when it starts an agent.
-/// Skills the agent already discovers natively are left out of the list.
-pub(crate) fn instruction_args(
-    profile: &AgentProfile,
-    user: &[OsString],
-    installed: &dyn InstalledSkills,
-) -> Result<Vec<OsString>> {
-    if profile.injection == Injection::None
-        || user
-            .first()
-            .and_then(|arg| arg.to_str())
-            .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
+/// Whether a launch runs a management subcommand or already passes what Power would add.
+fn skips_injection(profile: &AgentProfile, user: &[OsString]) -> bool {
+    user.first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
         || user.iter().any(|arg| {
             let arg = arg.to_string_lossy();
             profile
@@ -257,7 +250,93 @@ pub(crate) fn instruction_args(
                 .iter()
                 .any(|skip| arg.contains(skip))
         })
-    {
+}
+
+/// The command an agent's hook or status line runs to report its model to Power.
+pub(crate) const MODEL_CALLBACK: &str = "power session model --json";
+
+/// Arguments that register [`MODEL_CALLBACK`] with the agent for this launch only.
+/// `status_line_configured` reports whether the user's Claude Code settings already
+/// define a status line, which Power never replaces.
+pub(crate) fn model_callback_args(
+    profile: &AgentProfile,
+    user: &[OsString],
+    status_line_configured: impl FnOnce() -> bool,
+) -> Vec<OsString> {
+    if skips_injection(profile, user) {
+        return Vec::new();
+    }
+    match &profile.model_callback {
+        ModelCallback::None => Vec::new(),
+        ModelCallback::Args { args } => args
+            .iter()
+            .map(|arg| arg.replace("{command}", MODEL_CALLBACK).into())
+            .collect(),
+        ModelCallback::ClaudeStatusLine => {
+            let passes_settings = user.iter().any(|arg| {
+                let arg = arg.to_string_lossy();
+                arg == "--settings" || arg.starts_with("--settings=")
+            });
+            if passes_settings || status_line_configured() {
+                return Vec::new();
+            }
+            let settings = serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": MODEL_CALLBACK,
+                    "refreshInterval": 5,
+                }
+            });
+            vec!["--settings".into(), settings.to_string().into()]
+        }
+    }
+}
+
+/// Whether Claude Code's managed, user, project or local settings for `cwd` define a
+/// `statusLine`. Project and local settings are read from `cwd` up to its repository root.
+fn claude_status_line_configured(cwd: &Path) -> bool {
+    let user = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .map(|directory| directory.join("settings.json"));
+    let mut files: Vec<PathBuf> = [
+        Some(PathBuf::from("/etc/claude-code/managed-settings.json")),
+        user,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for directory in cwd.ancestors() {
+        files.push(directory.join(".claude/settings.json"));
+        files.push(directory.join(".claude/settings.local.json"));
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    files.iter().any(|path| settings_define_status_line(path))
+}
+
+fn settings_define_status_line(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(settings) => settings
+            .get("statusLine")
+            .is_some_and(|line| !line.is_null()),
+        // Leave a file Power cannot parse to Claude Code rather than risk replacing it.
+        Err(_) => text.contains("\"statusLine\""),
+    }
+}
+
+/// Arguments Power adds in front of the user's arguments when it starts an agent.
+/// Skills the agent already discovers natively are left out of the list.
+pub(crate) fn instruction_args(
+    profile: &AgentProfile,
+    user: &[OsString],
+    installed: &dyn InstalledSkills,
+) -> Result<Vec<OsString>> {
+    if profile.injection == Injection::None || skips_injection(profile, user) {
         return Ok(Vec::new());
     }
 
@@ -289,16 +368,21 @@ pub(crate) fn instruction_args(
     })
 }
 
-/// Replaces this process with the real agent binary, adding Power's instructions.
+/// Replaces this process with the real agent binary, adding Power's instructions and
+/// model callback.
 pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     let program = find_program(&profile.command)
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
+    let cwd = std::env::current_dir()?;
     command.args(instruction_args(
         profile,
         &args,
-        &LocalInstalledSkills(&std::env::current_dir()?),
+        &LocalInstalledSkills(&cwd),
     )?);
+    command.args(model_callback_args(profile, &args, || {
+        claude_status_line_configured(&cwd)
+    }));
     {
         let (assign, conversation) = assign_conversation(profile, &args);
         command.args(assign);
@@ -441,6 +525,93 @@ mod tests {
         let mut profile = grok.clone();
         profile.injection = Injection::None;
         assert!(instruction_args(&profile, &["prompt".into()], &NONE)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn claude_gets_a_status_line_callback_only_without_an_existing_status_line() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into())?;
+        let args = model_callback_args(claude, &["fix the bug".into()], || false);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--settings");
+        let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap())?;
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": "power session model --json",
+                    "refreshInterval": 5,
+                }
+            })
+        );
+
+        assert!(model_callback_args(claude, &["fix the bug".into()], || true).is_empty());
+        let unchecked = || panic!("settings need no check");
+        for user in [
+            vec!["mcp".into(), "list".into()],
+            vec!["--append-system-prompt".into(), "x".into()],
+            vec!["--settings".into(), "{}".into()],
+            vec!["--settings=custom.json".into()],
+        ] {
+            assert!(
+                model_callback_args(claude, &user, unchecked).is_empty(),
+                "{user:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_callback_args_substitute_the_command_and_respect_skips() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        for id in ["codex", "grok"] {
+            let profile = profiles.resolve(&id.into())?;
+            assert!(
+                model_callback_args(profile, &[], || false).is_empty(),
+                "{id}"
+            );
+        }
+        let mut codex = profiles.resolve(&"codex".into())?.clone();
+        codex.model_callback = ModelCallback::Args {
+            args: vec!["-c".into(), "hook=\"{command}\"".into()],
+        };
+        assert_eq!(
+            model_callback_args(&codex, &[], || panic!("not Claude")),
+            ["-c", "hook=\"power session model --json\""].map(OsString::from)
+        );
+        assert!(
+            model_callback_args(
+                &codex,
+                &["-c".into(), "developer_instructions=x".into()],
+                || { panic!("not Claude") }
+            )
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detects_status_lines_in_project_and_local_settings() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let nested = repo.path().join("crates/app");
+        fs::create_dir_all(&nested)?;
+        fs::create_dir(repo.path().join(".git"))?;
+        let claude = repo.path().join(".claude");
+        fs::create_dir(&claude)?;
+        let local = claude.join("settings.local.json");
+        fs::write(&local, r#"{ "statusLine": null, "model": "opus" }"#)?;
+        assert!(!settings_define_status_line(&local));
+        fs::write(
+            &local,
+            r#"{ "statusLine": { "type": "command", "command": "x" } }"#,
+        )?;
+        assert!(settings_define_status_line(&local));
+        assert!(claude_status_line_configured(&nested));
+        fs::write(&local, r#"{ "statusLine": "#)?;
+        assert!(settings_define_status_line(&local));
+        assert!(!settings_define_status_line(&claude.join("settings.json")));
         Ok(())
     }
 
