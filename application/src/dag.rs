@@ -825,7 +825,11 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             }
             WorktreeRequest::New { branch, base } => {
                 ensure!(
-                    !branch.trim().is_empty() && !matches!(branch.as_str(), "." | ".."),
+                    !branch.trim().is_empty(),
+                    "Specify --branch when using --worktree new"
+                );
+                ensure!(
+                    !matches!(branch.as_str(), "." | ".."),
                     "Invalid branch name {branch:?}"
                 );
                 let root = self
