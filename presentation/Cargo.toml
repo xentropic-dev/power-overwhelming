@@ -39,3 +39,7 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 base64 = "0.22"
+
+# GPUI's Linux shaper, to shape terminal runs in tests without a window.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+cosmic-text = "=0.14.2"

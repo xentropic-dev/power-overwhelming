@@ -4,6 +4,7 @@ mod input;
 mod links;
 mod metrics;
 mod paint;
+mod runs;
 mod selection;
 
 use self::metrics::preload_font_files;
@@ -46,6 +47,7 @@ pub fn terminal_font(settings: &TerminalSettings, cx: &App) -> TerminalFont {
     };
     let mut font = font(family);
     font.weight = FontWeight(f32::from(settings.font_weight));
+    font.features = runs::ligature_features(false);
     TerminalFont {
         font,
         size: settings.font_size,

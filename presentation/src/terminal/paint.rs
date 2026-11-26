@@ -1,4 +1,9 @@
-use super::{TerminalView, cell_metrics, frame::CellPosition, input::register_mouse_exit};
+use super::{
+    TerminalView, cell_metrics,
+    frame::CellPosition,
+    input::register_mouse_exit,
+    runs::{RowOp, RunCell, Shaping, row_ops},
+};
 use gpui::{prelude::*, *};
 use infrastructure::theme::blend;
 use std::sync::Arc;
@@ -20,6 +25,23 @@ impl Render for TerminalView {
         let hovered_link = self.hovered_link().cloned();
         let pressed_link = self.pressed_link().cloned();
         let selection = self.selection_range().filter(|_| pressed_link.is_none());
+        let ligatures = self.settings.ligatures;
+        let hovering = hovered_link.is_some();
+        let link_color = move |link: &Arc<str>| {
+            if pressed_link
+                .as_ref()
+                .is_some_and(|pressed| Arc::ptr_eq(link, pressed))
+            {
+                blend(colors.link, background, 15)
+            } else if hovered_link
+                .as_ref()
+                .is_some_and(|hovered| Arc::ptr_eq(link, hovered))
+            {
+                blend(colors.link, colors.foreground, 35)
+            } else {
+                colors.link
+            }
+        };
         div()
             .id("terminal")
             .relative()
@@ -27,7 +49,7 @@ impl Render for TerminalView {
             .min_h_0()
             .overflow_hidden()
             .bg(rgb(background))
-            .when(hovered_link.is_some(), |terminal| terminal.cursor_pointer())
+            .when(hovering, |terminal| terminal.cursor_pointer())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
             .on_hover(cx.listener(Self::hover))
@@ -41,86 +63,110 @@ impl Render for TerminalView {
                     move |bounds, _, cx| {
                         terminal.update(cx, |terminal, _| terminal.set_bounds(bounds, metrics));
                     },
-                    move |bounds, (), window, cx| {
+                    move |bounds, (), window, _| {
                         register_mouse_exit(pointer_owner.clone(), window);
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             let grid = metrics.snap(bounds.origin);
-                            for (row, line) in frame.rows.iter().enumerate() {
-                                for (column, cell) in line.cells.iter().enumerate() {
-                                    let position = CellPosition { row, column };
-                                    let origin = metrics.cell_origin(grid, row, column);
-                                    let selected = selection.is_some_and(|(start, end)| {
-                                        start <= position && position <= end
+                            let text_system = window.text_system().clone();
+                            let rows: Vec<_> = frame
+                                .rows
+                                .iter()
+                                .enumerate()
+                                .map(|(row, line)| {
+                                    let (styled, selected): (Vec<_>, Vec<_>) = line
+                                        .cells
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(column, cell)| {
+                                            let position = CellPosition { row, column };
+                                            let selected = selection.is_some_and(|(start, end)| {
+                                                start <= position && position <= end
+                                            });
+                                            let mut fg = cell.fg;
+                                            if let Some(link) = &cell.link {
+                                                fg = rgb(link_color(link)).into();
+                                            }
+                                            if selected
+                                                && let Some(color) = scheme.selection_foreground
+                                            {
+                                                fg = rgba(color).into();
+                                            }
+                                            (RunCell { cell, fg }, selected)
+                                        })
+                                        .unzip();
+                                    let shaping = Shaping {
+                                        font: &terminal_font,
+                                        font_size,
+                                        cell_width: cell_size.width,
+                                        ligatures,
+                                        cursor: frame
+                                            .cursor
+                                            .filter(|cursor| cursor.row == row)
+                                            .map(|cursor| cursor.column),
+                                    };
+                                    let ops = row_ops(&styled, &shaping, |text, size, runs| {
+                                        text_system.layout_line(text, size, runs, None)
                                     });
-                                    let cursor = frame.cursor == Some(position);
-                                    if let Some(color) = cell.bg {
-                                        window.paint_quad(fill(
-                                            Bounds::new(origin, cell_size),
-                                            color,
-                                        ));
+                                    (ops, selected)
+                                })
+                                .collect();
+                            let span = |row: usize, from: usize, to: usize| {
+                                Bounds::new(
+                                    metrics.cell_origin(grid, row, from),
+                                    size(cell_size.width * (to - from) as f32, cell_size.height),
+                                )
+                            };
+                            for (row, (ops, _)) in rows.iter().enumerate() {
+                                for op in ops {
+                                    if let RowOp::Background { from, to, color } = op {
+                                        window.paint_quad(fill(span(row, *from, *to), *color));
                                     }
-                                    if selected {
+                                }
+                            }
+                            for (row, (_, selected)) in rows.iter().enumerate() {
+                                let mut column = 0;
+                                while column < selected.len() {
+                                    let from = column;
+                                    while column < selected.len() && selected[column] {
+                                        column += 1;
+                                    }
+                                    if column > from {
                                         window.paint_quad(fill(
-                                            Bounds::new(origin, cell_size),
+                                            span(row, from, column),
                                             selection_background,
                                         ));
                                     }
-                                    if cursor {
-                                        let thickness = metrics.underline_thickness.max(px(2.));
-                                        let bar = Bounds::new(
-                                            origin + point(px(0.), cell_size.height - thickness),
-                                            size(cell_size.width, thickness),
-                                        );
-                                        window.paint_quad(fill(bar, rgb(cursor_color)));
-                                    }
-                                    let mut fg = cell.fg;
+                                    column += 1;
+                                }
+                            }
+                            if let Some(cursor) = frame.cursor {
+                                let origin = metrics.cell_origin(grid, cursor.row, cursor.column);
+                                let thickness = metrics.underline_thickness.max(px(2.));
+                                let bar = Bounds::new(
+                                    origin + point(px(0.), cell_size.height - thickness),
+                                    size(cell_size.width, thickness),
+                                );
+                                window.paint_quad(fill(bar, rgb(cursor_color)));
+                            }
+                            for (row, line) in frame.rows.iter().enumerate() {
+                                for (column, cell) in line.cells.iter().enumerate() {
                                     if let Some(link) = &cell.link {
-                                        let color = if pressed_link
-                                            .as_ref()
-                                            .is_some_and(|pressed| Arc::ptr_eq(link, pressed))
-                                        {
-                                            blend(colors.link, background, 15)
-                                        } else if hovered_link
-                                            .as_ref()
-                                            .is_some_and(|hovered| Arc::ptr_eq(link, hovered))
-                                        {
-                                            blend(colors.link, colors.foreground, 35)
-                                        } else {
-                                            colors.link
-                                        };
-                                        fg = rgb(color).into();
+                                        let origin = metrics.cell_origin(grid, row, column);
                                         let underline = Bounds::new(
                                             origin + point(px(0.), metrics.underline),
                                             size(cell_size.width, metrics.underline_thickness),
                                         );
-                                        window.paint_quad(fill(underline, fg));
+                                        window.paint_quad(fill(underline, rgb(link_color(link))));
                                     }
-                                    if selected && let Some(color) = scheme.selection_foreground {
-                                        fg = rgba(color).into();
+                                }
+                            }
+                            let baseline = point(metrics.glyph_x, metrics.baseline);
+                            for (row, (ops, _)) in rows.iter().enumerate() {
+                                for op in ops {
+                                    if let RowOp::Text { column, .. } = op {
+                                        let origin = metrics.cell_origin(grid, row, *column);
+                                        op.paint(origin + baseline, window);
                                     }
-                                    if cell.text.trim().is_empty() {
-                                        continue;
-                                    }
-                                    let run = TextRun {
-                                        len: cell.text.len(),
-                                        font: terminal_font.clone(),
-                                        color: fg,
-                                        background_color: None,
-                                        underline: None,
-                                        strikethrough: None,
-                                    };
-                                    let shaped = window.text_system().shape_line(
-                                        cell.text.clone().into(),
-                                        font_size,
-                                        &[run],
-                                        None,
-                                    );
-                                    let _ = shaped.paint(
-                                        metrics.text_origin(&shaped, origin),
-                                        cell_size.height,
-                                        window,
-                                        cx,
-                                    );
                                 }
                             }
                         });

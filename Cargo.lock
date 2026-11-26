@@ -5006,6 +5006,7 @@ dependencies = [
  "base64 0.22.1",
  "cc",
  "clap",
+ "cosmic-text",
  "domain",
  "fontdb 0.16.2",
  "ghostty-vt",

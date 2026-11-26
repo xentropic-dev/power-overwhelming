@@ -1,13 +1,13 @@
 //! Terminal cell metrics measured from the font, as Ghostty sizes its grid.
 //!
 //! Adapted from herdr-app `src/terminal.rs` (`font_cell_metrics`, `adjusted_cell_width`,
-//! `adjusted_cell_height`, `glyph_x` and `text_origin`), licensed under the Apache License,
+//! `adjusted_cell_height` and `glyph_x`), licensed under the Apache License,
 //! Version 2.0. herdr reads the font tables through a patched GPUI; this port finds the font
 //! file with `fontdb` and reads it with `ttf-parser`, and falls back to what stock GPUI
 //! reports when the file can't be found.
 
 use domain::session::Geometry;
-use gpui::{Font, FontId, LineLayout, Pixels, Point, Size, TextSystem, point, px, size};
+use gpui::{Font, FontId, Pixels, Point, Size, TextSystem, point, px, size};
 use std::{cell::RefCell, collections::HashMap, sync::LazyLock};
 
 /// The font the terminal grid is measured from.
@@ -109,14 +109,6 @@ impl CellMetrics {
                 self.size.width * column as f32,
                 self.size.height * row as f32,
             )
-    }
-
-    /// Where shaped text paints from so that its baseline sits on the cell's, moved across by
-    /// `glyph_x`. GPUI centres a line's ascent and descent in the line height it paints with,
-    /// so pass the cell height as that line height.
-    pub fn text_origin(&self, line: &LineLayout, origin: Point<Pixels>) -> Point<Pixels> {
-        let gpui_baseline = (self.size.height - line.ascent - line.descent) / 2. + line.ascent;
-        origin + point(self.glyph_x, self.baseline - gpui_baseline)
     }
 }
 

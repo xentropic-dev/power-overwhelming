@@ -3,6 +3,8 @@ use anyhow::Result;
 use ghostty_vt::{
     Terminal,
     render::{CellIterator, RenderState, RowIterator},
+    screen::CellWide,
+    style::Style,
     terminal::{Point as VtPoint, PointCoordinate},
 };
 use gpui::{Hsla, rgb};
@@ -15,9 +17,13 @@ pub(super) struct CellPosition {
 }
 
 pub(super) struct Cell {
+    /// The cell's grapheme, or a space when it has none.
     pub(super) text: String,
     pub(super) fg: Hsla,
     pub(super) bg: Option<Hsla>,
+    /// The cell's SGR attributes, as Ghostty stores them; `fg` and `bg` are already resolved.
+    pub(super) style: Style,
+    pub(super) wide: CellWide,
     pub(super) link: Option<Arc<str>>,
 }
 
@@ -67,7 +73,8 @@ pub(super) fn frame(
             }
             offsets.push(text.len());
             text.push_str(&grapheme);
-            let osc_uri = if cell.raw_cell()?.has_hyperlink()? {
+            let raw = cell.raw_cell()?;
+            let osc_uri = if raw.has_hyperlink()? {
                 terminal
                     .grid_ref(VtPoint::Viewport(PointCoordinate {
                         x: cells.len() as u16,
@@ -92,6 +99,8 @@ pub(super) fn frame(
                     .fg_color()?
                     .map_or(rgb(foreground).into(), |c| rgba_color(c.r, c.g, c.b)),
                 bg: cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b)),
+                style: cell.style()?,
+                wide: raw.wide()?,
                 link: osc_link.clone(),
             });
         }
