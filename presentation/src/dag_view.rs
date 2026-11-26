@@ -382,6 +382,14 @@ impl DagView {
         {
             actions.push(format!("{open_key} open worker"));
         }
+        let start_key = keymap.first(Scope::Dag, Command::DagStartNow);
+        if !start_key.is_empty()
+            && self
+                .task()
+                .is_some_and(|task| task.state == TaskState::Queued)
+        {
+            actions.push(format!("{start_key} start now, over budget"));
+        }
         let artifact_key = keymap.first(Scope::Dag, Command::DagArtifact);
         let artifacts = self.artifacts().len();
         if self.picking_artifact {
@@ -834,6 +842,7 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
     match state {
         TaskState::Waiting => ("Waiting", colors.muted),
         TaskState::Ready => ("Ready", colors.indexed[6]),
+        TaskState::Queued => ("Queued", colors.indexed[4]),
         TaskState::Working => ("Working", colors.accent),
         TaskState::NeedsInput => ("Needs input", colors.indexed[3]),
         TaskState::Completed => ("Completed", colors.indexed[2]),
@@ -909,6 +918,7 @@ mod tests {
             instructions: String::new(),
             deps: deps.iter().copied().map(str::to_owned).collect(),
             state: TaskState::Waiting,
+            queued_at: None,
             current_attempt: None,
             attempts: Vec::new(),
         }

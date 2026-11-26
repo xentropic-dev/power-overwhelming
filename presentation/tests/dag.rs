@@ -243,6 +243,12 @@ impl Fixture {
         )
         .unwrap();
         configure(root);
+        // Keep the host's free memory out of the tests. The budget test sets its own limits.
+        let config = root.join("config/power-overwhelming/config.lua");
+        if !config.exists() {
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(&config, "dag = { min_available_memory = 0 }\n").unwrap();
+        }
         let daemon = Daemon::start(root);
         Self {
             daemon,
@@ -1401,4 +1407,83 @@ fn daemon_restart_preserves_graph_and_reconciles_active_attempt() {
     fixture.release("restarted-go");
     fixture.wait_for_state(&run, "running", TaskState::Completed);
     assert_eq!(ready_ids(&fixture, &run), ["next"]);
+}
+
+#[test]
+fn worker_budget_queues_past_max_active_workers_and_starts_on_report() {
+    let fixture = Fixture::with_configure(|root| {
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            "dag = { max_active_workers = 2, min_available_memory = 0 }\n",
+        )
+        .unwrap();
+    });
+    let run = fixture.create_run();
+    for id in ["one", "two", "three"] {
+        fixture.add_task(&run.id, id);
+    }
+    let worktree = &fixture.worktrees[0];
+    let dispatch = |id: &str| {
+        json_output(fixture.dispatch(
+            &run.id,
+            id,
+            worktree,
+            false,
+            &["success", &format!("{id}.go"), &format!("{id} done")],
+        ))
+    };
+    for id in ["one", "two"] {
+        let started = dispatch(id);
+        assert!(started["attempt"]["id"].is_string(), "{started}");
+        fixture.wait_for_worker(&format!("{id}.go"));
+    }
+    let queued = dispatch("three");
+    assert_eq!(queued["queued"], true, "{queued}");
+    assert_eq!(queued["task"], "three", "{queued}");
+    assert!(
+        queued["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("2 of 2 workers")),
+        "{queued}"
+    );
+    let three = fixture.wait_for_state(&run.id, "three", TaskState::Queued);
+    assert!(three.attempts.is_empty());
+    assert!(three.queued_at.is_some());
+
+    let ready = fixture.json(&["dag", "ready", &run.id]);
+    assert_eq!(ready["queued"], json!(["three"]), "{ready}");
+    assert!(
+        ready["budget"]
+            .as_str()
+            .is_some_and(|note| note.contains("dag.max_active_workers")),
+        "{ready}"
+    );
+    let again = fixture.dispatch(&run.id, "three", worktree, false, &["success", "x", "x"]);
+    assert_rejected(&again);
+
+    // The third worker starts once one of the first two reports.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fixture.show(&run.id).tasks[2].state,
+        TaskState::Queued,
+        "The queued task started while the budget was full"
+    );
+    fixture.release("one.go");
+    fixture.wait_for_state(&run.id, "one", TaskState::Completed);
+    fixture.wait_for_state(&run.id, "three", TaskState::Working);
+    fixture.wait_for_worker("three.go");
+    let kinds: Vec<_> = fixture
+        .events(&run.id, 0, &["task_queued"])
+        .events
+        .into_iter()
+        .map(|event| (event.kind, event.task))
+        .collect();
+    assert_eq!(kinds, [(RunEventKind::TaskQueued, Some("three".into()))]);
+
+    for id in ["two", "three"] {
+        fixture.release(&format!("{id}.go"));
+        fixture.wait_for_state(&run.id, id, TaskState::Completed);
+    }
 }

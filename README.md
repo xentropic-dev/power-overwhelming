@@ -185,6 +185,19 @@ The table also holds `ligatures` (default `false`), `scroll_speed` (0.1 to 5, de
 
 Run `power skills get power-dag` to load the bundled coordinator skill, or `power dag guide` (an alias for `power skills get power-dag --full`) to print it with all references, including a three-task example. From a Power terminal, `power dag list` finds unfinished runs in the current box (`--all` adds completed and archived ones; `power agent list --all` likewise adds exited and done agents). Archive an abandoned run with `power dag archive <run>` (`--force` if attempts are still open) and restore it with `power dag unarchive <run>`; in the run picker, Ctrl+X does the same for the selected run. From an external terminal, use `power box list` and pass `--box` when listing or creating a run, plus `--coordinator` on creation. Create a run with `power dag create`, add tasks and dependencies with `power dag apply`, then use `power dag ready` and `power dag dispatch --provider <profile id>` to start background workers in existing worktrees. Follow results with `power dag wait --since` and explicitly retry failed or interrupted work with `power dag retry`.
 
+Power limits concurrent workers across every run and box. A worker counts while its attempt is active or waiting on input. When a dispatch would go over the budget, Power queues the task instead of starting it: the dispatch prints `{"queued": true, ...}`, the task shows as `queued` in `power dag show` and the task graph, and the daemon starts it as soon as a worker reports, exits, or memory frees up. Pass `--no-queue` to fail instead. To start a task over the budget, pass `--over-budget` to `power dag dispatch`, or press `s` on a queued task in the task graph (`keys.dag.start_now`). Set the budget in the `dag` table of `config.lua`; edits apply to the next dispatch:
+
+```lua
+dag = {
+  max_active_workers = 4,          -- all runs and boxes; 0 removes the limit
+  max_active_workers_per_run = 2,  -- optional
+  max_active_workers_per_box = 3,  -- optional
+  min_available_memory = "4 GiB",  -- MemAvailable plus free swap; bytes or "512 MiB"; 0 skips the check
+}
+```
+
+The defaults are 4 workers and 4 GiB.
+
 `power dag create` and `power dag show` return the run and a `pwr://dag/<run-id>` link. Coordinators share that link verbatim on its own line when they create or reopen a run. Click the link or open it with Ctrl+S then `o` to see the live graph.
 
 Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` to open its agent tree. DAG cards and their details show the latest known model for each attempt. The agent tree displays models and matches them in search. Managed agents and their attempts retain their model after exit. Attach to a worker from either view without interrupting its work. An input request highlights the box and the worker's tab when attached. Answer in that worker's terminal. Its highlight clears when it reports that the request is resolved, and the box highlight clears when its last request is resolved.

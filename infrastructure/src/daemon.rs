@@ -2,6 +2,7 @@ use crate::{
     agents::AgentProfiles,
     box_icons::IconFiles,
     boxes::BoxesFile,
+    budget::{LocalWorkerBudget, ProcMemory},
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
@@ -12,7 +13,7 @@ use crate::{
     workspace::{LocalWorkspace, LocalWorktreeRoot},
 };
 use anyhow::{Context, Result, bail, ensure};
-use application::{Application, PublishArtifact, ResolveArtifact, StartSession};
+use application::{Application, PublishArtifact, ResolveArtifact, StartSession, dag::EventScope};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::session::{Agent, Geometry};
 use fs2::FileExt;
@@ -72,7 +73,11 @@ struct Server {
     dag: Arc<DaemonDag>,
 }
 
-pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Result<()> {
+pub fn serve(
+    profiles: AgentProfiles,
+    worktree_root: LocalWorktreeRoot,
+    budget: LocalWorkerBudget,
+) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
         .parent()
@@ -146,7 +151,8 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
     ));
     let dag = Arc::new(
         DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
-            .with_worktree_root(worktree_root),
+            .with_worktree_root(worktree_root)
+            .with_worker_budget(budget, ProcMemory),
     );
     terminal_application
         .set(Arc::downgrade(&application))
@@ -156,6 +162,7 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
         .set(Arc::downgrade(&dag))
         .expect("connect terminal callbacks to the DAG once");
     dag.restore().context("Restore sessions")?;
+    start_queue(dag.clone());
     handle_shutdown(application.clone(), shutting_down)?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -173,6 +180,26 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
         });
     }
     Ok(())
+}
+
+/// How long the queue waits for a run event before it checks the budget again, so memory
+/// that frees up without an event still starts queued work.
+const QUEUE_RECHECK: Duration = Duration::from_secs(5);
+
+/// Starts queued dispatches whenever a run event may have freed capacity.
+fn start_queue(dag: Arc<DaemonDag>) {
+    thread::spawn(move || {
+        let mut cursor = dag.latest_seq().unwrap_or(0);
+        loop {
+            if let Err(error) = dag.start_queued() {
+                eprintln!("Could not start queued DAG workers. {error:#}");
+            }
+            match dag.events(EventScope::Watch(None), cursor, QUEUE_RECHECK) {
+                Ok(page) => cursor = page.cursor,
+                Err(_) => thread::sleep(QUEUE_RECHECK),
+            }
+        }
+    });
 }
 
 /// Bounds the final save so a reboot is not held up by a stuck terminal.

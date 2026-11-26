@@ -5,9 +5,9 @@ use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
         AgentState, AgentStatus, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo,
-        Coordinator, ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent,
-        RunEventKind, RunStatus, Task, TaskSpec, TaskState, can_dispatch, report_transition,
-        validate_batch,
+        BudgetLimit, Coordinator, ManagedAgent, Provider, ReportStatus, ReportTransition, Run,
+        RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState, WorkerBudget, WorkerLoad,
+        can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
@@ -45,6 +45,8 @@ pub trait DagReader {
     /// Looks up the ownership record created for this attempt ID.
     fn find_worktree_by_attempt(&self, attempt: &str) -> Result<Option<ManagedWorktree>>;
     fn find_worktree_by_path(&self, path: &Path) -> Result<Option<ManagedWorktree>>;
+    /// Dispatches waiting for the worker budget, oldest first.
+    fn queued_dispatches(&self) -> Result<Vec<QueuedDispatch>>;
 }
 
 pub trait DagTransaction: DagReader {
@@ -60,6 +62,10 @@ pub trait DagTransaction: DagReader {
     fn update_attempt(&self, attempt: &Attempt) -> Result<()>;
     fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()>;
     fn remove_worktree(&self, path: &Path) -> Result<()>;
+    /// At most one dispatch is queued per task.
+    fn insert_queued(&self, queued: &QueuedDispatch) -> Result<()>;
+    /// Returns whether the task had a queued dispatch.
+    fn remove_queued(&self, run: &str, task: &str) -> Result<bool>;
     fn event(
         &self,
         run: &str,
@@ -128,6 +134,68 @@ pub struct Dispatch {
     pub retry: bool,
     pub args: Vec<String>,
     pub caller: Option<String>,
+    pub budget: BudgetMode,
+}
+
+/// What a dispatch does when the worker budget is full.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BudgetMode {
+    /// Queue the task. Power starts it when capacity frees up.
+    #[default]
+    Queue,
+    /// Fail with the limit that holds the dispatch.
+    Refuse,
+    /// Start anyway. Also starts an already queued task now.
+    Override,
+}
+
+/// A dispatch waiting for the worker budget. A new worktree's base is resolved when it is
+/// queued, so the dispatch does not depend on the caller's HEAD later.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedDispatch {
+    pub run: String,
+    pub task: String,
+    pub provider: Provider,
+    pub worktree: WorktreeRequest,
+    pub retry: bool,
+    pub args: Vec<String>,
+    pub caller: Option<String>,
+    /// Unix seconds.
+    pub queued_at: u64,
+}
+
+impl QueuedDispatch {
+    fn into_dispatch(self, budget: BudgetMode) -> Dispatch {
+        Dispatch {
+            run: self.run,
+            task: self.task,
+            provider: self.provider,
+            worktree: self.worktree,
+            retry: self.retry,
+            args: self.args,
+            caller: self.caller,
+            budget,
+        }
+    }
+}
+
+pub enum DispatchOutcome {
+    Started(Box<DispatchResult>),
+    /// The task waits for the worker budget. `reason` names the limit.
+    Queued {
+        reason: String,
+    },
+}
+
+/// Reads the worker budget, at each dispatch so config edits apply at once.
+pub trait WorkerBudgetSource: Send + Sync {
+    fn worker_budget(&self) -> Result<WorkerBudget>;
+}
+
+/// Machine memory, for `WorkerBudget::min_available_memory`.
+pub trait MemoryProbe: Send + Sync {
+    /// Available memory plus free swap, in bytes, or `None` when unknown.
+    fn available_memory(&self) -> Option<u64>;
 }
 
 pub struct DispatchResult {
@@ -149,6 +217,7 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     registry: B,
     icons: I,
     worktree_root: Option<Box<dyn WorktreeRoot>>,
+    budget: Option<(Box<dyn WorkerBudgetSource>, Box<dyn MemoryProbe>)>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
@@ -179,6 +248,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             registry,
             icons,
             worktree_root: None,
+            budget: None,
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
@@ -188,6 +258,96 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     pub fn with_worktree_root(mut self, root: impl WorktreeRoot + 'static) -> Self {
         self.worktree_root = Some(Box::new(root));
         self
+    }
+
+    /// Limits concurrent workers. Without a budget, every dispatch starts at once.
+    pub fn with_worker_budget(
+        mut self,
+        source: impl WorkerBudgetSource + 'static,
+        memory: impl MemoryProbe + 'static,
+    ) -> Self {
+        self.budget = Some((Box::new(source), Box::new(memory)));
+        self
+    }
+
+    fn worker_budget(&self) -> Result<Option<WorkerBudget>> {
+        self.budget
+            .as_ref()
+            .map(|(source, _)| source.worker_budget())
+            .transpose()
+            .context("Read the worker budget from config.lua")
+    }
+
+    /// The limit that holds one more worker in `run`, if any.
+    fn budget_limit(
+        &self,
+        db: &dyn DagReader,
+        run: &Run,
+        budget: Option<&WorkerBudget>,
+    ) -> Result<Option<BudgetLimit>> {
+        let (Some(budget), Some((_, memory))) = (budget, &self.budget) else {
+            return Ok(None);
+        };
+        let open = db.open_attempts(None)?;
+        let load = WorkerLoad {
+            total: open.len(),
+            run: open.iter().filter(|open| open.run == run.id).count(),
+            box_workers: open.iter().filter(|open| open.box_id == run.box_id).count(),
+            available_memory: budget
+                .min_available_memory
+                .and_then(|_| memory.available_memory()),
+        };
+        Ok(budget.limit(load))
+    }
+
+    /// Starts queued dispatches, oldest first, while the worker budget has room. A queued
+    /// dispatch that cannot start is dropped from the queue with a `QueuedDispatchFailed`
+    /// event. Returns how many started.
+    pub fn start_queued(&self) -> Result<usize> {
+        let queued = self.store.read(|db| db.queued_dispatches())?;
+        if queued.is_empty() {
+            return Ok(0);
+        }
+        let budget = self.worker_budget()?;
+        let mut started = 0;
+        for entry in queued {
+            let (run, task) = (entry.run.clone(), entry.task.clone());
+            match self.dispatch_with(
+                entry.into_dispatch(BudgetMode::Queue),
+                true,
+                budget.as_ref(),
+            ) {
+                Ok(DispatchOutcome::Started(_)) => started += 1,
+                Ok(DispatchOutcome::Queued { .. }) => {}
+                Err(error) => self.write(|db| {
+                    if db.remove_queued(&run, &task)? {
+                        db.event(
+                            &run,
+                            RunEventKind::QueuedDispatchFailed,
+                            Some(&task),
+                            None,
+                            Some(&format!("{error:#}")),
+                        )?;
+                    }
+                    Ok(())
+                })?,
+            }
+        }
+        Ok(started)
+    }
+
+    /// Starts a queued task now, over the worker budget, with the dispatch it was queued with.
+    pub fn start_queued_now(&self, run: &str, task: &str) -> Result<DispatchResult> {
+        let entry = self
+            .store
+            .read(|db| db.queued_dispatches())?
+            .into_iter()
+            .find(|entry| entry.run == run && entry.task == task)
+            .with_context(|| format!("Task {task:?} in run {run:?} is not queued"))?;
+        match self.dispatch(entry.into_dispatch(BudgetMode::Override))? {
+            DispatchOutcome::Started(result) => Ok(*result),
+            DispatchOutcome::Queued { reason } => bail!("Task {task:?} stayed queued: {reason}"),
+        }
     }
 
     pub fn boxes(&self) -> Result<Vec<BoxInfo>> {
@@ -488,24 +648,70 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         result
     }
 
-    pub fn dispatch(&self, command: Dispatch) -> Result<DispatchResult> {
+    /// Starts a worker for the task, or queues the dispatch when the worker budget is full,
+    /// as `command.budget` says. The budget is checked in the same transaction that records
+    /// the attempt, so concurrent dispatches cannot overshoot it.
+    pub fn dispatch(&self, command: Dispatch) -> Result<DispatchOutcome> {
+        let budget = match command.budget {
+            BudgetMode::Override => None,
+            BudgetMode::Queue | BudgetMode::Refuse => self.worker_budget()?,
+        };
+        self.dispatch_with(command, false, budget.as_ref())
+    }
+
+    /// `from_queue` starts a queued dispatch if the budget has room, and otherwise leaves it
+    /// queued.
+    fn dispatch_with(
+        &self,
+        command: Dispatch,
+        from_queue: bool,
+        budget: Option<&WorkerBudget>,
+    ) -> Result<DispatchOutcome> {
         let mut created_path = None;
         let result = self.worker_transaction(|db, launched| {
             let run = load_run(db, &command.run)?;
             let task = find_task(&run, &command.task)?;
+            let queued = task.state == TaskState::Queued;
+            if from_queue && !queued {
+                // Started or dropped since the queue was read.
+                return Ok(Ok(DispatchOutcome::Queued {
+                    reason: "no longer queued".into(),
+                }));
+            }
+            if from_queue && run.archived_at.is_some() {
+                // An archived run starts no workers until it is unarchived.
+                return Ok(Ok(DispatchOutcome::Queued {
+                    reason: "the run is archived".into(),
+                }));
+            }
             ensure!(
-                can_dispatch(task.state, command.retry),
+                !queued || from_queue || command.budget == BudgetMode::Override,
+                "Task {:?} is already queued for the worker budget. Dispatch it with \
+                 --over-budget to start it now",
+                task.id
+            );
+            let state = if queued {
+                unqueued_state(&run, &task.id)
+            } else {
+                task.state
+            };
+            ensure!(
+                can_dispatch(state, command.retry),
                 "Task {:?} cannot be dispatched in state {:?}{}",
                 task.id,
-                task.state,
-                if !command.retry
-                    && matches!(task.state, TaskState::Failed | TaskState::Interrupted)
-                {
+                state,
+                if !command.retry && matches!(state, TaskState::Failed | TaskState::Interrupted) {
                     ". Use --retry to start another attempt"
                 } else {
                     ""
                 },
             );
+            let limit = self.budget_limit(db, &run, budget)?;
+            if from_queue && let Some(limit) = limit {
+                return Ok(Ok(DispatchOutcome::Queued {
+                    reason: limit.to_string(),
+                }));
+            }
             let number = task.attempts.last().map_or(Ok(1), |previous| {
                 previous
                     .number
@@ -516,6 +722,43 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             let caller = self.hosted_caller(command.caller.as_deref());
             let DispatchWorktree { path, kind } =
                 self.dispatch_worktree(db, &entry.info, task, &command, caller)?;
+            if let Some(limit) = limit {
+                ensure!(
+                    command.budget == BudgetMode::Queue,
+                    "The worker budget is full: {limit}. Wait for a worker to report, or \
+                     dispatch with --over-budget to start anyway"
+                );
+                let reason = limit.to_string();
+                db.insert_queued(&QueuedDispatch {
+                    run: run.id.clone(),
+                    task: task.id.clone(),
+                    provider: command.provider,
+                    worktree: match kind {
+                        DispatchWorktreeKind::New { branch, base } => WorktreeRequest::New {
+                            branch,
+                            base: Some(base),
+                        },
+                        DispatchWorktreeKind::Existing | DispatchWorktreeKind::Resume(_) => {
+                            command.worktree
+                        }
+                    },
+                    retry: command.retry,
+                    args: command.args,
+                    caller: caller.map(str::to_owned),
+                    queued_at: now(),
+                })?;
+                db.event(
+                    &run.id,
+                    RunEventKind::TaskQueued,
+                    Some(&task.id),
+                    None,
+                    Some(&reason),
+                )?;
+                return Ok(Ok(DispatchOutcome::Queued { reason }));
+            }
+            if queued {
+                db.remove_queued(&run.id, &task.id)?;
+            }
             // An external coordinator keeps its reference on the run, so its workers have no
             // parent agent, whatever terminal the CLI happens to run in. A Power caller that this
             // daemon hosts becomes the parent; otherwise the run's coordinating agent is.
@@ -589,11 +832,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 db.insert_worktree(&ownership)?;
             }
             // Commit the failed attempt, if any, before returning the error to the caller.
-            Ok(start.map(|branch| DispatchResult {
-                worktree: attempt.worktree.clone(),
-                agent,
-                attempt,
-                branch,
+            Ok(start.map(|branch| {
+                DispatchOutcome::Started(Box::new(DispatchResult {
+                    worktree: attempt.worktree.clone(),
+                    agent,
+                    attempt,
+                    branch,
+                }))
             }))
         });
         if result.is_err()
@@ -1157,6 +1402,16 @@ fn insert_dispatch_attempt(
         attempt.summary.as_deref(),
     )?;
     Ok(attempt)
+}
+
+/// The task's state as if its dispatch were not queued.
+fn unqueued_state(run: &Run, task: &str) -> TaskState {
+    let mut run = run.clone();
+    for entry in &mut run.tasks {
+        entry.queued_at = None;
+    }
+    run.derive_task_states();
+    find_task(&run, task).map_or(TaskState::Waiting, |task| task.state)
 }
 
 fn select_box<'a>(entries: &'a [RegisteredBox], selector: &str) -> Result<&'a RegisteredBox> {

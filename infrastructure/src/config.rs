@@ -2,7 +2,10 @@
 
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
-use domain::agent::{AgentProfile, Injection, ModelCallback, Resume};
+use domain::{
+    agent::{AgentProfile, Injection, ModelCallback, Resume},
+    dag::WorkerBudget,
+};
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -16,6 +19,7 @@ pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
 pub(crate) const WORKTREES_SECTION: &str = "worktrees";
+pub(crate) const DAG_SECTION: &str = "dag";
 
 fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     defaults.entry("power_bar".into()).or_insert_with(|| {
@@ -29,6 +33,67 @@ fn with_bundled_defaults(mut defaults: Sections) -> Sections {
         .entry(WORKTREES_SECTION.into())
         .or_insert_with(|| json!({}));
     defaults
+        .entry(DAG_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
+}
+
+pub(crate) fn load_worker_budget(defaults: Sections) -> Result<WorkerBudget> {
+    worker_budget(&load(with_bundled_defaults(defaults))?)
+}
+
+/// Reads the `dag` section over the default budget. A limit of 0 removes it.
+pub(crate) fn worker_budget(sections: &Sections) -> Result<WorkerBudget> {
+    let mut budget = WorkerBudget::default();
+    let Some(value) = sections.get(DAG_SECTION) else {
+        return Ok(budget);
+    };
+    let table = value.as_object().context("dag must be a table")?;
+    for (name, value) in table {
+        let count = || {
+            value
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .map(|count| (count > 0).then_some(count))
+                .with_context(|| format!("dag.{name} must be a whole number of workers"))
+        };
+        match name.as_str() {
+            "max_active_workers" => budget.max_active_workers = count()?,
+            "max_active_workers_per_run" => budget.max_active_workers_per_run = count()?,
+            "max_active_workers_per_box" => budget.max_active_workers_per_box = count()?,
+            "min_available_memory" => {
+                let bytes = memory_size(value).with_context(|| {
+                    format!("dag.{name} must be bytes or a size such as \"4 GiB\"")
+                })?;
+                budget.min_available_memory = (bytes > 0).then_some(bytes);
+            }
+            _ => bail!("dag.{name} is not a setting"),
+        }
+    }
+    Ok(budget)
+}
+
+/// A byte count, or a string such as "4 GiB", "512MiB" or "2G" in binary units.
+fn memory_size(value: &JsonValue) -> Option<u64> {
+    if let Some(bytes) = value.as_u64() {
+        return Some(bytes);
+    }
+    let text = value.as_str()?.trim();
+    let split = text
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let scale: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1 << 40,
+        _ => return None,
+    };
+    let bytes = number * scale as f64;
+    (bytes.is_finite() && bytes >= 0.0 && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 /// Load profiles from the same config as the desktop, with the bundled plugin defaults.
@@ -306,7 +371,57 @@ fn evaluate(
 mod tests {
     use super::*;
     use application::agents::AgentProfileRegistry;
+    use domain::dag::GIB;
     use serde_json::json;
+
+    #[test]
+    fn worker_budget_reads_the_dag_section() -> Result<()> {
+        let sections = |dag: JsonValue| Sections::from([(DAG_SECTION.into(), dag)]);
+        assert_eq!(worker_budget(&Sections::new())?, WorkerBudget::default());
+        assert_eq!(
+            worker_budget(&sections(json!({})))?,
+            WorkerBudget::default()
+        );
+        assert_eq!(
+            worker_budget(&sections(json!({
+                "max_active_workers": 2,
+                "max_active_workers_per_run": 1,
+                "max_active_workers_per_box": 0,
+                "min_available_memory": "1.5 GiB",
+            })))?,
+            WorkerBudget {
+                max_active_workers: Some(2),
+                max_active_workers_per_run: Some(1),
+                max_active_workers_per_box: None,
+                min_available_memory: Some(GIB + GIB / 2),
+            }
+        );
+        for (size, bytes) in [
+            (json!(1024), Some(1024)),
+            (json!("512MiB"), Some(512 << 20)),
+            (json!("2G"), Some(2 * GIB)),
+            (json!(0), None),
+        ] {
+            assert_eq!(
+                worker_budget(&sections(json!({ "min_available_memory": size })))?
+                    .min_available_memory,
+                bytes
+            );
+        }
+        for invalid in [
+            json!({ "max_active_workers": -1 }),
+            json!({ "max_active_workers": "four" }),
+            json!({ "min_available_memory": "4 parsecs" }),
+            json!({ "max_workers": 2 }),
+            json!(3),
+        ] {
+            assert!(
+                worker_budget(&sections(invalid.clone())).is_err(),
+                "{invalid}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn lua_extends_and_overrides_builtin_profiles() -> Result<()> {

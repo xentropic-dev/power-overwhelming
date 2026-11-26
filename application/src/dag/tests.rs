@@ -27,6 +27,7 @@ struct Records {
     runs: Vec<Run>,
     events: Vec<RunEvent>,
     worktrees: Vec<ManagedWorktree>,
+    queued: Vec<QueuedDispatch>,
 }
 
 #[derive(Default)]
@@ -207,9 +208,58 @@ impl DagReader for MemoryDb {
     fn latest_seq(&self) -> Result<u64> {
         Ok(self.0.borrow().events.last().map_or(0, |event| event.seq))
     }
+
+    fn queued_dispatches(&self) -> Result<Vec<QueuedDispatch>> {
+        Ok(self.0.borrow().queued.clone())
+    }
+}
+
+impl MemoryDb {
+    fn set_queued_at(&self, run: &str, task: &str, queued_at: Option<u64>) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .runs
+            .iter_mut()
+            .find(|entry| entry.id == run)
+            .context("Unknown run")?
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .context("Unknown task")?
+            .queued_at = queued_at;
+        Ok(())
+    }
 }
 
 impl DagTransaction for MemoryDb {
+    fn insert_queued(&self, queued: &QueuedDispatch) -> Result<()> {
+        ensure!(
+            !self
+                .0
+                .borrow()
+                .queued
+                .iter()
+                .any(|entry| entry.run == queued.run && entry.task == queued.task),
+            "Duplicate queued dispatch"
+        );
+        self.set_queued_at(&queued.run, &queued.task, Some(queued.queued_at))?;
+        self.0.borrow_mut().queued.push(queued.clone());
+        Ok(())
+    }
+
+    fn remove_queued(&self, run: &str, task: &str) -> Result<bool> {
+        let before = self.0.borrow().queued.len();
+        self.0
+            .borrow_mut()
+            .queued
+            .retain(|entry| entry.run != run || entry.task != task);
+        let removed = self.0.borrow().queued.len() != before;
+        if removed {
+            self.set_queued_at(run, task, None)?;
+        }
+        Ok(removed)
+    }
+
     fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()> {
         ensure!(
             self.find_worktree_by_path(&worktree.path)?.is_none(),
@@ -294,6 +344,7 @@ impl DagTransaction for MemoryDb {
                 instructions: task.instructions.clone(),
                 deps: task.deps.clone(),
                 state: TaskState::Waiting,
+                queued_at: None,
                 current_attempt: None,
                 attempts: Vec::new(),
             }));
@@ -602,6 +653,16 @@ impl BoxIcons for FakeIcons {
 
 type TestDag = DagApplication<FakeTerminal, MemoryStore, FakeRegistry, FakeIcons>;
 
+impl TestDag {
+    /// Dispatches and expects the worker to start.
+    fn start(&self, command: Dispatch) -> Result<DispatchResult> {
+        match self.dispatch(command)? {
+            DispatchOutcome::Started(result) => Ok(*result),
+            DispatchOutcome::Queued { reason } => bail!("Dispatch was queued: {reason}"),
+        }
+    }
+}
+
 struct FakeProfiles(Vec<AgentProfile>);
 
 impl AgentProfileRegistry for FakeProfiles {
@@ -687,6 +748,7 @@ fn command(run: &str, retry: bool) -> Dispatch {
         retry,
         args: vec!["worker".into()],
         caller: None,
+        budget: BudgetMode::Queue,
     }
 }
 
@@ -748,7 +810,7 @@ fn new_dispatch_uses_caller_head_or_explicit_base_and_records_ownership() -> Res
     )?;
     dag.add_tasks(&run.id, &[spec("work", &[]), spec("next", &["work"])])?;
 
-    let first = dag.dispatch(Dispatch {
+    let first = dag.start(Dispatch {
         caller: Some(caller.id.clone()),
         ..new_worktree(&run.id, "feature/first", None)
     })?;
@@ -785,7 +847,7 @@ fn new_dispatch_uses_caller_head_or_explicit_base_and_records_ownership() -> Res
         ReportStatus::Success,
         "Done",
     )?;
-    dag.dispatch(Dispatch {
+    dag.start(Dispatch {
         task: "next".into(),
         caller: Some(caller.id),
         ..new_worktree(&run.id, "feature/next", Some("feature/first"))
@@ -840,7 +902,7 @@ fn new_dispatch_rejects_missing_inputs_and_existing_branches_without_an_attempt(
         ),
     ] {
         let error = dag
-            .dispatch(dispatch)
+            .start(dispatch)
             .err()
             .context("Dispatch unexpectedly succeeded")?;
         assert!(error.to_string().contains(expected), "{error:#}");
@@ -862,7 +924,7 @@ fn git_creation_error_persists_a_failed_attempt_without_launching() -> Result<()
     workspace.0.lock().unwrap().creation_error = Some(git_error);
     let before = dag.latest_seq()?;
     let error = dag
-        .dispatch(new_worktree(&run, "fresh", Some("missing-base")))
+        .start(new_worktree(&run, "fresh", Some("missing-base")))
         .err()
         .context("Dispatch unexpectedly succeeded")?;
     assert_eq!(error.to_string(), git_error);
@@ -885,7 +947,7 @@ fn git_creation_error_persists_a_failed_attempt_without_launching() -> Result<()
     assert_eq!(page.events[0].kind, RunEventKind::AttemptFailed);
     assert_eq!(page.events[0].attempt.as_deref(), Some(attempt.id.as_str()));
     assert_eq!(page.events[0].summary.as_deref(), Some(git_error));
-    let retry = dag.dispatch(command(&run, true))?;
+    let retry = dag.start(command(&run, true))?;
     assert_eq!(retry.attempt.number, 2);
     assert_eq!(retry.worktree, Path::new("/worktree"));
     assert_eq!(retry.branch, None);
@@ -901,7 +963,7 @@ fn new_worktree_stays_owned_and_reusable_after_terminal_startup_fails() -> Resul
         .fail_start
         .store(true, Ordering::Release);
     let error = dag
-        .dispatch(new_worktree(&run, "fresh", Some("main")))
+        .start(new_worktree(&run, "fresh", Some("main")))
         .err()
         .context("Dispatch unexpectedly succeeded")?;
     assert_eq!(error.to_string(), "Terminal startup failed");
@@ -918,7 +980,7 @@ fn new_worktree_stays_owned_and_reusable_after_terminal_startup_fails() -> Resul
         .runtime
         .fail_start
         .store(false, Ordering::Release);
-    let retry = dag.dispatch(Dispatch {
+    let retry = dag.start(Dispatch {
         worktree: WorktreeRequest::RetryManaged,
         ..command(&run, true)
     })?;
@@ -932,11 +994,11 @@ fn new_worktree_stays_owned_and_reusable_after_terminal_startup_fails() -> Resul
 fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> Result<()> {
     let (dag, workspace) = managed_setup();
     let run = external_run(&dag)?;
-    let first = dag.dispatch(new_worktree(&run, "feature/original", Some("main")))?;
+    let first = dag.start(new_worktree(&run, "feature/original", Some("main")))?;
     let mut previous = first.attempt.clone();
     for number in 2..=3 {
         dag.session_exited(previous.session.as_deref().unwrap(), "interrupted")?;
-        let retry = dag.dispatch(Dispatch {
+        let retry = dag.start(Dispatch {
             provider: Provider::Agent("codex".into()),
             worktree: WorktreeRequest::RetryManaged,
             args: Vec::new(),
@@ -953,7 +1015,7 @@ fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> R
     assert_eq!(workspace.0.lock().unwrap().creation_requests.len(), 1);
 
     dag.session_exited(previous.session.as_deref().unwrap(), "interrupted")?;
-    let fresh = dag.dispatch(Dispatch {
+    let fresh = dag.start(Dispatch {
         retry: true,
         ..new_worktree(&run, "feature/fresh", Some("main"))
     })?;
@@ -978,7 +1040,7 @@ fn concurrent_dispatch_launches_once() -> Result<()> {
     let results = thread::scope(|scope| {
         let dispatch = || {
             start.wait();
-            dag.dispatch(command(&run, false))
+            dag.start(command(&run, false))
         };
         let first = scope.spawn(dispatch);
         let second = scope.spawn(dispatch);
@@ -1007,10 +1069,10 @@ fn publish(dag: &TestDag, id: &str, session: &str, title: &str) -> Result<()> {
 #[test]
 fn attempts_list_their_sessions_artifacts_in_publish_order() -> Result<()> {
     let (dag, run) = setup()?;
-    let first = dag.dispatch(command(&run, false))?;
+    let first = dag.start(command(&run, false))?;
     let first_session = first.agent.session.unwrap();
     dag.session_exited(&first_session, "worker exited")?;
-    let second = dag.dispatch(command(&run, true))?;
+    let second = dag.start(command(&run, true))?;
     let second_session = second.agent.session.unwrap();
 
     publish(&dag, "b-first", &first_session, "First report")?;
@@ -1064,16 +1126,16 @@ fn attempts_list_their_sessions_artifacts_in_publish_order() -> Result<()> {
 #[test]
 fn exit_without_report_interrupts_and_late_and_replayed_reports_are_safe() -> Result<()> {
     let (dag, run) = setup()?;
-    let first = dag.dispatch(command(&run, false))?;
+    let first = dag.start(command(&run, false))?;
     let first_id = first.attempt.id;
     let session = first.agent.session.unwrap();
     dag.session_exited(&session, "worker exited with code 7")?;
     assert_eq!(dag.run(&run)?.tasks[0].state, TaskState::Interrupted);
     let agent = dag.store.read(|db| db.agent(&first.agent.id))?;
     assert_eq!(agent.state, AgentState::Exited);
-    assert!(dag.dispatch(command(&run, false)).is_err());
+    assert!(dag.start(command(&run, false)).is_err());
 
-    let second = dag.dispatch(command(&run, true))?;
+    let second = dag.start(command(&run, true))?;
     let before = dag.latest_seq()?;
     let stale = dag.report(&run, "work", &first_id, ReportStatus::Success, "old result")?;
     assert!(!stale.applied);
@@ -1109,12 +1171,12 @@ fn exit_without_report_interrupts_and_late_and_replayed_reports_are_safe() -> Re
 fn reconcile_interrupts_active_and_blocked_attempts_and_keeps_reported_results() -> Result<()> {
     let (dag, run) = setup()?;
     dag.add_tasks(&run, &[spec("blocked", &[]), spec("done", &[])])?;
-    let active = dag.dispatch(command(&run, false))?;
-    let blocked = dag.dispatch(Dispatch {
+    let active = dag.start(command(&run, false))?;
+    let blocked = dag.start(Dispatch {
         task: "blocked".into(),
         ..command(&run, false)
     })?;
-    let done = dag.dispatch(Dispatch {
+    let done = dag.start(Dispatch {
         task: "done".into(),
         ..command(&run, false)
     })?;
@@ -1168,8 +1230,8 @@ fn reconcile_interrupts_active_and_blocked_attempts_and_keeps_reported_results()
 fn reconcile_keeps_attempts_and_agents_whose_session_was_restored() -> Result<()> {
     let (dag, run) = setup()?;
     dag.add_tasks(&run, &[spec("lost", &[])])?;
-    let restored = dag.dispatch(command(&run, false))?;
-    let lost = dag.dispatch(Dispatch {
+    let restored = dag.start(command(&run, false))?;
+    let lost = dag.start(Dispatch {
         task: "lost".into(),
         ..command(&run, false)
     })?;
@@ -1200,8 +1262,8 @@ fn reconcile_stops_restored_agents_whose_worktree_is_gone_unless_an_attempt_is_o
     );
     let run = external_run(&dag)?;
     dag.add_tasks(&run, &[spec("done", &[])])?;
-    let working = dag.dispatch(command(&run, false))?;
-    let finished = dag.dispatch(Dispatch {
+    let working = dag.start(command(&run, false))?;
+    let finished = dag.start(Dispatch {
         task: "done".into(),
         ..command(&run, false)
     })?;
@@ -1270,8 +1332,8 @@ fn restore_tells_only_workers_with_active_attempts_to_continue() -> Result<()> {
         caller: Some(caller.id.clone()),
         ..command(&run.id, false)
     };
-    let working = dag.dispatch(claude("work"))?;
-    let blocked = dag.dispatch(claude("blocked"))?;
+    let working = dag.start(claude("work"))?;
+    let blocked = dag.start(claude("blocked"))?;
     dag.report(
         &run.id,
         "blocked",
@@ -1373,7 +1435,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     };
     assert_eq!(dag.list_agents(selection(), true)?.len(), 1);
     dag.add_tasks(&run.id, &[spec("join", &["work"]), spec("work", &[])])?;
-    let first = dag.dispatch(command(&run.id, false))?;
+    let first = dag.start(command(&run.id, false))?;
     dag.report(
         &run.id,
         "work",
@@ -1399,7 +1461,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         .map(|agent| agent.id)
         .collect();
     assert_eq!(live, std::slice::from_ref(&coordinator));
-    let worker = dag.dispatch(Dispatch {
+    let worker = dag.start(Dispatch {
         task: "join".into(),
         provider: Provider::Agent("claude".into()),
         caller: Some(caller.id),
@@ -1434,10 +1496,10 @@ fn agent_status_follows_the_attempt_while_the_session_lives() -> Result<()> {
     let (dag, run) = setup()?;
     let tasks = ["blocked", "done", "failed", "exited"];
     dag.add_tasks(&run, &tasks.map(|id| spec(id, &[])))?;
-    let working = dag.dispatch(command(&run, false))?;
+    let working = dag.start(command(&run, false))?;
     assert_eq!(working.agent.status, AgentStatus::Working);
     let [blocked, done, failed, exited] = tasks.map(|task| {
-        dag.dispatch(Dispatch {
+        dag.start(Dispatch {
             task: task.into(),
             ..command(&run, false)
         })
@@ -1487,7 +1549,7 @@ fn external_coordinator_ignores_a_caller_session_this_daemon_does_not_host() -> 
     // A bootstrap coordinator can run in a multiplexer inside another Power daemon's terminal,
     // so the CLI forwards a POWER_SESSION this daemon has never seen.
     let (dag, run) = setup()?;
-    let worker = dag.dispatch(Dispatch {
+    let worker = dag.start(Dispatch {
         caller: Some("session-from-another-daemon".into()),
         ..command(&run, false)
     })?;
@@ -1553,7 +1615,7 @@ fn workers_need_an_explicit_opt_in_for_the_main_checkout() -> Result<()> {
         assert!(error.contains("--branch"), "{error}");
     };
     refused(
-        dag.dispatch(Dispatch {
+        dag.start(Dispatch {
             worktree: main_checkout(false),
             ..command(&run, false)
         })
@@ -1575,7 +1637,7 @@ fn workers_need_an_explicit_opt_in_for_the_main_checkout() -> Result<()> {
         .is_empty()
     );
 
-    let worker = dag.dispatch(Dispatch {
+    let worker = dag.start(Dispatch {
         worktree: main_checkout(true),
         ..command(&run, false)
     })?;
@@ -1714,6 +1776,7 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
                 instructions: String::new(),
                 deps: Vec::new(),
                 state: *state,
+                queued_at: None,
                 current_attempt: None,
                 attempts: Vec::new(),
             })
@@ -1766,7 +1829,7 @@ fn completed_runs_are_listed_only_when_finished_are_included() -> Result<()> {
             .collect())
     };
     assert_eq!(ids(false)?, std::slice::from_ref(&run));
-    let worker = dag.dispatch(command(&run, false))?;
+    let worker = dag.start(command(&run, false))?;
     dag.report(
         &run,
         "work",
@@ -1782,7 +1845,7 @@ fn completed_runs_are_listed_only_when_finished_are_included() -> Result<()> {
 #[test]
 fn archiving_refuses_open_attempts_unless_forced() -> Result<()> {
     let (dag, run) = setup()?;
-    let worker = dag.dispatch(command(&run, false))?;
+    let worker = dag.start(command(&run, false))?;
     let error = dag.archive_run(&run, false).unwrap_err().to_string();
     assert!(error.contains("1 open attempt"), "{error}");
     assert!(error.contains("--force"), "{error}");
@@ -1895,4 +1958,206 @@ fn live_agents_keep_finished_ancestors_of_shown_agents() {
             "root", "middle", "leaf", "failed", "waiting", "cycle-a", "cycle-b"
         ]
     );
+}
+
+struct FixedBudget(WorkerBudget);
+
+impl WorkerBudgetSource for FixedBudget {
+    fn worker_budget(&self) -> Result<WorkerBudget> {
+        Ok(self.0)
+    }
+}
+
+/// Available memory the test can change while the DAG holds the probe.
+#[derive(Clone, Default)]
+struct FakeMemory(Arc<AtomicU64>);
+
+impl MemoryProbe for FakeMemory {
+    fn available_memory(&self) -> Option<u64> {
+        Some(self.0.load(Ordering::Relaxed))
+    }
+}
+
+fn budgeted(budget: WorkerBudget, memory: &FakeMemory) -> Result<(TestDag, String)> {
+    let dag = TestDag::new(
+        application(),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_worker_budget(FixedBudget(budget), memory.clone());
+    let run = dag.create_run(
+        BoxSelection {
+            selector: Some("2".into()),
+            caller: None,
+        },
+        "Budget".into(),
+        Some("external".into()),
+    )?;
+    dag.add_tasks(&run.id, &[spec("a", &[]), spec("b", &[]), spec("c", &[])])?;
+    Ok((dag, run.id))
+}
+
+fn task_dispatch(run: &str, task: &str, budget: BudgetMode) -> Dispatch {
+    Dispatch {
+        task: task.into(),
+        budget,
+        ..command(run, false)
+    }
+}
+
+fn state_of(dag: &TestDag, run: &str, task: &str) -> Result<TaskState> {
+    Ok(find_task(&dag.run(run)?, task)?.state)
+}
+
+#[test]
+fn a_full_budget_queues_dispatches_and_reports_start_them_in_order() -> Result<()> {
+    let memory = FakeMemory::default();
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    let budget = WorkerBudget {
+        max_active_workers: Some(2),
+        ..WorkerBudget::default()
+    };
+    let (dag, run) = budgeted(budget, &memory)?;
+    let first = dag.start(task_dispatch(&run, "a", BudgetMode::Queue))?;
+    dag.start(task_dispatch(&run, "b", BudgetMode::Queue))?;
+    let DispatchOutcome::Queued { reason } =
+        dag.dispatch(task_dispatch(&run, "c", BudgetMode::Queue))?
+    else {
+        bail!("The third dispatch started");
+    };
+    assert_eq!(reason, "2 of 2 workers are active (dag.max_active_workers)");
+    assert_eq!(state_of(&dag, &run, "c")?, TaskState::Queued);
+    assert_eq!(dag.run(&run)?.status(), RunStatus::Active);
+    let queued = dag
+        .run(&run)?
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Queued)
+        .count();
+    assert_eq!(queued, 1);
+    let events = dag.events(
+        EventScope::Run(&run, &[RunEventKind::TaskQueued]),
+        0,
+        Duration::ZERO,
+    )?;
+    assert_eq!(events.events.len(), 1);
+    assert_eq!(events.events[0].summary.as_deref(), Some(reason.as_str()));
+
+    // Dispatching a queued task again is refused rather than queued twice.
+    let again = dag
+        .dispatch(task_dispatch(&run, "c", BudgetMode::Queue))
+        .err()
+        .context("A queued task was dispatched twice")?;
+    assert!(format!("{again:#}").contains("--over-budget"), "{again:#}");
+
+    // Nothing frees up, so nothing starts.
+    assert_eq!(dag.start_queued()?, 0);
+    assert_eq!(state_of(&dag, &run, "c")?, TaskState::Queued);
+
+    dag.report(&run, "a", &first.attempt.id, ReportStatus::Success, "done")?;
+    assert_eq!(dag.start_queued()?, 1);
+    assert_eq!(state_of(&dag, &run, "c")?, TaskState::Working);
+    assert!(dag.store.read(|db| db.queued_dispatches())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn low_memory_holds_dispatch_until_memory_frees_up() -> Result<()> {
+    let memory = FakeMemory::default();
+    memory.0.store(domain::dag::GIB, Ordering::Relaxed);
+    let (dag, run) = budgeted(WorkerBudget::default(), &memory)?;
+    let DispatchOutcome::Queued { reason } =
+        dag.dispatch(task_dispatch(&run, "a", BudgetMode::Queue))?
+    else {
+        bail!("Dispatch started with too little memory");
+    };
+    assert!(reason.contains("dag.min_available_memory"), "{reason}");
+    assert_eq!(dag.start_queued()?, 0);
+    memory.0.store(8 * domain::dag::GIB, Ordering::Relaxed);
+    dag.archive_run(&run, false)?;
+    assert_eq!(dag.start_queued()?, 0, "An archived run started a worker");
+    dag.unarchive_run(&run)?;
+    assert_eq!(dag.start_queued()?, 1);
+    assert_eq!(state_of(&dag, &run, "a")?, TaskState::Working);
+    Ok(())
+}
+
+#[test]
+fn refuse_fails_and_override_starts_over_the_budget() -> Result<()> {
+    let memory = FakeMemory::default();
+    let (dag, run) = budgeted(WorkerBudget::default(), &memory)?;
+    let refused = dag
+        .dispatch(task_dispatch(&run, "a", BudgetMode::Refuse))
+        .err()
+        .context("Refuse started a worker with no memory")?;
+    assert!(
+        format!("{refused:#}").contains("The worker budget is full"),
+        "{refused:#}"
+    );
+    assert_eq!(state_of(&dag, &run, "a")?, TaskState::Ready);
+
+    dag.start(task_dispatch(&run, "a", BudgetMode::Override))?;
+    assert_eq!(state_of(&dag, &run, "a")?, TaskState::Working);
+
+    // Override also starts a queued task at once, from the CLI or the stored dispatch.
+    dag.dispatch(task_dispatch(&run, "b", BudgetMode::Queue))?;
+    dag.dispatch(task_dispatch(&run, "c", BudgetMode::Queue))?;
+    dag.start(task_dispatch(&run, "b", BudgetMode::Override))?;
+    dag.start_queued_now(&run, "c")?;
+    for task in ["b", "c"] {
+        assert_eq!(state_of(&dag, &run, task)?, TaskState::Working);
+    }
+    assert!(dag.store.read(|db| db.queued_dispatches())?.is_empty());
+    assert!(dag.start_queued_now(&run, "c").is_err());
+    Ok(())
+}
+
+#[test]
+fn per_run_caps_let_other_runs_start() -> Result<()> {
+    let memory = FakeMemory::default();
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    let budget = WorkerBudget {
+        max_active_workers: Some(10),
+        max_active_workers_per_run: Some(1),
+        ..WorkerBudget::default()
+    };
+    let (dag, run) = budgeted(budget, &memory)?;
+    let other = external_run(&dag)?;
+    dag.start(task_dispatch(&run, "a", BudgetMode::Queue))?;
+    assert!(matches!(
+        dag.dispatch(task_dispatch(&run, "b", BudgetMode::Queue))?,
+        DispatchOutcome::Queued { .. }
+    ));
+    dag.start(task_dispatch(&other, "work", BudgetMode::Queue))?;
+    assert_eq!(state_of(&dag, &run, "b")?, TaskState::Queued);
+    Ok(())
+}
+
+#[test]
+fn a_queued_dispatch_that_cannot_start_leaves_the_queue_with_an_event() -> Result<()> {
+    let memory = FakeMemory::default();
+    let (dag, run) = budgeted(WorkerBudget::default(), &memory)?;
+    dag.dispatch(Dispatch {
+        args: Vec::new(),
+        ..task_dispatch(&run, "a", BudgetMode::Queue)
+    })?;
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    assert_eq!(dag.start_queued()?, 0);
+    assert_eq!(state_of(&dag, &run, "a")?, TaskState::Ready);
+    let failed = dag.events(
+        EventScope::Run(&run, &[RunEventKind::QueuedDispatchFailed]),
+        0,
+        Duration::ZERO,
+    )?;
+    assert_eq!(failed.events.len(), 1);
+    assert!(
+        failed.events[0]
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("Specify a command")),
+        "{:?}",
+        failed.events[0].summary
+    );
+    Ok(())
 }
