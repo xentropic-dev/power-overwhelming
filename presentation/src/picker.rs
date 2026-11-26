@@ -3,7 +3,7 @@ use domain::session::Session;
 use gpui::{prelude::*, *};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use infrastructure::{
-    client::{ManagedAgent, Run},
+    client::{ManagedAgent, Run, RunStatus},
     theme::Scheme,
 };
 use nucleo_matcher::{
@@ -489,7 +489,7 @@ impl Picker {
             .iter()
             .map(|run| Row {
                 label: run.title.clone(),
-                detail: run.id.clone(),
+                detail: run_detail(run),
                 choice: Choice::Run(run.id.clone()),
             })
             .collect();
@@ -1204,6 +1204,21 @@ fn byte_ranges(text: &str, mut indices: Vec<u32>) -> Vec<Range<usize>> {
         }
     }
     ranges
+}
+
+/// Status, task progress and ID, e.g. `Active · 3/10 done · run-id`.
+fn run_detail(run: &Run) -> String {
+    let status = match run.status() {
+        RunStatus::Active => "Active",
+        RunStatus::Stalled => "Stalled",
+        RunStatus::Completed => "Completed",
+    };
+    format!(
+        "{status} · {}/{} done · {}",
+        run.completed_tasks(),
+        run.tasks.len(),
+        run.id
+    )
 }
 
 #[cfg(test)]

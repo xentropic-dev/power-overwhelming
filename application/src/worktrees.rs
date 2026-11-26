@@ -1,14 +1,17 @@
 use super::{
-    BoxIcons, BoxRegistry, BranchStatus, DagApplication, DagStore, WorktreeCreator,
+    BoxIcons, BoxRegistry, BranchStatus, DagApplication, DagReader, DagStore, WorktreeCreator,
     default_worktree_path, now, select_box,
 };
 use crate::TerminalRuntime;
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
-    dag::BoxInfo,
+    dag::{AgentState, BoxInfo},
     worktree::{KeepReason, ManagedWorktree, PruneStatus, PruneVerdict, prune_verdict},
 };
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplication<T, S, B, I> {
     pub fn create_view_worktree(
@@ -98,25 +101,23 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     ) -> Result<Vec<(ManagedWorktree, PruneVerdict)>> {
         if dry_run {
             return self.store.read(|db| {
-                let mut in_use: BTreeSet<_> = db
-                    .open_attempts(None)?
-                    .into_iter()
-                    .map(|open| open.attempt.worktree)
+                let in_use: BTreeSet<_> = self
+                    .application
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|live| self.application.runtime.is_running(&live.terminal))
+                    .map(|live| live.session.worktree.clone())
                     .collect();
-                in_use.extend(
-                    self.application
-                        .sessions
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .filter(|live| self.application.runtime.is_running(&live.terminal))
-                        .map(|live| live.session.worktree.clone()),
-                );
                 db.list_worktrees(box_id)?
                     .into_iter()
                     .map(|worktree| {
-                        let verdict =
-                            self.worktree_verdict(&worktree, in_use.contains(&worktree.path))?;
+                        let verdict = self.worktree_verdict(
+                            &worktree,
+                            has_open_attempt(db, &worktree.path)?,
+                            in_use.contains(&worktree.path),
+                        )?;
                         Ok((worktree, verdict))
                     })
                     .collect()
@@ -131,17 +132,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 if db.find_worktree_by_path(&worktree.path)?.as_ref() != Some(&worktree) {
                     return Ok(Ok(None));
                 }
-                let open_attempt = db
-                    .open_attempts(None)?
-                    .iter()
-                    .any(|open| open.attempt.worktree == worktree.path);
+                let open_attempt = has_open_attempt(db, &worktree.path)?;
                 let sessions = self.application.sessions.lock().unwrap();
-                let in_use = open_attempt
-                    || sessions.values().any(|live| {
-                        live.session.worktree == worktree.path
-                            && self.application.runtime.is_running(&live.terminal)
-                    });
-                let verdict = self.worktree_verdict(&worktree, in_use)?;
+                let in_use = sessions.values().any(|live| {
+                    live.session.worktree == worktree.path
+                        && self.application.runtime.is_running(&live.terminal)
+                });
+                let verdict = self.worktree_verdict(&worktree, open_attempt, in_use)?;
                 if verdict == PruneVerdict::Remove {
                     let workspace = &self.application.workspace;
                     let removal = workspace
@@ -156,13 +153,52 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 Ok(Ok(Some(verdict)))
             })??;
             if let Some(verdict) = verdict {
+                let removed = verdict == PruneVerdict::Remove;
+                let path = worktree.path.clone();
                 results.push((worktree, verdict));
+                if removed {
+                    self.retire_worktree_agents(&path)
+                        .with_context(|| format!("Retire agents of {}", path.display()))?;
+                }
             }
         }
         Ok(results)
     }
 
-    fn worktree_verdict(&self, worktree: &ManagedWorktree, in_use: bool) -> Result<PruneVerdict> {
+    /// Stops agents left running in a worktree Power removed. An agent with a session
+    /// has it ended, and the session's exit marks the agent exited and interrupts its
+    /// attempts. An agent without a session is marked exited directly.
+    fn retire_worktree_agents(&self, path: &Path) -> Result<()> {
+        let agents = self.store.read(|db| db.worktree_agents(path))?;
+        let mut orphans = Vec::new();
+        for agent in agents {
+            if agent.state != AgentState::Running {
+                continue;
+            }
+            match agent.session.as_deref() {
+                Some(session) if self.application.session(session).is_ok() => {
+                    self.application.end_session(session)?;
+                }
+                _ => orphans.push(agent.id),
+            }
+        }
+        if !orphans.is_empty() {
+            self.write(|db| {
+                for id in &orphans {
+                    db.set_agent_exited(id)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn worktree_verdict(
+        &self,
+        worktree: &ManagedWorktree,
+        open_attempt: bool,
+        in_use: bool,
+    ) -> Result<PruneVerdict> {
         let workspace = &self.application.workspace;
         if !workspace.owns_worktree(worktree) {
             return Ok(PruneVerdict::Keep(KeepReason::NoLongerManaged));
@@ -173,7 +209,21 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(prune_verdict(PruneStatus {
             dirty: status.dirty,
             merged_into_default: status.merged_into_default,
+            open_attempt,
             in_use,
         }))
     }
+}
+
+/// Whether an open attempt runs in this worktree, or belongs to an agent that works in it.
+fn has_open_attempt(db: &dyn DagReader, path: &Path) -> Result<bool> {
+    let agents: BTreeSet<_> = db
+        .worktree_agents(path)?
+        .into_iter()
+        .map(|agent| agent.id)
+        .collect();
+    Ok(db
+        .open_attempts(None)?
+        .iter()
+        .any(|open| open.attempt.worktree == path || agents.contains(&open.attempt.agent)))
 }

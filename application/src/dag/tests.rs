@@ -108,6 +108,17 @@ impl DagReader for MemoryDb {
             .collect())
     }
 
+    fn worktree_agents(&self, worktree: &Path) -> Result<Vec<ManagedAgent>> {
+        Ok(self
+            .0
+            .borrow()
+            .agents
+            .iter()
+            .filter(|agent| agent.worktree == worktree)
+            .cloned()
+            .collect())
+    }
+
     fn run(&self, id: &str) -> Result<Run> {
         self.0
             .borrow()
@@ -368,6 +379,7 @@ struct FakeWorktrees {
     head_lookups: Vec<PathBuf>,
     creation_requests: Vec<(PathBuf, String, String)>,
     creation_error: Option<&'static str>,
+    missing: BTreeSet<PathBuf>,
 }
 
 impl Workspace for FakeWorkspace {
@@ -447,6 +459,10 @@ impl Workspace for FakeWorkspace {
 
     fn remove_worktree(&self, _path: &Path, _delete_branch: bool) -> Result<()> {
         bail!("Unexpected worktree removal")
+    }
+
+    fn worktree_exists(&self, path: &Path) -> bool {
+        !self.0.lock().unwrap().missing.contains(path)
     }
 
     fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
@@ -1150,6 +1166,55 @@ fn reconcile_keeps_attempts_and_agents_whose_session_was_restored() -> Result<()
 }
 
 #[test]
+fn reconcile_stops_restored_agents_whose_worktree_is_gone_unless_an_attempt_is_open() -> Result<()>
+{
+    let workspace = FakeWorkspace::default();
+    let dag = TestDag::new(
+        application_with_workspace(workspace.clone()),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    );
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("done", &[])])?;
+    let working = dag.dispatch(command(&run, false))?;
+    let finished = dag.dispatch(Dispatch {
+        task: "done".into(),
+        ..command(&run, false)
+    })?;
+    dag.report(
+        &run,
+        "done",
+        &finished.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let sessions =
+        [&working, &finished].map(|dispatched| dispatched.agent.session.clone().unwrap());
+    let agent = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.state);
+
+    dag.reconcile(&sessions)?;
+    assert_eq!(agent(&finished.agent.id)?, AgentState::Running);
+
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .missing
+        .insert("/worktree".into());
+    dag.reconcile(&sessions)?;
+
+    assert_eq!(agent(&working.agent.id)?, AgentState::Running);
+    assert_eq!(agent(&finished.agent.id)?, AgentState::Exited);
+    let snapshot = dag.run(&run)?;
+    assert_eq!(
+        snapshot.tasks[0].attempts.last().unwrap().state,
+        AttemptState::Active
+    );
+    Ok(())
+}
+
+#[test]
 fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     let application = application();
     let caller = application.start_session(StartSession {
@@ -1638,4 +1703,57 @@ fn planning_changes_clears_and_reports_the_plan() -> Result<()> {
         ]
     );
     Ok(())
+}
+
+#[test]
+fn runs_sort_active_then_stalled_then_completed_newest_first() {
+    let run = |id: &str, created_at: u64, states: &[TaskState]| Run {
+        id: id.into(),
+        box_id: "box".into(),
+        title: id.into(),
+        coordinator: Coordinator::External {
+            label: "test".into(),
+        },
+        created_at,
+        tasks: states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| Task {
+                id: format!("t{index}"),
+                title: String::new(),
+                instructions: String::new(),
+                deps: Vec::new(),
+                provider: None,
+                model: None,
+                state: *state,
+                current_attempt: None,
+                attempts: Vec::new(),
+            })
+            .collect(),
+    };
+    let mut runs = vec![
+        run("done-old", 1, &[TaskState::Completed]),
+        run("stalled-old", 2, &[TaskState::Failed]),
+        run("active-old", 3, &[TaskState::Working]),
+        run("done-new", 4, &[TaskState::Completed]),
+        run(
+            "stalled-new",
+            5,
+            &[TaskState::Completed, TaskState::Interrupted],
+        ),
+        run("active-new", 6, &[]),
+    ];
+    sort_runs(&mut runs);
+    let order: Vec<_> = runs.iter().map(|run| run.id.as_str()).collect();
+    assert_eq!(
+        order,
+        [
+            "active-new",
+            "active-old",
+            "stalled-new",
+            "stalled-old",
+            "done-new",
+            "done-old"
+        ]
+    );
 }

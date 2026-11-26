@@ -601,7 +601,7 @@ fn prune_reports_kept_reasons_and_only_removes_managed_worktrees_in_scope() {
     );
     assert!(plan.contains("uncommitted or untracked changes"), "{plan}");
     assert!(
-        plan.contains("in use by a live session or active attempt"),
+        plan.contains("an attempt there is still active or waiting for input"),
         "{plan}"
     );
     assert!(merged.is_dir());
