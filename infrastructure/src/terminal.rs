@@ -222,7 +222,8 @@ pub enum Command {
     },
     Output(Vec<u8>),
     /// A failed resume was replaced by a fresh agent process with this PID.
-    Relaunched(Option<u32>),
+    /// A failed resume's fresh start: its PID and the model it was started with.
+    Relaunched(Option<u32>, Option<String>),
     /// Recheck which agent owns the foreground of a shell session.
     Poll,
     OutputClosed,
@@ -272,7 +273,7 @@ fn launch(
         (Some(profile), Some(args)) => {
             let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
             configure(&mut command, runtime, session, &options, &cwd);
-            Some((command, conversation))
+            Some((command, conversation, requested_model(&session.agent, args)))
         }
         _ => None,
     };
@@ -296,16 +297,19 @@ fn launch(
     });
     // A relaunch needs the slave, which also keeps the reader from seeing EOF between
     // the two processes.
-    let relaunch = match fallback {
-        Some((command, conversation)) => Some(Relaunch {
-            command,
-            conversation,
-            slave: pair.slave,
-            deadline: Instant::now() + RESUME_WINDOW,
-        }),
+    let (relaunch, fresh_model) = match fallback {
+        Some((command, conversation, model)) => (
+            Some(Relaunch {
+                command,
+                conversation,
+                slave: pair.slave,
+                deadline: Instant::now() + RESUME_WINDOW,
+            }),
+            model,
+        ),
         None => {
             drop(pair.slave);
-            None
+            (None, None)
         }
     };
     if conversation.is_some() {
@@ -357,11 +361,23 @@ fn launch(
                     "Could not resume {}, so it starts a new conversation.",
                     waiter_lifecycle.session
                 );
+                // A fresh start is a new conversation, so the failed one's conversation
+                // and labels are dropped in one write. It is saved before the actor takes
+                // the new process, so no report from that process can be overwritten.
+                let fresh = Labels {
+                    task: None,
+                    model: fresh_model.clone(),
+                    model_reported: false,
+                };
+                waiter_lifecycle.record_foreground(
+                    &launched,
+                    conversation,
+                    None,
+                    Some(&fresh),
+                    false,
+                );
                 let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
-                let _ = waiter_tx.send(Command::Relaunched(pid));
-                if conversation.is_some() {
-                    waiter_lifecycle.record_foreground(&launched, conversation, None, None, false);
-                }
+                let _ = waiter_tx.send(Command::Relaunched(pid, fresh_model));
             },
         );
         let detail = match result {
@@ -941,10 +957,27 @@ fn terminal_actor(
                     Instant::now(),
                 ));
             }
-            Command::Relaunched(pid) => {
+            Command::Relaunched(pid, model) => {
                 shell_pid = pid;
                 if launched_agent != Agent::Shell {
                     run = pid.map(|pid| (pid, launched_agent.clone()));
+                    // The fresh start is a new conversation and shows none of the failed
+                    // one's labels.
+                    if metadata.model != model
+                        && let Err(error) = lifecycle.set_model(&launched_agent, model.clone())
+                    {
+                        eprintln!(
+                            "Could not save agent model for {}. {error:#}",
+                            lifecycle.session
+                        );
+                    }
+                    let fresh = SessionMetadata { task: None, model };
+                    model_reported = false;
+                    if metadata != fresh {
+                        metadata = fresh;
+                        notify_metadata(&metadata, &mut clients);
+                    }
+                    restore.labels = Some(current_labels(&metadata, model_reported));
                 }
             }
             Command::FlushScrollback(reply) => {
@@ -1195,11 +1228,13 @@ impl RestoreState {
     }
 
     /// Labels saved for the agent `pid` with `identity`: its own, when the owner comes
-    /// back, or a restored owner's, when this agent resumed that conversation.
+    /// back, or a restored owner's, when this agent resumed that conversation. An unknown
+    /// conversation never matches, since two unknown conversations may differ.
     fn labels_for(&mut self, pid: u32, identity: &Identity) -> Option<Labels> {
         if self.owner_pid == Some(pid) && self.saved.identity == *identity {
             return Some(self.saved.labels.clone());
         }
+        identity.conversation.as_ref()?;
         self.restored
             .take_if(|restored| restored.identity == *identity)
             .map(|restored| restored.labels)
@@ -2182,6 +2217,20 @@ mod tests {
         // They are handed over once.
         assert_eq!(
             restore.labels_for(2, &identity(claude(), Some("conv-a"))),
+            None
+        );
+    }
+
+    #[test]
+    fn restored_labels_never_go_to_a_conversation_nobody_knows() {
+        // Two unknown conversations may differ, so absent IDs on both sides never match.
+        let mut restore = shell_restore(Some(Owner {
+            identity: identity(codex(), None),
+            labels: labels("Saved task", Some("saved-model")),
+        }));
+        assert_eq!(restore.labels_for(me(), &identity(codex(), None)), None);
+        assert_eq!(
+            restore.labels_for(me(), &identity(codex(), Some("conv"))),
             None
         );
     }

@@ -114,6 +114,38 @@ fn setup(root: &Path) {
     )
     .unwrap();
     std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Codex resumes with `resume --last`, so no conversation ID is ever known. A first run
+    // reports labels. A resume fails while `fail-resume` exists, and a fresh start or a
+    // resume reports nothing and leaves a marker.
+    let codex = bin.join("codex");
+    std::fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh
+case \"$*\" in
+  *resume*)
+    [ ! -f {fail} ] || exit 1
+    : > {resumed}
+    sleep 30
+    exit;;
+esac
+if [ ! -f {marker} ]; then
+  : > {marker}
+  power session task 'Codex task'
+  power session model codex-model
+else
+  : > {fresh}
+fi
+read finish || sleep 30
+",
+            fail = root.join("fail-resume").display(),
+            resumed = root.join("codex-resumed").display(),
+            marker = root.join("codex-reported").display(),
+            fresh = root.join("codex-fresh").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
     let setup = Command::new(env!("CARGO_BIN_EXE_power"))
         .arg("setup")
         .env("HOME", root)
@@ -153,6 +185,38 @@ fn start_agent_with(socket: &Path, command: &str) -> (Value, BufReader<UnixStrea
         json!({"task":"Saved task", "model":"reported-model"}),
     );
     (session, attached)
+}
+
+/// The labels a new subscriber sees now. An attach sends them only when there are any.
+fn metadata_now(socket: &Path, session: &Value) -> Value {
+    let mut attached = request(socket, json!({"request":"subscribe", "session":session}));
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    assert_eq!(event(&mut attached)["event"], "agent");
+    attached
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut data = String::new();
+    match attached.read_line(&mut data) {
+        Ok(count) if count > 0 => {
+            let message: Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(message["event"], "metadata", "{message}");
+            message["metadata"].clone()
+        }
+        _ => json!({"task":null, "model":null}),
+    }
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn sandbox() -> (tempfile::TempDir, PathBuf) {
@@ -208,9 +272,9 @@ fn a_foreground_agent_with_redirected_input_keeps_its_labels() {
     let (directory, socket) = sandbox();
     let root = directory.path();
     let daemon = Daemon::start(root);
-    // Started without the wrapper and with its input redirected, the agent still runs in
-    // the terminal's foreground job and owns the labels it reports.
-    let (session, _attached) = start_agent_with(&socket, "command claude </dev/null\n");
+    // With its input redirected, the agent still runs in the terminal's foreground job
+    // and owns the labels it reports.
+    let (session, _attached) = start_agent_with(&socket, "claude </dev/null\n");
     daemon.terminate();
 
     let _daemon = Daemon::start(root);
@@ -218,6 +282,36 @@ fn a_foreground_agent_with_redirected_input_keeps_its_labels() {
     metadata_until(
         &mut attached,
         json!({"task":"Saved task", "model":"reported-model"}),
+    );
+}
+
+#[test]
+fn an_agent_started_without_its_wrapper_resumes_without_its_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    // Without the wrapper, no conversation ID is known, and `--continue` may open another
+    // conversation than the one that reported.
+    let (session, _attached) = start_agent_with(&socket, "command claude </dev/null\n");
+    daemon.terminate();
+
+    let _daemon = Daemon::start(root);
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "The resumed agent was never seen"
+        );
+        let message = event(&mut attached);
+        assert_ne!(message["event"], "metadata", "{message}");
+        if message["event"] == "agent" && message["agent"] == "claude" {
+            break;
+        }
+    }
+    assert_eq!(
+        metadata_now(&socket, &session),
+        json!({"task":null, "model":null})
     );
 }
 
@@ -253,4 +347,77 @@ fn a_background_agent_that_never_reported_is_not_resumed() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(!root.join("resumed").exists());
+}
+
+#[test]
+fn a_resumed_conversation_with_an_unknown_id_gets_no_saved_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    let (session, mut attached) = start_shell(&socket);
+    input(&socket, &session, "codex\n");
+    metadata_until(
+        &mut attached,
+        json!({"task":"Codex task", "model":"codex-model"}),
+    );
+    daemon.terminate();
+
+    let _daemon = Daemon::start(root);
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    // `resume --last` may open any conversation, so nothing shows the saved labels belong
+    // to the one it opened.
+    wait_for(&root.join("codex-resumed"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "The resumed agent was never seen"
+        );
+        let message = event(&mut attached);
+        assert_ne!(message["event"], "metadata", "{message}");
+        if message["event"] == "agent" && message["agent"] == "codex" {
+            break;
+        }
+    }
+    assert_eq!(
+        metadata_now(&socket, &session),
+        json!({"task":null, "model":null})
+    );
+}
+
+#[test]
+fn a_fresh_start_after_a_failed_resume_drops_the_old_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"codex"}),
+    ));
+    let session = launched["session"]["id"].clone();
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    metadata_until(
+        &mut attached,
+        json!({"task":"Codex task", "model":"codex-model"}),
+    );
+    std::fs::write(root.join("fail-resume"), "").unwrap();
+    daemon.terminate();
+
+    // The resume fails, and the fresh start is a new conversation without labels.
+    let daemon = Daemon::start(root);
+    wait_for(&root.join("codex-fresh"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while metadata_now(&socket, &session) != json!({"task":null, "model":null}) {
+        assert!(Instant::now() < deadline, "The old labels stayed shown");
+    }
+    daemon.terminate();
+
+    // The saved record dropped them too, so a later resume shows none.
+    std::fs::remove_file(root.join("fail-resume")).unwrap();
+    let _daemon = Daemon::start(root);
+    wait_for(&root.join("codex-resumed"));
+    assert_eq!(
+        metadata_now(&socket, &session),
+        json!({"task":null, "model":null})
+    );
 }
