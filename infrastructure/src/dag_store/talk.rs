@@ -4,6 +4,7 @@ use application::dag::DagReader;
 use application::talk::{
     DeliveryChange, LogFilter, TalkEvent, TalkEventKind, TalkReader, TalkStore, TalkTransaction,
 };
+use domain::dag::ManagedAgent;
 use domain::talk::{
     AgentRef, AgentTalkSummary, Delivery, Directory, Message, MessageId, Recipient, RunRef, Sender,
     ThreadId,
@@ -229,15 +230,21 @@ impl TalkReader for TalkDb<'_> {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    fn pending_agents(&self) -> Result<Vec<String>> {
+    fn pending_agents(&self, remind_before: u64) -> Result<Vec<String>> {
         Ok(self
             .0
             .prepare(
-                "SELECT DISTINCT recipient_agent FROM talk_messages
-             WHERE read_at IS NULL AND reminded_at IS NULL AND recipient_agent IS NOT NULL",
+                "SELECT DISTINCT t.recipient_agent FROM talk_messages t
+             JOIN agents a ON a.id = t.recipient_agent
+             WHERE t.read_at IS NULL AND a.state = 'running' AND a.session IS NOT NULL
+               AND (t.notified_at IS NULL OR (t.reminded_at IS NULL AND t.notified_at <= ?1))",
             )?
-            .query_map([], |row| row.get(0))?
+            .query_map([remind_before], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn agent(&self, id: &str) -> Result<ManagedAgent> {
+        DagDb(self.0).agent(id)
     }
 
     fn thread(&self, id: &ThreadId) -> Result<Vec<Message>> {
@@ -424,10 +431,13 @@ mod tests {
         let store = SqliteDagStore::initialize(Connection::open(file.path())?)?;
         store.write(|db| {
             assert_eq!(
-                db.inbox(&Recipient::User, Some("box"), false)?,
-                [message.clone()]
+                db.inbox(&Recipient::User, Some("box"), false)?.as_slice(),
+                std::slice::from_ref(&message)
             );
-            assert_eq!(db.thread(&message.thread)?, [message.clone()]);
+            assert_eq!(
+                db.thread(&message.thread)?.as_slice(),
+                std::slice::from_ref(&message)
+            );
             assert_eq!(db.cursor()?, 1);
             db.mark(&[&message], DeliveryChange::Read, 6)?;
             assert!(db.inbox(&Recipient::User, None, false)?.is_empty());

@@ -169,7 +169,7 @@ pub(crate) fn request(
                         after.map(MessageId),
                         deadline,
                     )?
-                    .map(Into::into),
+                    .map(|message| Box::new(message.into())),
             }
         }
         TalkCommand::Log {

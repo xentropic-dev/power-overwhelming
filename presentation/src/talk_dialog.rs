@@ -333,7 +333,7 @@ impl TalkDialog {
             Command::PickerCancel,
             if expanded { "back" } else { "close" },
         );
-        let status = self.error.as_deref().or_else(|| {
+        let status = self.error.as_deref().or({
             if self.loading {
                 Some("Loading messages…")
             } else if messages.is_empty() {

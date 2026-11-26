@@ -130,7 +130,7 @@ pub fn wait(
         Duration::from_secs(seconds.saturating_add(10)),
     )?;
     match decode(wire::receive(&mut socket)?.context("Daemon disconnected")?)? {
-        TalkResponse::Reply { message } => Ok(message.map(Into::into)),
+        TalkResponse::Reply { message } => Ok(message.map(|message| (*message).into())),
         _ => bail!("Unexpected talk response"),
     }
 }

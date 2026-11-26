@@ -74,8 +74,15 @@ impl TalkReader for Db {
     fn summary(&self, _: &str) -> Result<Vec<AgentTalkSummary>> {
         unreachable!()
     }
-    fn pending_agents(&self) -> Result<Vec<String>> {
+    fn pending_agents(&self, _: u64) -> Result<Vec<String>> {
         Ok(vec!["b".into()])
+    }
+    fn agent(&self, id: &str) -> Result<ManagedAgent> {
+        self.directory()?
+            .agents
+            .into_iter()
+            .find(|agent| agent.id == id)
+            .context("Unknown agent")
     }
     fn thread(&self, id: &ThreadId) -> Result<Vec<Message>> {
         Ok(self

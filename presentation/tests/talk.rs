@@ -5,6 +5,7 @@ use infrastructure::{
 use serde_json::Value;
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::Path,
     process::{Child, Command, Output, Stdio},
@@ -527,6 +528,126 @@ fn rejects_bad_targets_and_rate_limits_without_queueing() {
             .len(),
         20
     );
+}
+
+fn socket_request(path: &Path, command: &str) -> BufReader<UnixStream> {
+    let mut socket = UnixStream::connect(path.join("power.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        socket,
+        "{}",
+        serde_json::json!({
+            "request": "talk", "talk": { "command": command, "box_sel": BOX },
+        })
+    )
+    .unwrap();
+    BufReader::new(socket)
+}
+
+fn socket_response(socket: &mut BufReader<UnixStream>) -> Value {
+    let mut line = String::new();
+    assert_ne!(socket.read_line(&mut line).unwrap(), 0);
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn watch_and_summaries_follow_user_inbox_changes() {
+    let fixture = Fixture::new();
+    let mut watch = socket_request(fixture.path(), "watch");
+    assert_eq!(socket_response(&mut watch)["talk"]["kind"], "ok");
+    let sent = fixture.messages(Some(&fixture.a), &["send", "user", "read this", "--json"]);
+    let id = field(&sent[0], "id");
+    let queued = socket_response(&mut watch);
+    assert_eq!(queued["talk"]["event"]["kind"], "talk_message");
+    assert_eq!(queued["talk"]["event"]["message"], id);
+
+    let summary = |agent: &str| {
+        let response = socket_response(&mut socket_request(fixture.path(), "summary"));
+        response["talk"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["agent"] == agent)
+            .unwrap()
+            .clone()
+    };
+    let badge = summary(&fixture.a.id);
+    assert_eq!(badge["to_user"], 1);
+    assert_eq!(badge["unread"], 0);
+    assert_eq!(badge["count"], 1);
+    assert_eq!(badge["latest"], "read this");
+
+    let user = fixture.messages(None, &["inbox", "--box", BOX, "--json"]);
+    assert_eq!(user[0]["id"], id);
+    assert_eq!(
+        socket_response(&mut watch)["talk"]["event"]["kind"],
+        "talk_read"
+    );
+    assert_eq!(summary(&fixture.a.id)["to_user"], 0);
+    assert_eq!(notice_count(fixture.path(), "a"), 0);
+    assert!(
+        fixture
+            .messages(None, &["inbox", "--box", REMOTE_BOX, "--all", "--json"])
+            .is_empty()
+    );
+}
+
+#[test]
+fn accepts_file_and_stdin_and_sends_urgent_user_notice_while_busy() {
+    let fixture = Fixture::new();
+    let text_file = fixture.path().join("message.txt");
+    fs::write(&text_file, "line one\n第二行\n").unwrap();
+    success(fixture.talk(Some(&fixture.b), &["busy"]));
+    let sent = fixture.messages(
+        None,
+        &[
+            "send",
+            "--box",
+            BOX,
+            &fixture.b.id,
+            "--file",
+            text_file.to_str().unwrap(),
+            "--urgent",
+            "--json",
+        ],
+    );
+    assert_eq!(sent[0]["body"], "line one\n第二行\n");
+    assert_eq!(sent[0]["sender"]["kind"], "user");
+    poll("urgent user notice", || {
+        (notice_count(fixture.path(), "b") == 1).then_some(())
+    });
+
+    let mut child = power(fixture.path(), Some(&fixture.b))
+        .args(["talk", "reply", field(&sent[0], "id"), "-", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"from stdin\n")
+        .unwrap();
+    let reply = messages(child.wait_with_output().unwrap());
+    assert_eq!(reply[0]["body"], "from stdin\n");
+
+    fs::write(&text_file, vec![b'x'; 16 * 1024 + 1]).unwrap();
+    let rejected = fixture.talk(
+        None,
+        &[
+            "send",
+            "--box",
+            BOX,
+            &fixture.b.id,
+            "--file",
+            text_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("16 KiB"));
 }
 
 #[test]

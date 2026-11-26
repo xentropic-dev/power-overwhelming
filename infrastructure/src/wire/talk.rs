@@ -55,7 +55,7 @@ pub enum TalkCommand {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TalkResponse {
     Messages { messages: Vec<TalkMessage> },
-    Reply { message: Option<TalkMessage> },
+    Reply { message: Option<Box<TalkMessage>> },
     Summary { agents: Vec<TalkAgentSummary> },
     Event { event: TalkEvent },
     Ok,

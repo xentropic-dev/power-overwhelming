@@ -29,8 +29,8 @@ fn directory() -> Directory {
         agents: vec![
             agent("coord", "box", None, AgentStatus::Idle),
             agent("worker-a", "box", Some("a"), AgentStatus::Working),
-            agent("worker-b", "box", Some("b"), AgentStatus::NeedsInput),
             agent("worker-old", "box", Some("b"), AgentStatus::Exited),
+            agent("worker-b", "box", Some("b"), AgentStatus::NeedsInput),
             agent("other", "remote", None, AgentStatus::Idle),
         ],
         runs: vec![RunRef {
@@ -56,7 +56,7 @@ fn addresses_resolve_exact_aliases_and_current_attempts() {
         ("coord", 0),
         ("parent", 0),
         ("coordinator", 0),
-        ("task:b", 2),
+        ("task:b", 3),
     ] {
         assert_eq!(
             resolve(ctx(), &Target::One(Address::from(input)), &dir),
@@ -105,7 +105,7 @@ fn broadcast_excludes_the_sender_and_closed_attempts() {
     };
     assert_eq!(
         resolve(ctx, &Target::Run("run".into()), &dir),
-        Ok(vec![Recipient::agent(&dir.agents[2])])
+        Ok(vec![Recipient::agent(&dir.agents[3])])
     );
 }
 

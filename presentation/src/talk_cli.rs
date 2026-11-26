@@ -120,8 +120,10 @@ pub fn run(args: TalkArgs) -> Result<()> {
             let message = talk::reply(caller.clone(), MessageId(id), body, None)?;
             sent(caller, vec![message], input.wait, input.timeout, json)
         }
-        Action::Inbox { peek, all } => print_messages(talk::inbox(caller, all, peek)?, json),
-        Action::Show { id } => print_messages(talk::show(caller, MessageId(id), false)?, json),
+        Action::Inbox { peek, all } => print_messages(talk::inbox(caller, all, peek)?, json, false),
+        Action::Show { id } => {
+            print_messages(talk::show(caller, MessageId(id), false)?, json, true)
+        }
         Action::Log { agent, run, limit } => print_messages(
             talk::log(
                 caller,
@@ -133,6 +135,7 @@ pub fn run(args: TalkArgs) -> Result<()> {
                 },
             )?,
             json,
+            true,
         ),
         Action::Wait { thread, timeout } => {
             let threads = vec![ThreadId(thread)];
@@ -292,7 +295,7 @@ fn json_messages(messages: Vec<Message>) -> Vec<serde_json::Value> {
     messages.into_iter().map(talk::json).collect()
 }
 
-fn print_messages(messages: Vec<Message>, json: bool) -> Result<()> {
+fn print_messages(messages: Vec<Message>, json: bool, delivery: bool) -> Result<()> {
     if json {
         return super::print_json(json!({"messages": json_messages(messages)}));
     }
@@ -301,6 +304,25 @@ fn print_messages(messages: Vec<Message>, json: bool) -> Result<()> {
     }
     for message in &messages {
         println!("{}", envelope(message));
+        if delivery {
+            let state = &message.delivery;
+            let times = [
+                ("Queued", Some(state.queued_at)),
+                ("Notified", state.notified_at),
+                ("Reminded", state.reminded_at),
+                ("Read", state.read_at),
+            ];
+            let line = times
+                .into_iter()
+                .filter_map(|(label, stamp)| {
+                    let time =
+                        chrono::DateTime::from_timestamp_millis(i64::try_from(stamp?).ok()?)?;
+                    Some(format!("{label} {}", time.to_rfc3339()))
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("{line}");
+        }
     }
     Ok(())
 }

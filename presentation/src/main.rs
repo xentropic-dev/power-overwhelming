@@ -258,7 +258,10 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
-            config::load_talk_policy(settings::Settings::defaults())?,
+            config::load_talk_policy(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load talk settings. {error:#}");
+                domain::talk::NoticePolicy::default()
+            }),
         ),
         Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {

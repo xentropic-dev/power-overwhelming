@@ -739,7 +739,7 @@ done
         fs::write(
             config.join("config.lua"),
             format!(
-                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
+                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }}, turn_hook = {{ kind = "none" }} }}"#,
                 program.to_str().unwrap(),
             ),
         )

@@ -74,8 +74,7 @@ pub struct PtyRuntime {
 }
 
 struct Lifecycle {
-    activity: Mutex<Activity>,
-    output_sets_busy: AtomicBool,
+    input: Mutex<TerminalInput>,
     talk_wake: SyncSender<()>,
     running: AtomicBool,
     session: String,
@@ -86,6 +85,13 @@ struct Lifecycle {
     shutting_down: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct TerminalInput {
+    activity: Activity,
+    output_sets_busy: bool,
+    writer: Option<SyncSender<Vec<u8>>>,
+}
+
 struct Foreground {
     agent: Agent,
     model: Option<String>,
@@ -93,10 +99,12 @@ struct Foreground {
 
 impl Lifecycle {
     fn record_output(&self) {
-        let mut state = self.activity.lock().unwrap();
+        let mut input = self.input.lock().unwrap();
+        let output_sets_busy = input.output_sets_busy;
+        let state = &mut input.activity;
         let now = crate::talk_adapter::now_ms();
         state.last_output = now;
-        if self.output_sets_busy.load(Ordering::Acquire) {
+        if output_sets_busy {
             state.hook = HookState::Busy;
         }
         state.active_since = now;
@@ -104,9 +112,11 @@ impl Lifecycle {
     }
 
     fn notify_exit(&self, detail: &str) {
-        if self.running.swap(false, Ordering::AcqRel) && !self.shutting_down.load(Ordering::Acquire)
-        {
-            (self.on_exit)(&self.session, detail);
+        if self.running.swap(false, Ordering::AcqRel) {
+            self.input.lock().unwrap().writer.take();
+            if !self.shutting_down.load(Ordering::Acquire) {
+                (self.on_exit)(&self.session, detail);
+            }
         }
     }
 
@@ -143,7 +153,6 @@ impl Lifecycle {
 
 #[derive(Clone)]
 pub struct Handle {
-    input: SyncSender<Vec<u8>>,
     commands: SyncSender<Command>,
     lifecycle: Arc<Lifecycle>,
 }
@@ -158,16 +167,13 @@ impl Handle {
     }
 
     pub(crate) fn activity(&self) -> Activity {
-        *self.lifecycle.activity.lock().unwrap()
+        self.lifecycle.input.lock().unwrap().activity
     }
 
     pub(crate) fn report_turn(&self, hook: HookState, output_sets_busy: bool) {
-        let mut state = self.lifecycle.activity.lock().unwrap();
-        if output_sets_busy {
-            self.lifecycle
-                .output_sets_busy
-                .store(true, Ordering::Release);
-        }
+        let mut input = self.lifecycle.input.lock().unwrap();
+        input.output_sets_busy |= output_sets_busy;
+        let state = &mut input.activity;
         state.hook = hook;
         if hook == HookState::Busy {
             state.active_since = crate::talk_adapter::now_ms();
@@ -177,22 +183,33 @@ impl Handle {
     }
 
     pub(crate) fn input(&self, bytes: Vec<u8>, notice: Option<Activity>) -> Result<bool> {
-        let mut state = self.lifecycle.activity.lock().unwrap();
-        if notice.is_some_and(|expected| expected != *state)
+        let mut input = self.lifecycle.input.lock().unwrap();
+        if notice.is_some_and(|expected| expected != input.activity)
             || !self.is_running()
             || self.lifecycle.shutting_down.load(Ordering::Acquire)
         {
             return Ok(false);
         }
-        match self.input.try_send(bytes) {
+        let Some(writer) = &input.writer else {
+            return Ok(false);
+        };
+        match writer.try_send(bytes) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) if notice.is_some() => return Ok(false),
             Err(error) => return Err(error.into()),
         }
         let now = crate::talk_adapter::now_ms();
-        state.last_input = now;
+        let output_sets_busy = input.output_sets_busy;
+        let state = &mut input.activity;
+        if notice.is_some() {
+            state.last_notice = now;
+        } else {
+            state.last_input = now;
+        }
         state.active_since = now;
-        if state.hook == HookState::Ready {
+        // A notice submits a new prompt. Explicitly tracked turns also become
+        // busy as soon as the user starts typing into the terminal.
+        if output_sets_busy || state.hook == HookState::Ready {
             state.hook = HookState::Busy;
         }
         state.revision = state.revision.wrapping_add(1);
@@ -316,14 +333,17 @@ fn launch(
     let process = pair.slave.spawn_command(process)?;
     let pid = process.process_id();
     let started_at = crate::talk_adapter::now_ms();
+    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
     let lifecycle = Arc::new(Lifecycle {
-        activity: Mutex::new(Activity {
-            last_output: started_at,
-            last_input: started_at,
-            active_since: started_at,
-            ..Activity::default()
+        input: Mutex::new(TerminalInput {
+            activity: Activity {
+                last_output: started_at,
+                active_since: started_at,
+                ..Activity::default()
+            },
+            output_sets_busy,
+            writer: Some(write_tx.clone()),
         }),
-        output_sets_busy: AtomicBool::new(output_sets_busy),
         talk_wake: runtime.talk_wake.clone(),
         running: AtomicBool::new(true),
         session: session.id.clone(),
@@ -355,7 +375,6 @@ fn launch(
     }
 
     let (tx, rx) = mpsc::sync_channel(128);
-    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
     thread::spawn(move || {
         for bytes in write_rx {
             if writer.write_all(&bytes).is_err() {
@@ -424,7 +443,6 @@ fn launch(
         });
     }
     let launched_agent = session.agent.clone();
-    let input = write_tx.clone();
     let actor_lifecycle = lifecycle.clone();
     let active_scheme = runtime.scheme.clone();
     let profiles = runtime.profiles.clone();
@@ -457,7 +475,6 @@ fn launch(
         }
     });
     Ok(Handle {
-        input,
         commands: tx,
         lifecycle,
     })
@@ -775,10 +792,10 @@ fn terminal_actor(
                     notify_metadata(&metadata, &mut clients);
                 }
                 if run.is_none() {
-                    let mut state = lifecycle.activity.lock().unwrap();
-                    lifecycle.output_sets_busy.store(false, Ordering::Release);
-                    state.hook = HookState::Unknown;
-                    state.revision = state.revision.wrapping_add(1);
+                    let mut input = lifecycle.input.lock().unwrap();
+                    input.output_sets_busy = false;
+                    input.activity.hook = HookState::Unknown;
+                    input.activity.revision = input.activity.revision.wrapping_add(1);
                 }
                 restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
             }
@@ -1576,8 +1593,7 @@ mod tests {
     fn exits_during_shutdown_are_not_reported() {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
-            activity: Mutex::default(),
-            output_sets_busy: AtomicBool::new(false),
+            input: Mutex::default(),
             talk_wake: mpsc::sync_channel(1).0,
             running: AtomicBool::new(true),
             session: "worker".into(),

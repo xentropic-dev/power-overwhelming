@@ -52,7 +52,9 @@ timeout exits with status 3 and prints the thread ID so you can resume
 waiting. Use `--json` for structured output and delivery timestamps.
 
 A busy agent receives its notice when idle. Messages to the user appear in
-the user inbox. `power talk ready` and `power talk busy` are hidden commands
+the user inbox. To tune output and input quiet times where a provider has no turn
+hook, set `talk.idle_after` and `talk.user_quiet` in `config.lua`. Values are seconds
+and default to 5 and 10. `power talk ready` and `power talk busy` are hidden commands
 for provider hooks. They report turn state for the session in `POWER_SESSION`.
 
 The desktop opens an agent's talk dialog with Ctrl+T from the agent tree

@@ -19,7 +19,8 @@ pub trait TalkReader {
     fn inbox(&self, recipient: &Recipient, box_id: Option<&str>, all: bool)
     -> Result<Vec<Message>>;
     fn summary(&self, box_id: &str) -> Result<Vec<AgentTalkSummary>>;
-    fn pending_agents(&self) -> Result<Vec<String>>;
+    fn pending_agents(&self, remind_before: u64) -> Result<Vec<String>>;
+    fn agent(&self, id: &str) -> Result<ManagedAgent>;
     fn thread(&self, id: &ThreadId) -> Result<Vec<Message>>;
     fn log(&self, filter: &LogFilter) -> Result<Vec<Message>>;
     fn recent_sends(&self, sender: &Sender, recipient: &Recipient, since: u64) -> Result<Vec<u64>>;
@@ -109,8 +110,8 @@ use anyhow::{Context, bail, ensure};
 use domain::{
     dag::{AgentStatus, Coordinator, ManagedAgent},
     talk::{
-        Address, AgentRef, Delivery, MAX_BODY_BYTES, NoticeDecision, RATE_WINDOW_MS, SenderContext,
-        authorize, notice, rate_limit, resolve,
+        Address, AgentRef, Delivery, MAX_BODY_BYTES, NoticeDecision, RATE_WINDOW_MS,
+        REMINDER_AFTER_MS, SenderContext, authorize, notice, rate_limit, resolve,
     },
 };
 
@@ -452,7 +453,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     let messages = db.thread(thread)?;
                     let from = messages
                         .iter()
-                        .position(|message| {
+                        .rposition(|message| {
                             sent(message) && after.as_ref().is_none_or(|id| message.id == *id)
                         })
                         .with_context(|| {
@@ -555,59 +556,57 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     pub fn deliver_pending(&self) -> Result<()> {
-        let agents = self.store.read(|db| db.pending_agents())?;
+        let remind_before = (self.clock)().saturating_sub(REMINDER_AFTER_MS);
+        let pending = self.store.read(|db| db.pending_agents(remind_before))?;
         let mut first_error = None;
-        for id in agents {
-            if let Err(error) = self.deliver(&id) {
+        for id in pending {
+            let result = self.store.write(|db| {
+                let agent = db.agent(&id)?;
+                if agent.status == AgentStatus::Exited {
+                    return Ok(());
+                }
+                self.deliver(db, &agent)
+            });
+            if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 
-    fn deliver(&self, id: &str) -> Result<()> {
-        self.store.write(|db| {
-            let directory = db.directory()?;
-            let Some(agent) = directory
-                .agents
-                .iter()
-                .find(|agent| agent.id == id && agent.status != AgentStatus::Exited)
-            else {
-                return Ok(());
-            };
-            let Some(session) = agent.session.as_deref() else {
-                return Ok(());
-            };
-            let Some(activity) = self.activity.activity(session) else {
-                return Ok(());
-            };
-            let messages = db.inbox(&Recipient::agent(agent), Some(&agent.box_id), false)?;
-            let needs_input = agent.status == AgentStatus::NeedsInput;
-            let now = (self.clock)();
-            let mut notify = Vec::new();
-            let mut remind = Vec::new();
-            let mut included = Vec::new();
-            for message in &messages {
-                match self
-                    .policy
-                    .decide(activity, needs_input, activity.paused, message, now)
-                {
-                    NoticeDecision::Notify => notify.push(message),
-                    NoticeDecision::Remind => remind.push(message),
-                    NoticeDecision::Hold(_) => continue,
-                }
-                included.push(message);
-            }
-            if !included.is_empty()
-                && self
-                    .notifier
-                    .notify(session, activity, &notice(&included))?
+    fn deliver(&self, db: &dyn TalkTransaction, agent: &ManagedAgent) -> Result<()> {
+        let Some(session) = agent.session.as_deref() else {
+            return Ok(());
+        };
+        let Some(activity) = self.activity.activity(session) else {
+            return Ok(());
+        };
+        let messages = db.inbox(&Recipient::agent(agent), Some(&agent.box_id), false)?;
+        let needs_input = agent.status == AgentStatus::NeedsInput;
+        let now = (self.clock)();
+        let mut notify = Vec::new();
+        let mut remind = Vec::new();
+        let mut included = Vec::new();
+        for message in &messages {
+            match self
+                .policy
+                .decide(activity, needs_input, activity.paused, message, now)
             {
-                db.mark(&notify, DeliveryChange::Notified, now)?;
-                db.mark(&remind, DeliveryChange::Reminded, now)?;
+                NoticeDecision::Notify => notify.push(message),
+                NoticeDecision::Remind => remind.push(message),
+                NoticeDecision::Hold(_) => continue,
             }
-            Ok(())
-        })
+            included.push(message);
+        }
+        if !included.is_empty()
+            && self
+                .notifier
+                .notify(session, activity, &notice(&included))?
+        {
+            db.mark(&notify, DeliveryChange::Notified, now)?;
+            db.mark(&remind, DeliveryChange::Reminded, now)?;
+        }
+        Ok(())
     }
 }
 
@@ -617,7 +616,6 @@ fn require_message(db: &dyn TalkReader, id: &MessageId) -> Result<Message> {
 }
 
 fn validate_body(body: &str) -> Result<()> {
-    ensure!(!body.trim().is_empty(), "Talk message body is empty");
     ensure!(
         body.len() <= MAX_BODY_BYTES,
         "Talk message body exceeds the 16 KiB ({MAX_BODY_BYTES} bytes) limit"

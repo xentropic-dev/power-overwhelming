@@ -865,7 +865,7 @@ mod tests {
         numbered_artifact,
     };
     use crate::keymap::Command;
-    use domain::{dag::AttemptArtifact, talk::AgentTalkSummary};
+    use domain::dag::AttemptArtifact;
     use gpui::{Bounds, point, px, size};
     use infrastructure::client::{Attempt, AttemptState, Provider, Task, TaskState};
 

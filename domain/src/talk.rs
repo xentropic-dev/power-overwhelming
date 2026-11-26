@@ -132,6 +132,7 @@ pub struct RunRef {
 
 #[derive(Default)]
 pub struct Directory {
+    /// Agents in creation order. The last attempt of each task is its current one.
     pub agents: Vec<ManagedAgent>,
     pub runs: Vec<RunRef>,
 }
@@ -219,7 +220,7 @@ pub fn resolve(
     };
     let find_run = |id: Option<&str>, alias: &str| {
         let run = directory.run(id.ok_or_else(|| AddressError::Unknown(alias.into()))?)?;
-        check_box(&run.id, &run.box_id)?;
+        check_box(alias, &run.box_id)?;
         Ok(run)
     };
     let sender_run = ctx.agent.and_then(|agent| agent.run.as_deref());
@@ -271,17 +272,10 @@ pub fn resolve(
             let current = directory
                 .agents
                 .iter()
-                .filter(|agent| matches_task(agent))
-                .find(|agent| {
-                    matches!(agent.status, AgentStatus::Working | AgentStatus::NeedsInput)
-                });
-            match current {
-                Some(agent) => one(agent, &address),
-                None if directory.agents.iter().any(matches_task) => {
-                    Err(AddressError::Exited(address))
-                }
-                None => Err(AddressError::Unknown(address)),
-            }
+                .rev()
+                .find(|agent| matches_task(agent))
+                .ok_or_else(|| AddressError::Unknown(address.clone()))?;
+            one(current, &address)
         }
         Target::Run(id) => {
             let run = find_run(Some(id), id)?;
@@ -421,6 +415,7 @@ pub enum HookState {
 pub struct Activity {
     pub last_output: u64,
     pub last_input: u64,
+    pub last_notice: u64,
     /// Session start (including restore) or most recent activity ending an idle period.
     pub active_since: u64,
     pub hook: HookState,
@@ -501,7 +496,8 @@ impl NoticePolicy {
             HookState::Busy => false,
             HookState::Ready => true,
             HookState::Unknown => {
-                now.saturating_sub(activity.last_output) >= self.idle_after_ms
+                now.saturating_sub(activity.last_output.max(activity.last_notice))
+                    >= self.idle_after_ms
                     && now.saturating_sub(activity.last_input) >= self.user_quiet_ms
             }
         };
