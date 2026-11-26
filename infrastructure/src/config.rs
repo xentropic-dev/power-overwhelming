@@ -3,7 +3,7 @@
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
 use domain::{
-    agent::{AgentProfile, Injection, ModelCallback, Resume},
+    agent::{AgentProfile, Injection, ModelCallback, Resume, TurnHook},
     talk::NoticePolicy,
 };
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
@@ -138,6 +138,7 @@ struct ProfileConfig {
     skip_subcommands: Option<Vec<String>>,
     skip_if_args_contain: Option<Vec<String>>,
     model_callback: Option<ModelCallbackConfig>,
+    turn_hook: Option<TurnHookConfig>,
     skills_dir: Option<PathBuf>,
     resume: Option<ResumeConfig>,
 }
@@ -164,6 +165,14 @@ enum InjectionConfig {
 enum ModelCallbackConfig {
     ClaudeStatusLine,
     Args { args: Vec<String> },
+    None,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TurnHookConfig {
+    ClaudeSettings,
+    CodexNotify,
     None,
 }
 
@@ -200,6 +209,7 @@ fn read_agent_profile(
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: ModelCallback::None,
+            turn_hook: TurnHook::None,
             skills_dir: None,
             resume: None,
         });
@@ -222,6 +232,13 @@ fn read_agent_profile(
             ModelCallbackConfig::ClaudeStatusLine => ModelCallback::ClaudeStatusLine,
             ModelCallbackConfig::Args { args } => ModelCallback::Args { args },
             ModelCallbackConfig::None => ModelCallback::None,
+        };
+    }
+    if let Some(hook) = config.turn_hook {
+        profile.turn_hook = match hook {
+            TurnHookConfig::ClaudeSettings => TurnHook::ClaudeSettings,
+            TurnHookConfig::CodexNotify => TurnHook::CodexNotify,
+            TurnHookConfig::None => TurnHook::None,
         };
     }
     if let Some(skip) = config.skip_subcommands {
@@ -484,6 +501,44 @@ mod tests {
             let error = agent_profiles(&sections).err().unwrap();
             assert!(error.to_string().contains(id), "{error:#}");
         }
+    }
+
+    #[test]
+    fn talk_idle_settings_and_turn_hook_overrides_are_loaded() -> Result<()> {
+        let defaults = [
+            (TALK_SECTION.into(), json!({})),
+            (AGENTS_SECTION.into(), json!({})),
+        ]
+        .into();
+        let config = evaluate(
+            r#"
+            talk = { idle_after = 0.015, user_quiet = 0.025 }
+            agents.claude = { turn_hook = { kind = "none" } }
+            agents.grok = { turn_hook = { kind = "codex_notify" } }
+        "#,
+            Path::new("config.lua"),
+            defaults,
+        )?;
+        let timing = talk_policy(&config)?;
+        assert_eq!((timing.idle_after_ms, timing.user_quiet_ms), (15, 25));
+        let profiles = agent_profiles(&config)?;
+        assert_eq!(
+            profiles.resolve(&"claude".into())?.turn_hook,
+            TurnHook::None
+        );
+        assert_eq!(
+            profiles.resolve(&"grok".into())?.turn_hook,
+            TurnHook::CodexNotify
+        );
+        for value in [
+            json!({"idle_after": 0}),
+            json!({"user_quiet": -1}),
+            json!({"idle_after": "5"}),
+            json!({"idle_aftr": 5}),
+        ] {
+            assert!(talk_policy(&[(TALK_SECTION.into(), value)].into()).is_err());
+        }
+        Ok(())
     }
 
     #[test]

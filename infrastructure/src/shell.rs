@@ -8,7 +8,7 @@ use application::{
     agents::AgentProfileRegistry,
     skills::{InstalledSkills, LaunchSkills},
 };
-use domain::agent::{AgentProfile, Injection, ModelCallback};
+use domain::agent::{AgentProfile, Injection, ModelCallback, TurnHook};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
@@ -310,40 +310,136 @@ fn skips_injection(profile: &AgentProfile, user: &[OsString]) -> bool {
 /// The command an agent's hook or status line runs to report its model to Power.
 pub(crate) const MODEL_CALLBACK: &str = "power session model --json";
 
-/// Arguments that register [`MODEL_CALLBACK`] with the agent for this launch only.
-/// `status_line_configured` reports whether the user's Claude Code settings already
-/// define a status line, which Power never replaces.
-pub(crate) fn model_callback_args(
+/// Launcher hooks and whether terminal output should mark the turn busy.
+pub(crate) fn launch_callbacks(
+    profile: &AgentProfile,
+    user: &[OsString],
+    cwd: &Path,
+) -> (Vec<OsString>, bool) {
+    callback_args(
+        profile,
+        user,
+        || claude_status_line_configured(cwd),
+        || codex_notify_configured(user),
+    )
+}
+
+fn callback_args(
     profile: &AgentProfile,
     user: &[OsString],
     status_line_configured: impl FnOnce() -> bool,
-) -> Vec<OsString> {
-    if skips_injection(profile, user) {
-        return Vec::new();
+    notify_configured: impl FnOnce() -> bool,
+) -> (Vec<OsString>, bool) {
+    if skips_injection(profile, user)
+        || user.iter().any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("-h" | "--help" | "-v" | "-V" | "--version")
+            )
+        })
+    {
+        return (Vec::new(), false);
     }
-    match &profile.model_callback {
-        ModelCallback::None => Vec::new(),
+    let mut args: Vec<OsString> = match &profile.model_callback {
         ModelCallback::Args { args } => args
             .iter()
             .map(|arg| arg.replace("{command}", MODEL_CALLBACK).into())
             .collect(),
-        ModelCallback::ClaudeStatusLine => {
-            let passes_settings = user.iter().any(|arg| {
-                let arg = arg.to_string_lossy();
-                arg == "--settings" || arg.starts_with("--settings=")
-            });
-            if passes_settings || status_line_configured() {
-                return Vec::new();
-            }
-            let settings = serde_json::json!({
-                "statusLine": {
-                    "type": "command",
-                    "command": MODEL_CALLBACK,
-                    "refreshInterval": 5,
-                }
-            });
-            vec!["--settings".into(), settings.to_string().into()]
+        _ => Vec::new(),
+    };
+    let passes_settings = user.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--settings" || arg.starts_with("--settings=")
+    });
+    if !passes_settings {
+        let mut settings = serde_json::Map::new();
+        if profile.model_callback == ModelCallback::ClaudeStatusLine && !status_line_configured() {
+            settings.insert(
+                "statusLine".into(),
+                serde_json::json!({
+                    "type": "command", "command": MODEL_CALLBACK, "refreshInterval": 5,
+                }),
+            );
         }
+        if profile.turn_hook == TurnHook::ClaudeSettings {
+            settings.insert("hooks".into(), serde_json::json!({
+                "Stop": [{ "hooks": [{ "type": "command", "command": "power talk ready" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "power talk busy" }] }],
+            }));
+        }
+        if !settings.is_empty() {
+            args.extend([
+                OsString::from("--settings"),
+                serde_json::Value::Object(settings).to_string().into(),
+            ]);
+        }
+    }
+    let codex = profile.turn_hook == TurnHook::CodexNotify && !notify_configured();
+    if codex {
+        args.extend([
+            OsString::from("-c"),
+            r#"notify=["power","talk","ready"]"#.into(),
+        ]);
+    }
+    (args, codex)
+}
+
+fn codex_notify_configured(user: &[OsString]) -> bool {
+    let flags: Vec<_> = user.iter().map(|arg| arg.to_string_lossy()).collect();
+    let mut configs = flags
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| match arg.as_ref() {
+            "-c" | "--config" => flags.get(index + 1).map(|value| value.as_ref()),
+            _ => arg
+                .strip_prefix("--config=")
+                .or_else(|| arg.strip_prefix("-c")),
+        });
+    if configs.any(|config| {
+        config
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim().trim_matches(['"', '\'']) == "notify")
+    }) {
+        return true;
+    }
+    let user_directory = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")));
+    let profile = flags
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| match arg.as_ref() {
+            "--profile" | "-p" => flags.get(index + 1).map(|profile| profile.as_ref()),
+            _ => arg.strip_prefix("--profile="),
+        });
+    let system = Path::new("/etc/codex/config.toml");
+    settings_define_notify(system, profile)
+        || user_directory.is_some_and(|dir| {
+            settings_define_notify(&dir.join("config.toml"), profile)
+                || profile
+                    .filter(|name| !name.is_empty() && !name.contains('/'))
+                    .is_some_and(|name| {
+                        settings_define_notify(&dir.join(format!("{name}.config.toml")), None)
+                    })
+        })
+}
+
+fn settings_define_notify(path: &Path, profile: Option<&str>) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    match text.parse::<toml::Table>() {
+        Ok(config) => {
+            let profile = profile.or_else(|| config.get("profile").and_then(toml::Value::as_str));
+            config.contains_key("notify")
+                || profile.is_some_and(|profile| {
+                    config
+                        .get("profiles")
+                        .and_then(|profiles| profiles.get(profile))
+                        .is_some_and(|profile| profile.get("notify").is_some())
+                })
+        }
+        Err(_) => text.contains("notify"),
     }
 }
 
@@ -498,9 +594,18 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
         &args,
         &LocalInstalledSkills(&cwd),
     )?);
-    command.args(model_callback_args(profile, &args, || {
-        claude_status_line_configured(&cwd)
-    }));
+    let (callbacks, output_sets_busy) = launch_callbacks(profile, &args, &cwd);
+    command.args(callbacks);
+    if output_sets_busy && let Ok(session) = std::env::var("POWER_SESSION") {
+        let _ = crate::client::talk::turn(
+            crate::client::talk::Caller {
+                session: Some(session),
+                box_sel: None,
+            },
+            false,
+            true,
+        );
+    }
     {
         let (assign, conversation) = assign_conversation(profile, &args);
         command.args(assign);
@@ -653,26 +758,31 @@ mod tests {
     }
 
     #[test]
-    fn claude_gets_a_status_line_callback_only_without_an_existing_status_line() -> Result<()> {
+    fn claude_merges_status_line_and_hooks_and_respects_settings_override() -> Result<()> {
         let profiles = AgentProfiles::default();
         let claude = profiles.resolve(&"claude".into())?;
-        let args = model_callback_args(claude, &["fix the bug".into()], || false);
+        let (args, output_sets_busy) =
+            callback_args(claude, &["fix the bug".into()], || false, || false);
+        assert!(!output_sets_busy);
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], "--settings");
         let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap())?;
         assert_eq!(
-            settings,
-            serde_json::json!({
-                "statusLine": {
-                    "type": "command",
-                    "command": "power session model --json",
-                    "refreshInterval": 5,
-                }
-            })
+            settings["statusLine"]["command"],
+            "power session model --json"
         );
-
-        assert!(model_callback_args(claude, &["fix the bug".into()], || true).is_empty());
-        let unchecked = || panic!("settings need no check");
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "power talk ready"
+        );
+        assert_eq!(
+            settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            "power talk busy"
+        );
+        let (args, _) = callback_args(claude, &[], || true, || false);
+        let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap())?;
+        assert!(settings.get("statusLine").is_none());
+        assert!(settings.get("hooks").is_some());
         for user in [
             vec!["mcp".into(), "list".into()],
             vec!["--append-system-prompt".into(), "x".into()],
@@ -680,38 +790,50 @@ mod tests {
             vec!["--settings=custom.json".into()],
         ] {
             assert!(
-                model_callback_args(claude, &user, unchecked).is_empty(),
-                "{user:?}"
+                callback_args(claude, &user, || panic!("settings need no check"), || false)
+                    .0
+                    .is_empty()
             );
         }
         Ok(())
     }
 
     #[test]
-    fn model_callback_args_substitute_the_command_and_respect_skips() -> Result<()> {
+    fn codex_notify_respects_user_config_and_grok_uses_quiet_detection() -> Result<()> {
         let profiles = AgentProfiles::default();
-        for id in ["codex", "grok"] {
-            let profile = profiles.resolve(&id.into())?;
-            assert!(
-                model_callback_args(profile, &[], || false).is_empty(),
-                "{id}"
-            );
-        }
-        let mut codex = profiles.resolve(&"codex".into())?.clone();
-        codex.model_callback = ModelCallback::Args {
+        let codex = profiles.resolve(&"codex".into())?;
+        let grok = profiles.resolve(&"grok".into())?;
+        let config = tempfile::NamedTempFile::new()?;
+        let configured = || settings_define_notify(config.path(), None);
+        fs::write(config.path(), "# notify = []\nmodel = \"a\"")?;
+        assert_eq!(
+            callback_args(codex, &[], || false, configured),
+            (
+                [
+                    OsString::from("-c"),
+                    r#"notify=["power","talk","ready"]"#.into()
+                ]
+                .to_vec(),
+                true
+            )
+        );
+        fs::write(config.path(), r#"notify = ["existing", "command"]"#)?;
+        assert_eq!(
+            callback_args(codex, &[], || false, configured),
+            (vec![], false)
+        );
+        assert_eq!(
+            callback_args(grok, &[], || false, || panic!("no notify check")),
+            (vec![], false)
+        );
+        let mut custom = codex.clone();
+        custom.turn_hook = TurnHook::None;
+        custom.model_callback = ModelCallback::Args {
             args: vec!["-c".into(), "hook=\"{command}\"".into()],
         };
         assert_eq!(
-            model_callback_args(&codex, &[], || panic!("not Claude")),
+            callback_args(&custom, &[], || false, || false).0,
             ["-c", "hook=\"power session model --json\""].map(OsString::from)
-        );
-        assert!(
-            model_callback_args(
-                &codex,
-                &["-c".into(), "developer_instructions=x".into()],
-                || { panic!("not Claude") }
-            )
-            .is_empty()
         );
         Ok(())
     }
@@ -808,7 +930,7 @@ mod tests {
         assert!(!project_status_line(&nested));
         let profiles = AgentProfiles::default();
         let claude = profiles.resolve(&"claude".into())?;
-        let args = model_callback_args(claude, &[], || project_status_line(&nested));
+        let (args, _) = callback_args(claude, &[], || project_status_line(&nested), || false);
         assert_eq!(args[0], "--settings");
         Ok(())
     }

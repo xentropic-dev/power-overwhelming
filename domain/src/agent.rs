@@ -45,6 +45,7 @@ pub struct AgentProfile {
     pub skip_subcommands: Vec<String>,
     pub skip_if_args_contain: Vec<String>,
     pub model_callback: ModelCallback,
+    pub turn_hook: TurnHook,
     pub skills_dir: Option<PathBuf>,
     pub resume: Option<Resume>,
 }
@@ -133,6 +134,15 @@ pub enum ModelCallback {
     ClaudeStatusLine,
     /// Pass these arguments, with `{command}` replaced by the callback command.
     Args { args: Vec<String> },
+    #[default]
+    None,
+}
+
+/// How a profile reports the end of a turn to Power.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TurnHook {
+    ClaudeSettings,
+    CodexNotify,
     #[default]
     None,
 }

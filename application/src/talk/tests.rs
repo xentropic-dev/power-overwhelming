@@ -140,7 +140,7 @@ impl SessionActivity for Arc<Terminal> {
     fn activity(&self, _: &str) -> Option<Activity> {
         Some(*self.activity.lock().unwrap())
     }
-    fn report_turn(&self, _: &str, hook: HookState) -> Result<()> {
+    fn report_turn(&self, _: &str, hook: HookState, _: bool) -> Result<()> {
         self.activity.lock().unwrap().hook = hook;
         Ok(())
     }
@@ -187,10 +187,10 @@ fn queued_peer_and_user_messages_follow_delivery_and_read_rules() -> Result<()> 
     assert!(send(Some("a-session"), "no", true).is_err());
     let peer = send(Some("a-session"), "question", false)?.remove(0);
     let user = send(None, "answer", false)?.remove(0);
-    talk.report_turn(caller(Some("b-session")), HookState::Busy)?;
+    talk.report_turn(caller(Some("b-session")), HookState::Busy, false)?;
     talk.deliver_pending()?;
     assert!(terminal.typed.lock().unwrap().is_empty());
-    talk.report_turn(caller(Some("b-session")), HookState::Ready)?;
+    talk.report_turn(caller(Some("b-session")), HookState::Ready, false)?;
     talk.deliver_pending()?;
     talk.deliver_pending()?;
     let lines = terminal.typed.lock().unwrap();

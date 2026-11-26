@@ -75,6 +75,7 @@ pub struct PtyRuntime {
 
 struct Lifecycle {
     activity: Mutex<Activity>,
+    output_sets_busy: AtomicBool,
     talk_wake: SyncSender<()>,
     running: AtomicBool,
     session: String,
@@ -95,6 +96,9 @@ impl Lifecycle {
         let mut state = self.activity.lock().unwrap();
         let now = crate::talk_adapter::now_ms();
         state.last_output = now;
+        if self.output_sets_busy.load(Ordering::Acquire) {
+            state.hook = HookState::Busy;
+        }
         state.active_since = now;
         state.revision = state.revision.wrapping_add(1);
     }
@@ -157,8 +161,13 @@ impl Handle {
         *self.lifecycle.activity.lock().unwrap()
     }
 
-    pub(crate) fn report_turn(&self, hook: HookState) {
+    pub(crate) fn report_turn(&self, hook: HookState, output_sets_busy: bool) {
         let mut state = self.lifecycle.activity.lock().unwrap();
+        if output_sets_busy {
+            self.lifecycle
+                .output_sets_busy
+                .store(true, Ordering::Release);
+        }
         state.hook = hook;
         if hook == HookState::Busy {
             state.active_since = crate::talk_adapter::now_ms();
@@ -275,8 +284,10 @@ fn launch(
         .clone()
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
+    let mut output_sets_busy = false;
     let mut process = if let Some(profile) = profile {
-        let (command, id) = agent_command(profile, &session.worktree, &options.args)?;
+        let (command, id, track_output) = agent_command(profile, &cwd, &options.args)?;
+        output_sets_busy = track_output;
         conversation = id;
         command
     } else if let Some((program, args)) = options.args.split_first() {
@@ -293,7 +304,7 @@ fn launch(
     // The fresh start never repeats the initial prompt.
     let fallback = match (profile, &options.fallback_args) {
         (Some(profile), Some(args)) => {
-            let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
+            let (mut command, conversation, _) = agent_command(profile, &cwd, args)?;
             configure(&mut command, runtime, session, &options, &cwd);
             Some((command, conversation))
         }
@@ -312,6 +323,7 @@ fn launch(
             active_since: started_at,
             ..Activity::default()
         }),
+        output_sets_busy: AtomicBool::new(output_sets_busy),
         talk_wake: runtime.talk_wake.clone(),
         running: AtomicBool::new(true),
         session: session.id.clone(),
@@ -456,14 +468,16 @@ fn agent_command(
     profile: &AgentProfile,
     worktree: &Path,
     args: &[OsString],
-) -> Result<(CommandBuilder, Option<String>)> {
+) -> Result<(CommandBuilder, Option<String>, bool)> {
     let mut command = CommandBuilder::new(&profile.command);
     let installed = crate::skill_install::LocalInstalledSkills(worktree);
     command.args(crate::shell::instruction_args(profile, args, &installed)?);
+    let (callbacks, output_sets_busy) = crate::shell::launch_callbacks(profile, args, worktree);
+    command.args(callbacks);
     let (assign, conversation) = crate::shell::assign_conversation(profile, args);
     command.args(assign);
     command.args(args);
-    Ok((command, conversation))
+    Ok((command, conversation, output_sets_busy))
 }
 
 /// Sets the environment and directory every process in a Power terminal starts with.
@@ -759,6 +773,12 @@ fn terminal_actor(
                 if next != metadata {
                     metadata = next;
                     notify_metadata(&metadata, &mut clients);
+                }
+                if run.is_none() {
+                    let mut state = lifecycle.activity.lock().unwrap();
+                    lifecycle.output_sets_busy.store(false, Ordering::Release);
+                    state.hook = HookState::Unknown;
+                    state.revision = state.revision.wrapping_add(1);
                 }
                 restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
             }
@@ -1557,6 +1577,7 @@ mod tests {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
             activity: Mutex::default(),
+            output_sets_busy: AtomicBool::new(false),
             talk_wake: mpsc::sync_channel(1).0,
             running: AtomicBool::new(true),
             session: "worker".into(),
@@ -1735,6 +1756,7 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume: None,
         });

@@ -86,10 +86,13 @@ pub fn log(caller: Caller, filter: LogFilter) -> Result<Vec<Message>> {
     )
 }
 
-pub fn turn(caller: Caller, ready: bool) -> Result<()> {
+pub fn turn(caller: Caller, ready: bool, output_sets_busy: bool) -> Result<()> {
     match decode(wire::request(&request(
         caller,
-        TalkCommand::Turn { ready },
+        TalkCommand::Turn {
+            ready,
+            output_sets_busy,
+        },
     ))?)? {
         TalkResponse::Ok => Ok(()),
         _ => bail!("Unexpected talk response"),

@@ -34,8 +34,10 @@ impl SessionActivity for Terminal {
         terminal.is_running().then(|| terminal.activity())
     }
 
-    fn report_turn(&self, session: &str, state: HookState) -> Result<()> {
-        self.0.terminal(session)?.report_turn(state);
+    fn report_turn(&self, session: &str, state: HookState, output_sets_busy: bool) -> Result<()> {
+        self.0
+            .terminal(session)?
+            .report_turn(state, output_sets_busy);
         Ok(())
     }
 }
@@ -179,7 +181,10 @@ pub(crate) fn request(
                 ..LogFilter::default()
             },
         )?),
-        TalkCommand::Turn { ready } => {
+        TalkCommand::Turn {
+            ready,
+            output_sets_busy,
+        } => {
             talk.report_turn(
                 caller,
                 if ready {
@@ -187,6 +192,7 @@ pub(crate) fn request(
                 } else {
                     HookState::Busy
                 },
+                output_sets_busy,
             )?;
             TalkResponse::Ok
         }

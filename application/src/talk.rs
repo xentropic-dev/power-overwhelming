@@ -33,7 +33,7 @@ pub trait TalkTransaction: TalkReader {
 
 pub trait SessionActivity: Send + Sync {
     fn activity(&self, session: &str) -> Option<Activity>;
-    fn report_turn(&self, session: &str, state: HookState) -> Result<()>;
+    fn report_turn(&self, session: &str, state: HookState, output_sets_busy: bool) -> Result<()>;
 }
 
 pub trait Notifier: Send + Sync {
@@ -505,11 +505,16 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         })
     }
 
-    pub fn report_turn(&self, caller: Caller, state: HookState) -> Result<()> {
+    pub fn report_turn(
+        &self,
+        caller: Caller,
+        state: HookState,
+        output_sets_busy: bool,
+    ) -> Result<()> {
         let session = caller
             .session
             .context("POWER_SESSION is required to report a turn")?;
-        self.activity.report_turn(&session, state)
+        self.activity.report_turn(&session, state, output_sets_busy)
     }
 
     pub fn cursor(&self) -> Result<u64> {

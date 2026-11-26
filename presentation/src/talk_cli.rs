@@ -77,7 +77,7 @@ enum Action {
         limit: usize,
     },
     #[command(hide = true)]
-    Ready,
+    Ready { event: Option<String> },
     #[command(hide = true)]
     Busy,
 }
@@ -99,7 +99,7 @@ pub fn run(args: TalkArgs) -> Result<()> {
         box_sel: args.box_sel,
     };
     let json = args.json;
-    if !matches!(args.command, Action::Ready | Action::Busy) {
+    if !matches!(args.command, Action::Ready { .. } | Action::Busy) {
         client::ensure_daemon()?;
     }
     match args.command {
@@ -139,14 +139,27 @@ pub fn run(args: TalkArgs) -> Result<()> {
             let reply = talk::wait(caller, threads.clone(), None, timeout)?;
             wait_output(&threads, reply, json)
         }
-        Action::Ready | Action::Busy => {
-            talk::turn(caller, matches!(args.command, Action::Ready))?;
-            if json {
-                super::print_json(json!({"ok": true}))?;
+        Action::Ready { event } => {
+            let from_notify = event.is_some();
+            if let Some(event) = event {
+                let event: serde_json::Value =
+                    serde_json::from_str(&event).context("Read turn event")?;
+                if event["type"] != "agent-turn-complete" {
+                    return Ok(());
+                }
             }
-            Ok(())
+            report_turn(caller, true, from_notify, json)
         }
+        Action::Busy => report_turn(caller, false, false, json),
     }
+}
+
+fn report_turn(caller: Caller, ready: bool, from_notify: bool, json: bool) -> Result<()> {
+    talk::turn(caller, ready, from_notify)?;
+    if json {
+        super::print_json(json!({"ok": true}))?;
+    }
+    Ok(())
 }
 
 fn recipient_and_body(

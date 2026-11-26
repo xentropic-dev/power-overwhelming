@@ -43,6 +43,8 @@ pub enum TalkCommand {
     },
     Turn {
         ready: bool,
+        #[serde(default)]
+        output_sets_busy: bool,
     },
     Watch,
 }

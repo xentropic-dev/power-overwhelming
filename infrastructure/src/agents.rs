@@ -1,5 +1,5 @@
 use application::agents::AgentProfileRegistry;
-use domain::agent::{AgentId, AgentProfile, Injection, ModelCallback, Resume};
+use domain::agent::{AgentId, AgentProfile, Injection, ModelCallback, Resume, TurnHook};
 
 #[derive(Clone)]
 pub struct AgentProfiles(pub(crate) Vec<AgentProfile>);
@@ -44,7 +44,7 @@ impl Default for AgentProfiles {
                     "upgrade",
                 ],
                 &["--append-system-prompt"],
-                ModelCallback::ClaudeStatusLine,
+                (ModelCallback::ClaudeStatusLine, TurnHook::ClaudeSettings),
                 "~/.claude/skills",
                 resume(
                     &["--session-id", "{id}"],
@@ -74,7 +74,7 @@ impl Default for AgentProfiles {
                 &["developer_instructions"],
                 // Codex hooks from any source, `-c` included, run only after the user
                 // reviews and trusts them in `/hooks`, so Power cannot register one per launch.
-                ModelCallback::None,
+                (ModelCallback::None, TurnHook::CodexNotify),
                 // Codex reads the shared folder natively.
                 "~/.agents/skills",
                 resume(&[], &[], &["resume", "--last"], &["resume", "fork"]),
@@ -116,7 +116,7 @@ impl Default for AgentProfiles {
                 &["--rules"],
                 // The `GROK_CONFIG` overlay drops `[ui]`, so `ui.status_line` can only be
                 // set in the user's config file.
-                ModelCallback::None,
+                (ModelCallback::None, TurnHook::None),
                 // Grok reads ~/.agents/skills (as well as ~/.grok and ~/.claude) natively.
                 "~/.agents/skills",
                 resume(
@@ -143,7 +143,7 @@ fn builtin(
     injection: Injection,
     skip_subcommands: &[&str],
     skip_if_args_contain: &[&str],
-    model_callback: ModelCallback,
+    callbacks: (ModelCallback, TurnHook),
     skills_dir: &str,
     resume: Resume,
 ) -> AgentProfile {
@@ -153,7 +153,8 @@ fn builtin(
         injection,
         skip_subcommands: skip_subcommands.iter().map(|&arg| arg.into()).collect(),
         skip_if_args_contain: skip_if_args_contain.iter().map(|&arg| arg.into()).collect(),
-        model_callback,
+        model_callback: callbacks.0,
+        turn_hook: callbacks.1,
         skills_dir: Some(skills_dir.into()),
         resume: Some(resume),
     }
