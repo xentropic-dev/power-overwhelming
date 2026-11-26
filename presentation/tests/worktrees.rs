@@ -16,6 +16,7 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 const REPORT_SUCCESS: &str = r#"exec "$POWER_BIN" dag report success --summary done"#;
 const REPORT_AFTER_RELEASE: &str = r#"
     until test -f "${POWER_SOCKET%/*}/release"; do sleep 0.025; done
+    pwd -P > "${POWER_SOCKET%/*}/$POWER_TASK.cwd"
     exec "$POWER_BIN" dag report success --summary done
 "#;
 
@@ -72,16 +73,16 @@ impl Fixture {
         .unwrap();
     }
 
-    fn start_view(&mut self) -> String {
+    fn start_view(&mut self, worktree: &Path) -> String {
         let session = run(self
             .command()
             .args(["session", "start", "shell"])
-            .arg(&self.repo))
+            .arg(worktree))
         .trim()
         .to_owned();
         self.layout.boxes[0].views.push(SavedView {
             session: session.clone(),
-            worktree: self.repo.clone(),
+            worktree: worktree.to_owned(),
         });
         self.save_layout();
         session
@@ -280,8 +281,23 @@ fn checkout(dispatch: &Value, branch: &str) -> PathBuf {
 #[test]
 fn dispatches_from_a_view_and_an_explicit_base_and_records_creators() {
     let mut fixture = Fixture::new();
-    let session = fixture.start_view();
-    let current_head = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let coordinator = fixture.temp.path().join("coordinator");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "coordinator",
+            coordinator.to_str().unwrap(),
+        ],
+    );
+    git(
+        &coordinator,
+        &["commit", "-q", "--allow-empty", "-m", "Coordinator commit"],
+    );
+    let session = fixture.start_view(&coordinator);
+    let current_head = git(&coordinator, &["rev-parse", "HEAD"]);
     let in_view = || {
         let mut command = fixture.command();
         command.env("POWER_SESSION", &session);
@@ -331,8 +347,10 @@ fn dispatches_from_a_view_and_an_explicit_base_and_records_creators() {
         fixture.wait_for_state(run, task, "working");
     }
     fs::write(fixture.temp.path().join("release"), []).unwrap();
-    for (task, _, _, _) in &attempts {
+    for (task, _, path, _) in &attempts {
         fixture.wait_for_state(run, task, "completed");
+        let cwd = fs::read_to_string(fixture.temp.path().join(format!("{task}.cwd"))).unwrap();
+        assert_eq!(Path::new(cwd.trim_end()), path);
     }
 
     let first_path = &attempts[0].2;
