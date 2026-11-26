@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
         AgentState, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo, Coordinator,
-        ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind, Task,
-        TaskSpec, TaskState, can_dispatch, report_transition, validate_batch,
+        ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind,
+        RunStatus, Task, TaskSpec, TaskState, can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
@@ -234,6 +234,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         for run in &mut runs {
             self.attach_artifacts(run)?;
         }
+        sort_runs(&mut runs);
         Ok(runs)
     }
 
@@ -1081,6 +1082,16 @@ fn task_specs(run: &Run) -> Vec<TaskSpec> {
             deps: task.deps.clone(),
         })
         .collect()
+}
+
+/// Active runs first, then stalled, then completed; newest first within each group.
+fn sort_runs(runs: &mut [Run]) {
+    let rank = |status| match status {
+        RunStatus::Active => 0,
+        RunStatus::Stalled => 1,
+        RunStatus::Completed => 2,
+    };
+    runs.sort_by_key(|run| (rank(run.status()), std::cmp::Reverse(run.created_at)));
 }
 
 fn load_run(db: &dyn DagReader, id: &str) -> Result<Run> {

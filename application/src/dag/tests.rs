@@ -1275,3 +1275,54 @@ fn box_icons_follow_the_caller_or_selector() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn runs_sort_active_then_stalled_then_completed_newest_first() {
+    let run = |id: &str, created_at: u64, states: &[TaskState]| Run {
+        id: id.into(),
+        box_id: "box".into(),
+        title: id.into(),
+        coordinator: Coordinator::External {
+            label: "test".into(),
+        },
+        created_at,
+        tasks: states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| Task {
+                id: format!("t{index}"),
+                title: String::new(),
+                instructions: String::new(),
+                deps: Vec::new(),
+                state: *state,
+                current_attempt: None,
+                attempts: Vec::new(),
+            })
+            .collect(),
+    };
+    let mut runs = vec![
+        run("done-old", 1, &[TaskState::Completed]),
+        run("stalled-old", 2, &[TaskState::Failed]),
+        run("active-old", 3, &[TaskState::Working]),
+        run("done-new", 4, &[TaskState::Completed]),
+        run(
+            "stalled-new",
+            5,
+            &[TaskState::Completed, TaskState::Interrupted],
+        ),
+        run("active-new", 6, &[]),
+    ];
+    sort_runs(&mut runs);
+    let order: Vec<_> = runs.iter().map(|run| run.id.as_str()).collect();
+    assert_eq!(
+        order,
+        [
+            "active-new",
+            "active-old",
+            "stalled-new",
+            "stalled-old",
+            "done-new",
+            "done-old"
+        ]
+    );
+}

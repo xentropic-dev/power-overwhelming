@@ -509,8 +509,20 @@ pub struct Run {
     pub title: String,
     pub coordinator: Coordinator,
     pub created_at: u64,
+    /// Derived by the daemon from the task states.
+    #[serde(default)]
+    pub status: RunStatus,
     /// In insertion order.
     pub tasks: Vec<Task>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    #[default]
+    Active,
+    Completed,
+    Stalled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1024,7 +1036,37 @@ mod dag_dto {
         deps
     });
     struct_dto!(Task { id, title, instructions, deps, state, current_attempt } lists { attempts });
-    struct_dto!(Run { id, box_id, title, coordinator, created_at } lists { tasks });
+    enum_dto!(RunStatus {
+        Active,
+        Completed,
+        Stalled
+    });
+    impl From<dag::Run> for Run {
+        fn from(value: dag::Run) -> Self {
+            Self {
+                status: value.status().into(),
+                id: value.id,
+                box_id: value.box_id,
+                title: value.title,
+                coordinator: value.coordinator.into(),
+                created_at: value.created_at,
+                tasks: value.tasks.into_iter().map(Into::into).collect(),
+            }
+        }
+    }
+    /// The status is derived, so the domain recomputes it from the task states.
+    impl From<Run> for dag::Run {
+        fn from(value: Run) -> Self {
+            Self {
+                id: value.id,
+                box_id: value.box_id,
+                title: value.title,
+                coordinator: value.coordinator.into(),
+                created_at: value.created_at,
+                tasks: value.tasks.into_iter().map(Into::into).collect(),
+            }
+        }
+    }
     struct_dto!(RunEvent {
         seq,
         run,

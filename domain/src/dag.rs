@@ -25,6 +25,17 @@ pub enum TaskState {
     Interrupted,
 }
 
+/// A run's overall progress, derived from its task states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunStatus {
+    /// Some task is ready, working or waiting on input, or the run has no tasks yet.
+    Active,
+    /// Every task completed.
+    Completed,
+    /// Nothing is open, but not every task completed.
+    Stalled,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptState {
     Active,
@@ -362,6 +373,40 @@ impl Run {
             );
         }
     }
+
+    /// Requires `derive_task_states` to have run.
+    pub fn status(&self) -> RunStatus {
+        run_status(self.tasks.iter().map(|task| task.state))
+    }
+
+    pub fn completed_tasks(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Completed)
+            .count()
+    }
+}
+
+pub fn run_status(states: impl IntoIterator<Item = TaskState>) -> RunStatus {
+    let mut any = false;
+    let mut all_completed = true;
+    for state in states {
+        any = true;
+        match state {
+            TaskState::Ready | TaskState::Working | TaskState::NeedsInput => {
+                return RunStatus::Active;
+            }
+            TaskState::Completed => {}
+            TaskState::Waiting | TaskState::Failed | TaskState::Interrupted => {
+                all_completed = false;
+            }
+        }
+    }
+    match (any, all_completed) {
+        (false, _) => RunStatus::Active,
+        (true, true) => RunStatus::Completed,
+        (true, false) => RunStatus::Stalled,
+    }
 }
 
 pub fn can_dispatch(state: TaskState, retry: bool) -> bool {
@@ -521,6 +566,21 @@ mod tests {
         assert!(can_dispatch(T::Ready, false));
         assert!(can_dispatch(T::Ready, true));
         assert!(!can_dispatch(T::Waiting, true));
+    }
+
+    #[test]
+    fn run_status_follows_task_states() {
+        use RunStatus as R;
+        use TaskState as T;
+        assert_eq!(run_status([]), R::Active);
+        for open in [T::Ready, T::Working, T::NeedsInput] {
+            assert_eq!(run_status([T::Completed, T::Failed, open]), R::Active);
+        }
+        assert_eq!(run_status([T::Completed, T::Completed]), R::Completed);
+        for closed in [T::Waiting, T::Failed, T::Interrupted] {
+            assert_eq!(run_status([T::Completed, closed]), R::Stalled);
+            assert_eq!(run_status([closed]), R::Stalled);
+        }
     }
 
     #[test]

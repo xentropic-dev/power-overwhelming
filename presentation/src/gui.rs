@@ -855,6 +855,7 @@ impl Workspace {
             let initial = std::mem::take(&mut picker.loading);
             match result {
                 Ok(DagSnapshot::Runs(mut runs)) => {
+                    // Skip the list only when there is nothing else to pick.
                     if initial && runs.len() == 1 {
                         if let Some(run) = runs.pop() {
                             self.open_dag(run, window, cx);
