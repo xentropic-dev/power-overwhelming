@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use application::dag::{
-    BoxRegistry, BoxSelection, DagApplication, Dispatch, EventScope, StartAgent,
+    BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EventScope, StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
@@ -125,16 +125,26 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             retry,
             args,
             caller,
-        } => {
-            let result = application.dispatch(Dispatch {
-                run,
-                task,
-                provider: provider.into(),
-                worktree: worktree.into_domain(allow_main_checkout),
-                retry,
-                args,
-                caller,
-            })?;
+            budget,
+        } => match application.dispatch(Dispatch {
+            run: run.clone(),
+            task: task.clone(),
+            provider: provider.into(),
+            worktree: worktree.into_domain(allow_main_checkout),
+            retry,
+            args,
+            caller,
+            budget: budget.into(),
+        })? {
+            DispatchOutcome::Started(result) => Reply::Dispatched {
+                attempt: result.attempt.into(),
+                agent: Box::new(result.agent.into()),
+                branch: result.branch,
+            },
+            DispatchOutcome::Queued { reason } => Reply::Queued { run, task, reason },
+        },
+        DagRequest::StartQueued { run, task } => {
+            let result = application.start_queued_now(&run, &task)?;
             Reply::Dispatched {
                 attempt: result.attempt.into(),
                 agent: Box::new(result.agent.into()),

@@ -2,6 +2,7 @@ use crate::{
     agents::AgentProfiles,
     box_icons::IconFiles,
     boxes::BoxesFile,
+    budget::{LocalWorkerBudget, ProcMemory},
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
@@ -13,7 +14,7 @@ use crate::{
     workspace::{LocalWorkspace, LocalWorktreeRoot},
 };
 use anyhow::{Context, Result, bail, ensure};
-use application::{Application, PublishArtifact, ResolveArtifact, StartSession};
+use application::{Application, PublishArtifact, ResolveArtifact, StartSession, dag::EventScope};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     session::{Agent, Geometry},
@@ -82,6 +83,7 @@ pub fn serve(
     profiles: AgentProfiles,
     worktree_root: LocalWorktreeRoot,
     talk_policy: NoticePolicy,
+    budget: LocalWorkerBudget,
 ) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
@@ -163,7 +165,8 @@ pub fn serve(
             BoxesFile,
             IconFiles::open()?,
         )
-        .with_worktree_root(worktree_root),
+        .with_worktree_root(worktree_root)
+        .with_worker_budget(budget, ProcMemory),
     );
     terminal_application
         .set(Arc::downgrade(&application))
@@ -175,8 +178,10 @@ pub fn serve(
     dag.restore().context("Restore sessions")?;
     let talk = talk_adapter::start(application.clone(), store, talk_policy, talk_activity);
     handle_shutdown(application.clone(), shutting_down)?;
+    delay_bind_for_tests();
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    start_queue(dag.clone(), &listener);
     let server = Arc::new(Server {
         plugins: Plugins::start(application.clone()),
         talk,
@@ -193,6 +198,40 @@ pub fn serve(
         });
     }
     Ok(())
+}
+
+/// How long the queue waits for a run event before it checks the budget again, so memory
+/// that frees up without an event still starts queued work.
+const QUEUE_RECHECK: Duration = Duration::from_secs(5);
+
+/// Holds the bind in debug builds, so tests can show that nothing a worker needs the
+/// socket for starts before the daemon listens.
+fn delay_bind_for_tests() {
+    #[cfg(debug_assertions)]
+    if let Some(delay) = std::env::var("POWER_TEST_BIND_DELAY_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        thread::sleep(Duration::from_millis(delay));
+    }
+}
+
+/// Starts queued dispatches whenever a run event may have freed capacity. It takes the
+/// bound listener because a queued worker may report at once, and its report needs the
+/// socket.
+fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
+    thread::spawn(move || {
+        let mut cursor = dag.latest_seq().unwrap_or(0);
+        loop {
+            if let Err(error) = dag.start_queued() {
+                eprintln!("Could not start queued DAG workers. {error:#}");
+            }
+            match dag.events(EventScope::Watch(None), cursor, QUEUE_RECHECK) {
+                Ok(page) => cursor = page.cursor,
+                Err(_) => thread::sleep(QUEUE_RECHECK),
+            }
+        }
+    });
 }
 
 /// Bounds the final save so a reboot is not held up by a stuck terminal.

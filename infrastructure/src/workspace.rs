@@ -207,6 +207,10 @@ impl Workspace for LocalWorkspace {
         resolve_commit(worktree, "HEAD")
     }
 
+    fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String> {
+        resolve_commit(repository, commitish)
+    }
+
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus> {
         let reference = format!("refs/heads/{branch}");
         let branch_field = format!("branch {reference}");

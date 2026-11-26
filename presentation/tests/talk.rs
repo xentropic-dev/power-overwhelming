@@ -99,7 +99,8 @@ impl Sandbox {
         fs::write(
             path.join("config/power-overwhelming/config.lua"),
             format!(
-                "talk = {{ idle_after = 0.015, user_quiet = 0.025 }}\n\
+                "dag = {{ min_available_memory = 0 }}\n\
+                 talk = {{ idle_after = 0.015, user_quiet = 0.025 }}\n\
                  agents.fixture = {{ command = {:?} }}\n\
                  agents.notify = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n\
                  agents.held = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n",

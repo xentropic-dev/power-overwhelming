@@ -64,6 +64,7 @@ pub enum Command {
     DagZoomOut,
     DagOpen,
     DagArtifact,
+    DagStartNow,
     DagClose,
     TabOpenLink,
     TabPreview,
@@ -255,6 +256,7 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "open", C::DagOpen, &["enter", "o"], "Open assigned worker terminal"),
     entry(S::Dag, "talk", C::AgentTalk, &["t"], "Open talk for the selected task's agent"),
     entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
+    entry(S::Dag, "start_now", C::DagStartNow, &["s"], "Start the selected queued task now, over the worker budget"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
@@ -637,6 +639,7 @@ mod tests {
             (Scope::Dag, "enter", C::DagOpen),
             (Scope::Dag, "o", C::DagOpen),
             (Scope::Dag, "p", C::DagArtifact),
+            (Scope::Dag, "s", C::DagStartNow),
             (Scope::Dag, "escape", C::DagClose),
         ] {
             assert_eq!(keymap.command(scope, &stroke(key)), Some(command));
@@ -660,6 +663,10 @@ mod tests {
             (
                 "Preview the selected task's artifact, then 1–9 to pick",
                 "In the task graph: p",
+            ),
+            (
+                "Start the selected queued task now, over the worker budget",
+                "In the task graph: s",
             ),
             (
                 "Show or hide exited and done agents",

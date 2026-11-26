@@ -19,6 +19,8 @@ Many agents share this machine, so never wait on processes by name with `pgrep`,
 timeout 900 cargo clippy --all-targets
 ```
 
+Power limits how many workers run at once across the machine (`dag.max_active_workers` and `dag.min_available_memory`), and your attempt counts until you report `success` or `failed`. Report as soon as your work is done so queued workers can start. Keep your own footprint small: run one heavy build at a time.
+
 Publish screenshots, reports, HTML pages, and other visual results from your worker session with `power artifact publish <file> --title "..."` so they appear on your task's node. Mention relevant artifacts and their links in your final summary.
 
 Before exiting this terminal, report the outcome with one of these commands.

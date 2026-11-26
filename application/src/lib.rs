@@ -58,6 +58,8 @@ pub trait Workspace: Send + Sync {
     fn main_checkout(&self, repository: &Path) -> Result<Option<PathBuf>>;
     /// The full commit ID at the worktree's HEAD.
     fn head(&self, worktree: &Path) -> Result<String>;
+    /// The full commit ID that a commit-ish such as a branch name names in the repository.
+    fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String>;
     /// Looks up a local branch and reports where it is checked out, if anywhere.
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus>;
     /// Creates a new branch and checks it out at `path`, starting at the given commit-ish.

@@ -350,10 +350,10 @@ pub use domain::worktree::{KeepReason, ManagedWorktree, PruneVerdict, WorktreeCr
 /// The DAG wire contract, for callers that print or forward its JSON.
 pub mod protocol {
     pub use crate::wire::{
-        AgentState, AgentStatus, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator,
-        DagRequest, DagResponse, ManagedAgent, ManagedWorktree, Provider, ReportStatus, Run,
-        RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState, WorktreeRequest,
-        WorktreeScope,
+        AgentState, AgentStatus, Attempt, AttemptState, BoxAttention, BoxInfo, BudgetMode,
+        Coordinator, DagRequest, DagResponse, ManagedAgent, ManagedWorktree, Provider,
+        ReportStatus, Run, RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState,
+        WorktreeRequest, WorktreeScope,
     };
 }
 
@@ -450,6 +450,14 @@ pub fn get_run(run: String) -> Result<Run> {
 pub fn archive_run(run: String, force: bool) -> Result<Run> {
     match dag(DagRequest::ArchiveRun { run, force }, DAG_TIMEOUT)? {
         DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Starts a queued task now, over the worker budget.
+pub fn start_queued(run: String, task: String) -> Result<()> {
+    match dag(DagRequest::StartQueued { run, task }, DAG_TIMEOUT)? {
+        DagResponse::Dispatched { .. } => Ok(()),
         _ => bail!("Unexpected daemon response"),
     }
 }

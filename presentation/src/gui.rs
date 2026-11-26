@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
-    dag::{AgentStatus, Coordinator, RunStatus},
+    dag::{AgentStatus, Coordinator, RunStatus, TaskState},
     link::dag_run_id,
     session::{Agent, Session},
 };
@@ -1537,6 +1537,34 @@ impl Workspace {
         .detach();
     }
 
+    /// Starts the task graph's queued task now, over the worker budget. An error shows in the
+    /// graph's message line.
+    fn start_queued_task(
+        &mut self,
+        view: u64,
+        run: String,
+        task: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = cx
+            .background_executor()
+            .spawn(async move { client::start_queued(run, task) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = start.await;
+            let _ = app.update(cx, |this, cx| {
+                if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == view) {
+                    dag.message = result
+                        .err()
+                        .map(|error| format!("Could not start the task. {error:#}"));
+                }
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Archives the run picker's selected run, or unarchives it when `archived`. A refusal,
     /// such as open attempts, shows in the picker message; there is no confirm step.
     fn toggle_run_archive(
@@ -2407,6 +2435,16 @@ impl Workspace {
                         let box_id = dag.run.box_id.clone();
                         self.open_talk(box_id, target, window, cx);
                     }
+                }
+                Some(Command::DagStartNow) if !event.is_held && !dag.opening => {
+                    match dag.task().filter(|task| task.state == TaskState::Queued) {
+                        Some(task) => {
+                            let (id, run, task) = (dag.id, dag.run.id.clone(), task.id.clone());
+                            self.start_queued_task(id, run, task, window, cx);
+                        }
+                        None => dag.message = Some("This task is not queued.".into()),
+                    }
+                    cx.notify();
                 }
                 Some(Command::DagArtifact) if !event.is_held && !dag.opening => {
                     let artifacts = dag.artifacts();
@@ -3370,6 +3408,7 @@ mod tests {
                 instructions: String::new(),
                 deps: Vec::new(),
                 state,
+                queued_at: None,
                 current_attempt: None,
                 attempts: Vec::new(),
             });
