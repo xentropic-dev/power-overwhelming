@@ -110,6 +110,21 @@ appearance.scheme = "Catppuccin Latte"
 
 The Lua setting takes precedence at startup and when you reload with Ctrl+B then `r`. A picker selection applies immediately. [Palette sources](infrastructure/themes/README.md)
 
+## Terminal font
+
+Power sizes the terminal grid from the font, as Ghostty does: the cell is the widest ASCII advance by the font's ascent, descent and line gap, rounded to whole device pixels. Set the font and grid in the `terminal` table of `config.lua`:
+
+```lua
+terminal.font_family = "JetBrains Mono"  -- default: JetBrains Mono when installed, else monospace
+terminal.font_size = 14         -- logical pixels, 6 to 72, default 13
+terminal.font_weight = 400      -- 100 to 900; font_weight_bold defaults to 700
+terminal.line_height = 1.1      -- cell height multiplier, 0.8 to 2.0
+terminal.cell_width = 1.0       -- cell width multiplier, 0.8 to 2.0
+terminal.padding = 6            -- space around the grid in logical pixels, 0 to 64
+```
+
+The table also holds `ligatures` (default `false`), `scroll_speed` (0.1 to 5, default 1), `copy_on_select` (default `false`), `clipboard_write` (`"allow"` or `"deny"`, for OSC 52), `minimum_contrast` (1 to 21, default 1) and `opacity` (0 to 1, default 1). Power reports an unknown key or a value out of range. Ctrl+S then `+` or `=` makes terminal text bigger, Ctrl+S then `-` makes it smaller and Ctrl+S then `0` restores the configured size. Zoom applies to every terminal and resizes their sessions.
+
 ## DAG orchestration
 
 Run `power skills get power-dag` to load the bundled coordinator skill, or `power dag guide` (an alias for `power skills get power-dag --full`) to print it with all references, including a three-task example. From a Power terminal, `power dag list` finds runs in the current box. From an external terminal, use `power box list` and pass `--box` when listing or creating a run, plus `--coordinator` on creation. Create a run with `power dag create`, add tasks and dependencies with `power dag apply`, then use `power dag ready` and `power dag dispatch --provider <profile id>` to start background workers in existing worktrees. Follow results with `power dag wait --since` and explicitly retry failed or interrupted work with `power dag retry`.

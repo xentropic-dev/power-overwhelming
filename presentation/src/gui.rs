@@ -8,7 +8,7 @@ use crate::{
     keymap::{Command, Keymap, Scope},
     picker::{Choice, Kind, Picker, Row},
     preview::{Preview, PreviewAction, decode_image},
-    settings::{AutoOpen, Previews, Settings},
+    settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
     terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
 };
@@ -117,6 +117,9 @@ struct Workspace {
     config_error: Option<String>,
     keymap: Keymap,
     preview_settings: Previews,
+    terminal_settings: TerminalSettings,
+    /// Logical pixels the zoom keys add to `terminal.font_size`, for every terminal.
+    terminal_zoom: f32,
     agent_profiles: AgentProfiles,
     config_scheme: Option<&'static Scheme>,
     settings_ready: bool,
@@ -209,6 +212,8 @@ impl Workspace {
                     ConfigChanged::Settings(settings) => {
                         app.keymap = settings.keymap.clone();
                         app.preview_settings = settings.previews.clone();
+                        app.terminal_settings = settings.terminal.clone();
+                        app.apply_terminal_settings(cx);
                         app.agent_profiles = settings.agents.clone();
                         app.config_scheme = settings.scheme;
                         app.apply_preferred_scheme(cx);
@@ -244,6 +249,8 @@ impl Workspace {
             status_bar,
             keymap: Keymap::default(),
             preview_settings: Previews::default(),
+            terminal_settings: TerminalSettings::default(),
+            terminal_zoom: 0.,
             agent_profiles: AgentProfiles::default(),
             config_scheme: None,
             settings_ready: false,
@@ -348,6 +355,35 @@ impl Workspace {
         self.sync_status_bar(cx);
         cx.refresh_windows();
         cx.notify();
+    }
+
+    /// The terminal settings with the zoom added to the font size.
+    fn zoomed_terminal_settings(&self) -> TerminalSettings {
+        let mut settings = self.terminal_settings.clone();
+        settings.font_size =
+            (settings.font_size + self.terminal_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        settings
+    }
+
+    fn apply_terminal_settings(&mut self, cx: &mut Context<Self>) {
+        let settings = self.zoomed_terminal_settings();
+        for terminal in self.terminals.values() {
+            terminal
+                .view
+                .update(cx, |view, cx| view.set_settings(settings.clone(), cx));
+        }
+    }
+
+    /// Grows or shrinks every terminal's text by `step` logical pixels, or resets it.
+    fn zoom_terminals(&mut self, step: Option<f32>, cx: &mut Context<Self>) {
+        let size = self.terminal_settings.font_size;
+        self.terminal_zoom = match step {
+            Some(step) => {
+                (size + self.terminal_zoom + step).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE) - size
+            }
+            None => 0.,
+        };
+        self.apply_terminal_settings(cx);
     }
 
     fn pick_color_scheme(&mut self, first_run: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -931,7 +967,8 @@ impl Workspace {
             return;
         };
         let scheme = cx.global::<DesktopScheme>().0;
-        let view = cx.new(|cx| TerminalView::new(session, scheme, window, cx));
+        let settings = self.zoomed_terminal_settings();
+        let view = cx.new(|cx| TerminalView::new(session, scheme, settings, window, cx));
         let links = cx.subscribe_in(&view, window, |app, source, link: &OpenLink, window, cx| {
             let id = source.read(cx).session.id.clone();
             app.resolve(id, link.0.clone(), false, window, cx);
@@ -2121,6 +2158,9 @@ impl Workspace {
             Some(Command::TabLast) => self.navigate_tabs("l", window, cx),
             Some(Command::TabOpenLink) => self.start_hints(cx),
             Some(Command::TabPreview) => self.focus_preview(window, cx),
+            Some(Command::TerminalZoomIn) => self.zoom_terminals(Some(1.), cx),
+            Some(Command::TerminalZoomOut) => self.zoom_terminals(Some(-1.), cx),
+            Some(Command::TerminalZoomReset) => self.zoom_terminals(None, cx),
             Some(_) => {}
             None => match (prefix, digit) {
                 (Prefix::Box, Some(digit)) => {

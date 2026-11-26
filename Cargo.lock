@@ -5007,6 +5007,7 @@ dependencies = [
  "cc",
  "clap",
  "domain",
+ "fontdb 0.16.2",
  "ghostty-vt",
  "gpui",
  "gpui-video-player",
@@ -5021,6 +5022,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tiny_http",
+ "ttf-parser 0.20.0",
  "unicode-width",
  "url",
 ]

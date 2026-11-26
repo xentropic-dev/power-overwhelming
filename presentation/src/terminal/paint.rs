@@ -1,10 +1,14 @@
-use super::{HEIGHT, PAD, TerminalView, WIDTH, frame::CellPosition, input::register_mouse_exit};
+use super::{TerminalView, cell_metrics, frame::CellPosition, input::register_mouse_exit};
 use gpui::{prelude::*, *};
 use infrastructure::theme::blend;
 use std::sync::Arc;
 
 impl Render for TerminalView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let metrics = cell_metrics(window.text_system(), &self.font, window.scale_factor());
+        self.grid.metrics = metrics;
+        let (cell_size, pad) = (metrics.size, px(self.settings.padding));
+        let font_size = px(self.font.size);
         let terminal = cx.entity();
         let pointer_owner = terminal.downgrade();
         let frame = self.frame.clone();
@@ -12,7 +16,7 @@ impl Render for TerminalView {
         let colors = &scheme.colors;
         let (_, background, cursor_color) = scheme.terminal_ink(&self.terminal);
         let selection_background = Hsla::from(rgba(scheme.selection_background));
-        let terminal_font = self.font.clone();
+        let terminal_font = self.font.font.clone();
         let hovered_link = self.hovered_link().cloned();
         let pressed_link = self.pressed_link().cloned();
         let selection = self.selection_range().filter(|_| pressed_link.is_none());
@@ -35,36 +39,37 @@ impl Render for TerminalView {
             .child(
                 canvas(
                     move |bounds, _, cx| {
-                        terminal.update(cx, |terminal, _| terminal.set_bounds(bounds));
+                        terminal.update(cx, |terminal, _| terminal.set_bounds(bounds, metrics));
                     },
                     move |bounds, (), window, cx| {
                         register_mouse_exit(pointer_owner.clone(), window);
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            let grid = metrics.snap(bounds.origin);
                             for (row, line) in frame.rows.iter().enumerate() {
                                 for (column, cell) in line.cells.iter().enumerate() {
                                     let position = CellPosition { row, column };
-                                    let origin = bounds.origin
-                                        + point(px(column as f32 * WIDTH), px(row as f32 * HEIGHT));
+                                    let origin = metrics.cell_origin(grid, row, column);
                                     let selected = selection.is_some_and(|(start, end)| {
                                         start <= position && position <= end
                                     });
                                     let cursor = frame.cursor == Some(position);
                                     if let Some(color) = cell.bg {
                                         window.paint_quad(fill(
-                                            Bounds::new(origin, size(px(WIDTH), px(HEIGHT))),
+                                            Bounds::new(origin, cell_size),
                                             color,
                                         ));
                                     }
                                     if selected {
                                         window.paint_quad(fill(
-                                            Bounds::new(origin, size(px(WIDTH), px(HEIGHT))),
+                                            Bounds::new(origin, cell_size),
                                             selection_background,
                                         ));
                                     }
                                     if cursor {
+                                        let thickness = metrics.underline_thickness.max(px(2.));
                                         let bar = Bounds::new(
-                                            origin + point(px(0.), px(HEIGHT - 2.)),
-                                            size(px(WIDTH), px(2.)),
+                                            origin + point(px(0.), cell_size.height - thickness),
+                                            size(cell_size.width, thickness),
                                         );
                                         window.paint_quad(fill(bar, rgb(cursor_color)));
                                     }
@@ -85,8 +90,8 @@ impl Render for TerminalView {
                                         };
                                         fg = rgb(color).into();
                                         let underline = Bounds::new(
-                                            origin + point(px(0.), px(HEIGHT - 3.)),
-                                            size(px(WIDTH), px(1.)),
+                                            origin + point(px(0.), metrics.underline),
+                                            size(cell_size.width, metrics.underline_thickness),
                                         );
                                         window.paint_quad(fill(underline, fg));
                                     }
@@ -106,34 +111,39 @@ impl Render for TerminalView {
                                     };
                                     let shaped = window.text_system().shape_line(
                                         cell.text.clone().into(),
-                                        px(13.),
+                                        font_size,
                                         &[run],
                                         None,
                                     );
-                                    let _ = shaped.paint(origin, px(HEIGHT), window, cx);
+                                    let _ = shaped.paint(
+                                        metrics.text_origin(&shaped, origin),
+                                        cell_size.height,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             }
                         });
                     },
                 )
                 .absolute()
-                .top(px(PAD))
-                .left(px(PAD))
-                .right(px(PAD))
-                .bottom(px(PAD)),
+                .top(pad)
+                .left(pad)
+                .right(pad)
+                .bottom(pad),
             )
             .children(self.hints.iter().enumerate().map(|(index, (position, _))| {
                 div()
                     .absolute()
-                    .top(px(PAD + position.row as f32 * HEIGHT))
-                    .left(px(PAD + position.column as f32 * WIDTH))
-                    .h(px(HEIGHT))
+                    .top(pad + cell_size.height * position.row as f32)
+                    .left(pad + cell_size.width * position.column as f32)
+                    .h(cell_size.height)
                     .px(px(3.))
                     .flex()
                     .items_center()
                     .bg(rgb(colors.accent))
                     .text_color(rgb(colors.contrast(colors.accent)))
-                    .text_size(px(12.))
+                    .text_size((font_size - px(1.)).max(px(8.)))
                     .font_weight(FontWeight::BOLD)
                     .child((index + 1).to_string())
             }))

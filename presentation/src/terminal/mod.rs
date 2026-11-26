@@ -1,12 +1,19 @@
 mod frame;
+mod grid;
 mod input;
 mod links;
+mod metrics;
 mod paint;
 mod selection;
 
+use self::metrics::preload_font_files;
+pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
+
 use self::frame::{CellPosition, Frame, frame};
+use self::grid::PtyGrid;
+use crate::settings::TerminalSettings;
 use anyhow::{Result, bail};
-use domain::session::{Agent, Geometry, Session};
+use domain::session::{Agent, Session};
 use ghostty_vt::{Terminal, key, mouse, render::RenderState, snapshot, terminal::Options};
 use gpui::*;
 use infrastructure::{
@@ -15,16 +22,36 @@ use infrastructure::{
 };
 use std::{path::PathBuf, sync::Arc, thread};
 
-const WIDTH: f32 = 8.;
-const HEIGHT: f32 = 18.;
-const PAD: f32 = 6.;
-
 pub(crate) fn terminal_font_family(cx: &App) -> &'static str {
     let fonts = cx.text_system().all_font_names();
     ["JetBrainsMono Nerd Font Mono", "JetBrains Mono"]
         .into_iter()
         .find(|family| fonts.iter().any(|name| name == family))
         .unwrap_or("monospace")
+}
+
+/// The terminal font for `settings`: its `font_family` when installed, else the default.
+pub fn terminal_font(settings: &TerminalSettings, cx: &App) -> TerminalFont {
+    let family: SharedString = match &settings.font_family {
+        Some(family)
+            if cx
+                .text_system()
+                .all_font_names()
+                .iter()
+                .any(|name| name == family) =>
+        {
+            family.clone().into()
+        }
+        _ => terminal_font_family(cx).into(),
+    };
+    let mut font = font(family);
+    font.weight = FontWeight(f32::from(settings.font_weight));
+    TerminalFont {
+        font,
+        size: settings.font_size,
+        line_height: settings.line_height,
+        cell_width: settings.cell_width,
+    }
 }
 
 pub struct OpenLink(pub String);
@@ -41,11 +68,12 @@ pub struct TerminalView {
     pub focus: FocusHandle,
     pub metadata: SessionMetadata,
     scheme: &'static Scheme,
-    font: Font,
+    settings: TerminalSettings,
+    font: TerminalFont,
+    grid: PtyGrid,
     terminal: Terminal,
     renderer: RenderState,
     frame: Arc<Frame>,
-    bounds: Bounds<Pixels>,
     selection: Option<(CellPosition, CellPosition)>,
     pointer: Option<Point<Pixels>>,
     pressed_link: Option<Arc<str>>,
@@ -56,7 +84,6 @@ pub struct TerminalView {
     reporting_mouse: bool,
     exited: bool,
     status: Option<String>,
-    geometry: Option<Geometry>,
     encoder: key::Encoder,
     mouse: mouse::Encoder,
     commands: async_channel::Sender<TerminalControl>,
@@ -67,9 +94,12 @@ impl TerminalView {
     pub fn new(
         session: Session,
         scheme: &'static Scheme,
+        settings: TerminalSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        static PRELOAD: std::sync::Once = std::sync::Once::new();
+        PRELOAD.call_once(preload_font_files);
         let (commands, requests) = async_channel::bounded(128);
         let id = session.id.clone();
         thread::spawn(move || {
@@ -123,11 +153,12 @@ impl TerminalView {
             focus: cx.focus_handle(),
             metadata: SessionMetadata::default(),
             scheme,
-            font: font(terminal_font_family(cx)),
+            font: terminal_font(&settings, cx),
+            settings,
+            grid: PtyGrid::default(),
             terminal,
             renderer: RenderState::new().expect("allocate render state"),
             frame: Arc::default(),
-            bounds: Bounds::default(),
             selection: None,
             pointer: None,
             pressed_link: None,
@@ -137,7 +168,6 @@ impl TerminalView {
             reporting_mouse: false,
             exited: false,
             status: None,
-            geometry: None,
             encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             commands,
@@ -151,6 +181,21 @@ impl TerminalView {
             self.status = Some(format!("Could not apply color scheme. {error:#}"));
         }
         self.refresh();
+        cx.notify();
+    }
+
+    /// Applies new terminal settings, with zoom already in `font_size`. A new cell size
+    /// resizes the PTY now, whether or not this terminal is on screen.
+    pub fn set_settings(&mut self, settings: TerminalSettings, cx: &mut Context<Self>) {
+        if settings == self.settings {
+            return;
+        }
+        self.font = terminal_font(&settings, cx);
+        self.settings = settings;
+        if !self.exited {
+            let metrics = cell_metrics(cx.text_system(), &self.font, self.grid.metrics.scale);
+            self.grid.remeasure(metrics, &self.commands);
+        }
         cx.notify();
     }
 
@@ -212,29 +257,13 @@ impl TerminalView {
         }
     }
 
-    fn set_bounds(&mut self, bounds: Bounds<Pixels>) {
-        self.bounds = bounds;
-        let geometry = Geometry {
-            cols: (f32::from(bounds.size.width) / WIDTH).clamp(1., 500.) as u16,
-            rows: (f32::from(bounds.size.height) / HEIGHT).clamp(1., 500.) as u16,
-            cell_width: WIDTH as u16,
-            cell_height: HEIGHT as u16,
-        };
-        if self.geometry != Some(geometry)
-            && self
-                .commands
-                .try_send(TerminalControl::Resize(geometry))
-                .is_ok()
-        {
-            self.geometry = Some(geometry);
-        }
+    /// Records the grid's bounds, inside the padding, and resizes the PTY to the cells that
+    /// fit.
+    fn set_bounds(&mut self, bounds: Bounds<Pixels>, metrics: CellMetrics) {
+        self.grid.lay_out(bounds, metrics, &self.commands);
     }
 
     fn at(&self, position: Point<Pixels>) -> CellPosition {
-        let local = position - self.bounds.origin;
-        CellPosition {
-            row: (f32::from(local.y) / HEIGHT).max(0.) as usize,
-            column: (f32::from(local.x) / WIDTH).max(0.) as usize,
-        }
+        self.grid.at(position)
     }
 }
