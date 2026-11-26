@@ -125,6 +125,11 @@ pub trait TerminalRuntime: Send + Sync {
     fn model(&self, _handle: &Self::Handle, _agent: &Agent) -> Option<String> {
         None
     }
+    /// Ends whatever an earlier daemon left running for the session `id`, before it
+    /// is restored or forgotten. An error means some of it may still run.
+    fn reclaim(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct Live<H> {

@@ -165,7 +165,23 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &test_slice(self.temp.path())])
+            .stderr(Stdio::null())
+            .status();
     }
+}
+
+/// The systemd slice for this fixture's worker scopes, apart from the live daemon's.
+fn test_slice(root: &Path) -> String {
+    let name: String = root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("app-powertest{name}.slice")
 }
 
 fn power(root: &Path) -> Command {
@@ -177,6 +193,7 @@ fn power(root: &Path) -> Command {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root.join("home"))
         .env("SHELL", "/bin/sh")
+        .env("POWER_WORKER_SLICE", test_slice(root))
         .env_remove("POWER_SESSION")
         .env_remove("POWER_BOX")
         .env_remove("POWER_RUN")

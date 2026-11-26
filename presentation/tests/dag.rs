@@ -32,6 +32,7 @@ fn power(root: &Path) -> Command {
         .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("SHELL", "/bin/sh")
+        .env("POWER_WORKER_SLICE", test_slice(root))
         .env_remove("POWER_BIN")
         .env_remove("POWER_PLUGIN_DIR")
         .env_remove("POWER_SESSION")
@@ -41,6 +42,53 @@ fn power(root: &Path) -> Command {
         .env_remove("POWER_TASK")
         .env_remove("POWER_ATTEMPT");
     command
+}
+
+/// The systemd slice that holds this fixture's worker scopes, apart from the live
+/// daemon's and every other test's.
+fn test_slice(root: &Path) -> String {
+    let name: String = root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("app-powertest{name}.slice")
+}
+
+/// The cgroup directory of the fixture's slice.
+fn slice_dir(root: &Path) -> PathBuf {
+    let manager = Command::new("systemctl")
+        .args(["--user", "show", "--property=ControlGroup", "--value"])
+        .output()
+        .unwrap();
+    assert!(
+        manager.status.success(),
+        "these tests need a systemd user manager"
+    );
+    let manager = String::from_utf8(manager.stdout).unwrap();
+    Path::new("/sys/fs/cgroup")
+        .join(manager.trim().trim_start_matches('/'))
+        .join("app.slice")
+        .join(test_slice(root))
+}
+
+/// The session's scopes that still hold processes.
+fn populated_scopes(root: &Path, session: &str) -> Vec<String> {
+    let prefix = format!("power-{session}-");
+    let Ok(entries) = fs::read_dir(slice_dir(root)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .filter(|entry| {
+            fs::read_to_string(entry.path().join("cgroup.events"))
+                .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
 }
 
 struct Daemon(Child);
@@ -69,6 +117,19 @@ impl Daemon {
     fn stop(&mut self) {
         self.0.kill().unwrap();
         self.0.wait().unwrap();
+    }
+
+    /// Stops the daemon the way a reboot or `systemctl stop` does.
+    fn shut_down(&mut self) {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.0.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            child_finished(&mut self.0, TIMEOUT),
+            "the daemon did not shut down"
+        );
     }
 }
 
@@ -262,6 +323,11 @@ impl Fixture {
         self.daemon = Daemon::start(self.root());
     }
 
+    fn restart_gracefully(&mut self) {
+        self.daemon.shut_down();
+        self.daemon = Daemon::start(self.root());
+    }
+
     fn command(&self, args: &[&str]) -> Output {
         output(power(self.root()).args(args))
     }
@@ -418,6 +484,16 @@ impl Fixture {
         assert_eq!(response["event"], "dag", "{response}");
         assert_eq!(response["dag"]["kind"], "attention", "{response}");
         serde_json::from_value(response["dag"]["boxes"].take()).unwrap()
+    }
+}
+
+impl Drop for Fixture {
+    /// Stops the fixture's slice, which ends anything a failed test left in it.
+    fn drop(&mut self) {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &test_slice(self.root())])
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1354,6 +1430,100 @@ fn a_worker_whose_root_exits_first_is_exited_only_once_its_detached_child_ends()
     let task = task(&fixture.show(&run), "detach").clone();
     assert_eq!(task.attempts[0].id, attempt.id);
     assert_eq!(task.attempts[0].state, AttemptState::Succeeded);
+}
+
+/// Polls until the agent is exited, and fails if it is ever exited while any of
+/// `pids` runs or while its session's cgroup still holds a process.
+fn wait_for_exit_with_empty_scopes(fixture: &Fixture, agent: &str, session: &str, pids: &[u32]) {
+    poll("finished agent to exit", || {
+        let exited = fixture
+            .agents()
+            .into_iter()
+            .any(|listed| listed.id == agent && json!(listed.state) == "exited");
+        if exited {
+            let alive: Vec<_> = pids.iter().filter(|pid| process_running(**pid)).collect();
+            assert!(alive.is_empty(), "agent exited while {alive:?} still ran");
+            let scopes = populated_scopes(fixture.root(), session);
+            assert!(
+                scopes.is_empty(),
+                "agent exited while {scopes:?} held processes"
+            );
+        }
+        exited.then_some(())
+    });
+}
+
+/// Starts the escape fixture and returns its attempt, agent, root PID and helper PID
+/// once the helper has left the session, its environment and its parent.
+fn dispatch_escape(fixture: &Fixture, run: &str, mode: &str) -> (Attempt, ManagedAgent, u32, u32) {
+    fixture.add_task(run, mode);
+    let go = format!("{mode}-go");
+    let pids = format!("{mode}-pids");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        run,
+        mode,
+        &fixture.worktrees[0],
+        false,
+        &[mode, &go, "Left a helper", &pids],
+    ));
+    fixture.release(&go);
+    let [root, helper] = read_pids(&fixture.root().join(pids), 2)[..] else {
+        unreachable!()
+    };
+    let environment = fs::read(format!("/proc/{helper}/environ")).unwrap();
+    assert!(
+        !environment
+            .windows(14)
+            .any(|window| window == b"POWER_SESSION="),
+        "the helper kept POWER_SESSION"
+    );
+    let parent = fs::read_to_string(format!("/proc/{helper}/stat")).unwrap();
+    let parent = parent
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    assert_ne!(parent, root.to_string(), "the helper was not reparented");
+    (attempt, agent, root, helper)
+}
+
+#[test]
+fn a_detached_helper_with_a_clean_environment_ends_before_its_worker_is_exited() {
+    // A long grace, so only the root's own exit ends the helper. Discovery by
+    // ancestry, session or POWER_SESSION finds none of it, so only the cgroup does.
+    let fixture = with_grace("600");
+    let run = fixture.create_run().id;
+    let (attempt, agent, root, helper) = dispatch_escape(&fixture, &run, "escape");
+    let session = agent.session.clone().unwrap();
+    wait_for_exit_with_empty_scopes(&fixture, &agent.id, &session, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived");
+    let task = task(&fixture.show(&run), "escape").clone();
+    assert_eq!(task.attempts[0].id, attempt.id);
+    assert_eq!(task.attempts[0].state, AttemptState::Succeeded);
+}
+
+#[test]
+fn a_restart_finishes_a_finished_workers_pending_teardown() {
+    // The grace outlasts the test, so the teardown is still pending at the restart.
+    let mut fixture = with_grace("600");
+    let run = fixture.create_run().id;
+    let (_, agent, root, helper) = dispatch_escape(&fixture, &run, "escape-stay");
+    let session = agent.session.clone().unwrap();
+    fixture.wait_for_state(&run, "escape-stay", TaskState::Completed);
+    assert!(process_running(helper));
+    assert_eq!(populated_scopes(fixture.root(), &session).len(), 1);
+
+    // The old daemon's terminals close, but the helper ignores that.
+    fixture.restart_gracefully();
+
+    wait_for_exit_with_empty_scopes(&fixture, &agent.id, &session, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived the restart");
+    let listed = fixture.command(&["session", "list"]);
+    assert_success(&listed);
+    assert!(!String::from_utf8(listed.stdout).unwrap().contains(&session));
 }
 
 #[test]

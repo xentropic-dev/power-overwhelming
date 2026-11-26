@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod box_icons;
 pub mod boxes;
+mod cgroup;
 pub mod client;
 #[cfg(feature = "lua-config")]
 pub mod config;
@@ -9,6 +10,7 @@ pub mod plugins;
 
 mod dag_adapter;
 mod dag_store;
+mod ownership;
 mod persistence;
 mod process_tree;
 mod scheduler;

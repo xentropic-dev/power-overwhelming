@@ -2,6 +2,7 @@ use crate::{
     agents::AgentProfiles,
     box_icons::IconFiles,
     boxes::BoxesFile,
+    cgroup::{self, WorkerScopes},
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
@@ -119,6 +120,7 @@ pub fn serve(
     let model_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
+    let scopes = worker_scopes();
     let application = Arc::new(Application::new(
         artifacts,
         Arc::new(sessions),
@@ -147,6 +149,7 @@ pub fn serve(
                 Ok(())
             }),
             shutting_down: shutting_down.clone(),
+            scopes,
         },
         profiles,
         || uuid::Uuid::new_v4().to_string(),
@@ -154,8 +157,10 @@ pub fn serve(
     let mut dag = DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
         .with_worktree_root(worktree_root);
     if let Some(grace) = finished_worker_grace {
-        let scheduler = TimerScheduler::start(scheduler::DEFAULT_CAPACITY)?;
-        dag = dag.with_finished_worker_cleanup(grace, Arc::new(scheduler));
+        // Teardowns never wait behind the store writes that follow them.
+        let teardown = TimerScheduler::start("power-teardown", scheduler::DEFAULT_CAPACITY)?;
+        let persistence = TimerScheduler::start("power-forget", scheduler::DEFAULT_CAPACITY)?;
+        dag = dag.with_finished_worker_cleanup(grace, Arc::new(teardown), Arc::new(persistence));
     }
     let dag = Arc::new(dag);
     terminal_application
@@ -183,6 +188,29 @@ pub fn serve(
         });
     }
     Ok(())
+}
+
+/// Finds how this system lets Power own workers, and logs it. Without cgroup
+/// ownership, Power falls back to process discovery.
+fn worker_scopes() -> Option<Arc<WorkerScopes>> {
+    let slice = std::env::var(cgroup::SLICE_ENV).unwrap_or_else(|_| cgroup::DEFAULT_SLICE.into());
+    match WorkerScopes::detect(&slice) {
+        Ok(scopes) => {
+            eprintln!(
+                "Each worker runs in its own systemd user scope in {}, whose cgroup owns every process it starts.",
+                scopes.slice()
+            );
+            Some(Arc::new(scopes))
+        }
+        Err(error) => {
+            eprintln!(
+                "WARNING: workers run without cgroup ownership ({error:#}). Power falls back to \
+                 finding their processes by ancestry, session and POWER_SESSION, which cannot end \
+                 a process that leaves its session, clears its environment and is reparented."
+            );
+            None
+        }
+    }
 }
 
 /// Bounds the final save so a reboot is not held up by a stuck terminal.

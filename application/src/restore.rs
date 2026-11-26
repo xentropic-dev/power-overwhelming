@@ -52,6 +52,16 @@ impl<T: TerminalRuntime> Application<T> {
     ) -> Result<Vec<RestoredSession>> {
         let mut restored = Vec::new();
         for record in self.records.list()? {
+            // Anything an earlier daemon left of the session ends first, whether it
+            // is relaunched or forgotten, so a finished worker's teardown that the
+            // restart interrupted still completes.
+            let reclaimed = self.runtime.reclaim(&record.id);
+            if let Err(error) = &reclaimed {
+                eprintln!(
+                    "Could not end what an earlier daemon left of session {}. {error:#}",
+                    record.id
+                );
+            }
             let plan = match choose(&record.id) {
                 RestoreChoice::Resume(continuation) => self.restore_plan(&record, continuation),
                 RestoreChoice::Forget(reason) => Ok(Plan::Drop(reason)),
@@ -60,6 +70,11 @@ impl<T: TerminalRuntime> Application<T> {
                 Ok(Plan::Launch(options)) => options,
                 Ok(Plan::Drop(reason)) => {
                     eprintln!("Not restoring session {}: {reason}.", record.id);
+                    if reclaimed.is_err() {
+                        // The record is how a later start finds what still runs.
+                        eprintln!("Keeping session {} so a later start ends it.", record.id);
+                        continue;
+                    }
                     if let Err(error) = self.records.remove(&record.id) {
                         eprintln!("Could not forget session {}. {error:#}", record.id);
                     }

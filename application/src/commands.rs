@@ -118,6 +118,16 @@ impl<T: TerminalRuntime> Application<T> {
         Ok(session)
     }
 
+    /// Starts ending a session's processes without forgetting its record or its
+    /// place in the session list, so it never waits on the session store or on a
+    /// launch that holds the session list across a store write.
+    pub fn stop_terminal(&self, terminal: &T::Handle) -> Result<()> {
+        if !self.runtime.is_running(terminal) {
+            return Ok(());
+        }
+        self.runtime.end(terminal.clone())
+    }
+
     /// Ends a session and forgets it, so it is not restored after a restart. The
     /// session ends even when forgetting its record fails, and a retry forgets the
     /// record of a session whose terminal is already gone.

@@ -12,8 +12,9 @@ use domain::{
 use std::{
     cell::RefCell,
     sync::{
-        Barrier,
+        Barrier, Condvar,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread,
 };
@@ -1447,8 +1448,11 @@ fn restore_brings_back_only_workers_whose_attempt_is_open() -> Result<()> {
 #[test]
 fn terminal_reports_end_the_worker_session_after_the_grace() -> Result<()> {
     let (dag, run) = setup()?;
-    let dag =
-        dag.with_finished_worker_cleanup(Duration::from_millis(50), Arc::new(ThreadScheduler));
+    let dag = dag.with_finished_worker_cleanup(
+        Duration::from_millis(50),
+        Arc::new(ThreadScheduler),
+        Arc::new(ThreadScheduler),
+    );
     dag.add_tasks(&run, &[spec("failing", &[]), spec("waiting", &[])])?;
     let mut ended = Vec::new();
     for (task, status) in [
@@ -1557,7 +1561,11 @@ impl Scheduler for HeldScheduler {
 fn a_refused_cleanup_ends_the_finished_worker_at_once() -> Result<()> {
     let (dag, run) = setup()?;
     let scheduler = Arc::new(RefusingScheduler(AtomicU64::new(0)));
-    let dag = dag.with_finished_worker_cleanup(Duration::from_secs(600), scheduler.clone());
+    let dag = dag.with_finished_worker_cleanup(
+        Duration::from_secs(600),
+        scheduler.clone(),
+        scheduler.clone(),
+    );
     let dispatched = dag.dispatch(command(&run, false))?;
     let session = dispatched.agent.session.unwrap();
     let handle = dag.application.terminal(&session)?;
@@ -1582,7 +1590,11 @@ fn a_refused_cleanup_ends_the_finished_worker_at_once() -> Result<()> {
 fn a_replayed_terminal_report_schedules_the_cleanup_again() -> Result<()> {
     let (dag, run) = setup()?;
     let scheduler = Arc::new(HeldScheduler::default());
-    let dag = dag.with_finished_worker_cleanup(Duration::from_secs(600), scheduler.clone());
+    let dag = dag.with_finished_worker_cleanup(
+        Duration::from_secs(600),
+        scheduler.clone(),
+        scheduler.clone(),
+    );
     let dispatched = dag.dispatch(command(&run, false))?;
     let session = dispatched.agent.session.unwrap();
     let handle = dag.application.terminal(&session)?;
@@ -1672,6 +1684,151 @@ fn ending_a_session_still_ends_it_when_its_record_cannot_be_deleted() -> Result<
         "{retried:#}"
     );
     assert_eq!(records.list()?.len(), 1);
+    Ok(())
+}
+
+/// A session store whose deletes block until the test opens the gate, as a session
+/// database under another connection's write lock does.
+#[derive(Default)]
+struct BlockedSessions {
+    records: MemorySessions,
+    open: Mutex<bool>,
+    opened: Condvar,
+    waiting: AtomicU64,
+}
+
+impl BlockedSessions {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl SessionStore for BlockedSessions {
+    fn save(&self, record: &crate::SessionRecord) -> Result<()> {
+        self.records.save(record)
+    }
+
+    fn update_foreground(
+        &self,
+        id: &str,
+        foreground: &Agent,
+        conversation: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<()> {
+        self.records
+            .update_foreground(id, foreground, conversation, cwd)
+    }
+
+    fn remove(&self, id: &str) -> Result<()> {
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let open = self.open.lock().unwrap();
+        drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        self.records.remove(id)
+    }
+
+    fn list(&self) -> Result<Vec<crate::SessionRecord>> {
+        self.records.list()
+    }
+}
+
+/// Runs jobs one at a time on a single thread, in due order, as the daemon's timer
+/// does.
+struct SerialScheduler(Mutex<mpsc::Sender<(Instant, crate::Job)>>);
+
+impl SerialScheduler {
+    fn start() -> Arc<Self> {
+        let (tx, rx) = mpsc::channel::<(Instant, crate::Job)>();
+        thread::spawn(move || {
+            for (due, job) in rx {
+                thread::sleep(due.saturating_duration_since(Instant::now()));
+                job();
+            }
+        });
+        Arc::new(Self(Mutex::new(tx)))
+    }
+}
+
+impl Scheduler for SerialScheduler {
+    fn schedule(&self, delay: Duration, job: crate::Job) -> Result<()> {
+        if self
+            .0
+            .lock()
+            .unwrap()
+            .send((Instant::now() + delay, job))
+            .is_err()
+        {
+            bail!("the scheduler thread stopped");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_blocked_session_write_never_delays_the_next_finished_workers_teardown() -> Result<()> {
+    let records = Arc::new(BlockedSessions::default());
+    static ID: AtomicU64 = AtomicU64::new(0);
+    let application = Arc::new(Application::new(
+        FakeArtifacts::default(),
+        records.clone(),
+        FakeWorkspace::default(),
+        FakeTerminal::default(),
+        Arc::new(FakeProfiles(Vec::new())),
+        || format!("blocked-{}", ID.fetch_add(1, Ordering::Relaxed)),
+    ));
+    let dag = TestDag::new(
+        application,
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_finished_worker_cleanup(
+        Duration::from_millis(50),
+        SerialScheduler::start(),
+        SerialScheduler::start(),
+    );
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("second", &[])])?;
+    let mut handles = Vec::new();
+    for task in ["work", "second"] {
+        let dispatched = dag.dispatch(Dispatch {
+            task: task.into(),
+            ..command(&run, false)
+        })?;
+        handles.push(
+            dag.application
+                .terminal(&dispatched.agent.session.unwrap())?,
+        );
+        dag.report(
+            &run,
+            task,
+            &dispatched.attempt.id,
+            ReportStatus::Success,
+            task,
+        )?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handles.iter().any(|handle| handle.load(Ordering::Acquire)) {
+        assert!(
+            Instant::now() < deadline,
+            "a blocked record delete held up the second worker's teardown"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The first delete is still blocked while both workers have ended.
+    assert_eq!(records.waiting.load(Ordering::Acquire), 1);
+    assert_eq!(records.list()?.len(), 2);
+
+    records.open();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !records.list()?.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the records were never forgotten"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     Ok(())
 }
 

@@ -63,6 +63,21 @@ case "$1" in
         mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
         report success "$3"
         ;;
+    escape|escape-stay)
+        # Starts a helper that leaves the session and drops its whole environment,
+        # POWER_SESSION included, so it is reparented once its parent exits. Then
+        # reports success, and exits or, with escape-stay, keeps running.
+        wait_for_marker "$2"
+        helper="$fixture_dir/$4.helper"
+        setsid -f env -i /bin/sh -c 'echo $$ > "$0.tmp"; mv "$0.tmp" "$0"; exec sleep 600' "$helper"
+        until test -f "$helper"; do sleep 0.05; done
+        printf '%s %s\n' "$$" "$(cat "$helper")" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        if test "$1" = escape-stay; then
+            exec sleep 600
+        fi
+        ;;
     input)
         report needs-input "Which option should I use?"
         wait_for_marker "$2"

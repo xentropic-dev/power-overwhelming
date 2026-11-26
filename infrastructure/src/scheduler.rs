@@ -37,11 +37,11 @@ pub struct TimerScheduler {
 }
 
 impl TimerScheduler {
-    pub fn start(capacity: usize) -> Result<Self> {
+    pub fn start(name: &str, capacity: usize) -> Result<Self> {
         let shared = Arc::new(Shared::default());
         let timer = shared.clone();
         thread::Builder::new()
-            .name("power-scheduler".into())
+            .name(name.into())
             .spawn(move || run(&timer))
             .context("Could not start the scheduler thread")?;
         Ok(Self { shared, capacity })
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn jobs_run_in_due_order_after_their_delay() -> Result<()> {
-        let scheduler = TimerScheduler::start(8)?;
+        let scheduler = TimerScheduler::start("power-test", 8)?;
         let (tx, rx) = mpsc::channel();
         let started = Instant::now();
         for (delay, name) in [(150, "late"), (50, "early")] {
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn a_full_scheduler_refuses_jobs_instead_of_dropping_them() -> Result<()> {
-        let scheduler = TimerScheduler::start(2)?;
+        let scheduler = TimerScheduler::start("power-test", 2)?;
         let (tx, rx) = mpsc::channel();
         for _ in 0..2 {
             let tx = tx.clone();
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn a_panicking_job_does_not_stop_later_ones() -> Result<()> {
-        let scheduler = TimerScheduler::start(4)?;
+        let scheduler = TimerScheduler::start("power-test", 4)?;
         scheduler.schedule(Duration::ZERO, Box::new(|| panic!("job failed")))?;
         let (tx, rx) = mpsc::channel();
         scheduler.schedule(

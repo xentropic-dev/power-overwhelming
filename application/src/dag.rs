@@ -156,9 +156,20 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     worktree_root: Option<Box<dyn WorktreeRoot>>,
     /// How long a worker runs after its terminal report, and what ends it then.
     /// `None` keeps finished workers running.
-    finished_cleanup: Option<(Duration, Arc<dyn Scheduler>)>,
+    finished_cleanup: Option<FinishedCleanup>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
+}
+
+/// Ends finished workers. Due teardowns and the record writes that follow them run
+/// on separate schedulers, so a blocked session store write never delays the next
+/// worker's teardown.
+struct FinishedCleanup {
+    grace: Duration,
+    /// Runs due teardowns, which never touch a store.
+    teardown: Arc<dyn Scheduler>,
+    /// Forgets each ended session's record afterwards.
+    persistence: Arc<dyn Scheduler>,
 }
 
 struct DispatchWorktree {
@@ -200,13 +211,19 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     /// Ends a worker's session `grace` after it reports success or failure, using
-    /// `scheduler` to wait. Without this, finished workers keep running.
+    /// `teardown` to wait, then forgets its record through `persistence`. Without
+    /// this, finished workers keep running.
     pub fn with_finished_worker_cleanup(
         mut self,
         grace: Duration,
-        scheduler: Arc<dyn Scheduler>,
+        teardown: Arc<dyn Scheduler>,
+        persistence: Arc<dyn Scheduler>,
     ) -> Self {
-        self.finished_cleanup = Some((grace, scheduler));
+        self.finished_cleanup = Some(FinishedCleanup {
+            grace,
+            teardown,
+            persistence,
+        });
         self
     }
 
@@ -732,23 +749,44 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     {
         let (result, finished) =
             self.write(|db| report(db, run, task, attempt, status, summary))?;
-        if let (Some(session), Some((grace, scheduler))) = (finished, &self.finished_cleanup) {
-            self.end_finished_session(session, *grace, scheduler.as_ref());
+        if let (Some(session), Some(cleanup)) = (finished, &self.finished_cleanup) {
+            self.end_finished_session(session, cleanup);
         }
         Ok(result)
     }
 
-    /// Ends a finished worker's session after `grace`, which also forgets its record so
-    /// a restart cannot bring it back. Ending takes the whole process tree down. A
-    /// scheduler that refuses the job leaves the work here, so the session ends now.
-    fn end_finished_session(&self, session: String, grace: Duration, scheduler: &dyn Scheduler)
+    /// Ends a finished worker's session after the grace, then forgets its record so a
+    /// restart cannot bring it back. Ending takes everything the worker started down.
+    /// The due teardown holds the terminal handle taken now, so it takes no lock a
+    /// launch holds across a store write and never writes a store itself. A scheduler
+    /// that refuses the teardown leaves the work here, so the session ends now.
+    fn end_finished_session(&self, session: String, cleanup: &FinishedCleanup)
     where
         T: 'static,
     {
+        let Ok(terminal) = self.application.terminal(&session) else {
+            return;
+        };
         let application = self.application.clone();
+        let persistence = cleanup.persistence.clone();
         let scheduled = session.clone();
-        let job = Box::new(move || end_finished(&application, &scheduled));
-        if let Err(error) = scheduler.schedule(grace, job) {
+        let job = Box::new(move || {
+            if let Err(error) = application.stop_terminal(&terminal) {
+                eprintln!("Could not end finished worker session {scheduled}. {error:#}");
+            }
+            let forget = {
+                let application = application.clone();
+                let session = scheduled.clone();
+                Box::new(move || end_finished(&application, &session))
+            };
+            if let Err(error) = persistence.schedule(Duration::ZERO, forget) {
+                // The attempt is finished, so a restart forgets the record anyway.
+                eprintln!(
+                    "Could not schedule forgetting ended session {scheduled}, so a restart forgets it. {error:#}"
+                );
+            }
+        });
+        if let Err(error) = cleanup.teardown.schedule(cleanup.grace, job) {
             eprintln!(
                 "Could not schedule the end of finished worker session {session}, so it ends now. {error:#}"
             );

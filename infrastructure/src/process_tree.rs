@@ -1,15 +1,17 @@
-//! Own a session's whole process tree from launch until it is verifiably gone: its
-//! root, every descendant, any process left in the root's session, and any process
-//! that carries the session's owner marker after it detached from both.
+//! The fallback for systems without cgroup ownership (see `cgroup`): find a
+//! session's processes by ancestry, session ID and the session's owner marker.
+//! This cannot find a process that leaves the session, clears its environment and
+//! is reparented, so the daemon logs that it runs without cgroups.
 //!
-//! Ending a session and pausing or resuming one share this. Identity is pinned, so
-//! a reused PID is never signalled or used to find a tree:
+//! Identity is pinned, so a reused PID is never signalled or used to find a tree:
 //!
 //! - The root is the caller's child, which the caller leaves unreaped until the
 //!   tree is gone. Until then its PID, and the session ID it leads, cannot be reused.
 //! - Every other member is held by a pidfd, opened only after its start time was
-//!   checked, and signalled through it. A start-time pin rechecked before each
-//!   signal replaces the pidfd on kernels without one.
+//!   checked, and signalled through it. Only a kernel without pidfds falls back to a
+//!   start-time pin rechecked before each signal. A member whose pidfd cannot be
+//!   opened for any other reason is never signalled by PID, and an end that leaves
+//!   it running says so.
 //! - A member's PID seeds discovery of its children only while its pidfd shows it
 //!   alive, which also means its PID still names it.
 
@@ -27,6 +29,9 @@ const POLL: Duration = Duration::from_millis(50);
 const MAX_ROUNDS: usize = 16;
 /// How often `terminate` logs members that outlive SIGKILL.
 const STUCK_LOG: Duration = Duration::from_secs(10);
+/// How long `terminate` keeps killing members that outlive SIGKILL before it
+/// reports the teardown as incomplete.
+const KILL_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TreeSignal {
@@ -99,7 +104,7 @@ fn carries(pid: u32, entry: &[u8]) -> bool {
 
 /// What a signal to a pinned process did.
 #[derive(Debug, Eq, PartialEq)]
-enum Sent {
+pub(crate) enum Sent {
     Delivered,
     /// The process has exited, so it is no longer a member.
     Gone,
@@ -109,7 +114,7 @@ enum Sent {
 
 /// A process pinned by a pidfd, or by its start time where pidfds are unavailable.
 #[derive(Debug)]
-struct Pinned {
+pub(crate) struct Pinned {
     pid: u32,
     start: u64,
     fd: Option<OwnedFd>,
@@ -118,24 +123,43 @@ struct Pinned {
 impl Pinned {
     /// Pins `pid` if it is still the process that started at `start`. The pidfd is
     /// opened before the recheck, so a match means the pidfd names that process.
-    fn open(pid: u32, start: u64) -> Option<Self> {
-        let fd = pidfd_open(pid);
-        stat(pid)
+    /// `Err` means the process could not be pinned at all, so it must not be
+    /// signalled by PID.
+    fn open(pid: u32, start: u64) -> Result<Option<Self>, io::Error> {
+        let fd = match pidfd_open(pid) {
+            Ok(fd) => Some(fd),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => None,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(stat(pid)
             .filter(|stat| stat.start == start && !stat.zombie)
-            .map(|_| Self { pid, start, fd })
+            .map(|_| Self { pid, start, fd }))
+    }
+
+    /// Pins a process that is not the caller's child by a pidfd. Without one, the
+    /// process is not pinned, since only a pidfd keeps a reused PID from being
+    /// signalled.
+    pub(crate) fn member(pid: u32) -> Option<Self> {
+        let fd = pidfd_open(pid).ok()?;
+        Some(Self {
+            pid,
+            start: stat(pid).map_or(0, |stat| stat.start),
+            fd: Some(fd),
+        })
     }
 
     /// Pins the caller's unreaped child, whose PID cannot be reused until it is reaped.
-    fn child(pid: u32) -> Self {
+    pub(crate) fn child(pid: u32) -> Self {
         Self {
             pid,
             start: stat(pid).map_or(0, |stat| stat.start),
-            fd: pidfd_open(pid),
+            fd: pidfd_open(pid).ok(),
         }
     }
 
     /// Whether the process has exited. A zombie has exited.
-    fn exited(&self) -> bool {
+    pub(crate) fn exited(&self) -> bool {
         match &self.fd {
             Some(fd) => {
                 let mut poll = libc::pollfd {
@@ -151,7 +175,7 @@ impl Pinned {
         }
     }
 
-    fn signal(&self, signal: libc::c_int) -> Sent {
+    pub(crate) fn signal(&self, signal: libc::c_int) -> Sent {
         let result = match &self.fd {
             // SAFETY: the pidfd is open, and pidfd_send_signal reads no memory when
             // info is null.
@@ -186,13 +210,16 @@ impl Pinned {
     }
 }
 
-fn pidfd_open(pid: u32) -> Option<OwnedFd> {
-    let pid = libc::pid_t::try_from(pid).ok()?;
+fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
     // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let fd = libc::c_int::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = libc::c_int::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EBADF))?;
     // SAFETY: the kernel returned a new descriptor that nothing else owns.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// A launched process and everything it started, owned until all of it has exited.
@@ -207,6 +234,12 @@ pub(crate) struct ProcessTree {
     members: BTreeMap<u32, Pinned>,
     /// Processes already checked for the owner marker and found without it.
     strangers: BTreeMap<u32, u64>,
+    /// Members that belong to another user, by PID and start time. Power cannot
+    /// signal them, so they are not waited for, and an end reports them.
+    denied: BTreeMap<u32, u64>,
+    /// Processes found in the last look that could not be pinned, so they were
+    /// never signalled.
+    unpinned: BTreeSet<u32>,
 }
 
 impl ProcessTree {
@@ -221,6 +254,8 @@ impl ProcessTree {
             owner: owner.map(String::into_bytes),
             members: BTreeMap::new(),
             strangers: BTreeMap::new(),
+            denied: BTreeMap::new(),
+            unpinned: BTreeSet::new(),
         }
     }
 
@@ -237,8 +272,14 @@ impl ProcessTree {
         // After the snapshot, so a member that is alive now was alive in it, under
         // the same PID.
         self.members.retain(|_, member| !member.exited());
-        self.strangers
-            .retain(|pid, start| processes.get(pid).is_some_and(|stat| stat.start == *start));
+        let same = |pid: &u32, start: &mut u64| {
+            processes
+                .get(pid)
+                .is_some_and(|stat| stat.start == *start && !stat.zombie)
+        };
+        self.strangers.retain(same);
+        self.denied.retain(same);
+        self.unpinned.clear();
         let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for (pid, stat) in &processes {
             children.entry(stat.parent).or_default().push(*pid);
@@ -247,7 +288,11 @@ impl ProcessTree {
             .chain(self.members.keys().copied())
             .collect();
         for (pid, stat) in &processes {
-            if self.members.contains_key(pid) || protected.contains(pid) || stat.zombie {
+            if self.members.contains_key(pid)
+                || self.denied.contains_key(pid)
+                || protected.contains(pid)
+                || stat.zombie
+            {
                 continue;
             }
             if Some(stat.session) == self.session {
@@ -267,7 +312,7 @@ impl ProcessTree {
         let mut joined = 0;
         let mut seen = BTreeSet::new();
         while let Some(pid) = queue.pop() {
-            if !seen.insert(pid) || protected.contains(&pid) {
+            if !seen.insert(pid) || protected.contains(&pid) || self.denied.contains_key(&pid) {
                 continue;
             }
             let known = pid == self.root.pid || self.members.contains_key(&pid);
@@ -275,8 +320,16 @@ impl ProcessTree {
                 let Some(stat) = processes.get(&pid).filter(|stat| !stat.zombie) else {
                     continue;
                 };
-                let Some(pinned) = Pinned::open(pid, stat.start) else {
-                    continue;
+                let pinned = match Pinned::open(pid, stat.start) {
+                    Ok(Some(pinned)) => pinned,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // Its PID could be reused before a signal, so it is never sent
+                        // one, and neither are children found through it.
+                        eprintln!("Could not pin process {pid}, so it is not signalled. {error}");
+                        self.unpinned.insert(pid);
+                        continue;
+                    }
                 };
                 self.members.insert(pid, pinned);
                 joined += 1;
@@ -316,6 +369,7 @@ impl ProcessTree {
                     Sent::Gone => gone.push(*pid),
                     Sent::Denied => {
                         eprintln!("Process {pid} belongs to another user, so it is left running.");
+                        self.denied.insert(*pid, member.start);
                         gone.push(*pid);
                     }
                 }
@@ -331,9 +385,10 @@ impl ProcessTree {
     }
 
     /// Asks the tree to exit, waits up to `grace`, then kills whatever is left.
-    /// Returns only once every member has exited, so the caller may then reap the
-    /// root and report the session as ended.
-    pub(crate) fn terminate(&mut self, grace: Duration) {
+    /// Returns once every member Power can signal has exited, so the caller may then
+    /// reap the root. The error names processes still running that Power could not
+    /// signal or kill, so the end is incomplete.
+    pub(crate) fn terminate(&mut self, grace: Duration) -> Result<(), String> {
         self.signal(TreeSignal::Terminate);
         let deadline = Instant::now() + grace;
         while self.alive() {
@@ -345,7 +400,11 @@ impl ProcessTree {
             thread::sleep(POLL);
         }
         let mut logged = Instant::now();
+        let killing = Instant::now();
         while self.alive() {
+            if killing.elapsed() >= KILL_LIMIT {
+                break;
+            }
             self.signal(TreeSignal::Kill);
             thread::sleep(POLL);
             if logged.elapsed() >= STUCK_LOG {
@@ -356,6 +415,27 @@ impl ProcessTree {
                     self.root.pid
                 );
             }
+        }
+        let mut left: Vec<String> = Vec::new();
+        if !self.members.is_empty() {
+            left.push(format!(
+                "{:?} outlived SIGKILL",
+                self.members.keys().collect::<Vec<_>>()
+            ));
+        }
+        if !self.denied.is_empty() {
+            left.push(format!(
+                "{:?} belong to another user",
+                self.denied.keys().collect::<Vec<_>>()
+            ));
+        }
+        if !self.unpinned.is_empty() {
+            left.push(format!("{:?} could not be pinned", self.unpinned));
+        }
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("processes {}", left.join(", and ")))
         }
     }
 }
@@ -472,7 +552,7 @@ mod tests {
         assert!(!tree.members.contains_key(&std::process::id()));
 
         let started = Instant::now();
-        tree.terminate(Duration::from_millis(300));
+        tree.terminate(Duration::from_millis(300)).unwrap();
         assert!(!tree.alive());
         child.wait().unwrap();
 
@@ -506,7 +586,7 @@ mod tests {
         assert!(tree.alive(), "the detached child was not found");
         assert!(tree.members.contains_key(&detached));
 
-        tree.terminate(Duration::from_millis(300));
+        tree.terminate(Duration::from_millis(300)).unwrap();
         assert!(!running(detached), "{detached} survived");
         assert!(!tree.alive());
         child.wait().unwrap();
@@ -518,7 +598,7 @@ mod tests {
         let mut stranger = spawn("sleep 600", &format!("theirs-{}", std::process::id()));
         let mut child = spawn("sleep 600", &marker);
         let mut tree = ProcessTree::pin(child.id(), owner(&marker));
-        tree.terminate(Duration::from_millis(300));
+        tree.terminate(Duration::from_millis(300)).unwrap();
         child.wait().unwrap();
         assert!(running(stranger.id()));
         stranger.kill().unwrap();
@@ -530,8 +610,8 @@ mod tests {
         let mut child = spawn("sleep 600", "reuse");
         let start = stat(child.id()).unwrap().start;
         // The same PID with another start time is what a reused PID looks like.
-        assert!(Pinned::open(child.id(), start + 1).is_none());
-        let pinned = Pinned::open(child.id(), start).unwrap();
+        assert!(Pinned::open(child.id(), start + 1).unwrap().is_none());
+        let pinned = Pinned::open(child.id(), start).unwrap().unwrap();
         assert!(pinned.fd.is_some(), "this kernel has pidfds");
         child.kill().unwrap();
         child.wait().unwrap();
@@ -572,7 +652,7 @@ mod tests {
         settle(false);
         // Terminating a paused tree still ends it.
         tree.signal(TreeSignal::Stop);
-        tree.terminate(Duration::from_millis(300));
+        tree.terminate(Duration::from_millis(300)).unwrap();
         child.wait().unwrap();
         for pid in descendants {
             assert!(!running(pid), "{pid} survived");
