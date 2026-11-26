@@ -88,9 +88,42 @@ pub fn prune_verdict(status: PruneStatus) -> PruneVerdict {
     }
 }
 
+const NAME_ADJECTIVES: &[&str] = &[
+    "amber", "brisk", "calm", "dusky", "eager", "fern", "gentle", "hardy", "ivory", "jolly",
+    "keen", "lively", "mossy", "nimble", "olive", "proud", "quiet", "rustic", "sunny", "tall",
+    "umber", "vivid", "wild", "young",
+];
+
+const NAME_TREES: &[&str] = &[
+    "alder", "aspen", "birch", "cedar", "cypress", "elm", "fir", "hazel", "hemlock", "juniper",
+    "larch", "linden", "maple", "oak", "pine", "poplar", "redwood", "rowan", "sequoia", "spruce",
+    "sycamore", "willow", "yew",
+];
+
+/// Suggests a worktree name such as `quiet-cedar` from a random seed.
+pub fn generated_worktree_name(seed: u64) -> String {
+    let adjective = NAME_ADJECTIVES[(seed % NAME_ADJECTIVES.len() as u64) as usize];
+    let tree = NAME_TREES[((seed >> 32) % NAME_TREES.len() as u64) as usize];
+    format!("{adjective}-{tree}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_names_are_valid_branch_and_directory_names() {
+        for seed in [0, 1, u64::MAX, 0x1234_5678_9abc_def0] {
+            let name = generated_worktree_name(seed);
+            let (adjective, tree) = name.split_once('-').unwrap();
+            assert!(NAME_ADJECTIVES.contains(&adjective), "{name}");
+            assert!(NAME_TREES.contains(&tree), "{name}");
+        }
+        assert_ne!(
+            generated_worktree_name(0),
+            generated_worktree_name(1 << 32 | 1)
+        );
+    }
 
     #[test]
     fn default_path_uses_the_first_available_slug() {

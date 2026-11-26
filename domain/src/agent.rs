@@ -44,6 +44,7 @@ pub struct AgentProfile {
     pub injection: Injection,
     pub skip_subcommands: Vec<String>,
     pub skip_if_args_contain: Vec<String>,
+    pub model_callback: ModelCallback,
     pub skills_dir: Option<PathBuf>,
     pub resume: Option<Resume>,
 }
@@ -119,6 +120,19 @@ pub enum Injection {
         flag: String,
         key: String,
     },
+    #[default]
+    None,
+}
+
+/// How Power registers `power session model --json` with an agent for one launch, so the
+/// agent reports its model without changes to the user's config files.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ModelCallback {
+    /// Pass Claude Code `--settings` with a `statusLine` that runs the callback, unless the
+    /// user's settings already define a status line or the launch passes `--settings`.
+    ClaudeStatusLine,
+    /// Pass these arguments, with `{command}` replaced by the callback command.
+    Args { args: Vec<String> },
     #[default]
     None,
 }

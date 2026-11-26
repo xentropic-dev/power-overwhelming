@@ -1906,6 +1906,7 @@ mod tests {
             injection: Default::default(),
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
+            model_callback: domain::agent::ModelCallback::None,
             skills_dir: None,
             resume: None,
         });

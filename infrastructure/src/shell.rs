@@ -8,13 +8,14 @@ use application::{
     agents::AgentProfileRegistry,
     skills::{InstalledSkills, LaunchSkills},
 };
-use domain::agent::{AgentProfile, Injection};
+use domain::agent::{AgentProfile, Injection, ModelCallback};
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -293,18 +294,11 @@ pub(crate) fn assign_conversation(
     Some(resume.launch(user, || uuid::Uuid::new_v4().to_string()))
 }
 
-/// Arguments Power adds in front of the user's arguments when it starts an agent.
-/// Skills the agent already discovers natively are left out of the list.
-pub(crate) fn instruction_args(
-    profile: &AgentProfile,
-    user: &[OsString],
-    installed: &dyn InstalledSkills,
-) -> Result<Vec<OsString>> {
-    if profile.injection == Injection::None
-        || user
-            .first()
-            .and_then(|arg| arg.to_str())
-            .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
+/// Whether a launch runs a management subcommand or already passes what Power would add.
+fn skips_injection(profile: &AgentProfile, user: &[OsString]) -> bool {
+    user.first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
         || user.iter().any(|arg| {
             let arg = arg.to_string_lossy();
             profile
@@ -312,7 +306,152 @@ pub(crate) fn instruction_args(
                 .iter()
                 .any(|skip| arg.contains(skip))
         })
+}
+
+/// The command an agent's hook or status line runs to report its model to Power.
+pub(crate) const MODEL_CALLBACK: &str = "power session model --json";
+
+/// Arguments that register [`MODEL_CALLBACK`] with the agent for this launch only.
+/// `status_line_configured` reports whether the user's Claude Code settings already
+/// define a status line, which Power never replaces.
+pub(crate) fn model_callback_args(
+    profile: &AgentProfile,
+    user: &[OsString],
+    status_line_configured: impl FnOnce() -> bool,
+) -> Vec<OsString> {
+    if skips_injection(profile, user) {
+        return Vec::new();
+    }
+    match &profile.model_callback {
+        ModelCallback::None => Vec::new(),
+        ModelCallback::Args { args } => args
+            .iter()
+            .map(|arg| arg.replace("{command}", MODEL_CALLBACK).into())
+            .collect(),
+        ModelCallback::ClaudeStatusLine => {
+            let passes_settings = user.iter().any(|arg| {
+                let arg = arg.to_string_lossy();
+                arg == "--settings" || arg.starts_with("--settings=")
+            });
+            if passes_settings || status_line_configured() {
+                return Vec::new();
+            }
+            let settings = serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": MODEL_CALLBACK,
+                    "refreshInterval": 5,
+                }
+            });
+            vec!["--settings".into(), settings.to_string().into()]
+        }
+    }
+}
+
+/// Whether Claude Code's managed, user, project or local settings for `cwd` define a
+/// `statusLine`.
+fn claude_status_line_configured(cwd: &Path) -> bool {
+    let managed = Path::new("/etc/claude-code");
+    let mut files = vec![managed.join("managed-settings.json")];
+    if let Ok(entries) = fs::read_dir(managed.join("managed-settings.d")) {
+        files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        }));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(user) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")))
     {
+        files.push(user.join("settings.json"));
+    }
+    files.extend(claude_project_settings(cwd, home.as_deref()));
+    files.iter().any(|path| settings_define_status_line(path))
+}
+
+/// The project settings files Claude Code reads for a session started in `cwd`. Shared
+/// settings come only from `cwd`. Local settings come from `cwd` and from the repository
+/// root, which for a linked worktree is the main checkout's root.
+fn claude_project_settings(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut files = vec![
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+    ];
+    if let Some(root) = local_settings_root(cwd, home) {
+        let local = root.join(".claude/settings.local.json");
+        if !files.contains(&local) {
+            files.push(local);
+        }
+    }
+    files
+}
+
+/// Where Claude Code keeps `settings.local.json` for a session in `cwd`, when that is
+/// a repository root rather than `cwd` itself.
+fn local_settings_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let (root, dot_git) = cwd
+        .ancestors()
+        .map(|directory| (directory, directory.join(".git")))
+        .find(|(_, dot_git)| dot_git.exists())?;
+    let root = main_checkout_root(root, &dot_git).unwrap_or_else(|| root.to_path_buf());
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let user = unsafe { libc::geteuid() };
+    let owned = |path: &Path| {
+        path.symlink_metadata()
+            .is_ok_and(|metadata| metadata.uid() == user)
+    };
+    let claude = root.join(".claude");
+    let usable = owned(&root)
+        && owned(&root.join(".git"))
+        && (!claude.exists() || owned(&claude))
+        && home.is_none_or(|home| !same_directory(&root, home));
+    usable.then_some(root)
+}
+
+/// The main checkout's root for a linked worktree whose `.git` file is `dot_git`.
+/// `None` for a main checkout, a submodule or a worktree of a bare repository.
+fn main_checkout_root(worktree: &Path, dot_git: &Path) -> Option<PathBuf> {
+    if dot_git.is_dir() {
+        return None;
+    }
+    let text = fs::read_to_string(dot_git).ok()?;
+    let git_dir = worktree.join(text.strip_prefix("gitdir:")?.trim());
+    let common = git_dir.join(fs::read_to_string(git_dir.join("commondir")).ok()?.trim());
+    let common = common.canonicalize().ok()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn settings_define_status_line(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(settings) => settings
+            .get("statusLine")
+            .is_some_and(|line| !line.is_null()),
+        // Leave a file Power cannot parse to Claude Code rather than risk replacing it.
+        Err(_) => text.contains("\"statusLine\""),
+    }
+}
+
+/// Arguments Power adds in front of the user's arguments when it starts an agent.
+/// Skills the agent already discovers natively are left out of the list.
+pub(crate) fn instruction_args(
+    profile: &AgentProfile,
+    user: &[OsString],
+    installed: &dyn InstalledSkills,
+) -> Result<Vec<OsString>> {
+    if profile.injection == Injection::None || skips_injection(profile, user) {
         return Ok(Vec::new());
     }
 
@@ -328,7 +467,9 @@ pub(crate) fn instruction_args(
     instructions.push_str(concat!(
         "\nWhen you understand the user's objective, run ",
         "`power session task 'Short task label'` from this terminal. ",
-        "Use a short, concrete label and update it when the objective changes.\n\n",
+        "Use a short, concrete label and update it when the objective changes. ",
+        "On long work, update it at major milestones so it shows current progress, e.g. ",
+        "'Port sprites: 3/5 done'.\n\n",
         "When you can verify the active model for this session, run ",
         "`power session model 'Verified model name'` from this terminal at the start of your work ",
         "and again when the model changes. Leave it unset if the model is unknown.\n\n",
@@ -344,16 +485,21 @@ pub(crate) fn instruction_args(
     })
 }
 
-/// Replaces this process with the real agent binary, adding Power's instructions.
+/// Replaces this process with the real agent binary, adding Power's instructions and
+/// model callback.
 pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     let program = find_program(&profile.command)
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
+    let cwd = std::env::current_dir()?;
     command.args(instruction_args(
         profile,
         &args,
-        &LocalInstalledSkills(&std::env::current_dir()?),
+        &LocalInstalledSkills(&cwd),
     )?);
+    command.args(model_callback_args(profile, &args, || {
+        claude_status_line_configured(&cwd)
+    }));
     if let Some((assign, conversation)) = assign_conversation(profile, &args) {
         command.args(assign);
         // The report identifies this process, which the agent replaces, as the agent
@@ -421,7 +567,9 @@ mod tests {
     const TASK_LINE: &str = concat!(
         "When you understand the user's objective, run ",
         "`power session task 'Short task label'` from this terminal. ",
-        "Use a short, concrete label and update it when the objective changes.",
+        "Use a short, concrete label and update it when the objective changes. ",
+        "On long work, update it at major milestones so it shows current progress, e.g. ",
+        "'Port sprites: 3/5 done'.",
     );
 
     const MODEL_LINE: &str = concat!(
@@ -495,6 +643,167 @@ mod tests {
         let mut profile = grok.clone();
         profile.injection = Injection::None;
         assert!(instruction_args(&profile, &["prompt".into()], &NONE)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn claude_gets_a_status_line_callback_only_without_an_existing_status_line() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into())?;
+        let args = model_callback_args(claude, &["fix the bug".into()], || false);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--settings");
+        let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap())?;
+        assert_eq!(
+            settings,
+            serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": "power session model --json",
+                    "refreshInterval": 5,
+                }
+            })
+        );
+
+        assert!(model_callback_args(claude, &["fix the bug".into()], || true).is_empty());
+        let unchecked = || panic!("settings need no check");
+        for user in [
+            vec!["mcp".into(), "list".into()],
+            vec!["--append-system-prompt".into(), "x".into()],
+            vec!["--settings".into(), "{}".into()],
+            vec!["--settings=custom.json".into()],
+        ] {
+            assert!(
+                model_callback_args(claude, &user, unchecked).is_empty(),
+                "{user:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_callback_args_substitute_the_command_and_respect_skips() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        for id in ["codex", "grok"] {
+            let profile = profiles.resolve(&id.into())?;
+            assert!(
+                model_callback_args(profile, &[], || false).is_empty(),
+                "{id}"
+            );
+        }
+        let mut codex = profiles.resolve(&"codex".into())?.clone();
+        codex.model_callback = ModelCallback::Args {
+            args: vec!["-c".into(), "hook=\"{command}\"".into()],
+        };
+        assert_eq!(
+            model_callback_args(&codex, &[], || panic!("not Claude")),
+            ["-c", "hook=\"power session model --json\""].map(OsString::from)
+        );
+        assert!(
+            model_callback_args(
+                &codex,
+                &["-c".into(), "developer_instructions=x".into()],
+                || { panic!("not Claude") }
+            )
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    fn project_status_line(cwd: &Path) -> bool {
+        claude_project_settings(cwd, None)
+            .iter()
+            .any(|path| settings_define_status_line(path))
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> Result<()> {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Power",
+                "-c",
+                "user.email=power@example.com",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+        Ok(())
+    }
+
+    #[test]
+    fn detects_status_lines_in_project_and_local_settings() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let nested = repo.path().join("crates/app");
+        fs::create_dir_all(&nested)?;
+        fs::create_dir(repo.path().join(".git"))?;
+        let claude = repo.path().join(".claude");
+        fs::create_dir(&claude)?;
+        let local = claude.join("settings.local.json");
+        fs::write(&local, r#"{ "statusLine": null, "model": "opus" }"#)?;
+        assert!(!settings_define_status_line(&local));
+        fs::write(
+            &local,
+            r#"{ "statusLine": { "type": "command", "command": "x" } }"#,
+        )?;
+        assert!(settings_define_status_line(&local));
+        assert!(project_status_line(&nested));
+        assert!(project_status_line(repo.path()));
+        // Claude Code keeps the local file in the starting directory when the
+        // repository root is the home directory.
+        assert!(!claude_project_settings(&nested, Some(repo.path())).contains(&local));
+        fs::write(&local, r#"{ "statusLine": "#)?;
+        assert!(settings_define_status_line(&local));
+        assert!(!settings_define_status_line(&claude.join("settings.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn linked_worktrees_read_the_main_checkouts_local_settings() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let main = temp.path().join("main");
+        fs::create_dir(&main)?;
+        git(&main, &["init", "-q"])?;
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"])?;
+        git(&main, &["worktree", "add", "-q", "../linked"])?;
+        let linked = temp.path().join("linked");
+        let nested = linked.join("nested");
+        fs::create_dir(&nested)?;
+        assert!(!project_status_line(&linked));
+
+        // Untracked, so the linked worktree has no copy of its own.
+        fs::create_dir(main.join(".claude"))?;
+        fs::write(
+            main.join(".claude/settings.local.json"),
+            r#"{ "statusLine": { "type": "command", "command": "mine" } }"#,
+        )?;
+        assert!(project_status_line(&linked));
+        assert!(project_status_line(&nested));
+        assert!(project_status_line(&main));
+        Ok(())
+    }
+
+    #[test]
+    fn subdirectories_ignore_a_parents_shared_status_line() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let nested = repo.path().join("nested");
+        fs::create_dir(&nested)?;
+        fs::create_dir(repo.path().join(".git"))?;
+        fs::create_dir(repo.path().join(".claude"))?;
+        fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{ "statusLine": { "type": "command", "command": "shared" } }"#,
+        )?;
+        assert!(project_status_line(repo.path()));
+        assert!(!project_status_line(&nested));
+        let profiles = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into())?;
+        let args = model_callback_args(claude, &[], || project_status_line(&nested));
+        assert_eq!(args[0], "--settings");
         Ok(())
     }
 
