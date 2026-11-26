@@ -59,15 +59,39 @@ enum Prefix {
 }
 
 enum DagQuery {
-    Runs(String),
-    Run { id: String, repository: PathBuf },
-    Agents(String),
+    Runs {
+        box_id: String,
+        include_finished: bool,
+    },
+    Run {
+        id: String,
+        repository: PathBuf,
+    },
+    Agents {
+        box_id: String,
+        include_finished: bool,
+    },
 }
 
 enum DagSnapshot {
     Runs(Vec<Run>),
     Run(Run, Box<DagWorktrees>),
     Agents(Vec<ManagedAgent>),
+}
+
+/// The empty picker text, naming the key that shows finished items while they are hidden.
+fn empty_message(
+    none: &str,
+    none_live: &str,
+    show_finished: bool,
+    toggle: &str,
+    finished: &str,
+) -> String {
+    if show_finished {
+        none.to_owned()
+    } else {
+        format!("{none_live} {toggle} shows {finished}.")
+    }
 }
 
 fn running_progress(run: &Run) -> Option<String> {
@@ -82,7 +106,8 @@ fn running_progress(run: &Run) -> Option<String> {
 }
 
 fn session_dag_progress(box_id: String, session: &str) -> Result<Option<String>> {
-    let agents = client::list_agents(Some(box_id.clone()), None)?;
+    // A worker whose attempt is done keeps its session, so finished agents count here.
+    let agents = client::list_agents(Some(box_id.clone()), None, true)?;
     let Some(agent) = agents
         .into_iter()
         .find(|agent| agent.session.as_deref() == Some(session))
@@ -92,7 +117,7 @@ fn session_dag_progress(box_id: String, session: &str) -> Result<Option<String>>
     if let Some(run) = agent.run {
         return Ok(running_progress(&client::get_run(run)?));
     }
-    let runs = client::list_runs(Some(box_id), None)?;
+    let runs = client::list_runs(Some(box_id), None, false)?;
     Ok(runs
         .iter()
         .filter(
@@ -805,17 +830,21 @@ impl Workspace {
                         .background_executor()
                         .spawn(async move {
                             match query {
-                                DagQuery::Runs(box_id) => {
-                                    client::list_runs(Some(box_id), None).map(DagSnapshot::Runs)
-                                }
+                                DagQuery::Runs {
+                                    box_id,
+                                    include_finished,
+                                } => client::list_runs(Some(box_id), None, include_finished)
+                                    .map(DagSnapshot::Runs),
                                 DagQuery::Run { id, repository } => {
                                     let run = client::get_run(id)?;
                                     let worktrees = DagWorktrees::load(&repository);
                                     Ok(DagSnapshot::Run(run, Box::new(worktrees)))
                                 }
-                                DagQuery::Agents(box_id) => {
-                                    client::list_agents(Some(box_id), None).map(DagSnapshot::Agents)
-                                }
+                                DagQuery::Agents {
+                                    box_id,
+                                    include_finished,
+                                } => client::list_agents(Some(box_id), None, include_finished)
+                                    .map(DagSnapshot::Agents),
                             }
                         })
                         .await;
@@ -879,9 +908,16 @@ impl Workspace {
             ));
         }
         let picker = self.picker.as_ref()?;
+        let include_finished = picker.show_finished;
         let query = match &picker.kind {
-            Kind::Runs { box_id, .. } => DagQuery::Runs(box_id.clone()),
-            Kind::Agents { box_id, .. } => DagQuery::Agents(box_id.clone()),
+            Kind::Runs { box_id, .. } => DagQuery::Runs {
+                box_id: box_id.clone(),
+                include_finished,
+            },
+            Kind::Agents { box_id, .. } => DagQuery::Agents {
+                box_id: box_id.clone(),
+                include_finished,
+            },
             _ => return None,
         };
         Some((picker.id, query))
@@ -916,6 +952,7 @@ impl Workspace {
             }
         } else if let Some(picker) = self.picker.as_mut().filter(|picker| picker.id == id) {
             let initial = std::mem::take(&mut picker.loading);
+            let toggle = |scope| self.keymap.first(scope, Command::ToggleFinished);
             match result {
                 Ok(DagSnapshot::Runs(mut runs)) => {
                     // Skip the list only when there is nothing else to pick.
@@ -925,13 +962,27 @@ impl Workspace {
                         }
                         return;
                     }
-                    picker.message = runs.is_empty().then(|| "This box has no DAG runs.".into());
+                    picker.message = runs.is_empty().then(|| {
+                        empty_message(
+                            "This box has no DAG runs.",
+                            "This box has no unfinished DAG runs.",
+                            picker.show_finished,
+                            &toggle(Scope::Runs),
+                            "completed runs",
+                        )
+                    });
                     picker.set_runs(runs);
                 }
                 Ok(DagSnapshot::Agents(agents)) => {
-                    picker.message = agents
-                        .is_empty()
-                        .then(|| "This box has no managed agents.".into());
+                    picker.message = agents.is_empty().then(|| {
+                        empty_message(
+                            "This box has no managed agents.",
+                            "This box has no live managed agents.",
+                            picker.show_finished,
+                            &toggle(Scope::AgentTree),
+                            "exited and done agents",
+                        )
+                    });
                     picker.set_agents(agents);
                 }
                 Err(error) => {
@@ -2262,6 +2313,8 @@ impl Workspace {
             cx.stop_propagation();
             let scope = if matches!(picker.kind, Kind::Agents { .. }) {
                 Scope::AgentTree
+            } else if matches!(picker.kind, Kind::Runs { .. }) {
+                Scope::Runs
             } else if picker.has_text_field() {
                 Scope::Picker
             } else {
@@ -2293,6 +2346,12 @@ impl Workspace {
                     picker.step(false);
                     self.preview_selected_scheme(cx);
                     cx.notify();
+                }
+                Some(Command::ToggleFinished) => {
+                    if !picker.waiting {
+                        picker.show_finished = !picker.show_finished;
+                        let _ = self.dag_refresh.try_send(());
+                    }
                 }
                 Some(command @ (Command::AgentCollapse | Command::AgentExpand)) => {
                     if !picker.waiting {
@@ -3042,8 +3101,26 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Coordinator, LinkAction, Run, Task, link_action, running_progress};
+    use super::{Coordinator, LinkAction, Run, Task, empty_message, link_action, running_progress};
     use domain::dag::TaskState;
+
+    #[test]
+    fn empty_pickers_name_the_toggle_while_finished_items_are_hidden() {
+        let message = |show_finished| {
+            empty_message(
+                "No runs.",
+                "No unfinished runs.",
+                show_finished,
+                "Ctrl+F",
+                "completed runs",
+            )
+        };
+        assert_eq!(
+            message(false),
+            "No unfinished runs. Ctrl+F shows completed runs."
+        );
+        assert_eq!(message(true), "No runs.");
+    }
 
     #[test]
     fn shows_progress_while_the_dag_has_actionable_work() {

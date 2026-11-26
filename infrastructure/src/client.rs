@@ -405,15 +405,33 @@ pub fn set_box_icon(
     }
 }
 
-pub fn list_agents(box_sel: Option<String>, caller: Option<String>) -> Result<Vec<ManagedAgent>> {
-    match dag(DagRequest::ListAgents { box_sel, caller }, DAG_TIMEOUT)? {
+pub fn list_agents(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<ManagedAgent>> {
+    let request = DagRequest::ListAgents {
+        box_sel,
+        caller,
+        include_finished,
+    };
+    match dag(request, DAG_TIMEOUT)? {
         DagResponse::Agents { agents } => Ok(domain_list(agents)),
         _ => bail!("Unexpected daemon response"),
     }
 }
 
-pub fn list_runs(box_sel: Option<String>, caller: Option<String>) -> Result<Vec<Run>> {
-    match dag(DagRequest::ListRuns { box_sel, caller }, DAG_TIMEOUT)? {
+pub fn list_runs(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<Run>> {
+    let request = DagRequest::ListRuns {
+        box_sel,
+        caller,
+        include_finished,
+    };
+    match dag(request, DAG_TIMEOUT)? {
         DagResponse::Runs { runs } => Ok(domain_list(runs)),
         _ => bail!("Unexpected daemon response"),
     }

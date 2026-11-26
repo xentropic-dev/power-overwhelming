@@ -20,7 +20,7 @@ The steps below are for coordinators.
 
 - Outside Power, use `power box list` to find the repository's box. Pass `--box "$BOX"` to `power dag list` and `power dag create`. The selector can be a box ID, unique ID prefix, shortcut digit, or unique repository folder name. On create, supply `--coordinator "$LABEL"` to identify the external coordinator, for example `herdr:w6J:p3`.
 - Inside Power, omit both flags to use your terminal's box and register or reuse its agent as the coordinator on create.
-- To reopen a run, find its ID with `power dag list` and load it with `power dag show "$RUN"`. To start one, use `power dag create --title "Task plan"` with the appropriate flags and save `run.id` as `RUN`.
+- To reopen a run, find its ID with `power dag list` (add `--all` to include completed runs) and load it with `power dag show "$RUN"`. To start one, use `power dag create --title "Task plan"` with the appropriate flags and save `run.id` as `RUN`.
 
 Both `power dag create` and `power dag show` return JSON with `run` and `link` fields (`{"run":Run,"link":"pwr://dag/<id>"}`). After creating or reopening a run, include the returned `link` verbatim on its own line in your reply. The user can click it or press Ctrl+S then `o` to open the live graph.
 

@@ -221,17 +221,32 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(box_id)
     }
 
-    pub fn list_agents(&self, selection: BoxSelection) -> Result<Vec<ManagedAgent>> {
-        self.store
-            .read(|db| db.list_agents(self.resolve_box(db, &selection)?.as_deref()))
+    /// Lists the box's agents. Unless `include_finished`, exited and done agents are left out,
+    /// except ancestors of an agent that is shown, so the tree stays connected.
+    pub fn list_agents(
+        &self,
+        selection: BoxSelection,
+        include_finished: bool,
+    ) -> Result<Vec<ManagedAgent>> {
+        let agents = self
+            .store
+            .read(|db| db.list_agents(self.resolve_box(db, &selection)?.as_deref()))?;
+        Ok(if include_finished {
+            agents
+        } else {
+            live_agents(agents)
+        })
     }
 
-    pub fn list_runs(&self, selection: BoxSelection) -> Result<Vec<Run>> {
+    /// Lists the box's runs, live ones first. Unless `include_finished`, finished runs (see
+    /// `RunStatus::is_finished`) are left out.
+    pub fn list_runs(&self, selection: BoxSelection, include_finished: bool) -> Result<Vec<Run>> {
         let mut runs = self.store.read(|db| {
             let mut runs = db.list_runs(self.resolve_box(db, &selection)?.as_deref())?;
             for run in &mut runs {
                 run.derive_task_states();
             }
+            runs.retain(|run| include_finished || !run.status().is_finished());
             Ok(runs)
         })?;
         for run in &mut runs {
@@ -1196,6 +1211,29 @@ fn task_specs(run: &Run) -> Vec<TaskSpec> {
 }
 
 /// Active runs first, then stalled, then completed; newest first within each group.
+/// Keeps unfinished agents and every ancestor of one, in their original order.
+fn live_agents(agents: Vec<ManagedAgent>) -> Vec<ManagedAgent> {
+    let parents: BTreeMap<&str, &str> = agents
+        .iter()
+        .filter_map(|agent| Some((agent.id.as_str(), agent.parent.as_deref()?)))
+        .collect();
+    let mut keep = BTreeSet::new();
+    for agent in agents.iter().filter(|agent| !agent.status.is_finished()) {
+        let mut id = agent.id.as_str();
+        // Stop at an ancestor already kept; this also ends any parent cycle.
+        while keep.insert(id.to_owned()) {
+            match parents.get(id) {
+                Some(parent) => id = parent,
+                None => break,
+            }
+        }
+    }
+    agents
+        .into_iter()
+        .filter(|agent| keep.contains(&agent.id))
+        .collect()
+}
+
 fn sort_runs(runs: &mut [Run]) {
     let rank = |status| match status {
         RunStatus::Active => 0,

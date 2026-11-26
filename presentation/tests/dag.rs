@@ -306,8 +306,10 @@ impl Fixture {
     }
 
     fn agents(&self) -> Vec<ManagedAgent> {
-        serde_json::from_value(self.json(&["agent", "list", "--box", BOX_ID])["agents"].take())
-            .unwrap()
+        serde_json::from_value(
+            self.json(&["agent", "list", "--box", BOX_ID, "--all"])["agents"].take(),
+        )
+        .unwrap()
     }
 
     fn dispatch(
@@ -840,7 +842,7 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
     let alpha = fixture.wait_for_state(run, "alpha", TaskState::Completed);
     assert_eq!(alpha.attempts[0].summary.as_deref(), Some("Alpha result"));
     let status = |id: &str| {
-        let agents = fixture.json(&["agent", "list", "--box", BOX_ID])["agents"].take();
+        let agents = fixture.json(&["agent", "list", "--box", BOX_ID, "--all"])["agents"].take();
         let agent = agents
             .as_array()
             .unwrap()
@@ -850,6 +852,15 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
     };
     assert_eq!(status(&alpha_agent.id), "done");
     assert_eq!(status(&beta_agent.id), "working");
+    let live = fixture.json(&["agent", "list", "--box", BOX_ID])["agents"].take();
+    let live: Vec<_> = live
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].clone())
+        .collect();
+    assert!(!live.contains(&alpha_agent.id.as_str().into()));
+    assert!(live.contains(&beta_agent.id.as_str().into()));
     fixture.release("alpha-exit");
     poll("alpha agent to exit", || {
         (status(&alpha_agent.id) == "exited").then_some(())

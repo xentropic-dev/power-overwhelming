@@ -755,9 +755,12 @@ pub enum DagRequest {
     ListBoxes,
     /// `box_sel` accepts a box ID, a unique ID prefix, a shortcut digit, or a unique repo name.
     /// `caller` is the caller's POWER_SESSION and selects its box when `box_sel` is absent.
+    /// Finished agents are left out unless `include_finished`.
     ListAgents {
         box_sel: Option<String>,
         caller: Option<String>,
+        #[serde(default)]
+        include_finished: bool,
     },
     StartAgent {
         box_sel: Option<String>,
@@ -781,9 +784,12 @@ pub enum DagRequest {
         /// becomes the coordinating agent.
         coordinator: Option<String>,
     },
+    /// Finished runs are left out unless `include_finished`.
     ListRuns {
         box_sel: Option<String>,
         caller: Option<String>,
+        #[serde(default)]
+        include_finished: bool,
     },
     GetRun {
         run: String,

@@ -1027,10 +1027,13 @@ fn attempts_list_their_sessions_artifacts_in_publish_order() -> Result<()> {
         "pwr://artifact/b-first"
     );
 
-    let listed = dag.list_runs(BoxSelection {
-        selector: Some("2".into()),
-        caller: None,
-    })?;
+    let listed = dag.list_runs(
+        BoxSelection {
+            selector: Some("2".into()),
+            caller: None,
+        },
+        true,
+    )?;
     let listed = listed.iter().find(|listed| listed.id == run).unwrap();
     assert_eq!(listed.tasks[0].attempts[0].artifacts, expected[0]);
     // Artifacts are derived at read time, not stored with the run.
@@ -1243,7 +1246,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     let Coordinator::Agent { agent: coordinator } = run.coordinator else {
         panic!("Expected a managed coordinator")
     };
-    assert_eq!(dag.list_agents(selection())?.len(), 1);
+    assert_eq!(dag.list_agents(selection(), true)?.len(), 1);
     dag.add_tasks(&run.id, &[spec("join", &["work"]), spec("work", &[])])?;
     let first = dag.dispatch(command(&run.id, false))?;
     dag.report(
@@ -1254,7 +1257,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         "Prerequisite result",
     )?;
     let statuses: Vec<_> = dag
-        .list_agents(selection())?
+        .list_agents(selection(), true)?
         .into_iter()
         .map(|agent| (agent.id, agent.status))
         .collect();
@@ -1265,6 +1268,12 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
             (first.agent.id.clone(), AgentStatus::Done)
         ]
     );
+    let live: Vec<_> = dag
+        .list_agents(selection(), false)?
+        .into_iter()
+        .map(|agent| agent.id)
+        .collect();
+    assert_eq!(live, std::slice::from_ref(&coordinator));
     let worker = dag.dispatch(Dispatch {
         task: "join".into(),
         provider: Provider::Agent("claude".into()),
@@ -1431,10 +1440,13 @@ fn workers_need_an_explicit_opt_in_for_the_main_checkout() -> Result<()> {
             .map(|_| ()),
     );
     assert!(
-        dag.list_agents(BoxSelection {
-            selector: Some("2".into()),
-            caller: None,
-        })?
+        dag.list_agents(
+            BoxSelection {
+                selector: Some("2".into()),
+                caller: None,
+            },
+            true,
+        )?
         .is_empty()
     );
 
@@ -1604,6 +1616,75 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
             "stalled-old",
             "done-new",
             "done-old"
+        ]
+    );
+}
+
+#[test]
+fn completed_runs_are_listed_only_when_finished_are_included() -> Result<()> {
+    let (dag, run) = setup()?;
+    let box_two = || BoxSelection {
+        selector: Some("2".into()),
+        caller: None,
+    };
+    let ids = |include_finished| -> Result<Vec<String>> {
+        Ok(dag
+            .list_runs(box_two(), include_finished)?
+            .into_iter()
+            .map(|run| run.id)
+            .collect())
+    };
+    assert_eq!(ids(false)?, std::slice::from_ref(&run));
+    let worker = dag.dispatch(command(&run, false))?;
+    dag.report(
+        &run,
+        "work",
+        &worker.attempt.id,
+        ReportStatus::Success,
+        "Done",
+    )?;
+    assert!(ids(false)?.is_empty());
+    assert_eq!(ids(true)?, [run]);
+    Ok(())
+}
+
+#[test]
+fn live_agents_keep_finished_ancestors_of_shown_agents() {
+    let agent = |id: &str, parent: Option<&str>, status| ManagedAgent {
+        id: id.into(),
+        box_id: "box".into(),
+        worktree: PathBuf::from("/worktree"),
+        provider: Provider::Agent("claude".into()),
+        model: None,
+        parent: parent.map(Into::into),
+        session: None,
+        run: None,
+        task: None,
+        attempt: None,
+        state: AgentState::Running,
+        status,
+        label: id.into(),
+        created_at: 0,
+    };
+    let agents = vec![
+        agent("root", None, AgentStatus::Exited),
+        agent("middle", Some("root"), AgentStatus::Done),
+        agent("leaf", Some("middle"), AgentStatus::Working),
+        agent("done-sibling", Some("root"), AgentStatus::Done),
+        agent("gone", None, AgentStatus::Exited),
+        agent("failed", None, AgentStatus::Failed),
+        agent("waiting", Some("gone-parent"), AgentStatus::NeedsInput),
+        agent("cycle-a", Some("cycle-b"), AgentStatus::Idle),
+        agent("cycle-b", Some("cycle-a"), AgentStatus::Done),
+    ];
+    let kept: Vec<_> = live_agents(agents)
+        .into_iter()
+        .map(|agent| agent.id)
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            "root", "middle", "leaf", "failed", "waiting", "cycle-a", "cycle-b"
         ]
     );
 }
