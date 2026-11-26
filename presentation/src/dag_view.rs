@@ -5,13 +5,21 @@ use infrastructure::{
     client::{Attempt, Coordinator, Run, Task, TaskState},
     theme::{Colors, blend},
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet, VecDeque},
+    rc::Rc,
+};
 
 const NODE_WIDTH: f32 = 182.;
 const NODE_HEIGHT: f32 = 68.;
 const COLUMN_GAP: f32 = 66.;
 const ROW_GAP: f32 = 22.;
 const PADDING: f32 = 20.;
+const ZOOM_STEP: f32 = 1.2;
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 3.;
+const DRAG_THRESHOLD: f64 = 4.;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Position {
@@ -31,8 +39,14 @@ impl Position {
 struct GraphLayout {
     positions: Vec<Position>,
     edges: Vec<(usize, usize)>,
-    columns: usize,
     rows: usize,
+}
+
+struct GraphEdge {
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    distance: usize,
+    selected: bool,
 }
 
 /// Assign each task to its longest prerequisite depth and keep insertion order within a layer.
@@ -87,7 +101,6 @@ fn layout(tasks: &[Task]) -> GraphLayout {
     GraphLayout {
         positions,
         edges,
-        columns,
         rows,
     }
 }
@@ -145,6 +158,85 @@ impl GraphLayout {
     }
 }
 
+pub(super) enum GraphAction {
+    Select(usize),
+    Zoom { steps: f32, position: Point<Pixels> },
+    Press(Point<Pixels>),
+    Move(Option<Point<Pixels>>),
+    Release,
+}
+
+struct GraphDrag {
+    position: Point<Pixels>,
+    panning: bool,
+}
+
+struct GraphViewport {
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    offset: Point<Pixels>,
+    scale: f32,
+    drag: Option<GraphDrag>,
+}
+
+impl GraphViewport {
+    fn new() -> Self {
+        Self {
+            bounds: Rc::default(),
+            offset: Point::default(),
+            scale: 1.,
+            drag: None,
+        }
+    }
+
+    fn zoom(&mut self, steps: f32, position: Point<Pixels>) -> bool {
+        let scale = (self.scale * ZOOM_STEP.powf(steps)).clamp(MIN_ZOOM, MAX_ZOOM);
+        if scale == self.scale {
+            return false;
+        }
+        let anchor = position - self.bounds.get().origin;
+        self.offset = anchor + (self.offset - anchor) * (scale / self.scale);
+        self.scale = scale;
+        true
+    }
+
+    fn panning(&self) -> bool {
+        self.drag.as_ref().is_some_and(|drag| drag.panning)
+    }
+
+    fn pan(&mut self, position: Option<Point<Pixels>>) -> bool {
+        let Some(position) = position else {
+            return self.release();
+        };
+        let Some(drag) = &mut self.drag else {
+            return false;
+        };
+        let delta = position - drag.position;
+        if delta == Point::default() || (!drag.panning && delta.magnitude() < DRAG_THRESHOLD) {
+            return false;
+        }
+        self.offset = self.offset + delta;
+        drag.position = position;
+        drag.panning = true;
+        true
+    }
+
+    fn release(&mut self) -> bool {
+        self.drag.take().is_some_and(|drag| drag.panning)
+    }
+
+    fn reveal(&mut self, position: Position) {
+        let viewport = self.bounds.get().size;
+        if viewport.width <= px(0.) || viewport.height <= px(0.) {
+            return;
+        }
+        let node = position.origin() * self.scale;
+        let origin = node + self.offset;
+        let max_x = (viewport.width - px(NODE_WIDTH * self.scale)).max(px(0.));
+        let max_y = (viewport.height - px(NODE_HEIGHT * self.scale)).max(px(0.));
+        self.offset = point(origin.x.clamp(px(0.), max_x), origin.y.clamp(px(0.), max_y)) - node;
+    }
+}
+
 pub(super) struct DagView {
     pub id: u64,
     pub run: Run,
@@ -154,7 +246,7 @@ pub(super) struct DagView {
     pub refresh_error: Option<String>,
     graph: GraphLayout,
     selected: usize,
-    scroll: ScrollHandle,
+    viewport: GraphViewport,
 }
 
 impl DagView {
@@ -170,7 +262,7 @@ impl DagView {
             message: None,
             refresh_error: None,
             selected,
-            scroll: ScrollHandle::new(),
+            viewport: GraphViewport::new(),
         }
     }
 
@@ -183,8 +275,10 @@ impl DagView {
             .unwrap_or_else(|| graph.first_node());
         self.graph = graph;
         self.run = run;
-        if self.graph.positions.get(self.selected).copied() != old_position {
-            self.scroll.scroll_to_item(self.selected + 1);
+        if let Some(&position) = self.graph.positions.get(self.selected)
+            && Some(position) != old_position
+        {
+            self.viewport.reveal(position);
         }
     }
 
@@ -194,10 +288,50 @@ impl DagView {
         }
     }
 
-    pub fn select(&mut self, index: usize) {
+    fn select(&mut self, index: usize) {
         self.selected = index;
         self.message = None;
-        self.scroll.scroll_to_item(index + 1);
+        self.viewport.reveal(self.graph.positions[index]);
+    }
+
+    pub fn zoom(&mut self, steps: f32) -> bool {
+        let Some(position) = self.graph.positions.get(self.selected) else {
+            return false;
+        };
+        let bounds = self.viewport.bounds.get();
+        let node_center = bounds.origin
+            + self.viewport.offset
+            + (position.origin() + point(px(NODE_WIDTH / 2.), px(NODE_HEIGHT / 2.)))
+                * self.viewport.scale;
+        let anchor = if bounds.contains(&node_center) {
+            node_center
+        } else {
+            bounds.center()
+        };
+        self.viewport.zoom(steps, anchor)
+    }
+
+    pub fn graph_action(&mut self, action: GraphAction) -> bool {
+        match action {
+            GraphAction::Select(index) => {
+                if self.opening || self.viewport.panning() || index >= self.graph.positions.len() {
+                    return false;
+                }
+                self.select(index);
+                true
+            }
+            GraphAction::Zoom { steps, position } => self.viewport.zoom(steps, position),
+            GraphAction::Press(position) => {
+                let panning = self.viewport.panning();
+                self.viewport.drag = Some(GraphDrag {
+                    position,
+                    panning: false,
+                });
+                panning
+            }
+            GraphAction::Move(position) => self.viewport.pan(position),
+            GraphAction::Release => self.viewport.release(),
+        }
     }
 
     pub fn task(&self) -> Option<&Task> {
@@ -212,7 +346,7 @@ impl DagView {
         &self,
         colors: &'static Colors,
         keymap: &Keymap,
-        select: impl Fn(usize, &mut App) + Clone + 'static,
+        graph_action: impl Fn(GraphAction, &mut App) + Clone + 'static,
     ) -> impl IntoElement {
         let coordinator = match &self.run.coordinator {
             Coordinator::Agent { agent } => agent,
@@ -220,15 +354,32 @@ impl DagView {
         };
         let open_key = keymap.keys(Scope::Dag, Command::DagOpen);
         let close_key = keymap.first(Scope::Dag, Command::DagClose);
-        let actions = if !open_key.is_empty()
+        let mut actions = Vec::new();
+        if !open_key.is_empty()
             && self
                 .attempt()
                 .is_some_and(|attempt| attempt.session.is_some())
         {
-            format!("{open_key} open worker · {close_key} close")
-        } else {
-            format!("{close_key} close")
-        };
+            actions.push(format!("{open_key} open worker"));
+        }
+        if self.task().is_some() {
+            let zoom_keys = [
+                keymap.keys(Scope::Dag, Command::DagZoomIn),
+                keymap.keys(Scope::Dag, Command::DagZoomOut),
+            ];
+            let zoom_controls = std::iter::once("Wheel")
+                .chain(
+                    zoom_keys
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|key| !key.is_empty()),
+                )
+                .collect::<Vec<_>>()
+                .join(" / ");
+            actions.push(format!("{zoom_controls} zoom"));
+            actions.push("Drag to pan".into());
+        }
+        actions.push(format!("{close_key} close"));
         div()
             .absolute()
             .inset_0()
@@ -275,7 +426,7 @@ impl DagView {
                             .min_h_0()
                             .border_y_1()
                             .border_color(rgb(colors.border))
-                            .child(self.graph_elements(colors, select))
+                            .child(self.graph_elements(colors, graph_action))
                             .child(details(colors, task))
                             .into_any_element()
                     } else {
@@ -307,7 +458,7 @@ impl DagView {
                             .when(self.opening, |footer| {
                                 footer.child(div().child("Opening worker terminal…"))
                             })
-                            .child(actions),
+                            .child(actions.join(" · ")),
                     ),
             )
     }
@@ -315,12 +466,14 @@ impl DagView {
     fn graph_elements(
         &self,
         colors: &'static Colors,
-        select: impl Fn(usize, &mut App) + Clone + 'static,
+        action: impl Fn(GraphAction, &mut App) + Clone + 'static,
     ) -> impl IntoElement {
-        let width =
-            px(2. * PADDING + self.graph.columns as f32 * (NODE_WIDTH + COLUMN_GAP) - COLUMN_GAP);
-        let height = px(2. * PADDING + self.graph.rows as f32 * (NODE_HEIGHT + ROW_GAP));
-        let mut edge_points: Vec<_> = self
+        let lane = px(PADDING + self.graph.rows as f32 * (NODE_HEIGHT + ROW_GAP));
+        let scale = self.viewport.scale;
+        let offset = self.viewport.offset;
+        let viewport_bounds = self.viewport.bounds.clone();
+        let panning = self.viewport.panning();
+        let mut edges: Vec<_> = self
             .graph
             .edges
             .iter()
@@ -328,17 +481,15 @@ impl DagView {
                 let from = self.graph.positions[source];
                 let to = self.graph.positions[target];
                 let distance = to.depth.checked_sub(from.depth)?;
-                (distance > 0).then(|| {
-                    (
-                        from.origin() + point(px(NODE_WIDTH), px(NODE_HEIGHT / 2.)),
-                        to.origin() + point(px(0.), px(NODE_HEIGHT / 2.)),
-                        distance,
-                        source == self.selected || target == self.selected,
-                    )
+                (distance > 0).then(|| GraphEdge {
+                    from: from.origin() + point(px(NODE_WIDTH), px(NODE_HEIGHT / 2.)),
+                    to: to.origin() + point(px(0.), px(NODE_HEIGHT / 2.)),
+                    distance,
+                    selected: source == self.selected || target == self.selected,
                 })
             })
             .collect();
-        edge_points.sort_by_key(|&(_, _, _, selected)| selected);
+        edges.sort_by_key(|edge| edge.selected);
 
         div()
             .id("dag-graph")
@@ -346,40 +497,64 @@ impl DagView {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .overflow_scroll()
-            .track_scroll(&self.scroll)
+            .overflow_hidden()
             .bg(rgb(colors.background))
+            .cursor(if panning {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::OpenHand
+            })
+            .on_scroll_wheel({
+                let action = action.clone();
+                move |event, _, cx| {
+                    let steps = f32::from(event.delta.pixel_delta(px(16.)).y) / 48.;
+                    if steps != 0. {
+                        action(
+                            GraphAction::Zoom {
+                                steps,
+                                position: event.position,
+                            },
+                            cx,
+                        );
+                    }
+                    cx.stop_propagation();
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let action = action.clone();
+                move |event, _, cx| action(GraphAction::Press(event.position), cx)
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let action = action.clone();
+                // Node clicks bubble first and can tell whether this press became a drag.
+                move |_, _, cx| action(GraphAction::Release, cx)
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let action = action.clone();
+                move |_, _, cx| action(GraphAction::Release, cx)
+            })
             .child(
-                canvas(
-                    |_, _, _| (),
+                canvas(move |bounds, _, _| viewport_bounds.set(bounds), {
+                    let action = action.clone();
                     move |bounds, (), window, _| {
-                        for (from, to, distance, selected) in edge_points {
-                            paint_edge(
-                                window,
-                                bounds.origin,
-                                from,
-                                to,
-                                distance,
-                                height - px(20.),
-                                selected,
-                                if selected {
-                                    colors.accent
-                                } else {
-                                    colors.muted
-                                },
-                            );
+                        // Keep panning while the pointer crosses the edge of the graph.
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase.capture() {
+                                let position = event.dragging().then_some(event.position);
+                                action(GraphAction::Move(position), cx);
+                            }
+                        });
+                        for edge in edges {
+                            edge.paint(window, bounds.origin + offset, scale, lane, colors);
                         }
-                    },
-                )
+                    }
+                })
                 .absolute()
-                .top_0()
-                .left_0()
-                .w(width)
-                .h(height),
+                .inset_0(),
             )
             .children(self.run.tasks.iter().enumerate().map(|(index, task)| {
-                let select = select.clone();
-                let origin = self.graph.positions[index].origin();
+                let action = action.clone();
+                let origin = self.graph.positions[index].origin() * scale + offset;
                 let (label, tint) = task_style(colors, task.state);
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
@@ -388,67 +563,89 @@ impl DagView {
                     .absolute()
                     .left(origin.x)
                     .top(origin.y)
-                    .w(px(NODE_WIDTH))
-                    .h(px(NODE_HEIGHT))
-                    .px_2()
-                    .py_1()
+                    .w(px(NODE_WIDTH * scale))
+                    .h(px(NODE_HEIGHT * scale))
+                    .px(rems(0.5 * scale))
+                    .py(rems(0.25 * scale))
                     .flex()
                     .flex_col()
                     .justify_center()
-                    .gap_1()
-                    .border_2()
+                    .gap(rems(0.25 * scale))
+                    .border(px(2. * scale))
                     .border_color(if index == self.selected {
                         rgb(colors.foreground)
                     } else {
                         rgb(tint)
                     })
                     .bg(rgb(fill))
-                    .cursor_pointer()
-                    .child(div().text_sm().truncate().child(task.title.clone()))
-                    .child(div().text_xs().text_color(rgb(color)).child(label))
-                    .on_click(move |_, _, cx| select(index, cx))
+                    .when(!panning, |node| node.cursor_pointer())
+                    .child(
+                        div()
+                            .text_size(rems(0.875 * scale))
+                            .truncate()
+                            .child(task.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.75 * scale))
+                            .text_color(rgb(color))
+                            .child(label),
+                    )
+                    .on_click(move |_, _, cx| action(GraphAction::Select(index), cx))
             }))
     }
 }
 
-fn paint_edge(
-    window: &mut Window,
-    origin: Point<Pixels>,
-    from: Point<Pixels>,
-    to: Point<Pixels>,
-    distance: usize,
-    bottom: Pixels,
-    selected: bool,
-    color: u32,
-) {
-    let from = origin + from;
-    let to = origin + to;
-    let tip = to - point(px(1.), px(0.));
-    let mut path = PathBuilder::stroke(px(if selected { 2. } else { 1. }));
-    path.move_to(from);
-    if distance == 1 {
-        let bend = point(px(COLUMN_GAP / 2.), px(0.));
-        path.cubic_bezier_to(tip, from + bend, tip - bend);
-    } else {
-        // Bypass intervening cards through the space below the layers.
-        let lane = origin.y + bottom;
-        let start = from.x + px(10.);
-        let end = to.x - px(10.);
-        for point in [
-            point(start, from.y),
-            point(start, lane),
-            point(end, lane),
-            point(end, to.y),
-            tip,
-        ] {
-            path.line_to(point);
+impl GraphEdge {
+    fn paint(
+        self,
+        window: &mut Window,
+        origin: Point<Pixels>,
+        scale: f32,
+        lane: Pixels,
+        colors: &Colors,
+    ) {
+        let Self {
+            from,
+            to,
+            distance,
+            selected,
+        } = self;
+        let tip = to - point(px(1.), px(0.));
+        let mut path = PathBuilder::stroke(px(scale * if selected { 2. } else { 1. }));
+        path.move_to(from);
+        if distance == 1 {
+            let bend = point(px(COLUMN_GAP / 2.), px(0.));
+            path.cubic_bezier_to(tip, from + bend, tip - bend);
+        } else {
+            // Bypass intervening cards through the space below the layers.
+            let start = from.x + px(10.);
+            let end = to.x - px(10.);
+            for point in [
+                point(start, from.y),
+                point(start, lane),
+                point(end, lane),
+                point(end, to.y),
+                tip,
+            ] {
+                path.line_to(point);
+            }
         }
-    }
-    path.move_to(tip - point(px(6.), px(4.)));
-    path.line_to(tip);
-    path.line_to(tip - point(px(6.), px(-4.)));
-    if let Ok(path) = path.build() {
-        window.paint_path(path, rgb(color));
+        path.move_to(tip - point(px(6.), px(4.)));
+        path.line_to(tip);
+        path.line_to(tip - point(px(6.), px(-4.)));
+        path.scale(scale);
+        path.translate(origin);
+        if let Ok(path) = path.build() {
+            window.paint_path(
+                path,
+                rgb(if selected {
+                    colors.accent
+                } else {
+                    colors.muted
+                }),
+            );
+        }
     }
 }
 
@@ -534,8 +731,9 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Position, layout};
+    use super::{GraphDrag, GraphViewport, MAX_ZOOM, MIN_ZOOM, Position, layout};
     use crate::keymap::Command;
+    use gpui::{Bounds, point, px, size};
     use infrastructure::client::{Task, TaskState};
 
     fn task(id: &str, deps: &[&str]) -> Task {
@@ -570,7 +768,7 @@ mod tests {
             ]
         );
         assert_eq!(graph.edges, [(2, 0), (1, 0), (2, 1), (3, 1)]);
-        assert_eq!((graph.columns, graph.rows), (3, 3));
+        assert_eq!(graph.rows, 3);
         assert_eq!(graph.first_node(), 2);
         assert!(layout(&[]).positions.is_empty());
     }
@@ -588,5 +786,46 @@ mod tests {
         assert_eq!(graph.neighbor(2, Command::DagLeft), Some(1));
         assert_eq!(graph.neighbor(1, Command::DagRight), Some(2));
         assert_eq!(graph.neighbor(2, Command::DagRight), None);
+    }
+
+    #[test]
+    fn zoom_keeps_the_graph_point_under_the_pointer_even_at_the_limits() {
+        let mut viewport = GraphViewport::new();
+        viewport.bounds.set(Bounds {
+            origin: point(px(30.), px(60.)),
+            size: size(px(600.), px(400.)),
+        });
+        viewport.offset = point(px(-25.), px(50.));
+        let anchor = point(px(150.), px(90.));
+        let graph_point = anchor - viewport.offset;
+        let pointer = viewport.bounds.get().origin + anchor;
+        for (steps, expected) in [(100., MAX_ZOOM), (-100., MIN_ZOOM)] {
+            assert!(viewport.zoom(steps, pointer));
+            assert_eq!(viewport.scale, expected);
+            assert_eq!(viewport.offset + graph_point * viewport.scale, anchor);
+            assert!(!viewport.zoom(steps, pointer));
+        }
+    }
+
+    #[test]
+    fn dragging_ignores_click_jitter_and_moves_in_both_directions() {
+        let mut viewport = GraphViewport::new();
+        let start = point(px(50.), px(30.));
+        viewport.drag = Some(GraphDrag {
+            position: start,
+            panning: false,
+        });
+        assert!(!viewport.pan(Some(start + point(px(2.), px(1.)))));
+        assert!(!viewport.panning());
+        let end = start + point(px(-40.), px(20.));
+        assert!(viewport.pan(Some(end)));
+        assert!(viewport.panning());
+        assert_eq!(viewport.offset, end - start);
+        assert!(viewport.pan(Some(start)));
+        assert!(viewport.panning());
+        assert!(viewport.release());
+        assert!(!viewport.panning());
+        assert!(!viewport.pan(Some(end)));
+        assert_eq!(viewport.offset, Default::default());
     }
 }
