@@ -546,10 +546,84 @@ pub(crate) fn instruction_args(
     user: &[OsString],
     installed: &dyn InstalledSkills,
 ) -> Result<Vec<OsString>> {
-    if profile.injection == Injection::None || skips_injection(profile, user) {
+    if !matches!(
+        profile.injection,
+        Injection::Flag { .. } | Injection::ConfigValue { .. }
+    ) || skips_injection(profile, user)
+    {
         return Ok(Vec::new());
     }
+    let instructions = launch_instructions(profile, installed)?;
+    Ok(match &profile.injection {
+        Injection::Flag { flag } => vec![flag.into(), instructions.into()],
+        Injection::ConfigValue { flag, key } => vec![
+            flag.into(),
+            format!("{key}={}", serde_json::to_string(&instructions)?).into(),
+        ],
+        Injection::FirstMessage | Injection::None => Vec::new(),
+    })
+}
 
+/// The first message Power types into an agent whose profile uses
+/// [`Injection::FirstMessage`]: the instructions, unless the launch skips them, then the
+/// initial prompt. `None` for other profiles or when there is nothing to type.
+pub(crate) fn first_message(
+    profile: &AgentProfile,
+    user: &[OsString],
+    prompt: Option<&OsStr>,
+    installed: &dyn InstalledSkills,
+) -> Result<Option<String>> {
+    if profile.injection != Injection::FirstMessage {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    if !skips_injection(profile, user) {
+        parts.push(launch_instructions(profile, installed)?);
+    }
+    parts.extend(prompt.map(|prompt| prompt.to_string_lossy().into_owned()));
+    Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
+}
+
+/// Terminal input that pastes `message` and presses Enter twice. Bracketed paste keeps
+/// its newlines from submitting early. Escape characters are dropped so the text cannot
+/// end the paste, and carriage returns become newlines. jcode ignores an Enter that it
+/// handles within 150 ms of a paste, which is what happens when the input waits for the
+/// TUI to start, and an Enter on an empty prompt does nothing. So exactly one of the
+/// two submits, whatever the timing.
+pub(crate) fn typed_message(message: &str) -> Vec<u8> {
+    let mut input = b"\x1b[200~".to_vec();
+    input.extend(
+        message
+            .replace("\r\n", "\n")
+            .bytes()
+            .filter(|&byte| byte != 0x1b)
+            .map(|byte| if byte == b'\r' { b'\n' } else { byte }),
+    );
+    input.extend_from_slice(b"\x1b[201~\r\r");
+    input
+}
+
+/// The profile's launch environment for a session of the daemon listening on `socket`,
+/// and the private server socket this launch gets, if the profile asks for one.
+pub(crate) fn profile_env(
+    profile: &AgentProfile,
+    session: &str,
+    socket: &Path,
+) -> (Vec<(String, String)>, Option<PathBuf>) {
+    // A relative socket from `POWER_SOCKET` would leave the directory empty.
+    let absolute = std::path::absolute(socket).unwrap_or_else(|_| socket.to_owned());
+    let runtime = absolute.parent().unwrap_or(Path::new("/"));
+    let mut env = profile.launch_env(session, &runtime.to_string_lossy());
+    let server = profile.server_socket_env.as_ref().map(|name| {
+        let server = crate::agent_socket::launch_socket(session, socket);
+        env.push((name.clone(), server.to_string_lossy().into_owned()));
+        server
+    });
+    (env, server)
+}
+
+/// Power's instructions for an agent it starts.
+fn launch_instructions(profile: &AgentProfile, installed: &dyn InstalledSkills) -> Result<String> {
     let mut instructions = String::from("You are running inside Power Overwhelming.");
     let skills = LaunchSkills::execute(&EmbeddedSkillCatalog, installed, profile)?;
     if !skills.is_empty() {
@@ -577,14 +651,7 @@ pub(crate) fn instruction_args(
         "Make code changes in a Git worktree of your own, never in the repository's main ",
         "checkout, where the user and other agents work.",
     ));
-    Ok(match &profile.injection {
-        Injection::Flag { flag } => vec![flag.into(), instructions.into()],
-        Injection::ConfigValue { flag, key } => vec![
-            flag.into(),
-            format!("{key}={}", serde_json::to_string(&instructions)?).into(),
-        ],
-        Injection::None => Vec::new(),
-    })
+    Ok(instructions)
 }
 
 /// Replaces this process with the real agent binary, adding Power's instructions and
@@ -594,6 +661,14 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
     let cwd = std::env::current_dir()?;
+    // A wrapper that replaces itself cannot type a first message, so a profile using
+    // `Injection::FirstMessage` starts here without Power's instructions.
+    if let (Some(session), Some(socket)) = (
+        std::env::var_os("POWER_SESSION"),
+        std::env::var_os("POWER_SOCKET"),
+    ) {
+        command.envs(profile_env(profile, &session.to_string_lossy(), Path::new(&socket)).0);
+    }
     command.args(instruction_args(
         profile,
         &args,
@@ -768,6 +843,67 @@ mod tests {
         let mut profile = grok.clone();
         profile.injection = Injection::None;
         assert!(instruction_args(&profile, &["prompt".into()], &NONE)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn jcode_types_instructions_and_prompt_instead_of_passing_arguments() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        let jcode = profiles.resolve(&"jcode".into())?;
+        assert!(instruction_args(jcode, &[], &NONE)?.is_empty());
+
+        let prompt = OsStr::new("Task: fix the bug");
+        let message = first_message(jcode, &[], Some(prompt), &NONE)?.unwrap();
+        assert!(message.starts_with("You are running inside Power Overwhelming."));
+        assert!(
+            message
+                .ends_with("checkout, where the user and other agents work.\n\nTask: fix the bug")
+        );
+
+        // A resumed conversation already holds the instructions, so only the prompt is typed.
+        let resume = ["--resume".into(), "session_1".into()];
+        assert_eq!(
+            first_message(jcode, &resume, Some(prompt), &NONE)?.as_deref(),
+            Some("Task: fix the bug")
+        );
+        assert_eq!(first_message(jcode, &resume, None, &NONE)?, None);
+        assert_eq!(
+            first_message(jcode, &["version".into()], None, &NONE)?,
+            None
+        );
+        // Profiles with other injections never type.
+        let claude = profiles.resolve(&"claude".into())?;
+        assert_eq!(first_message(claude, &[], Some(prompt), &NONE)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_messages_paste_safely_and_press_enter() {
+        assert_eq!(
+            typed_message("one\r\ntwo\rthree\x1b[201~four"),
+            b"\x1b[200~one\ntwo\nthree[201~four\x1b[201~\r\r"
+        );
+    }
+
+    #[test]
+    fn jcode_gets_a_private_socket_per_launch() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        let jcode = profiles.resolve(&"jcode".into())?;
+        let runtime = tempfile::tempdir()?;
+        let power = &runtime.path().join("power-overwhelming.sock");
+        let (env, server) = profile_env(jcode, "abc", power);
+        let server = server.unwrap();
+        assert_eq!(
+            env,
+            [("JCODE_SOCKET".to_owned(), server.to_string_lossy().into())]
+        );
+        assert_eq!(server.parent(), power.parent());
+        assert_ne!(profile_env(jcode, "abc", power).1, Some(server));
+        let claude = profiles.resolve(&"claude".into())?;
+        assert_eq!(
+            profile_env(claude, "abc", Path::new("/s")),
+            (Vec::new(), None)
+        );
         Ok(())
     }
 

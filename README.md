@@ -2,7 +2,7 @@
 
 # Power Overwhelming
 
-Power is a native Wayland desktop multiplexer for coding agents such as Claude Code, Codex, and Grok. Close the GPUI window and the local daemon keeps your terminals and agents running. Artifact links open in a preview pane you can close independently of the terminal.
+Power is a native Wayland desktop multiplexer for coding agents such as Claude Code, Codex, Grok, and jcode. Close the GPUI window and the local daemon keeps your terminals and agents running. Artifact links open in a preview pane you can close independently of the terminal.
 
 Contributions are welcome. See the [contribution guide](CONTRIBUTING.md) for the project's design principles and how to get started.
 
@@ -108,7 +108,7 @@ Power only replaces what it wrote. It rewrites a stub when the file matches a st
 
 ## Agent profiles
 
-Power provides `claude`, `codex`, and `grok` profiles. Pass a profile ID to `power session start`, `power agent start --provider`, or `power dag dispatch --provider`. With shell integration, use the ID as a command inside a Power terminal.
+Power provides `claude`, `codex`, `grok`, and `jcode` profiles. Pass a profile ID to `power session start`, `power agent start --provider`, or `power dag dispatch --provider`. With shell integration, use the ID as a command inside a Power terminal.
 
 Add profiles or override built-in fields in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua`. For example, this sets every field of the Grok profile. The built-in profile skips more subcommands.
 
@@ -144,7 +144,7 @@ agents.codex = { command = "/opt/bin/codex" }
 
 For a new profile, `command` defaults to the ID and `injection` defaults to `{ kind = "none" }`. Use the executable's name on PATH or an absolute path. Profile IDs use lowercase letters, digits, hyphens and underscores and start with a letter or digit. Power reserves `shell`, `command`, and `power`.
 
-Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings.
+Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. `{ kind = "first_message" }` is for agents that take neither an instructions flag nor a prompt argument: Power types the instructions, then any initial prompt, into the agent's terminal as one bracketed paste followed by Enter twice. jcode ignores an Enter within 150 ms of a paste and does nothing on an Enter at an empty prompt, so exactly one of the two submits. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings.
 
 `model_callback` registers `power session model --json` at launch so the agent can report its model without changing your config files. The Claude profile uses `{ kind = "claude_status_line" }` to pass a status line through `--settings`. `{ kind = "args", args = { ... } }` passes the listed arguments and replaces `{command}` with the callback command. Codex, Grok, and new profiles default to `{ kind = "none" }`. The callback and launch instructions use the same skip rules for subcommands and arguments. See [Report models from provider callbacks](#report-models-from-provider-callbacks).
 
@@ -152,7 +152,25 @@ Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to 
 
 The optional `resume` table describes how the agent accepts conversation IDs. `assign` supplies launch arguments that pin a new ID, and `resume` supplies arguments to reopen a known ID. Both replace `{id}` with the conversation ID. `resume_last` supplies fallback arguments when the ID is unknown or the `resume` list is empty. An exact argument match in `conflicts` skips assignment and lets Power pick up a conversation ID from a pair such as `--resume <id>`. Omitted lists inherit their built-in values, and an empty list `{}` clears the corresponding value. Codex uses `resume --last` to select the most recent conversation for the working directory.
 
+`env` sets environment variables for each launch. Values replace `{session}` with the Power session ID and `{runtime}` with the directory that holds Power's socket. `conversation_env` names a variable through which the agent exposes its conversation ID to the commands it runs. When an agent runs `power session task`, `power session model` or `power dag report` with that variable set, Power records the conversation for a restore. `server_socket_env` names a variable that Power sets to a private server socket for each launch, at a short path that fits the Unix socket limit. Before it launches a session again, Power stops any server still listening on a socket from that session's earlier launches.
+
+### jcode
+
+The `jcode` profile runs [jcode](https://github.com/1jehuang/jcode)'s TUI. jcode has no flag for extra instructions and no prompt argument, so the profile uses `first_message` injection: Power's instructions and the task prompt arrive as the first message. A resumed session already holds the instructions, so a restore types only #72's continuation prompt. For a restore, Power holds that prompt back for the 5-second resume window. If `--resume` fails, the prompt never reaches the fresh start that replaces it, and the fresh start gets the instructions instead.
+
+jcode's TUI is a client of a `jcode serve` daemon, which runs the model loop and the bash tool. By default every jcode client shares one daemon, and tool commands inherit the daemon's environment, not the client's. A worker on the shared daemon would report with another agent's `POWER_*` variables, and ending a worker could take down the daemon that every other jcode window depends on. The profile therefore sets `JCODE_SOCKET` (through `server_socket_env`) to a private socket for each launch, so each jcode launch gets its own daemon. The TUI starts the daemon as its own child, so the daemon inherits the worker's environment. The path is short (a hash of the session plus a launch ID) and moves out of a long runtime directory if needed, so it always fits the 108-byte Unix socket limit. A restore never reattaches to the previous launch's daemon: Power stops any daemon still listening on that session's earlier sockets before it starts the new one. A private daemon whose client is gone exits on its own after jcode's 5-minute idle timeout. Each jcode worker pays for its own daemon (and its MCP servers) instead of sharing one.
+
+jcode resumes only by session ID (`jcode --resume <id>`). It cannot reopen "the latest session in this directory" without its interactive picker. Its bash tool exports `JCODE_SESSION_ID`, and the launch instructions ask every agent to run `power session task` early, so Power learns the ID then. A restore resumes that exact session. Before the agent has reported an ID, a restore starts a new jcode conversation instead of guessing. If you type `jcode` in a Power shell, it gets the private socket but no injected instructions, because the shell wrapper replaces itself with jcode and cannot type into it.
+
+jcode has no approval prompts: its tools run as soon as the model calls them, so a worker runs `power dag report`, `power session task` and `power session model` without stopping. Its bash tool sends destructive commands, such as an `rm -rf` with a wide target, back to the model for a justification and never asks the user.
+
 Open a new shell to pick up new wrapper names. Restart the daemon when you want profile changes to apply to daemon-launched agents.
+
+## Troubleshooting
+
+### A new Codex or Claude Code agent stops at "Hooks need review"
+
+Installing jcode adds a `SessionStart` hook to `~/.codex/hooks.json` and `~/.claude/settings.json` (`jcode setup-hotkey --notify-cli-launch codex|claude`). Codex runs a new hook only after you review and trust it, so every new Codex agent stops at "Hooks need review", including unattended Power workers. Such a worker looks `active` but makes no progress. Review the hook in Codex's `/hooks` once, or remove the entry from `~/.codex/hooks.json` if you don't use jcode's hotkey notification. Power never edits or trusts hooks for you.
 
 ## Color schemes
 

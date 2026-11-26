@@ -731,6 +731,9 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
                 resume_last: vec!["--continue".into()],
                 ..Default::default()
             }),
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         })
         .collect();
     Arc::new(Application::new(
