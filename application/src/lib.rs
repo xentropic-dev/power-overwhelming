@@ -71,6 +71,8 @@ pub trait Workspace: Send + Sync {
     }
     fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus>;
     fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()>;
+    /// Whether a worktree directory is still present on disk.
+    fn worktree_exists(&self, path: &Path) -> bool;
     fn open_artifact_file(&self, path: &Path) -> Result<PathBuf>;
 }
 

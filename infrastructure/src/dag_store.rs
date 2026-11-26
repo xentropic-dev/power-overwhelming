@@ -208,6 +208,19 @@ impl DagReader for DagDb<'_> {
         )?)
     }
 
+    fn worktree_agents(&self, worktree: &Path) -> Result<Vec<ManagedAgent>> {
+        // Agent worktrees are stored as UTF-8, so no agent can match any other path.
+        let Some(worktree) = worktree.to_str() else {
+            return Ok(Vec::new());
+        };
+        Ok(rows(
+            self.0,
+            &format!("{AGENT_SELECT} WHERE a.worktree = ?1 ORDER BY a.rowid"),
+            [worktree],
+            agent_from_row,
+        )?)
+    }
+
     fn agent(&self, id: &str) -> Result<ManagedAgent> {
         self.0
             .query_row(
@@ -595,7 +608,7 @@ fn invalid_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::dag::Provider;
+    use domain::dag::{AgentState, Provider};
     use std::ffi::OsStr;
 
     #[test]
@@ -645,6 +658,45 @@ mod tests {
                 assert_eq!(agent.provider, expected);
                 assert_eq!(agent.model, None);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn finds_agents_by_exact_worktree() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store =
+            SqliteDagStore::initialize(Connection::open(directory.path().join("dag.sqlite3"))?)?;
+        let agent = |id: &str, worktree: &str| ManagedAgent {
+            id: id.into(),
+            box_id: "box".into(),
+            worktree: worktree.into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: None,
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            label: id.into(),
+            created_at: 1,
+        };
+        let first = agent("first", "/worktrees/feature");
+        let second = agent("second", "/worktrees/feature");
+        store.write(|db| {
+            db.insert_agent(&first)?;
+            db.insert_agent(&agent("nested", "/worktrees/feature/sub"))?;
+            db.insert_agent(&second)
+        })?;
+        store.read(|db| {
+            assert_eq!(
+                db.worktree_agents(Path::new("/worktrees/feature"))?,
+                [first.clone(), second.clone()]
+            );
+            assert!(db.worktree_agents(Path::new("/worktrees"))?.is_empty());
+            let invalid = OsStr::from_bytes(b"/worktrees/\xff");
+            assert!(db.worktree_agents(Path::new(invalid))?.is_empty());
             Ok(())
         })
     }

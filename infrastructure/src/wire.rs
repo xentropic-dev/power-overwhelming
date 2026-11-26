@@ -651,6 +651,7 @@ pub enum PruneVerdict {
 pub enum KeepReason {
     Dirty,
     Unmerged,
+    OpenAttempt,
     InUse,
     NoLongerManaged,
 }
@@ -704,6 +705,7 @@ impl From<worktree::PruneVerdict> for PruneVerdict {
             worktree::PruneVerdict::Keep(reason) => Self::Keep(match reason {
                 worktree::KeepReason::Dirty => KeepReason::Dirty,
                 worktree::KeepReason::Unmerged => KeepReason::Unmerged,
+                worktree::KeepReason::OpenAttempt => KeepReason::OpenAttempt,
                 worktree::KeepReason::InUse => KeepReason::InUse,
                 worktree::KeepReason::NoLongerManaged => KeepReason::NoLongerManaged,
             }),
@@ -718,6 +720,7 @@ impl From<PruneVerdict> for worktree::PruneVerdict {
             PruneVerdict::Keep(reason) => Self::Keep(match reason {
                 KeepReason::Dirty => worktree::KeepReason::Dirty,
                 KeepReason::Unmerged => worktree::KeepReason::Unmerged,
+                KeepReason::OpenAttempt => worktree::KeepReason::OpenAttempt,
                 KeepReason::InUse => worktree::KeepReason::InUse,
                 KeepReason::NoLongerManaged => worktree::KeepReason::NoLongerManaged,
             }),

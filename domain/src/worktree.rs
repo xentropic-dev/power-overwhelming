@@ -58,6 +58,9 @@ pub fn default_worktree_path(
 pub struct PruneStatus {
     pub dirty: bool,
     pub merged_into_default: bool,
+    /// An attempt in this checkout, or of an agent working in it, is still active or
+    /// waiting for input.
+    pub open_attempt: bool,
     pub in_use: bool,
 }
 
@@ -71,16 +74,19 @@ pub enum PruneVerdict {
 pub enum KeepReason {
     Dirty,
     Unmerged,
+    OpenAttempt,
     InUse,
     NoLongerManaged,
 }
 
-/// Reports the first applicable keep reason in the order dirty, unmerged, in use.
+/// Reports the first applicable keep reason in the order dirty, unmerged, open attempt, in use.
 pub fn prune_verdict(status: PruneStatus) -> PruneVerdict {
     if status.dirty {
         PruneVerdict::Keep(KeepReason::Dirty)
     } else if !status.merged_into_default {
         PruneVerdict::Keep(KeepReason::Unmerged)
+    } else if status.open_attempt {
+        PruneVerdict::Keep(KeepReason::OpenAttempt)
     } else if status.in_use {
         PruneVerdict::Keep(KeepReason::InUse)
     } else {
@@ -147,6 +153,7 @@ mod tests {
         let mut status = PruneStatus {
             dirty: true,
             merged_into_default: false,
+            open_attempt: true,
             in_use: true,
         };
         assert_eq!(prune_verdict(status), PruneVerdict::Keep(KeepReason::Dirty));
@@ -156,6 +163,11 @@ mod tests {
             PruneVerdict::Keep(KeepReason::Unmerged)
         );
         status.merged_into_default = true;
+        assert_eq!(
+            prune_verdict(status),
+            PruneVerdict::Keep(KeepReason::OpenAttempt)
+        );
+        status.open_attempt = false;
         assert_eq!(prune_verdict(status), PruneVerdict::Keep(KeepReason::InUse));
         status.in_use = false;
         assert_eq!(prune_verdict(status), PruneVerdict::Remove);

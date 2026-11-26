@@ -108,6 +108,17 @@ impl DagReader for MemoryDb {
             .collect())
     }
 
+    fn worktree_agents(&self, worktree: &Path) -> Result<Vec<ManagedAgent>> {
+        Ok(self
+            .0
+            .borrow()
+            .agents
+            .iter()
+            .filter(|agent| agent.worktree == worktree)
+            .cloned()
+            .collect())
+    }
+
     fn run(&self, id: &str) -> Result<Run> {
         self.0
             .borrow()
@@ -344,6 +355,7 @@ struct FakeWorktrees {
     head_lookups: Vec<PathBuf>,
     creation_requests: Vec<(PathBuf, String, String)>,
     creation_error: Option<&'static str>,
+    missing: BTreeSet<PathBuf>,
 }
 
 impl Workspace for FakeWorkspace {
@@ -423,6 +435,10 @@ impl Workspace for FakeWorkspace {
 
     fn remove_worktree(&self, _path: &Path, _delete_branch: bool) -> Result<()> {
         bail!("Unexpected worktree removal")
+    }
+
+    fn worktree_exists(&self, path: &Path) -> bool {
+        !self.0.lock().unwrap().missing.contains(path)
     }
 
     fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
@@ -1120,6 +1136,55 @@ fn reconcile_keeps_attempts_and_agents_whose_session_was_restored() -> Result<()
     let agent = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.state);
     assert_eq!(agent(&restored.agent.id)?, AgentState::Running);
     assert_eq!(agent(&lost.agent.id)?, AgentState::Exited);
+    Ok(())
+}
+
+#[test]
+fn reconcile_stops_restored_agents_whose_worktree_is_gone_unless_an_attempt_is_open() -> Result<()>
+{
+    let workspace = FakeWorkspace::default();
+    let dag = TestDag::new(
+        application_with_workspace(workspace.clone()),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    );
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("done", &[])])?;
+    let working = dag.dispatch(command(&run, false))?;
+    let finished = dag.dispatch(Dispatch {
+        task: "done".into(),
+        ..command(&run, false)
+    })?;
+    dag.report(
+        &run,
+        "done",
+        &finished.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let sessions =
+        [&working, &finished].map(|dispatched| dispatched.agent.session.clone().unwrap());
+    let agent = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.state);
+
+    dag.reconcile(&sessions)?;
+    assert_eq!(agent(&finished.agent.id)?, AgentState::Running);
+
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .missing
+        .insert("/worktree".into());
+    dag.reconcile(&sessions)?;
+
+    assert_eq!(agent(&working.agent.id)?, AgentState::Running);
+    assert_eq!(agent(&finished.agent.id)?, AgentState::Exited);
+    let snapshot = dag.run(&run)?;
+    assert_eq!(
+        snapshot.tasks[0].attempts.last().unwrap().state,
+        AttemptState::Active
+    );
     Ok(())
 }
 

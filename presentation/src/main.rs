@@ -904,7 +904,10 @@ fn run_worktree(command: WorktreeAction) -> Result<()> {
                         let reason = match reason {
                             KeepReason::Dirty => "uncommitted or untracked changes",
                             KeepReason::Unmerged => "branch has not merged into the default branch",
-                            KeepReason::InUse => "in use by a live session or active attempt",
+                            KeepReason::OpenAttempt => {
+                                "an attempt there is still active or waiting for input"
+                            }
+                            KeepReason::InUse => "in use by a live session",
                             KeepReason::NoLongerManaged => "checkout no longer managed by Power",
                         };
                         writeln!(stdout, "Kept {path} ({branch}) — {reason}")?;
