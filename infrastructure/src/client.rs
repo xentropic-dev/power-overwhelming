@@ -1,3 +1,5 @@
+pub mod talk;
+
 pub use crate::wire::SessionMetadata;
 use crate::wire::{self, Request, Response};
 use anyhow::{Context, Result, bail};

@@ -1,0 +1,228 @@
+use crate::{
+    dag_adapter::DaemonDag,
+    dag_store::SqliteDagStore,
+    terminal::PtyRuntime,
+    wire::{
+        self, Response,
+        talk::{TalkCommand, TalkRequest, TalkResponse},
+    },
+};
+use anyhow::{Context, Result, bail};
+use application::{
+    Application,
+    dag::BoxSelection,
+    talk::{Caller, LogFilter, Notifier, Reply, SendMessage, SessionActivity, Talk},
+};
+use domain::talk::{
+    Activity, Address, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
+};
+use std::{
+    os::unix::net::UnixStream,
+    sync::{Arc, mpsc::Receiver},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+pub(crate) type DaemonTalk = Talk<SqliteDagStore, Terminal, Terminal>;
+
+#[derive(Clone)]
+pub(crate) struct Terminal(Arc<Application<PtyRuntime>>);
+
+impl SessionActivity for Terminal {
+    fn activity(&self, session: &str) -> Option<Activity> {
+        let terminal = self.0.terminal(session).ok()?;
+        terminal.is_running().then(|| terminal.activity())
+    }
+
+    fn report_turn(&self, session: &str, state: HookState) -> Result<()> {
+        self.0.terminal(session)?.report_turn(state);
+        Ok(())
+    }
+}
+
+impl Notifier for Terminal {
+    fn notify(&self, session: &str, expected: Activity, line: &str) -> Result<bool> {
+        self.0
+            .terminal(session)?
+            .input(format!("{line}\r").into_bytes(), Some(expected))
+    }
+}
+
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub(crate) fn start(
+    application: Arc<Application<PtyRuntime>>,
+    store: SqliteDagStore,
+    policy: NoticePolicy,
+    wake: Receiver<()>,
+) -> Arc<DaemonTalk> {
+    let terminal = Terminal(application);
+    let talk = Arc::new(Talk::new(
+        Arc::new(store),
+        terminal.clone(),
+        terminal,
+        policy,
+        now_ms,
+        || uuid::Uuid::new_v4().to_string(),
+    ));
+    let delivery = talk.clone();
+    thread::spawn(move || {
+        loop {
+            if matches!(
+                wake.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ) {
+                break;
+            }
+            if let Err(error) = delivery.deliver_pending() {
+                eprintln!("Could not deliver talk notice. {error:#}");
+            }
+        }
+    });
+    talk
+}
+
+fn caller(dag: &DaemonDag, session: Option<String>, selector: Option<String>) -> Result<Caller> {
+    let box_id = if selector.is_some() {
+        dag.box_for(BoxSelection {
+            selector,
+            caller: None,
+        })?
+    } else if session.is_some() {
+        // Plain sessions can exist without an attached box. Managed sessions get their
+        // authoritative box from the talk store when resolving the caller.
+        dag.box_for(BoxSelection {
+            selector: None,
+            caller: session.clone(),
+        })
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    Ok(Caller { session, box_id })
+}
+
+pub(crate) fn request(
+    talk: &DaemonTalk,
+    dag: &DaemonDag,
+    request: TalkRequest,
+) -> Result<TalkResponse> {
+    let caller = caller(dag, request.session, request.box_sel)?;
+    let items = |messages: Vec<Message>| TalkResponse::Messages {
+        messages: messages.into_iter().map(Into::into).collect(),
+    };
+    Ok(match request.command {
+        TalkCommand::Send {
+            to,
+            run,
+            body,
+            urgent,
+        } => {
+            let target = match (to, &run) {
+                (Some(to), _) => Target::One(Address::from(to.as_str())),
+                (None, Some(run)) => Target::Run(run.clone()),
+                (None, None) => bail!("Specify a talk target or --run"),
+            };
+            items(talk.send(SendMessage {
+                caller,
+                target,
+                run,
+                body,
+                urgent,
+            })?)
+        }
+        TalkCommand::Reply { id, body, urgent } => items(vec![talk.reply(Reply {
+            caller,
+            message: MessageId(id),
+            body,
+            urgent,
+        })?]),
+        TalkCommand::Inbox { all, peek } => items(talk.inbox(caller, all, peek)?),
+        TalkCommand::Show { id, read } => items(talk.show(caller, MessageId(id), read)?),
+        TalkCommand::Wait {
+            thread,
+            after,
+            seconds,
+        } => {
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(seconds))
+                .context("Talk timeout is too large")?;
+            TalkResponse::Reply {
+                message: talk
+                    .wait_for_reply(caller, ThreadId(thread), after.map(MessageId), deadline)?
+                    .map(Into::into),
+            }
+        }
+        TalkCommand::Log {
+            agent,
+            run,
+            limit,
+            to_user,
+        } => items(talk.log(
+            caller,
+            LogFilter {
+                agent,
+                run,
+                limit,
+                to_user,
+                ..LogFilter::default()
+            },
+        )?),
+        TalkCommand::Turn { ready } => {
+            talk.report_turn(
+                caller,
+                if ready {
+                    HookState::Ready
+                } else {
+                    HookState::Busy
+                },
+            )?;
+            TalkResponse::Ok
+        }
+        TalkCommand::Watch => unreachable!("Talk watch uses the streaming handler"),
+    })
+}
+
+pub(crate) fn watch(
+    talk: &DaemonTalk,
+    dag: &DaemonDag,
+    request: TalkRequest,
+    mut socket: &UnixStream,
+) -> Result<()> {
+    let caller = caller(dag, request.session, request.box_sel)?;
+    let mut cursor = talk.cursor()?;
+    wire::send(
+        &mut socket,
+        &Response::Talk {
+            talk: TalkResponse::Ok,
+        },
+    )?;
+    loop {
+        let events = talk.events(&caller, cursor, Instant::now() + Duration::from_secs(10))?;
+        if events.is_empty() {
+            wire::send(
+                &mut socket,
+                &Response::Talk {
+                    talk: TalkResponse::Ok,
+                },
+            )?;
+        }
+        for event in events {
+            cursor = event.seq;
+            wire::send(
+                &mut socket,
+                &Response::Talk {
+                    talk: TalkResponse::Event {
+                        event: event.into(),
+                    },
+                },
+            )?;
+        }
+    }
+}

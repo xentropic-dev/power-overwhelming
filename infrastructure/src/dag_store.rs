@@ -14,12 +14,13 @@ use std::{
     ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
-    sync::{Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 mod talk;
 
-pub(crate) struct SqliteDagStore(Mutex<Connection>, Condvar);
+#[derive(Clone)]
+pub(crate) struct SqliteDagStore(Arc<Mutex<Connection>>, Arc<Condvar>);
 
 impl SqliteDagStore {
     pub(crate) fn open() -> Result<Self> {
@@ -97,7 +98,7 @@ impl SqliteDagStore {
             db.execute("ALTER TABLE runs ADD COLUMN archived_at INTEGER", [])?;
         }
         talk::migrate(&db)?;
-        Ok(Self(Mutex::new(db), Condvar::new()))
+        Ok(Self(Arc::new(Mutex::new(db)), Arc::new(Condvar::new())))
     }
 }
 

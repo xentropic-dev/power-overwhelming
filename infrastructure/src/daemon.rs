@@ -6,6 +6,7 @@ use crate::{
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
+    talk_adapter::{self, DaemonTalk},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
     wire::{self, DagRequest, DagResponse, Request, Response},
@@ -14,7 +15,10 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use application::{Application, PublishArtifact, ResolveArtifact, StartSession};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::session::{Agent, Geometry};
+use domain::{
+    session::{Agent, Geometry},
+    talk::NoticePolicy,
+};
 use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
@@ -70,9 +74,15 @@ struct Server {
     plugins: Option<Plugins>,
     scheme: ActiveScheme,
     dag: Arc<DaemonDag>,
+    talk: Arc<DaemonTalk>,
+    talk_wake: mpsc::SyncSender<()>,
 }
 
-pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Result<()> {
+pub fn serve(
+    profiles: AgentProfiles,
+    worktree_root: LocalWorktreeRoot,
+    talk_policy: NoticePolicy,
+) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
         .parent()
@@ -112,6 +122,7 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
     let model_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
+    let (talk_wake, talk_activity) = mpsc::sync_channel(1);
     let application = Arc::new(Application::new(
         artifacts,
         Arc::new(sessions),
@@ -120,6 +131,7 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
             socket: socket.clone(),
             scheme: scheme.clone(),
             profiles: profiles.clone(),
+            talk_wake: talk_wake.clone(),
             on_exit: Arc::new(move |session, detail| {
                 if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
                     && let Err(error) = dag.session_exited(session, detail)
@@ -145,8 +157,13 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
         || uuid::Uuid::new_v4().to_string(),
     ));
     let dag = Arc::new(
-        DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
-            .with_worktree_root(worktree_root),
+        DaemonDag::new(
+            application.clone(),
+            store.clone(),
+            BoxesFile,
+            IconFiles::open()?,
+        )
+        .with_worktree_root(worktree_root),
     );
     terminal_application
         .set(Arc::downgrade(&application))
@@ -156,11 +173,14 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
         .set(Arc::downgrade(&dag))
         .expect("connect terminal callbacks to the DAG once");
     dag.restore().context("Restore sessions")?;
+    let talk = talk_adapter::start(application.clone(), store, talk_policy, talk_activity);
     handle_shutdown(application.clone(), shutting_down)?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let server = Arc::new(Server {
         plugins: Plugins::start(application.clone()),
+        talk,
+        talk_wake,
         dag,
         application,
         scheme,
@@ -276,11 +296,35 @@ fn handle(mut socket: UnixStream, server: &Server) -> Result<()> {
         return Ok(());
     }
 
+    if let Request::Talk {
+        talk:
+            talk @ wire::TalkRequest {
+                command: wire::talk::TalkCommand::Watch,
+                ..
+            },
+    } = request
+    {
+        if let Err(error) = talk_adapter::watch(&server.talk, &server.dag, talk, &socket) {
+            wire::send(
+                socket,
+                &Response::Error {
+                    message: format!("{error:#}"),
+                },
+            )?;
+        }
+        return Ok(());
+    }
+
+    let is_talk = matches!(&request, Request::Talk { .. });
     let response =
         handle_request(request, server, &socket).unwrap_or_else(|error| Response::Error {
             message: format!("{error:#}"),
         });
-    wire::send(socket, &response)
+    wire::send(socket, &response)?;
+    if is_talk {
+        let _ = server.talk_wake.try_send(());
+    }
+    Ok(())
 }
 
 fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Result<Response> {
@@ -377,9 +421,12 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         }
         Request::Input { session, data } => {
             ensure!(data.len() <= 350_000, "Terminal input is too large");
-            application
-                .terminal(&session)?
-                .send(Command::Input(STANDARD.decode(data)?))?;
+            ensure!(
+                application
+                    .terminal(&session)?
+                    .input(STANDARD.decode(data)?, None)?,
+                "Terminal session has exited"
+            );
             Ok(Response::Ok)
         }
         Request::Resize { session, geometry } => {
@@ -436,6 +483,9 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+        }),
+        Request::Talk { talk } => Ok(Response::Talk {
+            talk: talk_adapter::request(&server.talk, &server.dag, talk)?,
         }),
         Request::Dag { dag } => {
             let dag = dag_adapter::request(&server.dag, dag)?;

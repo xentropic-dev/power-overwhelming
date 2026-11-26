@@ -9,6 +9,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     agent::AgentProfile,
     session::{Agent, Geometry, Session},
+    talk::{Activity, HookState},
 };
 use ghostty_vt::{
     Terminal,
@@ -69,9 +70,12 @@ pub struct PtyRuntime {
     /// is only saved by an explicit flush, so a reboot cannot erase what a restore needs.
     pub shutting_down: Arc<AtomicBool>,
     pub profiles: Arc<dyn AgentProfileRegistry>,
+    pub(crate) talk_wake: SyncSender<()>,
 }
 
 struct Lifecycle {
+    activity: Mutex<Activity>,
+    talk_wake: SyncSender<()>,
     running: AtomicBool,
     session: String,
     on_exit: ExitHandler,
@@ -87,6 +91,14 @@ struct Foreground {
 }
 
 impl Lifecycle {
+    fn record_output(&self) {
+        let mut state = self.activity.lock().unwrap();
+        let now = crate::talk_adapter::now_ms();
+        state.last_output = now;
+        state.active_since = now;
+        state.revision = state.revision.wrapping_add(1);
+    }
+
     fn notify_exit(&self, detail: &str) {
         if self.running.swap(false, Ordering::AcqRel) && !self.shutting_down.load(Ordering::Acquire)
         {
@@ -127,6 +139,7 @@ impl Lifecycle {
 
 #[derive(Clone)]
 pub struct Handle {
+    input: SyncSender<Vec<u8>>,
     commands: SyncSender<Command>,
     lifecycle: Arc<Lifecycle>,
 }
@@ -138,6 +151,44 @@ impl Handle {
 
     pub fn send(&self, command: Command) -> Result<(), mpsc::SendError<Command>> {
         self.commands.send(command)
+    }
+
+    pub(crate) fn activity(&self) -> Activity {
+        *self.lifecycle.activity.lock().unwrap()
+    }
+
+    pub(crate) fn report_turn(&self, hook: HookState) {
+        let mut state = self.lifecycle.activity.lock().unwrap();
+        state.hook = hook;
+        if hook == HookState::Busy {
+            state.active_since = crate::talk_adapter::now_ms();
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let _ = self.lifecycle.talk_wake.try_send(());
+    }
+
+    pub(crate) fn input(&self, bytes: Vec<u8>, notice: Option<Activity>) -> Result<bool> {
+        let mut state = self.lifecycle.activity.lock().unwrap();
+        if notice.is_some_and(|expected| expected != *state)
+            || !self.is_running()
+            || self.lifecycle.shutting_down.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        match self.input.try_send(bytes) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) if notice.is_some() => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let now = crate::talk_adapter::now_ms();
+        state.last_input = now;
+        state.active_since = now;
+        if state.hook == HookState::Ready {
+            state.hook = HookState::Busy;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let _ = self.lifecycle.talk_wake.try_send(());
+        Ok(true)
     }
 
     pub(crate) fn refresh_theme(&self) {
@@ -183,7 +234,6 @@ impl TerminalRuntime for PtyRuntime {
 pub enum Command {
     RefreshTheme,
     Attach(SyncSender<Response>),
-    Input(Vec<u8>),
     Resize(Geometry),
     WorkingDirectory(SyncSender<Option<PathBuf>>),
     SetMetadata {
@@ -254,7 +304,15 @@ fn launch(
     let mut writer = pair.master.take_writer()?;
     let process = pair.slave.spawn_command(process)?;
     let pid = process.process_id();
+    let started_at = crate::talk_adapter::now_ms();
     let lifecycle = Arc::new(Lifecycle {
+        activity: Mutex::new(Activity {
+            last_output: started_at,
+            last_input: started_at,
+            active_since: started_at,
+            ..Activity::default()
+        }),
+        talk_wake: runtime.talk_wake.clone(),
         running: AtomicBool::new(true),
         session: session.id.clone(),
         on_exit: runtime.on_exit.clone(),
@@ -295,19 +353,21 @@ fn launch(
     });
 
     let reader_tx = tx.clone();
+    let output_lifecycle = lifecycle.clone();
     thread::spawn(move || {
         let mut buffer = [0; 16 * 1024];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count)
+                Ok(count) => {
+                    output_lifecycle.record_output();
                     if reader_tx
                         .send(Command::Output(buffer[..count].to_vec()))
-                        .is_err() =>
-                {
-                    break;
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -352,6 +412,7 @@ fn launch(
         });
     }
     let launched_agent = session.agent.clone();
+    let input = write_tx.clone();
     let actor_lifecycle = lifecycle.clone();
     let active_scheme = runtime.scheme.clone();
     let profiles = runtime.profiles.clone();
@@ -384,6 +445,7 @@ fn launch(
         }
     });
     Ok(Handle {
+        input,
         commands: tx,
         lifecycle,
     })
@@ -724,11 +786,6 @@ fn terminal_actor(
                             .is_ok())
                 {
                     clients.push(client);
-                }
-            }
-            Command::Input(bytes) => {
-                if !exited {
-                    let _ = writer.try_send(bytes);
                 }
             }
             Command::Resize(next) if next != geometry && !exited => {
@@ -1499,6 +1556,8 @@ mod tests {
     fn exits_during_shutdown_are_not_reported() {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
+            activity: Mutex::default(),
+            talk_wake: mpsc::sync_channel(1).0,
             running: AtomicBool::new(true),
             session: "worker".into(),
             on_exit: {

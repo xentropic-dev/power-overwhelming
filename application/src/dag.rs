@@ -206,6 +206,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .clone())
     }
 
+    pub fn box_for(&self, selection: BoxSelection) -> Result<Option<String>> {
+        self.store.read(|db| self.resolve_box(db, &selection))
+    }
+
     /// Sets the selected box's icon from an image on disk, or restores the identicon when
     /// `source` is absent. Returns the box ID.
     pub fn set_box_icon(&self, selection: BoxSelection, source: Option<PathBuf>) -> Result<String> {

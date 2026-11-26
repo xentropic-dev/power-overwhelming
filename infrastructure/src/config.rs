@@ -2,7 +2,10 @@
 
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
-use domain::agent::{AgentProfile, Injection, ModelCallback, Resume};
+use domain::{
+    agent::{AgentProfile, Injection, ModelCallback, Resume},
+    talk::NoticePolicy,
+};
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -10,11 +13,13 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
+pub const TALK_SECTION: &str = "talk";
 pub(crate) const WORKTREES_SECTION: &str = "worktrees";
 
 fn with_bundled_defaults(mut defaults: Sections) -> Sections {
@@ -24,6 +29,9 @@ fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     });
     defaults
         .entry(AGENTS_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
+        .entry(TALK_SECTION.into())
         .or_insert_with(|| json!({}));
     defaults
         .entry(WORKTREES_SECTION.into())
@@ -38,6 +46,35 @@ pub fn load_agent_profiles(defaults: Sections) -> Result<AgentProfiles> {
 
 pub(crate) fn load_worktree_root(defaults: Sections) -> Result<Option<PathBuf>> {
     worktree_root(&load(with_bundled_defaults(defaults))?)
+}
+
+pub fn load_talk_policy(defaults: Sections) -> Result<NoticePolicy> {
+    talk_policy(&load(with_bundled_defaults(defaults))?)
+}
+
+/// The fallback idle settings are expressed in seconds, with fractional values supported.
+pub fn talk_policy(sections: &Sections) -> Result<NoticePolicy> {
+    let mut policy = NoticePolicy::default();
+    let Some(value) = sections.get(TALK_SECTION) else {
+        return Ok(policy);
+    };
+    let table = value.as_object().context("talk must be a table")?;
+    for (key, value) in table {
+        let setting = match key.as_str() {
+            "idle_after" => &mut policy.idle_after_ms,
+            "user_quiet" => &mut policy.user_quiet_ms,
+            _ => bail!("talk.{key} is not a setting"),
+        };
+        *setting = value
+            .as_f64()
+            .filter(|seconds| *seconds >= 0.001)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .with_context(|| {
+                format!("talk.{key} must be a duration in seconds of at least 0.001")
+            })?;
+    }
+    Ok(policy)
 }
 
 /// Validate and expand the configured root without touching the filesystem.

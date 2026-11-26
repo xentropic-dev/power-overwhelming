@@ -13,6 +13,7 @@ mod persistence;
 pub mod shell;
 pub mod skill_install;
 pub mod skills;
+mod talk_adapter;
 mod terminal;
 pub mod theme;
 mod wire;

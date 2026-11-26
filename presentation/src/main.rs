@@ -254,6 +254,7 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
+            config::load_talk_policy(settings::Settings::defaults())?,
         ),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },

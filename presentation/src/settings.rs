@@ -229,12 +229,14 @@ impl Settings {
             (APPEARANCE.to_owned(), json!({})),
             (TERMINAL.to_owned(), terminal_defaults()),
             (AGENTS_SECTION.to_owned(), json!({})),
+            (infrastructure::config::TALK_SECTION.to_owned(), json!({})),
         ]
         .into()
     }
 
     /// Resolves the desktop sections of an evaluated config over their defaults.
     pub fn from_sections(config: &Sections) -> Result<Self> {
+        infrastructure::config::talk_policy(config)?;
         Ok(Self {
             keymap: Keymap::from_sections(config).context("Read keys from config.lua")?,
             previews: match config.get(PREVIEWS) {
