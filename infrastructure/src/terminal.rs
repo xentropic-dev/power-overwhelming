@@ -1,4 +1,5 @@
 use crate::{
+    persistence::state_directory,
     theme::Scheme,
     wire::{MetadataField, Response, SessionMetadata},
 };
@@ -11,15 +12,18 @@ use domain::{
 };
 use ghostty_vt::{
     Terminal,
-    fmt::{Formatter, FormatterOptions},
+    fmt::{Format, Formatter, FormatterOptions},
+    screen::Screen,
     snapshot,
     terminal::{Event, Mode, Options},
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     ffi::OsStr,
-    io::{Read, Write},
-    path::PathBuf,
+    fs::{self, File, Permissions},
+    io::{self, Read, Write},
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -145,6 +149,12 @@ pub enum Command {
     Poll,
     OutputClosed,
     ProcessExited(String),
+    /// Save pending scrollback on the actor and acknowledge after the write attempt.
+    #[allow(
+        dead_code,
+        reason = "The daemon shutdown handler will send this command"
+    )]
+    FlushScrollback(SyncSender<()>),
     End,
 }
 
@@ -349,6 +359,8 @@ fn terminal_actor(
         rows: geometry.rows,
         ..Options::default()
     })?;
+    // A snapshot taken while saving an alternate screen may cross a PTY read boundary.
+    terminal.set_continuation_max_bytes(CONTINUATION_LIMIT)?;
     let mut scheme = *active_scheme.read().unwrap();
     scheme.apply_to(&mut terminal)?;
     terminal.set_xtversion(Some("Power Overwhelming".into()));
@@ -358,6 +370,25 @@ fn terminal_actor(
         geometry.cell_width.into(),
         geometry.cell_height.into(),
     )?;
+    let mut scrollback =
+        match state_directory().and_then(|dir| Scrollback::new(&dir, &lifecycle.session)) {
+            Ok(mut scrollback) => {
+                if let Err(error) = scrollback.restore(&mut terminal) {
+                    eprintln!(
+                        "Could not restore scrollback for {}. {error:#}",
+                        lifecycle.session
+                    );
+                }
+                Some(scrollback)
+            }
+            Err(error) => {
+                eprintln!(
+                    "Could not open scrollback for {}. {error:#}",
+                    lifecycle.session
+                );
+                None
+            }
+        };
     let mut clients: Vec<SyncSender<Response>> = Vec::new();
     let mut sequence = 0;
     let mut exited = false;
@@ -387,18 +418,28 @@ fn terminal_actor(
             clear_metadata(&mut metadata, &mut clients);
             clients.retain(|client| client.try_send(Response::Exit).is_ok());
         }
-        let command = match &process_exit {
-            Some((_, deadline)) => {
-                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
+        let now = Instant::now();
+        let save_at = scrollback.as_mut().and_then(|scrollback| {
+            if scrollback
+                .deadline()
+                .is_some_and(|deadline| now >= deadline)
+            {
+                scrollback.flush(&terminal);
             }
-            None => match rx.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            },
+            scrollback.deadline()
+        });
+        let deadline = save_at
+            .into_iter()
+            .chain(process_exit.as_ref().map(|(_, deadline)| *deadline))
+            .min();
+        let received = match deadline {
+            Some(deadline) => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        let command = match received {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let next = *active_scheme.read().unwrap();
         if !std::ptr::eq(next, scheme) {
@@ -560,6 +601,9 @@ fn terminal_actor(
             }
             Command::Output(bytes) => {
                 terminal.vt_write(&bytes);
+                if let Some(scrollback) = &mut scrollback {
+                    scrollback.dirty = true;
+                }
                 sequence += 1;
                 if !clients.is_empty() {
                     let data = STANDARD.encode(&bytes);
@@ -578,7 +622,21 @@ fn terminal_actor(
             Command::ProcessExited(detail) => {
                 process_exit = Some((detail, Instant::now() + Duration::from_millis(150)));
             }
+            Command::FlushScrollback(reply) => {
+                if let Some(scrollback) = &mut scrollback {
+                    scrollback.flush(&terminal);
+                }
+                let _ = reply.send(());
+            }
             Command::End => {
+                if let Some(scrollback) = &scrollback
+                    && let Err(error) = scrollback.remove()
+                {
+                    eprintln!(
+                        "Could not remove scrollback for {}. {error:#}",
+                        lifecycle.session
+                    );
+                }
                 if !exited {
                     return Ok(Some(with_terminal_tail(
                         &terminal,
@@ -595,6 +653,135 @@ fn terminal_actor(
         }
     }
     Ok(None)
+}
+
+const SCROLLBACK_LIMIT: usize = 2 * 1024 * 1024;
+const SCROLLBACK_INTERVAL: Duration = Duration::from_secs(30);
+const CONTINUATION_LIMIT: usize = 64 * 1024;
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
+
+struct Scrollback {
+    path: PathBuf,
+    dirty: bool,
+    save_at: Instant,
+}
+
+impl Scrollback {
+    fn new(state_dir: &Path, session: &str) -> Result<Self> {
+        anyhow::ensure!(
+            Path::new(session).file_name() == Some(OsStr::new(session)),
+            "Invalid scrollback session ID"
+        );
+        Ok(Self {
+            path: state_dir.join("scrollback").join(session),
+            dirty: false,
+            save_at: Instant::now() + SCROLLBACK_INTERVAL,
+        })
+    }
+
+    fn restore(&mut self, terminal: &mut Terminal) -> Result<()> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        terminal.vt_write(&bytes);
+        terminal.vt_write(b"\x18"); // Cancel a partial VT sequence before writing the separator.
+        if terminal.active_screen()? == Screen::Alternate {
+            terminal.vt_write(LEAVE_ALT_SCREEN);
+        }
+        // DECSTR resets modes, margins and the cursor style without clearing the history.
+        terminal.vt_write(b"\x1b[!p\x1b]8;;\x1b\\\x1b[0m\r\n\x1b[2m");
+        terminal.vt_write("── restored after restart ──".as_bytes());
+        terminal.vt_write(b"\x1b[0m\r\n");
+        terminal.events().for_each(drop);
+        self.dirty = true;
+        self.remove()?;
+        Ok(())
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.dirty.then_some(self.save_at)
+    }
+
+    fn flush(&mut self, terminal: &Terminal) {
+        if !self.dirty {
+            return;
+        }
+        self.save_at = Instant::now() + SCROLLBACK_INTERVAL;
+        match format_scrollback(terminal).and_then(|bytes| write_scrollback(&self.path, &bytes)) {
+            Ok(()) => self.dirty = false,
+            Err(error) => eprintln!(
+                "Could not save scrollback at {}. {error:#}",
+                self.path.display()
+            ),
+        }
+    }
+
+    fn remove(&self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => File::open(self.path.parent().unwrap())?.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn format_scrollback(terminal: &Terminal) -> Result<Vec<u8>> {
+    // VT formatting emits SGR and CRLF. Preserve physical line boundaries so the
+    // saved tail can start at a complete row. Omit the old application's modes.
+    let options = || {
+        FormatterOptions::new()
+            .with_format(Format::Vt)
+            .with_trim(true)
+    };
+    let mut bytes = Vec::new();
+    if terminal.active_screen()? == Screen::Alternate {
+        // The formatter sees only the active screen. Switch a copy so saving
+        // the primary history cannot disturb the live TUI or its VT parser.
+        let snapshot = snapshot::encode(terminal).context("Encode terminal snapshot")?;
+        let mut copy = snapshot::Decoder::from_slice(&snapshot)
+            .decode()
+            .context("Decode terminal snapshot")?;
+        copy.vt_write(b"\x18");
+        copy.vt_write(LEAVE_ALT_SCREEN);
+        Formatter::new(&copy, options())?.format_to(&mut bytes)?;
+        if !bytes.is_empty() {
+            bytes.extend_from_slice(b"\r\n");
+        }
+    }
+    Formatter::new(terminal, options())?.format_to(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_scrollback(path: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = path.parent().context("Invalid scrollback path")?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
+    fs::set_permissions(directory, Permissions::from_mode(0o700))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary
+        .as_file()
+        .set_permissions(Permissions::from_mode(0o600))?;
+    temporary.write_all(scrollback_tail(bytes))?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn scrollback_tail(bytes: &[u8]) -> &[u8] {
+    if bytes.len() <= SCROLLBACK_LIMIT {
+        return bytes;
+    }
+    // Skip through the first complete CRLF at or past the cap. This avoids
+    // starting the replay inside a UTF-8 character or a VT escape sequence.
+    let tail = &bytes[bytes.len() - SCROLLBACK_LIMIT - 1..];
+    tail.windows(2)
+        .position(|pair| pair == b"\r\n")
+        .map_or(&[], |newline| &tail[newline + 2..])
 }
 
 fn with_terminal_tail(terminal: &Terminal, mut detail: String) -> String {
@@ -781,6 +968,138 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghostty_vt::terminal::{Point, PointCoordinate};
+
+    fn test_terminal() -> Terminal {
+        let mut terminal = Terminal::new(Options {
+            cols: 40,
+            rows: 3,
+            ..Options::default()
+        })
+        .unwrap();
+        terminal
+            .set_continuation_max_bytes(CONTINUATION_LIMIT)
+            .unwrap();
+        terminal
+    }
+
+    fn terminal_text(terminal: &Terminal) -> String {
+        let bytes = Formatter::new(terminal, FormatterOptions::new().with_trim(true))
+            .unwrap()
+            .format_alloc()
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn scrollback_vt_round_trip_preserves_history_screen_and_style() -> Result<()> {
+        let mut original = test_terminal();
+        original.vt_write(
+            "\x1b[1;31mold red line\x1b[0m\r\nsecond\r\n\r\nthird\r\n  current 界".as_bytes(),
+        );
+        let mut replayed = test_terminal();
+        replayed.vt_write(&format_scrollback(&original)?);
+
+        assert_eq!(terminal_text(&replayed), terminal_text(&original));
+        assert_eq!(replayed.scrollback_rows()?, 2);
+        let history_start = Point::History(PointCoordinate { x: 0, y: 0 });
+        let style = replayed.grid_ref(history_start)?.style()?;
+        assert!(!style.is_default());
+        assert_eq!(style, original.grid_ref(history_start)?.style()?);
+        Ok(())
+    }
+
+    #[test]
+    fn scrollback_replay_consumes_snapshot_and_allows_a_new_alternate_screen() -> Result<()> {
+        let state_dir = tempfile::tempdir()?;
+        let mut store = Scrollback::new(state_dir.path(), "test-session")?;
+        let mut original = test_terminal();
+        original.vt_write(b"first\r\nsecond\r\nthird\r\nold prompt");
+        original.vt_write(b"\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[Hprevious TUI\x1b[");
+        store.dirty = true;
+        store.flush(&original);
+        assert!(!store.dirty);
+        assert_eq!(original.active_screen()?, Screen::Alternate);
+        assert!(!original.is_vt_ground()?);
+
+        let mut replayed = test_terminal();
+        store.restore(&mut replayed)?;
+        assert!(store.dirty);
+        assert!(!store.path.exists());
+        assert_eq!(replayed.active_screen()?, Screen::Primary);
+        assert!(replayed.is_cursor_visible()?);
+        assert!(!replayed.mode(Mode::BRACKETED_PASTE)?);
+        assert!(replayed.cursor_style()?.is_default());
+        replayed.vt_write(b"new prompt");
+        let restored = terminal_text(&replayed);
+        assert_eq!(
+            restored,
+            "first\nsecond\nthird\nold prompt\nprevious TUI\n── restored after restart ──\nnew prompt"
+        );
+        assert!(
+            replayed
+                .grid_ref(Point::Active(PointCoordinate { x: 0, y: 1 }))?
+                .style()?
+                .faint
+        );
+
+        replayed.vt_write(b"\x1b[?1049h\x1b[Hnew TUI");
+        assert_eq!(replayed.active_screen()?, Screen::Alternate);
+        assert_eq!(terminal_text(&replayed), "new TUI");
+        replayed.vt_write(LEAVE_ALT_SCREEN);
+        assert_eq!(terminal_text(&replayed), restored);
+
+        let mut unused = test_terminal();
+        store.restore(&mut unused)?;
+        assert!(terminal_text(&unused).trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scrollback_file_keeps_the_newest_complete_rows_within_the_size_cap() -> Result<()> {
+        let state_dir = tempfile::tempdir()?;
+        let store = Scrollback::new(state_dir.path(), "test-session")?;
+        let line = "\x1b[31molder 界 row\x1b[0m\r\n".repeat(SCROLLBACK_LIMIT / 20);
+        let bytes = line + "\x1b[1mnewest row\x1b[0m";
+        assert!(bytes.len() > SCROLLBACK_LIMIT);
+        write_scrollback(&store.path, bytes.as_bytes())?;
+
+        let saved = fs::read_to_string(&store.path)?;
+        assert!(saved.len() <= SCROLLBACK_LIMIT);
+        assert!(saved.len() > SCROLLBACK_LIMIT - 32);
+        assert!(saved.starts_with("\x1b[31molder 界 row\x1b[0m\r\n"));
+        assert!(saved.ends_with("\x1b[1mnewest row\x1b[0m"));
+        Ok(())
+    }
+
+    #[test]
+    fn scrollback_replaces_the_file_atomically_with_private_permissions() -> Result<()> {
+        let state_dir = tempfile::tempdir()?;
+        let store = Scrollback::new(state_dir.path(), "test-session")?;
+        let directory = state_dir.path().join("scrollback");
+        write_scrollback(&store.path, b"old scrollback")?;
+        let mut previous = File::open(&store.path)?;
+        write_scrollback(&store.path, b"new scrollback")?;
+
+        let mut old = String::new();
+        previous.read_to_string(&mut old)?;
+        assert_eq!(old, "old scrollback");
+        assert_eq!(fs::read(&store.path)?, b"new scrollback");
+        assert_eq!(
+            fs::metadata(&directory)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&store.path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        let other_session = directory.join("other-session");
+        fs::create_dir(&other_session)?;
+        assert!(write_scrollback(&other_session, b"failed write").is_err());
+        assert!(other_session.is_dir());
+        assert_eq!(fs::read_dir(&directory)?.count(), 2);
+        Ok(())
+    }
 
     #[test]
     fn recognizes_agent_programs() {
