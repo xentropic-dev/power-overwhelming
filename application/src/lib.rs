@@ -3,6 +3,7 @@ mod commands;
 pub mod dag;
 mod queries;
 mod restore;
+mod scheduler;
 mod sessions;
 pub mod skill_install;
 pub mod skills;
@@ -12,6 +13,7 @@ pub use commands::{
 };
 pub use queries::ResolveArtifact;
 pub use restore::{RestoreChoice, RestoredSession};
+pub use scheduler::{Job, Scheduler};
 pub use sessions::{MemorySessions, SessionRecord, SessionStore};
 
 use anyhow::{Context, Result};

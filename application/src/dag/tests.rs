@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact, SessionArtifact,
-    Workspace, WorktreeStatus, agents::AgentProfileRegistry,
+    SessionStore, Workspace, WorktreeStatus, agents::AgentProfileRegistry,
 };
 use anyhow::bail;
 use domain::{
@@ -1360,9 +1360,9 @@ fn restore_brings_back_only_workers_whose_attempt_is_open() -> Result<()> {
         MemoryStore::default(),
         FakeRegistry(vec![caller.id.clone()]),
         FakeIcons::default(),
-    )
-    // Keep finished sessions alive, as before a restart that interrupts their grace.
-    .with_finished_worker_grace(None);
+    );
+    // Without a cleanup, finished sessions stay alive, as before a restart that
+    // interrupts their grace.
     let run = dag.create_run(
         BoxSelection {
             selector: None,
@@ -1447,7 +1447,8 @@ fn restore_brings_back_only_workers_whose_attempt_is_open() -> Result<()> {
 #[test]
 fn terminal_reports_end_the_worker_session_after_the_grace() -> Result<()> {
     let (dag, run) = setup()?;
-    let dag = dag.with_finished_worker_grace(Some(Duration::from_millis(50)));
+    let dag =
+        dag.with_finished_worker_cleanup(Duration::from_millis(50), Arc::new(ThreadScheduler));
     dag.add_tasks(&run, &[spec("failing", &[]), spec("waiting", &[])])?;
     let mut ended = Vec::new();
     for (task, status) in [
@@ -1515,6 +1516,162 @@ fn terminal_reports_end_the_worker_session_after_the_grace() -> Result<()> {
             ("waiting", AttemptState::NeedsInput),
         ]
     );
+    Ok(())
+}
+
+/// Runs each job on its own sleeping thread, which tests can afford.
+struct ThreadScheduler;
+
+impl Scheduler for ThreadScheduler {
+    fn schedule(&self, delay: Duration, job: crate::Job) -> Result<()> {
+        thread::spawn(move || {
+            thread::sleep(delay);
+            job();
+        });
+        Ok(())
+    }
+}
+
+/// Refuses every job, as a full scheduler or one that cannot start a thread does.
+struct RefusingScheduler(AtomicU64);
+
+impl Scheduler for RefusingScheduler {
+    fn schedule(&self, _: Duration, _: crate::Job) -> Result<()> {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        bail!("Resource temporarily unavailable (os error 11)")
+    }
+}
+
+/// Holds jobs until the test runs them.
+#[derive(Default)]
+struct HeldScheduler(Mutex<Vec<crate::Job>>);
+
+impl Scheduler for HeldScheduler {
+    fn schedule(&self, _: Duration, job: crate::Job) -> Result<()> {
+        self.0.lock().unwrap().push(job);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_refused_cleanup_ends_the_finished_worker_at_once() -> Result<()> {
+    let (dag, run) = setup()?;
+    let scheduler = Arc::new(RefusingScheduler(AtomicU64::new(0)));
+    let dag = dag.with_finished_worker_cleanup(Duration::from_secs(600), scheduler.clone());
+    let dispatched = dag.dispatch(command(&run, false))?;
+    let session = dispatched.agent.session.unwrap();
+    let handle = dag.application.terminal(&session)?;
+
+    let result = dag.report(
+        &run,
+        "work",
+        &dispatched.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+
+    assert!(result.applied);
+    assert_eq!(scheduler.0.load(Ordering::Acquire), 1);
+    assert!(!handle.load(Ordering::Acquire), "the cleanup was lost");
+    assert!(dag.application.terminal(&session).is_err());
+    assert!(dag.application.records.list()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_replayed_terminal_report_schedules_the_cleanup_again() -> Result<()> {
+    let (dag, run) = setup()?;
+    let scheduler = Arc::new(HeldScheduler::default());
+    let dag = dag.with_finished_worker_cleanup(Duration::from_secs(600), scheduler.clone());
+    let dispatched = dag.dispatch(command(&run, false))?;
+    let session = dispatched.agent.session.unwrap();
+    let handle = dag.application.terminal(&session)?;
+    let report = || {
+        dag.report(
+            &run,
+            "work",
+            &dispatched.attempt.id,
+            ReportStatus::Success,
+            "done",
+        )
+    };
+    assert!(report()?.applied);
+    // The first cleanup is lost, as one that never ran before a crash would be.
+    drop(scheduler.0.lock().unwrap().pop());
+
+    let replayed = report()?;
+
+    assert!(!replayed.applied);
+    let jobs: Vec<_> = scheduler.0.lock().unwrap().drain(..).collect();
+    assert_eq!(jobs.len(), 1);
+    assert!(handle.load(Ordering::Acquire));
+    for job in jobs {
+        job();
+    }
+    assert!(!handle.load(Ordering::Acquire));
+    Ok(())
+}
+
+/// Keeps records but refuses to delete them, as a failing session database does.
+#[derive(Default)]
+struct UndeletableSessions(MemorySessions);
+
+impl SessionStore for UndeletableSessions {
+    fn save(&self, record: &crate::SessionRecord) -> Result<()> {
+        self.0.save(record)
+    }
+
+    fn update_foreground(
+        &self,
+        id: &str,
+        foreground: &Agent,
+        conversation: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<()> {
+        self.0.update_foreground(id, foreground, conversation, cwd)
+    }
+
+    fn remove(&self, _: &str) -> Result<()> {
+        bail!("attempt to write a readonly database")
+    }
+
+    fn list(&self) -> Result<Vec<crate::SessionRecord>> {
+        self.0.list()
+    }
+}
+
+#[test]
+fn ending_a_session_still_ends_it_when_its_record_cannot_be_deleted() -> Result<()> {
+    let records = Arc::new(UndeletableSessions::default());
+    let application = Application::new(
+        FakeArtifacts::default(),
+        records.clone(),
+        FakeWorkspace::default(),
+        FakeTerminal::default(),
+        Arc::new(FakeProfiles(Vec::new())),
+        || "rejected".into(),
+    );
+    let session = application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Shell,
+    })?;
+    let handle = application.terminal(&session.id)?;
+
+    let error = application.end_session(&session.id).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("readonly database"),
+        "{error:#}"
+    );
+    assert!(!handle.load(Ordering::Acquire), "the session kept running");
+    assert!(application.terminal(&session.id).is_err());
+    // A retry still tries to forget the record of the session that is gone.
+    let retried = application.end_session(&session.id).unwrap_err();
+    assert!(
+        format!("{retried:#}").contains("readonly database"),
+        "{retried:#}"
+    );
+    assert_eq!(records.list()?.len(), 1);
     Ok(())
 }
 

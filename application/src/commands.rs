@@ -118,13 +118,20 @@ impl<T: TerminalRuntime> Application<T> {
         Ok(session)
     }
 
-    /// Ends a session and forgets it, so it is not restored after a restart.
+    /// Ends a session and forgets it, so it is not restored after a restart. The
+    /// session ends even when forgetting its record fails, and a retry forgets the
+    /// record of a session whose terminal is already gone.
     pub fn end_session(&self, id: &str) -> Result<()> {
         let live = self.sessions.lock().unwrap().remove(id);
-        // Remove the record even when the terminal is already gone.
-        self.records.remove(id)?;
-        self.runtime
-            .end(live.context("Terminal session is unavailable")?.terminal)
+        let ended = live
+            .context("Terminal session is unavailable")
+            .and_then(|live| self.runtime.end(live.terminal));
+        let forgotten = self
+            .records
+            .remove(id)
+            .context("Could not forget the ended session");
+        // A record that could not be forgotten is what a retry must fix.
+        forgotten.and(ended)
     }
 
     /// Saves the foreground state a restore resumes from.

@@ -7,6 +7,7 @@ use infrastructure::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
@@ -1256,17 +1257,48 @@ fn process_running(pid: u32) -> bool {
     })
 }
 
-#[test]
-fn a_finished_worker_and_its_descendants_end_after_the_grace() {
-    let fixture = Fixture::with_configure(|root| {
-        let config = root.join("config/power-overwhelming");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(
-            config.join("config.lua"),
-            "dag.end_finished_workers_after = 0.5\n",
-        )
-        .unwrap();
+fn with_grace(grace: &str) -> Fixture {
+    Fixture::with_configure(|root| {
+        write_config(root, &format!("dag.end_finished_workers_after = {grace}\n"))
+    })
+}
+
+fn write_config(root: &Path, source: &str) {
+    let config = root.join("config/power-overwhelming");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.lua"), source).unwrap();
+}
+
+fn read_pids(path: &Path, count: usize) -> Vec<u32> {
+    poll("worker to record its processes", || {
+        let pids: Vec<u32> = fs::read_to_string(path)
+            .ok()?
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        (pids.len() == count).then_some(pids)
+    })
+}
+
+/// Polls until the agent is exited, and fails if it is ever exited while any of
+/// `pids` still runs.
+fn wait_for_exit_after(fixture: &Fixture, agent: &str, pids: &[u32]) {
+    poll("finished agent to exit", || {
+        let exited = fixture
+            .agents()
+            .into_iter()
+            .any(|listed| listed.id == agent && json!(listed.state) == "exited");
+        if exited {
+            let alive: Vec<_> = pids.iter().filter(|pid| process_running(**pid)).collect();
+            assert!(alive.is_empty(), "agent exited while {alive:?} still ran");
+        }
+        exited.then_some(())
     });
+}
+
+#[test]
+fn a_finished_worker_and_its_descendants_end_after_the_configured_grace() {
+    let fixture = with_grace("0.5");
     let run = fixture.create_run().id;
     fixture.add_task(&run, "linger");
     let (attempt, agent) = dispatched(fixture.dispatch(
@@ -1277,27 +1309,18 @@ fn a_finished_worker_and_its_descendants_end_after_the_grace() {
         &["linger", "linger-go", "Done, still running", "linger-pids"],
     ));
     fixture.release("linger-go");
-    let pids_file = fixture.root().join("linger-pids");
-    let pids: Vec<u32> = poll("worker to record its processes", || {
-        let pids: Vec<u32> = fs::read_to_string(&pids_file)
-            .ok()?
-            .split_whitespace()
-            .map(|pid| pid.parse().unwrap())
-            .collect();
-        (pids.len() == 3).then_some(pids)
-    });
+    let pids = read_pids(&fixture.root().join("linger-pids"), 3);
     let completed = fixture.wait_for_state(&run, "linger", TaskState::Completed);
+    let reported = Instant::now();
 
-    // Half a second of grace, then SIGTERM, which these processes obey.
-    poll("finished worker processes to end", || {
-        pids.iter().all(|pid| !process_running(*pid)).then_some(())
-    });
-    poll("finished agent to exit", || {
-        fixture
-            .agents()
-            .into_iter()
-            .find(|listed| listed.id == agent.id && json!(listed.state) == "exited")
-    });
+    // Half a second of grace, then SIGTERM, which these processes obey. The
+    // default grace is ten seconds, so ending well before that proves the setting.
+    wait_for_exit_after(&fixture, &agent.id, &pids);
+    let ended = reported.elapsed();
+    assert!(ended < Duration::from_secs(4), "took {ended:?}");
+    for pid in &pids {
+        assert!(!process_running(*pid), "{pid} survived");
+    }
     let task = task(&fixture.show(&run), "linger").clone();
     assert_eq!(task.state, TaskState::Completed);
     assert_eq!(task.attempts, completed.attempts);
@@ -1306,6 +1329,149 @@ fn a_finished_worker_and_its_descendants_end_after_the_grace() {
     assert_eq!(
         task.attempts[0].summary.as_deref(),
         Some("Done, still running")
+    );
+}
+
+#[test]
+fn a_worker_whose_root_exits_first_is_exited_only_once_its_detached_child_ends() {
+    // A long grace, so only the root's own exit can end the detached child in time.
+    let fixture = with_grace("600");
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "detach");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "detach",
+        &fixture.worktrees[0],
+        false,
+        &["detach", "detach-go", "Left a child", "detach-pids"],
+    ));
+    fixture.release("detach-go");
+    let pids = read_pids(&fixture.root().join("detach-pids"), 2);
+    wait_for_exit_after(&fixture, &agent.id, &pids);
+    for pid in &pids {
+        assert!(!process_running(*pid), "{pid} survived");
+    }
+    let task = task(&fixture.show(&run), "detach").clone();
+    assert_eq!(task.attempts[0].id, attempt.id);
+    assert_eq!(task.attempts[0].state, AttemptState::Succeeded);
+}
+
+#[test]
+fn a_restart_skips_finished_workers_and_resumes_active_ones_without_a_fresh_start() {
+    // A coding-agent profile backed by a shell script. It logs each launch, reports
+    // success when it finishes, and keeps running afterwards as agents do.
+    let profile = |root: &Path, grace: &str| {
+        format!(
+            r#"
+            dag.end_finished_workers_after = {grace}
+            agents["fixture-resumable"] = {{
+                command = {:?},
+                injection = {{ kind = "flag", flag = "--instructions" }},
+                resume = {{
+                    assign = {{ "--id", "{{id}}" }},
+                    resume = {{ "--resume", "{{id}}" }},
+                    resume_last = {{ "--continue" }},
+                    conflicts = {{ "--id", "--resume", "--continue" }},
+                }},
+            }}
+            "#,
+            root.join("resumable").to_str().unwrap()
+        )
+    };
+    let mut fixture = Fixture::with_configure(|root| {
+        let program = root.join("resumable");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+fixture_dir="${POWER_SOCKET%/*}"
+test "$1" = "--instructions"
+shift 2
+case "$1" in
+    --id) mode=fresh ;;
+    --resume) mode=resume ;;
+    *) exit 2 ;;
+esac
+printf '%s %s\n' "$mode" "$POWER_TASK" >> "$fixture_dir/launches"
+case "$mode $POWER_TASK" in
+    "fresh finished") "$POWER_BIN" dag report success --summary "Finished before the restart" ;;
+    "resume active") "$POWER_BIN" dag report success --summary "Finished after the resume" ;;
+esac
+exec sleep 600
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        // Finished workers keep running, so the finished one is saved at the restart.
+        write_config(root, &profile(root, "false"));
+    });
+    let launches = fixture.root().join("launches");
+    let launched = || {
+        let mut lines: Vec<String> = fs::read_to_string(&launches)
+            .unwrap_or_default()
+            .lines()
+            .map(Into::into)
+            .collect();
+        lines.sort();
+        lines
+    };
+    let run = fixture.create_run().id;
+    let mut agents = BTreeMap::new();
+    for (index, id) in ["finished", "active"].into_iter().enumerate() {
+        fixture.add_task(&run, id);
+        let (_, agent) = dispatched(output(
+            power(fixture.root())
+                .args(["dag", "dispatch", &run, id])
+                .args(["--provider", "fixture-resumable", "--worktree"])
+                .arg(&fixture.worktrees[index]),
+        ));
+        agents.insert(id, agent);
+    }
+    fixture.wait_for_state(&run, "finished", TaskState::Completed);
+    poll("both workers to start", || {
+        (launched().len() == 2).then_some(())
+    });
+    let sessions = |fixture: &Fixture| {
+        let listed = fixture.command(&["session", "list"]);
+        assert_success(&listed);
+        String::from_utf8(listed.stdout).unwrap()
+    };
+    let finished_session = agents["finished"].session.clone().unwrap();
+    let active_session = agents["active"].session.clone().unwrap();
+    assert!(sessions(&fixture).contains(&finished_session));
+
+    // The second daemon ends finished workers half a second after they report,
+    // well inside the window in which a failed resume starts a fresh conversation.
+    write_config(fixture.root(), &profile(fixture.root(), "0.5"));
+    fixture.restart();
+
+    fixture.wait_for_state(&run, "active", TaskState::Completed);
+    wait_for_exit_after(&fixture, &agents["active"].id, &[]);
+    // Give a mistaken fresh start time to appear.
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        launched(),
+        ["fresh active", "fresh finished", "resume active"],
+        "the finished worker was relaunched or the resumed one restarted fresh"
+    );
+    let listed = sessions(&fixture);
+    assert!(!listed.contains(&finished_session), "{listed}");
+    assert!(!listed.contains(&active_session), "{listed}");
+    let snapshot = fixture.show(&run);
+    let finished = task(&snapshot, "finished");
+    assert_eq!(finished.attempts.len(), 1);
+    assert_eq!(finished.attempts[0].state, AttemptState::Succeeded);
+    let active = task(&snapshot, "active");
+    assert_eq!(active.attempts.len(), 1);
+    assert_eq!(active.attempts[0].state, AttemptState::Succeeded);
+    assert_eq!(
+        active.attempts[0].summary.as_deref(),
+        Some("Finished after the resume")
+    );
+    assert!(
+        fixture.agents().iter().any(|listed| {
+            listed.id == agents["finished"].id && json!(listed.state) == "exited"
+        })
     );
 }
 

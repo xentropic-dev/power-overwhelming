@@ -55,6 +55,14 @@ case "$1" in
         report success "$3"
         wait
         ;;
+    detach)
+        # Reports success, starts a child in its own session, and exits first.
+        wait_for_marker "$2"
+        setsid sleep 600 &
+        printf '%s %s\n' "$$" "$!" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        ;;
     input)
         report needs-input "Which option should I use?"
         wait_for_marker "$2"

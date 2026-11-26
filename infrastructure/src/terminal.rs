@@ -62,8 +62,6 @@ const AGENT_EXIT_GRACE: Duration = Duration::from_secs(1);
 /// How long an ended session's processes have to exit after SIGTERM before they
 /// are killed.
 const END_GRACE: Duration = Duration::from_secs(3);
-/// How long an ended session waits for its process tree before reporting the exit.
-const END_WAIT: Duration = Duration::from_secs(10);
 
 pub struct PtyRuntime {
     pub socket: PathBuf,
@@ -322,12 +320,17 @@ fn launch(
     });
     let waiter_tx = tx.clone();
     let (stop_tx, stop_rx) = mpsc::channel();
-    let (ended_tx, ended_rx) = mpsc::channel::<()>();
+    let gone = Arc::new(TreeGone::default());
+    let waiter_gone = gone.clone();
     let waiter_lifecycle = lifecycle.clone();
     let launched = session.agent.clone();
+    let owner = format!("POWER_SESSION={}", session.id);
     thread::spawn(move || {
+        // Even a panicking waiter releases whoever waits for the tree.
+        let gone_guard = SetOnDrop(waiter_gone);
         let result = wait_process(
             process,
+            Some(owner),
             relaunch,
             &stop_rx,
             &waiter_lifecycle.shutting_down,
@@ -347,8 +350,9 @@ fn launch(
             Ok(status) => format!("Worker process exited ({status})"),
             Err(error) => format!("Could not wait for worker process ({error})"),
         };
+        // Before the send, which blocks while an ending actor waits for this.
+        drop(gone_guard);
         let _ = waiter_tx.send(Command::ProcessExited(detail));
-        let _ = ended_tx.send(());
     });
     if session.agent == Agent::Shell {
         let poll_tx = tx.clone();
@@ -377,13 +381,14 @@ fn launch(
                 profiles: profiles.as_ref(),
                 cwd,
                 initial_task: options.initial_task,
+                teardown: Teardown(stop_tx),
+                gone: &gone,
             },
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
-            let _ = stop_tx.send(());
             // Report the exit only once the process tree is gone, so an exited agent
             // never has live processes.
-            let _ = ended_rx.recv_timeout(END_WAIT);
+            gone.wait();
             let detail = match result {
                 Ok(detail) => detail.unwrap_or_else(|| "Terminal session ended".into()),
                 Err(error) => {
@@ -463,43 +468,74 @@ struct Relaunch {
     deadline: Instant,
 }
 
-/// Waits for the session's process, killing it when `stop` fires. If it exits before
-/// the relaunch deadline outside shutdown, its fresh start replaces it once, and
-/// `relaunched` gets the new PID and conversation.
+/// Waits for the session's process and owns its process tree until all of it has
+/// exited. `stop` asks for a teardown, which cancels any relaunch before anything is
+/// signalled. If the process exits before the relaunch deadline outside shutdown and
+/// teardown, its fresh start replaces it once, and `relaunched` gets the new PID and
+/// conversation. Either way, everything the process started is ended before it is
+/// reaped, so a returned status means the whole tree is gone.
 fn wait_process(
     mut process: Child,
+    owner: Option<String>,
     mut relaunch: Option<Relaunch>,
     stop: &Receiver<()>,
     shutting_down: &AtomicBool,
     relaunched: impl FnOnce(Option<u32>, Option<&str>),
 ) -> io::Result<portable_pty::ExitStatus> {
+    let pin = |process: &Child| {
+        process
+            .process_id()
+            .map(|pid| ProcessTree::pin(pid, owner.clone()))
+    };
     let mut relaunched = Some(relaunched);
+    let mut tree = pin(&process);
+    let mut teardown = false;
     loop {
-        match process.try_wait() {
-            Ok(Some(status)) => {
-                let Some(next) = relaunch
-                    .take()
-                    .filter(|next| Instant::now() < next.deadline)
-                    .filter(|_| !shutting_down.load(Ordering::Acquire))
-                else {
+        teardown |= requested(stop);
+        if teardown {
+            // Cancel the fresh start before signalling, so an exit caused by the
+            // teardown is never mistaken for a failed resume.
+            drop(relaunch.take());
+            if let Some(tree) = &mut tree {
+                tree.terminate(END_GRACE);
+            }
+            let _ = process.kill();
+            return process.wait();
+        }
+        let exited = match &tree {
+            Some(tree) => tree.root_exited(),
+            // Without a PID there is no tree to own, only the process.
+            None => process.try_wait()?.is_some(),
+        };
+        if exited {
+            // A teardown sent before the exit caused it, so it wins over a relaunch.
+            teardown |= requested(stop);
+            let next = relaunch
+                .take()
+                .filter(|next| Instant::now() < next.deadline)
+                .filter(|_| !teardown && !shutting_down.load(Ordering::Acquire));
+            // Anything the process left behind ends before it is reaped.
+            if let Some(tree) = &mut tree {
+                tree.terminate(END_GRACE);
+            }
+            let status = process.wait()?;
+            let Some(next) = next else {
+                return Ok(status);
+            };
+            match next.slave.spawn_command(next.command) {
+                Ok(child) => {
+                    process = child;
+                    tree = pin(&process);
+                    if let Some(relaunched) = relaunched.take() {
+                        relaunched(process.process_id(), next.conversation.as_deref());
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("Could not start a new conversation. {error:#}");
                     return Ok(status);
-                };
-                match next.slave.spawn_command(next.command) {
-                    Ok(child) => {
-                        process = child;
-                        if let Some(relaunched) = relaunched.take() {
-                            relaunched(process.process_id(), next.conversation.as_deref());
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        eprintln!("Could not start a new conversation. {error:#}");
-                        return Ok(status);
-                    }
                 }
             }
-            Err(error) => return Err(error),
-            Ok(None) => {}
         }
         // Past the deadline, release the slave so the reader sees EOF at exit.
         if relaunch
@@ -509,17 +545,53 @@ fn wait_process(
             relaunch = None;
         }
         match stop.recv_timeout(Duration::from_millis(100)) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // The actor normally ended the tree already. This covers a root
-                // whose actor stopped without ending it.
-                if let Some(pid) = process.process_id() {
-                    ProcessTree::new(pid).terminate(END_GRACE);
-                }
-                let _ = process.kill();
-                return process.wait();
-            }
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => teardown = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+    }
+}
+
+/// Whether a teardown was asked for. A dropped sender asks for one too.
+fn requested(stop: &Receiver<()>) -> bool {
+    !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty))
+}
+
+/// Set once a session's process tree is gone, for everyone who reports its end.
+#[derive(Default)]
+struct TreeGone {
+    gone: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl TreeGone {
+    fn set(&self) {
+        *self.gone.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut gone = self.gone.lock().unwrap();
+        while !*gone {
+            gone = self.changed.wait(gone).unwrap();
+        }
+    }
+}
+
+struct SetOnDrop(Arc<TreeGone>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
+/// Asks the waiter to tear the tree down when dropped, which is before the actor
+/// closes the PTY, so a hangup exit is never taken for a failed resume.
+struct Teardown(mpsc::Sender<()>);
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
 }
 
@@ -539,6 +611,9 @@ struct ActorEnv<'a> {
     /// Directory the session started in.
     cwd: PathBuf,
     initial_task: Option<String>,
+    /// Tears the process tree down once the actor stops, before the PTY closes.
+    teardown: Teardown,
+    gone: &'a TreeGone,
 }
 
 fn terminal_actor(
@@ -556,6 +631,8 @@ fn terminal_actor(
         profiles,
         cwd,
         initial_task,
+        teardown,
+        gone,
     } = env;
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
@@ -894,11 +971,10 @@ fn terminal_actor(
                 if !exited {
                     // Ending a session ends everything it started, not only its root:
                     // an agent's MCP servers, shells and their background jobs too.
-                    // This runs before the PTY closes, since the hangup would kill the
-                    // root first and orphan descendants that left its session.
-                    if let Some(pid) = shell_pid {
-                        ProcessTree::new(pid).terminate(END_GRACE);
-                    }
+                    // The PTY stays open until the waiter has ended the tree, so the
+                    // processes get SIGTERM and its grace before any hangup.
+                    drop(teardown);
+                    gone.wait();
                     return Ok(Some(with_terminal_tail(
                         &terminal,
                         "Terminal session ended".into(),
@@ -1434,6 +1510,7 @@ mod tests {
         fresh: &str,
         window: Duration,
         shutting_down: bool,
+        teardown: bool,
     ) -> Result<(u32, Reports, String)> {
         let pair = native_pty_system().openpty(pty_size(Geometry::default()))?;
         let shell = |script: &str| {
@@ -1454,10 +1531,14 @@ mod tests {
             let _ = reader.read_to_end(&mut output);
             String::from_utf8_lossy(&output).into_owned()
         });
-        let (_stop, stop) = mpsc::channel();
+        let (stop_tx, stop) = mpsc::channel();
+        if teardown {
+            stop_tx.send(())?;
+        }
         let mut reports = Vec::new();
         let status = wait_process(
             process,
+            None,
             Some(relaunch),
             &stop,
             &AtomicBool::new(shutting_down),
@@ -1473,6 +1554,7 @@ mod tests {
             "echo resume; exit 1",
             "echo fresh; exit 3",
             RESUME_WINDOW,
+            false,
             false,
         )?;
         // The fresh start also exits at once, but there is no second retry.
@@ -1492,6 +1574,7 @@ mod tests {
             "echo fresh",
             Duration::from_millis(100),
             false,
+            false,
         )?;
         assert_eq!(code, 1);
         assert!(reports.is_empty());
@@ -1501,9 +1584,65 @@ mod tests {
 
     #[test]
     fn shutdown_never_relaunches_a_failed_resume() -> Result<()> {
-        let (code, reports, _) = wait_with_relaunch("exit 1", "echo fresh", RESUME_WINDOW, true)?;
+        let (code, reports, _) =
+            wait_with_relaunch("exit 1", "echo fresh", RESUME_WINDOW, true, false)?;
         assert_eq!(code, 1);
         assert!(reports.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_teardown_inside_the_resume_window_never_starts_a_fresh_conversation() -> Result<()> {
+        // The resumed worker is ended moments after it starts, as a finished worker
+        // with a short grace is. Its exit must not count as a failed resume.
+        let started = Instant::now();
+        let (code, reports, output) = wait_with_relaunch(
+            "echo resume; sleep 600",
+            "echo fresh",
+            RESUME_WINDOW,
+            false,
+            true,
+        )?;
+        assert!(started.elapsed() < RESUME_WINDOW, "the teardown was slow");
+        assert_ne!(code, 0);
+        assert!(reports.is_empty(), "{reports:?}");
+        assert!(!output.contains("fresh"), "{output:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_root_exit_waits_for_its_detached_descendants_to_end() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pid_file = directory.path().join("pid");
+        let pair = native_pty_system().openpty(pty_size(Geometry::default()))?;
+        let marker = format!("TERMINAL_TEST_OWNER=detached-{}", std::process::id());
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "setsid sleep 600 & echo $! > {0}.tmp; mv {0}.tmp {0}",
+                pid_file.display()
+            ),
+        ]);
+        let (name, value) = marker.split_once('=').unwrap();
+        command.env(name, value);
+        let process = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+        let (_stop, stop) = mpsc::channel();
+        wait_process(
+            process,
+            Some(marker),
+            None,
+            &stop,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )?;
+        let pid = fs::read_to_string(&pid_file)?.trim().to_owned();
+        let state = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        assert!(
+            state.is_none_or(|stat| stat.contains(") Z ")),
+            "the detached child {pid} outlived the reported exit"
+        );
         Ok(())
     }
 

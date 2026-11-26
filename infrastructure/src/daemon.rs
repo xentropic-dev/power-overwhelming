@@ -6,6 +6,7 @@ use crate::{
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
+    scheduler::{self, TimerScheduler},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
     wire::{self, DagRequest, DagResponse, Request, Response},
@@ -150,11 +151,13 @@ pub fn serve(
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
-    let dag = Arc::new(
-        DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
-            .with_worktree_root(worktree_root)
-            .with_finished_worker_grace(finished_worker_grace),
-    );
+    let mut dag = DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
+        .with_worktree_root(worktree_root);
+    if let Some(grace) = finished_worker_grace {
+        let scheduler = TimerScheduler::start(scheduler::DEFAULT_CAPACITY)?;
+        dag = dag.with_finished_worker_cleanup(grace, Arc::new(scheduler));
+    }
+    let dag = Arc::new(dag);
     terminal_application
         .set(Arc::downgrade(&application))
         .expect("connect terminal callbacks to the application once");

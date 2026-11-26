@@ -11,6 +11,7 @@ mod dag_adapter;
 mod dag_store;
 mod persistence;
 mod process_tree;
+mod scheduler;
 pub mod shell;
 pub mod skill_install;
 pub mod skills;

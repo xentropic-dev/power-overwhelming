@@ -1,6 +1,6 @@
 use crate::{
-    Application, BranchStatus, RestoreChoice, SessionOptions, StartSession, TerminalRuntime,
-    WorktreeRoot,
+    Application, BranchStatus, RestoreChoice, Scheduler, SessionOptions, StartSession,
+    TerminalRuntime, WorktreeRoot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
@@ -154,8 +154,9 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     registry: B,
     icons: I,
     worktree_root: Option<Box<dyn WorktreeRoot>>,
-    /// When to end a worker's session after its terminal report. `None` keeps it.
-    finished_worker_grace: Option<Duration>,
+    /// How long a worker runs after its terminal report, and what ends it then.
+    /// `None` keeps finished workers running.
+    finished_cleanup: Option<(Duration, Arc<dyn Scheduler>)>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
@@ -186,7 +187,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             registry,
             icons,
             worktree_root: None,
-            finished_worker_grace: Some(FINISHED_WORKER_GRACE),
+            finished_cleanup: None,
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
@@ -198,10 +199,14 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         self
     }
 
-    /// Sets how long a worker runs after reporting success or failure before its
-    /// session ends. `None` leaves finished workers running, for debugging.
-    pub fn with_finished_worker_grace(mut self, grace: Option<Duration>) -> Self {
-        self.finished_worker_grace = grace;
+    /// Ends a worker's session `grace` after it reports success or failure, using
+    /// `scheduler` to wait. Without this, finished workers keep running.
+    pub fn with_finished_worker_cleanup(
+        mut self,
+        grace: Duration,
+        scheduler: Arc<dyn Scheduler>,
+    ) -> Self {
+        self.finished_cleanup = Some((grace, scheduler));
         self
     }
 
@@ -727,32 +732,27 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     {
         let (result, finished) =
             self.write(|db| report(db, run, task, attempt, status, summary))?;
-        if let (Some(session), Some(grace)) = (finished, self.finished_worker_grace) {
-            self.end_finished_session(session, grace);
+        if let (Some(session), Some((grace, scheduler))) = (finished, &self.finished_cleanup) {
+            self.end_finished_session(session, *grace, scheduler.as_ref());
         }
         Ok(result)
     }
 
     /// Ends a finished worker's session after `grace`, which also forgets its record so
-    /// a restart cannot bring it back. Ending takes the whole process tree down.
-    fn end_finished_session(&self, session: String, grace: Duration)
+    /// a restart cannot bring it back. Ending takes the whole process tree down. A
+    /// scheduler that refuses the job leaves the work here, so the session ends now.
+    fn end_finished_session(&self, session: String, grace: Duration, scheduler: &dyn Scheduler)
     where
         T: 'static,
     {
         let application = self.application.clone();
-        let spawned = std::thread::Builder::new()
-            .name("end-finished-worker".into())
-            .spawn(move || {
-                std::thread::sleep(grace);
-                // A session that already ended has nothing left to stop.
-                if application.terminal(&session).is_ok()
-                    && let Err(error) = application.end_session(&session)
-                {
-                    eprintln!("Could not end finished worker session {session}. {error:#}");
-                }
-            });
-        if let Err(error) = spawned {
-            eprintln!("Could not schedule the end of a finished worker. {error:#}");
+        let scheduled = session.clone();
+        let job = Box::new(move || end_finished(&application, &scheduled));
+        if let Err(error) = scheduler.schedule(grace, job) {
+            eprintln!(
+                "Could not schedule the end of finished worker session {session}, so it ends now. {error:#}"
+            );
+            end_finished(&self.application, &session);
         }
     }
 
@@ -1414,6 +1414,15 @@ fn find_task<'a>(run: &'a Run, id: &str) -> Result<&'a Task> {
         .with_context(|| format!("Unknown task {id:?} in run {:?}", run.id))
 }
 
+/// Ends a finished worker's session if it still runs.
+fn end_finished<T: TerminalRuntime>(application: &Application<T>, session: &str) {
+    if application.terminal(session).is_ok()
+        && let Err(error) = application.end_session(session)
+    {
+        eprintln!("Could not end finished worker session {session}. {error:#}");
+    }
+}
+
 fn report(
     db: &dyn DagTransaction,
     run_id: &str,
@@ -1450,12 +1459,20 @@ fn report(
             ));
         }
         ReportTransition::AlreadyReported => {
+            // A replayed terminal report asks for the cleanup again, so a cleanup
+            // lost after the first report still happens.
+            let finished = matches!(
+                attempt.state,
+                AttemptState::Succeeded | AttemptState::Failed
+            )
+            .then(|| attempt.session.clone())
+            .flatten();
             return Ok((
                 ReportResult {
                     applied: false,
                     reason: Some("already reported".into()),
                 },
-                None,
+                finished,
             ));
         }
         ReportTransition::Unchanged => {

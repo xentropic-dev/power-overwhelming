@@ -1,12 +1,23 @@
-//! Signal a session's whole process tree: its root, every descendant, and any
-//! process left in the root's session after its parent died.
+//! Own a session's whole process tree from launch until it is verifiably gone: its
+//! root, every descendant, any process left in the root's session, and any process
+//! that carries the session's owner marker after it detached from both.
 //!
-//! Ending a session and pausing or resuming one share this. A process is named by
-//! its PID and start time, so a reused PID is never signalled.
+//! Ending a session and pausing or resuming one share this. Identity is pinned, so
+//! a reused PID is never signalled or used to find a tree:
+//!
+//! - The root is the caller's child, which the caller leaves unreaped until the
+//!   tree is gone. Until then its PID, and the session ID it leads, cannot be reused.
+//! - Every other member is held by a pidfd, opened only after its start time was
+//!   checked, and signalled through it. A start-time pin rechecked before each
+//!   signal replaces the pidfd on kernels without one.
+//! - A member's PID seeds discovery of its children only while its pidfd shows it
+//!   alive, which also means its PID still names it.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, thread,
+    fs, io,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -14,6 +25,8 @@ use std::{
 const POLL: Duration = Duration::from_millis(50);
 /// Bounds discovery when processes keep forking while being signalled.
 const MAX_ROUNDS: usize = 16;
+/// How often `terminate` logs members that outlive SIGKILL.
+const STUCK_LOG: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TreeSignal {
@@ -78,96 +91,239 @@ fn all_processes() -> BTreeMap<u32, Stat> {
         .collect()
 }
 
-/// A live process tree rooted at a session's launched process.
+/// Whether the process's initial environment holds exactly `entry`.
+fn carries(pid: u32, entry: &[u8]) -> bool {
+    fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|environ| environ.split(|byte| *byte == 0).any(|item| item == entry))
+}
+
+/// What a signal to a pinned process did.
+#[derive(Debug, Eq, PartialEq)]
+enum Sent {
+    Delivered,
+    /// The process has exited, so it is no longer a member.
+    Gone,
+    /// Another user's process, which Power cannot own.
+    Denied,
+}
+
+/// A process pinned by a pidfd, or by its start time where pidfds are unavailable.
+#[derive(Debug)]
+struct Pinned {
+    pid: u32,
+    start: u64,
+    fd: Option<OwnedFd>,
+}
+
+impl Pinned {
+    /// Pins `pid` if it is still the process that started at `start`. The pidfd is
+    /// opened before the recheck, so a match means the pidfd names that process.
+    fn open(pid: u32, start: u64) -> Option<Self> {
+        let fd = pidfd_open(pid);
+        stat(pid)
+            .filter(|stat| stat.start == start && !stat.zombie)
+            .map(|_| Self { pid, start, fd })
+    }
+
+    /// Pins the caller's unreaped child, whose PID cannot be reused until it is reaped.
+    fn child(pid: u32) -> Self {
+        Self {
+            pid,
+            start: stat(pid).map_or(0, |stat| stat.start),
+            fd: pidfd_open(pid),
+        }
+    }
+
+    /// Whether the process has exited. A zombie has exited.
+    fn exited(&self) -> bool {
+        match &self.fd {
+            Some(fd) => {
+                let mut poll = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd and a zero timeout.
+                let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                ready != 0
+            }
+            None => !stat(self.pid).is_some_and(|stat| stat.start == self.start && !stat.zombie),
+        }
+    }
+
+    fn signal(&self, signal: libc::c_int) -> Sent {
+        let result = match &self.fd {
+            // SAFETY: the pidfd is open, and pidfd_send_signal reads no memory when
+            // info is null.
+            Some(fd) => unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            },
+            None => {
+                // Recheck the start time so a reused PID is left alone.
+                if self.exited() {
+                    return Sent::Gone;
+                }
+                let Ok(pid) = libc::pid_t::try_from(self.pid) else {
+                    return Sent::Gone;
+                };
+                // SAFETY: kill has no memory effects.
+                unsafe { libc::kill(pid, signal) }.into()
+            }
+        };
+        if result == 0 {
+            return Sent::Delivered;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => Sent::Denied,
+            _ => Sent::Gone,
+        }
+    }
+}
+
+fn pidfd_open(pid: u32) -> Option<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = libc::c_int::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: the kernel returned a new descriptor that nothing else owns.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A launched process and everything it started, owned until all of it has exited.
 pub(crate) struct ProcessTree {
-    root: u32,
+    root: Pinned,
     /// Session ID whose members belong to the tree, when the root leads a session.
     session: Option<u32>,
-    /// Every process found so far, by PID, with its start time.
-    members: BTreeMap<u32, u64>,
+    /// `NAME=value` that every process started in the tree inherits, so a process
+    /// that left both the root's descendants and its session is still found.
+    owner: Option<Vec<u8>>,
+    /// Every process found so far besides the root, by PID.
+    members: BTreeMap<u32, Pinned>,
+    /// Processes already checked for the owner marker and found without it.
+    strangers: BTreeMap<u32, u64>,
 }
 
 impl ProcessTree {
-    /// Finds the tree under `root`. Power's own process and its ancestors are never
-    /// members, so a stray PID cannot end the daemon.
-    pub(crate) fn new(root: u32) -> Self {
+    /// Pins `root`, which must be the caller's child. The caller reaps it only after
+    /// `alive` returns false, or after dropping the tree. `owner` is an environment
+    /// entry like `POWER_SESSION=<id>` that the root was started with.
+    pub(crate) fn pin(root: u32, owner: Option<String>) -> Self {
         let session = stat(root).filter(|stat| stat.session == root).map(|_| root);
-        let mut tree = Self {
-            root,
+        Self {
+            root: Pinned::child(root),
             session,
+            owner: owner.map(String::into_bytes),
             members: BTreeMap::new(),
-        };
-        tree.discover();
-        tree
+            strangers: BTreeMap::new(),
+        }
     }
 
-    /// Adds processes that joined the tree since the last look, and forgets exited ones.
-    fn discover(&mut self) -> Vec<u32> {
+    /// Whether the root has exited. It stays unreaped, so its PID stays pinned.
+    pub(crate) fn root_exited(&self) -> bool {
+        self.root.exited()
+    }
+
+    /// Adds processes that joined the tree since the last look, and forgets exited
+    /// ones. Returns how many joined.
+    fn discover(&mut self) -> usize {
         let processes = all_processes();
-        let protected = protected(&processes);
-        self.members.retain(|pid, start| {
-            processes
-                .get(pid)
-                .is_some_and(|stat| stat.start == *start && !stat.zombie)
-        });
+        let protected = protected(&processes, self.root.pid);
+        // After the snapshot, so a member that is alive now was alive in it, under
+        // the same PID.
+        self.members.retain(|_, member| !member.exited());
+        self.strangers
+            .retain(|pid, start| processes.get(pid).is_some_and(|stat| stat.start == *start));
         let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         for (pid, stat) in &processes {
             children.entry(stat.parent).or_default().push(*pid);
         }
-        let mut found = Vec::new();
-        let mut queue: Vec<u32> = std::iter::once(self.root)
+        let mut queue: Vec<u32> = std::iter::once(self.root.pid)
             .chain(self.members.keys().copied())
-            .chain(
-                processes
-                    .iter()
-                    .filter(|(_, stat)| Some(stat.session) == self.session)
-                    .map(|(pid, _)| *pid),
-            )
             .collect();
+        for (pid, stat) in &processes {
+            if self.members.contains_key(pid) || protected.contains(pid) || stat.zombie {
+                continue;
+            }
+            if Some(stat.session) == self.session {
+                queue.push(*pid);
+                continue;
+            }
+            let Some(owner) = &self.owner else { continue };
+            if self.strangers.get(pid) == Some(&stat.start) {
+                continue;
+            }
+            if carries(*pid, owner) {
+                queue.push(*pid);
+            } else {
+                self.strangers.insert(*pid, stat.start);
+            }
+        }
+        let mut joined = 0;
         let mut seen = BTreeSet::new();
         while let Some(pid) = queue.pop() {
             if !seen.insert(pid) || protected.contains(&pid) {
                 continue;
             }
-            let Some(stat) = processes.get(&pid).filter(|stat| !stat.zombie) else {
-                continue;
-            };
-            if self.members.insert(pid, stat.start).is_none() {
-                found.push(pid);
+            let known = pid == self.root.pid || self.members.contains_key(&pid);
+            if !known {
+                let Some(stat) = processes.get(&pid).filter(|stat| !stat.zombie) else {
+                    continue;
+                };
+                let Some(pinned) = Pinned::open(pid, stat.start) else {
+                    continue;
+                };
+                self.members.insert(pid, pinned);
+                joined += 1;
             }
             queue.extend(children.get(&pid).into_iter().flatten().copied());
         }
-        found
+        joined
     }
 
-    /// Whether any member is still running. Zombies count as exited.
+    /// Whether any process in the tree, the root included, is still running.
     pub(crate) fn alive(&mut self) -> bool {
         self.discover();
-        !self.members.is_empty()
+        !self.root.exited() || !self.members.is_empty()
     }
 
-    /// Sends `signal` to every member, including processes that appear while it is
+    /// Sends `signal` to the whole tree, including processes that appear while it is
     /// being sent, and returns how many processes received it.
     pub(crate) fn signal(&mut self, signal: TreeSignal) -> usize {
         let mut sent = BTreeSet::new();
+        self.discover();
         for _ in 0..MAX_ROUNDS {
-            let pending: Vec<(u32, u64)> = self
-                .members
-                .iter()
-                .filter(|(pid, _)| !sent.contains(*pid))
-                .map(|(pid, start)| (*pid, *start))
-                .collect();
-            for (pid, start) in pending {
-                // Recheck the start time so a reused PID is left alone.
-                if stat(pid).is_some_and(|stat| stat.start == start) && send(pid, signal.number()) {
-                    if signal == TreeSignal::Terminate {
-                        // A paused process handles SIGTERM only once it runs again.
-                        send(pid, libc::SIGCONT);
+            if !sent.contains(&self.root.pid)
+                && !self.root.exited()
+                && deliver(&self.root, signal) == Sent::Delivered
+            {
+                sent.insert(self.root.pid);
+            }
+            let mut gone = Vec::new();
+            for (pid, member) in &self.members {
+                if sent.contains(pid) {
+                    continue;
+                }
+                match deliver(member, signal) {
+                    Sent::Delivered => {
+                        sent.insert(*pid);
                     }
-                    sent.insert(pid);
+                    Sent::Gone => gone.push(*pid),
+                    Sent::Denied => {
+                        eprintln!("Process {pid} belongs to another user, so it is left running.");
+                        gone.push(*pid);
+                    }
                 }
             }
-            if self.discover().is_empty() {
+            for pid in gone {
+                self.members.remove(&pid);
+            }
+            if self.discover() == 0 {
                 break;
             }
         }
@@ -175,45 +331,64 @@ impl ProcessTree {
     }
 
     /// Asks the tree to exit, waits up to `grace`, then kills whatever is left.
-    /// Returns once no member runs, or after the kill if some never exit.
+    /// Returns only once every member has exited, so the caller may then reap the
+    /// root and report the session as ended.
     pub(crate) fn terminate(&mut self, grace: Duration) {
         self.signal(TreeSignal::Terminate);
         let deadline = Instant::now() + grace;
         while self.alive() {
             if Instant::now() >= deadline {
-                self.signal(TreeSignal::Kill);
-                let deadline = Instant::now() + grace.max(POLL * 10);
-                while self.alive() && Instant::now() < deadline {
-                    thread::sleep(POLL);
-                }
-                return;
+                break;
             }
             // Children forked after the first signal are asked too.
             self.signal(TreeSignal::Terminate);
             thread::sleep(POLL);
         }
+        let mut logged = Instant::now();
+        while self.alive() {
+            self.signal(TreeSignal::Kill);
+            thread::sleep(POLL);
+            if logged.elapsed() >= STUCK_LOG {
+                logged = Instant::now();
+                eprintln!(
+                    "Still waiting for processes {:?} of tree {} to exit after SIGKILL.",
+                    self.members.keys().collect::<Vec<_>>(),
+                    self.root.pid
+                );
+            }
+        }
     }
 }
 
-/// Power's own PID and its ancestors.
-fn protected(processes: &BTreeMap<u32, Stat>) -> BTreeSet<u32> {
+fn deliver(process: &Pinned, signal: TreeSignal) -> Sent {
+    let sent = process.signal(signal.number());
+    if sent == Sent::Delivered && signal == TreeSignal::Terminate {
+        // A paused process handles SIGTERM only once it runs again. The same pin
+        // carries the SIGCONT, so it reaches the same process.
+        process.signal(libc::SIGCONT);
+    }
+    sent
+}
+
+/// Power's own PID, its ancestors, and its other children, which are other
+/// sessions' roots and Power's own helpers. None of them is ever a member.
+fn protected(processes: &BTreeMap<u32, Stat>, root: u32) -> BTreeSet<u32> {
+    let own = std::process::id();
     let mut protected = BTreeSet::from([0, 1]);
-    let mut pid = std::process::id();
+    let mut pid = own;
     while protected.insert(pid) {
         match processes.get(&pid) {
             Some(stat) => pid = stat.parent,
             None => break,
         }
     }
+    protected.extend(
+        processes
+            .iter()
+            .filter(|(pid, stat)| stat.parent == own && **pid != root)
+            .map(|(pid, _)| *pid),
+    );
     protected
-}
-
-fn send(pid: u32, signal: libc::c_int) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: kill has no memory effects. The PID was checked against its start time.
-    unsafe { libc::kill(pid, signal) == 0 }
 }
 
 #[cfg(test)]
@@ -221,14 +396,14 @@ mod tests {
     use super::*;
     use std::{
         os::unix::process::CommandExt,
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
     };
 
     fn running(pid: u32) -> bool {
         stat(pid).is_some_and(|stat| !stat.zombie)
     }
 
-    fn read_pids(path: &std::path::Path) -> Vec<u32> {
+    fn read_pids(path: &std::path::Path, count: usize) -> Vec<u32> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(text) = fs::read_to_string(path) {
@@ -236,7 +411,7 @@ mod tests {
                     .split_whitespace()
                     .filter_map(|pid| pid.parse().ok())
                     .collect();
-                if pids.len() == 2 {
+                if pids.len() == count {
                     return pids;
                 }
             }
@@ -248,18 +423,12 @@ mod tests {
         }
     }
 
-    /// A session leader with a child that ignores SIGTERM and a grandchild in a new
-    /// session, which a process group signal would miss.
-    fn spawn_tree(directory: &std::path::Path) -> (std::process::Child, Vec<u32>) {
-        let pids = directory.join("pids");
-        let script = format!(
-            "trap '' TERM; sleep 600 & a=$!; setsid sleep 600 & b=$!; \
-             echo \"$a $b\" > {}.tmp; mv {0}.tmp {0}; wait",
-            pids.display()
-        );
+    /// Runs `script` in a new session with `marker` in its environment.
+    fn spawn(script: &str, marker: &str) -> Child {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", &script])
+            .args(["-c", script])
+            .env("PROCESS_TREE_TEST", marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -270,16 +439,33 @@ mod tests {
                 Ok(())
             });
         }
-        let child = command.spawn().unwrap();
-        let descendants = read_pids(&pids);
-        (child, descendants)
+        command.spawn().unwrap()
+    }
+
+    fn owner(marker: &str) -> Option<String> {
+        Some(format!("PROCESS_TREE_TEST={marker}"))
+    }
+
+    /// A session leader with a child that ignores SIGTERM and a grandchild in a new
+    /// session, which a process group signal would miss.
+    fn spawn_tree(directory: &std::path::Path) -> (Child, ProcessTree, Vec<u32>) {
+        let pids = directory.join("pids");
+        let script = format!(
+            "trap '' TERM; sleep 600 & a=$!; setsid sleep 600 & b=$!; \
+             echo \"$a $b\" > {}.tmp; mv {0}.tmp {0}; wait",
+            pids.display()
+        );
+        let child = spawn(&script, "tree");
+        let tree = ProcessTree::pin(child.id(), None);
+        let descendants = read_pids(&pids, 2);
+        (child, tree, descendants)
     }
 
     #[test]
     fn terminate_ends_descendants_that_ignore_sigterm_or_left_the_session() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut child, descendants) = spawn_tree(directory.path());
-        let mut tree = ProcessTree::new(child.id());
+        let (mut child, mut tree, descendants) = spawn_tree(directory.path());
+        tree.discover();
         for pid in &descendants {
             assert!(tree.members.contains_key(pid), "{pid} not discovered");
         }
@@ -287,6 +473,7 @@ mod tests {
 
         let started = Instant::now();
         tree.terminate(Duration::from_millis(300));
+        assert!(!tree.alive());
         child.wait().unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -296,9 +483,69 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_child_is_still_owned_after_the_root_exits_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let pids = directory.path().join("pids");
+        // The root starts a child in its own session, then exits before anything
+        // looks at its tree, so neither parentage nor session leads to the child.
+        let script = format!(
+            "setsid sleep 600 & echo $! > {}.tmp; mv {0}.tmp {0}",
+            pids.display()
+        );
+        let marker = format!("detached-{}", std::process::id());
+        let mut child = spawn(&script, &marker);
+        let mut tree = ProcessTree::pin(child.id(), owner(&marker));
+        let detached = read_pids(&pids, 1)[0];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !tree.root_exited() {
+            assert!(Instant::now() < deadline, "the root never exited");
+            thread::sleep(POLL);
+        }
+        // The unreaped root still pins its PID.
+        assert!(stat(child.id()).is_some_and(|stat| stat.zombie));
+        assert!(tree.alive(), "the detached child was not found");
+        assert!(tree.members.contains_key(&detached));
+
+        tree.terminate(Duration::from_millis(300));
+        assert!(!running(detached), "{detached} survived");
+        assert!(!tree.alive());
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_process_without_the_owner_marker_is_left_alone() {
+        let marker = format!("ours-{}", std::process::id());
+        let mut stranger = spawn("sleep 600", &format!("theirs-{}", std::process::id()));
+        let mut child = spawn("sleep 600", &marker);
+        let mut tree = ProcessTree::pin(child.id(), owner(&marker));
+        tree.terminate(Duration::from_millis(300));
+        child.wait().unwrap();
+        assert!(running(stranger.id()));
+        stranger.kill().unwrap();
+        stranger.wait().unwrap();
+    }
+
+    #[test]
+    fn a_pid_whose_start_time_changed_is_never_pinned() {
+        let mut child = spawn("sleep 600", "reuse");
+        let start = stat(child.id()).unwrap().start;
+        // The same PID with another start time is what a reused PID looks like.
+        assert!(Pinned::open(child.id(), start + 1).is_none());
+        let pinned = Pinned::open(child.id(), start).unwrap();
+        assert!(pinned.fd.is_some(), "this kernel has pidfds");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // Once reaped, the pin reports the exit and delivers nothing, whatever
+        // process takes the PID next.
+        assert!(pinned.exited());
+        assert_eq!(pinned.signal(libc::SIGTERM), Sent::Gone);
+        assert_eq!(pinned.signal(libc::SIGCONT), Sent::Gone);
+    }
+
+    #[test]
     fn stop_and_continue_pause_the_whole_tree() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut child, descendants) = spawn_tree(directory.path());
+        let (mut child, mut tree, descendants) = spawn_tree(directory.path());
         let state = |pid: u32| {
             let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
             stat.rsplit_once(')')
@@ -319,7 +566,6 @@ mod tests {
                 thread::sleep(POLL);
             }
         };
-        let mut tree = ProcessTree::new(child.id());
         assert!(tree.signal(TreeSignal::Stop) >= 3);
         settle(true);
         tree.signal(TreeSignal::Continue);
