@@ -54,7 +54,8 @@ impl Default for AgentProfiles {
                 },
                 &[],
                 &["developer_instructions"],
-                "~/.codex/skills",
+                // Codex reads the shared folder natively.
+                "~/.agents/skills",
             ),
             builtin(
                 "grok",
@@ -91,7 +92,8 @@ impl Default for AgentProfiles {
                     "wrap",
                 ],
                 &["--rules"],
-                "~/.grok/skills",
+                // Grok reads ~/.agents/skills (as well as ~/.grok and ~/.claude) natively.
+                "~/.agents/skills",
             ),
         ])
     }

@@ -1,6 +1,6 @@
 # Power Overwhelming
 
-A native Wayland desktop multiplexer for Codex and Claude Code. The local daemon keeps terminals and agents running when the GPUI window closes. Artifact links open in a closable pane beside the terminal.
+A native Wayland desktop multiplexer for coding agents such as Claude Code, Codex, and Grok. The local daemon keeps terminals and agents running when the GPUI window closes. Artifact links open in a closable pane beside the terminal.
 
 ## Build and run
 
@@ -15,15 +15,60 @@ Run `power` or `power gui` from any directory. Enter a Git checkout path in the 
 
 ## Shell integration
 
-On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines a shell function for each agent profile. Profiles with launch instructions give agents a list of bundled Power skills and tell them how to load a guide with `power skills get <name>`. Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Power restores the last open box and its active tab when you relaunch with the daemon still running.
+On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines a shell function for each agent profile. Profiles with launch instructions tell agents how to load bundled Power skills (see [Skills](#skills)). Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Power restores the last open box and its active tab when you relaunch with the daemon still running.
 
 Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
+
+## Skills
+
+Power bundles skills that teach agents its workflows: `power-dag` for DAG orchestration and `power-artifacts` for publishing previews. They ship inside the `power` binary, so the guide always matches the release, and reading them needs no daemon.
+
+```sh
+power skills list                           # name and description of each skill
+power skills get power-dag                  # the guide
+power skills get power-dag --references     # list reference names
+power skills get power-dag --reference worker-contract
+power skills get power-dag --full           # guide plus every reference
+```
+
+Add `--json` to any of these for machine-readable output.
+
+### Discovery
+
+Agents find skills in two ways. `power --help`, `power dag --help`, and `power skills --help` end with a short footer that points agents at `power skills list`. Agents that Power starts with a profile that has launch instructions, from a shell wrapper, `power session start`, or `power dag dispatch`, also get a short block naming each bundled skill and how to load it, plus a request to label the session with `power session task`. Skills already installed in the agent's native skill folder are left out of that block, and when every skill is installed, the block keeps only the `power session task` line.
+
+### Native installs
+
+`power skills install` writes a small stub `SKILL.md` for each bundled skill so agents can find it without Power's launch instructions. The stub tells the agent to load the full guide with `power skills get <name>`, so installs stay current when Power updates.
+
+```sh
+power skills install --dry-run   # show what would change
+power skills install             # user scope: ~/.agents/skills
+power skills install --local     # project scope: .agents/skills in the current Git worktree
+power skills update              # refresh existing installs; never adds new locations
+```
+
+Stubs go in the shared `.agents/skills` folder, which Codex and Grok read natively. For every other detected agent profile with a `skills_dir`, Power links `<skills_dir>/<name>` to the shared stub. In user scope an agent counts as detected when the parent of its `skills_dir` exists (for Claude Code, `~/.claude`). In project scope the worktree must already contain the profile's skill folder, such as `.claude/skills`. Use `--skill <name>` to select skills and `--agent <id>` to select profiles by ID, or `--agent universal` for the shared folder alone. `--json` prints each location's outcome.
+
+Power only replaces what it wrote. It rewrites a stub when the file matches a stub from some Power release, and replaces a link only when it points at the shared copy. A stub you edited, a folder with other files, or a skill another package installed under the same name is left alone with a warning. Pass `--force` to replace those. Power moves the old copy to `~/.agents/.power-skill-backups` first.
 
 ## Agent profiles
 
 Power provides `claude`, `codex`, and `grok` profiles. Pass a profile ID to `power session start`, `power agent start --provider`, or `power dag dispatch --provider`. With shell integration, use the ID as a command inside a Power terminal.
 
-Add profiles or override built-in fields in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua`.
+Add profiles or override built-in fields in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua`. For example, this sets every field of the Grok profile. The built-in profile skips more subcommands.
+
+```lua
+agents.grok = {
+  command = "grok",
+  injection = { kind = "flag", flag = "--rules" },
+  skip_subcommands = { "login", "logout", "mcp", "update", "version" },
+  skip_if_args_contain = { "--rules" },
+  skills_dir = "~/.agents/skills",
+}
+```
+
+A new profile for another agent, and an override of one built-in field:
 
 ```lua
 agents["my-agent"] = {
@@ -39,7 +84,9 @@ agents.codex = { command = "/opt/bin/codex" }
 
 For a new profile, `command` defaults to the ID and `injection` defaults to `{ kind = "none" }`. Use the executable's name on PATH or an absolute path. Profile IDs use lowercase letters, digits, hyphens and underscores and start with a letter or digit. Power reserves `shell`, `command`, and `power`.
 
-Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings. `skills_dir` records the optional directory where the agent reads native skills.
+Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings.
+
+`skills_dir` is the folder where the agent reads user skills natively; a leading `~` means your home directory. The same path relative to home is the project skill folder, so `~/.claude/skills` also means `.claude/skills` in the worktree and its parents. `power skills install` links skills into it, and launch instructions leave out skills already there. Set it to `~/.agents/skills` for an agent that reads the shared folder, and leave it out when the agent has no skill folder.
 
 Open a new shell to pick up new wrapper names. Restart the daemon when you want profile changes to apply to daemon-launched agents.
 
@@ -57,7 +104,7 @@ The Lua setting takes precedence at startup and when you reload with Ctrl+B then
 
 ## DAG orchestration
 
-Run `power dag guide` to load the bundled coordinator skill and a three-task example. From a Power terminal, `power dag list` finds runs in the current box. From an external terminal, use `power box list` and pass `--box` when listing or creating a run, plus `--coordinator` on creation. Create a run with `power dag create`, add tasks and dependencies with `power dag apply`, then use `power dag ready` and `power dag dispatch` to start background Codex or Claude Code workers in existing worktrees. Follow results with `power dag wait --since` and explicitly retry failed or interrupted work with `power dag retry`.
+Run `power skills get power-dag` to load the bundled coordinator skill, or `power dag guide` (an alias for `power skills get power-dag --full`) to print it with all references, including a three-task example. From a Power terminal, `power dag list` finds runs in the current box. From an external terminal, use `power box list` and pass `--box` when listing or creating a run, plus `--coordinator` on creation. Create a run with `power dag create`, add tasks and dependencies with `power dag apply`, then use `power dag ready` and `power dag dispatch --provider <profile id>` to start background workers in existing worktrees. Follow results with `power dag wait --since` and explicitly retry failed or interrupted work with `power dag retry`.
 
 `power dag create` and `power dag show` return the run and a `pwr://dag/<run-id>` link. Coordinators share that link verbatim on its own line when they create or reopen a run. Click the link or open it with Ctrl+S then `o` to see the live graph.
 

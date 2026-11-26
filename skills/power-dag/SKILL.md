@@ -1,6 +1,6 @@
 ---
 name: power-dag
-description: Coordinate background Codex or Claude Code workers in Power Overwhelming. Use to plan tasks and dependencies, dispatch parallel workers in worktrees, monitor results and input requests, recover or retry a DAG run, or report progress and outcomes as a dispatched worker.
+description: Coordinate background coding agent workers in Power Overwhelming. Use to plan tasks and dependencies, dispatch parallel workers in worktrees, monitor results and input requests, recover or retry a DAG run, or report progress and outcomes as a dispatched worker.
 ---
 
 If `POWER_BIN` is unset, you are not inside Power. Say so and stop, unless the user

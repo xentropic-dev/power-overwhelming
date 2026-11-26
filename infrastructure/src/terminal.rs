@@ -128,7 +128,12 @@ fn launch(
     let pair = native_pty_system().openpty(pty_size(geometry))?;
     let mut process = if let Some(profile) = profile {
         let mut command = CommandBuilder::new(&profile.command);
-        command.args(crate::shell::instruction_args(profile, &options.args)?);
+        let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
+        command.args(crate::shell::instruction_args(
+            profile,
+            &options.args,
+            &installed,
+        )?);
         command.args(&options.args);
         command
     } else if let Some((program, args)) = options.args.split_first() {

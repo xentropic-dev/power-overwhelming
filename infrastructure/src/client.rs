@@ -389,11 +389,18 @@ pub fn watch_runs(box_sel: Option<String>, deliver: impl Fn(RunEvent) -> bool) -
     let mut socket = UnixStream::connect(wire::socket_path()).context("Connect to power daemon")?;
     // The daemon sends keepalives every few seconds, so a long silence means it is gone.
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
-    wire::send(&mut socket, &Request::Dag { dag: DagRequest::Watch { box_sel } })?;
+    wire::send(
+        &mut socket,
+        &Request::Dag {
+            dag: DagRequest::Watch { box_sel },
+        },
+    )?;
     let mut reader = BufReader::new(socket);
     while let Some(response) = wire::receive::<Response>(&mut reader)? {
         match response {
-            Response::Dag { dag: DagResponse::Event { event } } => {
+            Response::Dag {
+                dag: DagResponse::Event { event },
+            } => {
                 if !deliver(event.into()) {
                     break;
                 }

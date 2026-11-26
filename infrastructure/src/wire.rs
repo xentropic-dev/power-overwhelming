@@ -625,16 +625,39 @@ pub enum DagRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DagResponse {
-    Boxes { boxes: Vec<BoxInfo> },
-    Agents { agents: Vec<ManagedAgent> },
-    Agent { agent: ManagedAgent },
-    Run { run: Run },
-    Runs { runs: Vec<Run> },
-    Dispatched { attempt: Attempt, agent: ManagedAgent },
-    Reported { applied: bool, reason: Option<String> },
-    Events { events: Vec<RunEvent>, cursor: u64 },
-    Attention { boxes: Vec<BoxAttention> },
-    Event { event: RunEvent },
+    Boxes {
+        boxes: Vec<BoxInfo>,
+    },
+    Agents {
+        agents: Vec<ManagedAgent>,
+    },
+    Agent {
+        agent: ManagedAgent,
+    },
+    Run {
+        run: Run,
+    },
+    Runs {
+        runs: Vec<Run>,
+    },
+    Dispatched {
+        attempt: Attempt,
+        agent: ManagedAgent,
+    },
+    Reported {
+        applied: bool,
+        reason: Option<String>,
+    },
+    Events {
+        events: Vec<RunEvent>,
+        cursor: u64,
+    },
+    Attention {
+        boxes: Vec<BoxAttention>,
+    },
+    Event {
+        event: RunEvent,
+    },
 }
 
 // Domain entities do not depend on serde. These conversions keep the transport
