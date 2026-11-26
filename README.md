@@ -1,4 +1,4 @@
-![Power Overwhelming](pwr-archon.gif)
+![Power Overwhelming](pwr-archon.webp)
 
 # Power Overwhelming
 
