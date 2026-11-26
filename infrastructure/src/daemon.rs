@@ -106,6 +106,7 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
     let store = SqliteDagStore::open().context("Open DAG store")?;
     let terminal_application = Arc::new(OnceLock::<Weak<Application<PtyRuntime>>>::new());
     let foreground_application = terminal_application.clone();
+    let labels_application = terminal_application.clone();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let terminal_dag = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
     let exit_dag = terminal_dag.clone();
@@ -136,6 +137,12 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
             on_foreground_changed: Arc::new(move |session, agent, conversation, cwd| {
                 if let Some(application) = foreground_application.get().and_then(Weak::upgrade) {
                     application.record_foreground(session, agent, conversation, cwd)?;
+                }
+                Ok(())
+            }),
+            on_labels_changed: Arc::new(move |session, task, model| {
+                if let Some(application) = labels_application.get().and_then(Weak::upgrade) {
+                    application.record_labels(session, task, model)?;
                 }
                 Ok(())
             }),

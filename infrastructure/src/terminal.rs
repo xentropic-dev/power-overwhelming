@@ -4,7 +4,7 @@ use crate::{
     wire::{MetadataField, Response, SessionMetadata},
 };
 use anyhow::{Context, Result};
-use application::{SessionOptions, TerminalRuntime, agents::AgentProfileRegistry};
+use application::{Labels, SessionOptions, TerminalRuntime, agents::AgentProfileRegistry};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     agent::AgentProfile,
@@ -36,6 +36,8 @@ use std::{
 pub(crate) type ActiveScheme = Arc<RwLock<&'static Scheme>>;
 type ExitHandler = Arc<dyn Fn(&str, &str) + Send + Sync>;
 type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send + Sync>;
+/// Saves a session's reported task and model.
+type LabelsChanged = Arc<dyn Fn(&str, Option<&str>, Option<&str>) -> Result<()> + Send + Sync>;
 /// Saves a session's foreground agent, its conversation and the shell's directory.
 type ForegroundChanged =
     Arc<dyn Fn(&str, &Agent, Option<&str>, Option<&Path>) -> Result<()> + Send + Sync>;
@@ -65,6 +67,7 @@ pub struct PtyRuntime {
     pub on_exit: ExitHandler,
     pub on_model_changed: ModelChanged,
     pub on_foreground_changed: ForegroundChanged,
+    pub on_labels_changed: LabelsChanged,
     /// Set on daemon shutdown. Exits are then not reported and foreground state
     /// is only saved by an explicit flush, so a reboot cannot erase what a restore needs.
     pub shutting_down: Arc<AtomicBool>,
@@ -78,6 +81,7 @@ struct Lifecycle {
     foreground: Mutex<Foreground>,
     on_model_changed: ModelChanged,
     on_foreground_changed: ForegroundChanged,
+    on_labels_changed: LabelsChanged,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -110,6 +114,21 @@ impl Lifecycle {
                 "Could not save foreground state for {}. {error:#}",
                 self.session
             );
+        }
+    }
+
+    /// Saves the reported labels. Shutdown kills the agents, which clears their labels,
+    /// so nothing is saved once it has begun.
+    fn record_labels(&self, metadata: &SessionMetadata) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(error) = (self.on_labels_changed)(
+            &self.session,
+            metadata.task.as_deref(),
+            metadata.model.as_deref(),
+        ) {
+            eprintln!("Could not save labels for {}. {error:#}", self.session);
         }
     }
 
@@ -219,7 +238,14 @@ fn launch(
 ) -> Result<Handle> {
     let geometry = Geometry::default();
     let pair = native_pty_system().openpty(pty_size(geometry))?;
-    let model = requested_model(&session.agent, &options.args);
+    // A shell shows its saved model only once its agent is back, so only an agent
+    // session seeds the live model here.
+    let model = requested_model(&session.agent, &options.args).or_else(|| {
+        profile
+            .is_some()
+            .then(|| options.labels.model.clone())
+            .flatten()
+    });
     let cwd = options
         .cwd
         .clone()
@@ -264,6 +290,7 @@ fn launch(
         }),
         on_model_changed: runtime.on_model_changed.clone(),
         on_foreground_changed: runtime.on_foreground_changed.clone(),
+        on_labels_changed: runtime.on_labels_changed.clone(),
         shutting_down: runtime.shutting_down.clone(),
     });
     // A relaunch needs the slave, which also keeps the reader from seeing EOF between
@@ -352,6 +379,7 @@ fn launch(
         });
     }
     let launched_agent = session.agent.clone();
+    let labels = options.labels.clone();
     let actor_lifecycle = lifecycle.clone();
     let active_scheme = runtime.scheme.clone();
     let profiles = runtime.profiles.clone();
@@ -368,6 +396,7 @@ fn launch(
                 active_scheme,
                 profiles: profiles.as_ref(),
                 cwd,
+                labels,
             },
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
@@ -521,6 +550,8 @@ struct ActorEnv<'a> {
     profiles: &'a dyn AgentProfileRegistry,
     /// Directory the session started in.
     cwd: PathBuf,
+    /// Labels saved before a restore.
+    labels: Labels,
 }
 
 fn terminal_actor(
@@ -537,6 +568,7 @@ fn terminal_actor(
         active_scheme,
         profiles,
         cwd,
+        labels,
     } = env;
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
@@ -583,8 +615,10 @@ fn terminal_actor(
     };
     let mut metadata = SessionMetadata {
         model: lifecycle.foreground.lock().unwrap().model.clone(),
-        ..SessionMetadata::default()
+        task: labels.task.clone(),
     };
+    // A restored shell has no agent yet, so its saved labels wait for the agent to return.
+    let mut pending_labels = (launched_agent == Agent::Shell).then_some(labels);
 
     let mut restore = RestoreState::new(launched_agent.clone(), cwd);
 
@@ -681,13 +715,18 @@ fn terminal_actor(
                             .is_ok()
                     });
                 }
-                let next = SessionMetadata {
+                let mut next = SessionMetadata {
                     model: initial_model,
                     task: None,
                 };
+                if let Some(saved) = pending_labels.take_if(|_| run.is_some()) {
+                    next.task = saved.task;
+                    next.model = next.model.or(saved.model);
+                }
                 if next != metadata {
                     metadata = next;
                     notify_metadata(&metadata, &mut clients);
+                    lifecycle.record_labels(&metadata);
                 }
                 restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
             }
@@ -784,6 +823,7 @@ fn terminal_actor(
                     if *field != value {
                         *field = value;
                         notify_metadata(&metadata, &mut clients);
+                        lifecycle.record_labels(&metadata);
                     }
                     Ok(true)
                 })();
@@ -1440,6 +1480,7 @@ mod tests {
             }),
             on_model_changed: Arc::new(|_, _, _| Ok(())),
             on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
+            on_labels_changed: Arc::new(|_, _, _| Ok(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         // A reboot sets shutdown during the agent's exit grace period.

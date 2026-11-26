@@ -151,6 +151,20 @@ impl SqliteSessions {
                 conversation TEXT, cwd BLOB, created INTEGER NOT NULL DEFAULT (unixepoch())
             );",
         )?;
+        // Older databases predate the reported labels.
+        for column in ["task", "model"] {
+            let present: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                db.execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
+        }
         Ok(Self(Mutex::new(db)))
     }
 }
@@ -175,12 +189,14 @@ impl SessionStore for SqliteSessions {
             .collect();
         // Keep the original rowid when saving an existing session.
         self.0.lock().unwrap().execute(
-            "INSERT INTO sessions (id, worktree, agent, args, env, foreground, conversation, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO sessions
+                (id, worktree, agent, args, env, foreground, conversation, cwd, task, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                 worktree = excluded.worktree, agent = excluded.agent, args = excluded.args,
                 env = excluded.env, foreground = excluded.foreground,
-                conversation = excluded.conversation, cwd = excluded.cwd",
+                conversation = excluded.conversation, cwd = excluded.cwd,
+                task = excluded.task, model = excluded.model",
             params![
                 record.id,
                 path_bytes(&record.worktree),
@@ -190,7 +206,17 @@ impl SessionStore for SqliteSessions {
                 record.foreground.as_str(),
                 record.conversation,
                 record.cwd.as_deref().map(path_bytes),
+                record.task,
+                record.model,
             ],
+        )?;
+        Ok(())
+    }
+
+    fn update_labels(&self, id: &str, task: Option<&str>, model: Option<&str>) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE sessions SET task = ?2, model = ?3 WHERE id = ?1",
+            params![id, task, model],
         )?;
         Ok(())
     }
@@ -220,7 +246,7 @@ impl SessionStore for SqliteSessions {
     fn list(&self) -> Result<Vec<SessionRecord>> {
         let db = self.0.lock().unwrap();
         let mut statement = db.prepare(
-            "SELECT id, worktree, agent, args, env, foreground, conversation, cwd
+            "SELECT id, worktree, agent, args, env, foreground, conversation, cwd, task, model
              FROM sessions ORDER BY rowid",
         )?;
         let mut rows = statement.query([])?;
@@ -255,6 +281,8 @@ fn read_session(row: &Row<'_>) -> Result<SessionRecord> {
         foreground: session_agent(row.get(5)?)?,
         conversation: row.get(6)?,
         cwd: row.get::<_, Option<Vec<u8>>>(7)?.map(path_from_bytes),
+        task: row.get(8)?,
+        model: row.get(9)?,
     })
 }
 
@@ -399,6 +427,8 @@ mod tests {
             foreground: Agent::Coding("custom".into()),
             conversation: Some("conversation-id".to_owned()),
             cwd: Some("/repo/subdir".into()),
+            task: Some("Fix the build".to_owned()),
+            model: Some("opus".to_owned()),
         }
     }
 
@@ -445,6 +475,42 @@ mod tests {
         record.conversation = None;
         record.cwd = None;
         assert_eq!(store.list()?, [record]);
+        Ok(())
+    }
+
+    #[test]
+    fn updates_and_clears_labels() -> Result<()> {
+        let store = SqliteSessions::open_in_memory()?;
+        let mut record = session("id");
+        store.save(&record)?;
+        store.update_labels("id", Some("New task"), None)?;
+        record.task = Some("New task".to_owned());
+        record.model = None;
+        assert_eq!(store.list()?, [record]);
+        Ok(())
+    }
+
+    #[test]
+    fn loads_records_saved_before_labels_existed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("sessions.sqlite3");
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, worktree BLOB NOT NULL, agent TEXT NOT NULL,
+                args TEXT NOT NULL, env TEXT NOT NULL, foreground TEXT NOT NULL,
+                conversation TEXT, cwd BLOB, created INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            INSERT INTO sessions (id, worktree, agent, args, env, foreground)
+                VALUES ('old', x'2f72', 'shell', '[]', '[]', 'shell');",
+        )?;
+        drop(db);
+        let store = SqliteSessions::open_at(directory.path())?;
+        let records = store.list()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!((&records[0].task, &records[0].model), (&None, &None));
+        store.update_labels("old", Some("t"), Some("m"))?;
+        assert_eq!(store.list()?[0].task.as_deref(), Some("t"));
         Ok(())
     }
 

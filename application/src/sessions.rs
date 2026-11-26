@@ -22,6 +22,10 @@ pub struct SessionRecord {
     pub conversation: Option<String>,
     /// Last observed working directory of the foreground process.
     pub cwd: Option<PathBuf>,
+    /// Last task label the agent reported.
+    pub task: Option<String>,
+    /// Last model the agent reported.
+    pub model: Option<String>,
 }
 
 pub trait SessionStore: Send + Sync {
@@ -35,6 +39,8 @@ pub trait SessionStore: Send + Sync {
         conversation: Option<&str>,
         cwd: Option<&Path>,
     ) -> Result<()>;
+    /// Updates the reported task and model if the record exists.
+    fn update_labels(&self, id: &str, task: Option<&str>, model: Option<&str>) -> Result<()>;
     fn remove(&self, id: &str) -> Result<()>;
     /// All records, in creation order.
     fn list(&self) -> Result<Vec<SessionRecord>>;
@@ -67,6 +73,15 @@ impl SessionStore for MemorySessions {
             record.foreground = foreground.clone();
             record.conversation = conversation.map(str::to_owned);
             record.cwd = cwd.map(Path::to_path_buf);
+        }
+        Ok(())
+    }
+
+    fn update_labels(&self, id: &str, task: Option<&str>, model: Option<&str>) -> Result<()> {
+        let mut records = self.0.lock().unwrap();
+        if let Some(record) = records.iter_mut().find(|record| record.id == id) {
+            record.task = task.map(str::to_owned);
+            record.model = model.map(str::to_owned);
         }
         Ok(())
     }

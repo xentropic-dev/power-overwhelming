@@ -1,4 +1,4 @@
-use crate::{Application, ResumeCommand, SessionOptions, SessionRecord, TerminalRuntime};
+use crate::{Application, Labels, ResumeCommand, SessionOptions, SessionRecord, TerminalRuntime};
 use anyhow::Result;
 use domain::{
     agent::Resume,
@@ -8,7 +8,7 @@ use std::ffi::OsString;
 
 /// What to do with one saved session on daemon start.
 enum Plan {
-    Launch(SessionOptions),
+    Launch(Box<SessionOptions>),
     /// Forget the record. The reason is logged.
     Drop(&'static str),
 }
@@ -39,7 +39,7 @@ impl<T: TerminalRuntime> Application<T> {
                 worktree: record.worktree.clone(),
                 agent: record.agent.clone(),
             };
-            match self.launch(session, options) {
+            match self.launch(session, *options) {
                 Ok(_) => restored.push(record.id),
                 Err(error) => eprintln!("Could not restore session {}. {error:#}", record.id),
             }
@@ -99,7 +99,14 @@ impl<T: TerminalRuntime> Application<T> {
                 }
             }
         }
-        Ok(Plan::Launch(options))
+        // Labels belong to an agent, so a shell with no agent to resume has none.
+        if matches!(record.foreground, Agent::Coding(_)) {
+            options.labels = Labels {
+                task: record.task.clone(),
+                model: record.model.clone(),
+            };
+        }
+        Ok(Plan::Launch(Box::new(options)))
     }
 }
 
@@ -118,9 +125,9 @@ fn restart_args(
 #[cfg(test)]
 mod tests {
     use crate::{
-        Application, ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact,
-        ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession, TerminalRuntime,
-        Workspace, WorktreeStatus, agents::AgentProfileRegistry,
+        Application, ArtifactStore, BranchStatus, CreatedWorktree, Labels, MemorySessions,
+        RecentArtifact, ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession,
+        TerminalRuntime, Workspace, WorktreeStatus, agents::AgentProfileRegistry,
     };
     use anyhow::{Result, bail};
     use domain::{
@@ -278,6 +285,8 @@ mod tests {
             foreground: agent,
             conversation: None,
             cwd: None,
+            task: None,
+            model: None,
         }
     }
 
@@ -515,6 +524,52 @@ mod tests {
         assert_eq!(saved.foreground, coding("claude"));
         assert_eq!(saved.conversation.as_deref(), Some("conv"));
         assert_eq!(saved.cwd.as_deref(), Some(Path::new("/repo/sub")));
+        Ok(())
+    }
+
+    #[test]
+    fn reported_labels_survive_a_restore() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let store = Arc::new(MemorySessions::default());
+        let (application, _) = app(store.clone());
+        let agent = application.start_session(StartSession {
+            worktree: worktree.path().into(),
+            agent: coding("claude"),
+        })?;
+        let shell = application.start_session(StartSession {
+            worktree: worktree.path().into(),
+            agent: Agent::Shell,
+        })?;
+        application.record_labels(&agent.id, Some("Fix the build"), Some("opus"))?;
+        application.record_foreground(&shell.id, &coding("claude"), None, None)?;
+        application.record_labels(&shell.id, Some("Review"), None)?;
+        let bare = application.start_session(StartSession {
+            worktree: worktree.path().into(),
+            agent: Agent::Shell,
+        })?;
+        application.record_labels(&bare.id, Some("Stale"), Some("old"))?;
+
+        let (restored, starts) = app(store);
+        restored.restore_sessions()?;
+
+        let starts = starts.0.lock().unwrap();
+        let labels: Vec<_> = starts
+            .iter()
+            .map(|(session, options)| (session.id.clone(), options.labels.clone()))
+            .collect();
+        let saved = |task: &str, model: Option<&str>| Labels {
+            task: Some(task.into()),
+            model: model.map(Into::into),
+        };
+        assert_eq!(
+            labels,
+            [
+                (agent.id, saved("Fix the build", Some("opus"))),
+                (shell.id, saved("Review", None)),
+                // A shell with no agent to resume has no labels to show.
+                (bare.id, Labels::default()),
+            ]
+        );
         Ok(())
     }
 }
