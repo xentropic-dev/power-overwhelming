@@ -12,6 +12,13 @@ power dag report needs-input --summary "Which configuration should I use?"
 power dag report working --summary "Configuration confirmed"
 ```
 
+Many agents share this machine, so never wait on processes by name with `pgrep`, `pidof`, `killall`, or `ps | grep`. Those match other agents' builds and your own wait loop, so the wait never ends. Wait on your own command instead: run it in the foreground, or use your tool's background-task completion or the PID you started. Give every long wait a timeout.
+
+```sh
+# Never: until ! pgrep -f "cargo clippy" >/dev/null; do sleep 5; done
+timeout 900 cargo clippy --all-targets
+```
+
 Publish screenshots, reports, HTML pages, and other visual results from your worker session with `power artifact publish <file> --title "..."` so they appear on your task's node. Mention relevant artifacts and their links in your final summary.
 
 Before exiting this terminal, report the outcome with one of these commands.
