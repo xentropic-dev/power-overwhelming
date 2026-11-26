@@ -133,6 +133,9 @@ pub struct Picker {
     pub show_finished: bool,
     /// The still-working agent whose end key was pressed once, awaiting a second press.
     pub armed_end: Option<String>,
+    /// Why the last archive or unarchive in the run picker failed. Kept across refreshes
+    /// until the next attempt.
+    pub run_notice: Option<String>,
     pub focus: FocusHandle,
     query: String,
     cursor: usize,
@@ -214,6 +217,7 @@ impl Picker {
             accept_pending: false,
             show_finished: false,
             armed_end: None,
+            run_notice: None,
             focus,
             query: String::new(),
             cursor: 0,
@@ -451,6 +455,17 @@ impl Picker {
         rows
     }
 
+    /// The run under the selection in the run picker.
+    pub fn selected_run(&self) -> Option<&Run> {
+        let Some(Choice::Run(id)) = self.selection() else {
+            return None;
+        };
+        let Kind::Runs { runs, .. } = &self.kind else {
+            return None;
+        };
+        runs.iter().find(|run| run.id == id)
+    }
+
     pub fn choice(&self, index: usize) -> Option<Choice> {
         self.visible_rows()
             .into_iter()
@@ -594,6 +609,7 @@ impl Picker {
         self.accept_pending = false;
         if !self.loading {
             self.message = None;
+            self.run_notice = None;
         }
         self.reset_selection();
         match &mut self.kind {
@@ -1219,6 +1235,7 @@ fn run_detail(run: &Run) -> String {
         RunStatus::Active => "Active",
         RunStatus::Stalled => "Stalled",
         RunStatus::Completed => "Completed",
+        RunStatus::Archived => "Archived",
     };
     format!(
         "{status} · {}/{} done · {}",
@@ -1230,7 +1247,25 @@ fn run_detail(run: &Run) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Rank, Shortcut, path_match, search_shortcuts, walk};
+    use super::{Entry, Rank, Run, Shortcut, path_match, run_detail, search_shortcuts, walk};
+    use infrastructure::client::Coordinator;
+
+    #[test]
+    fn archived_runs_say_archived_in_the_row_detail() {
+        let mut run = Run {
+            id: "run-id".into(),
+            box_id: "box".into(),
+            title: "Abandoned".into(),
+            coordinator: Coordinator::External { label: "x".into() },
+            created_at: 1,
+            archived_at: None,
+            tasks: Vec::new(),
+        };
+        assert_eq!(run_detail(&run), "Active · 0/0 done · run-id");
+        run.archived_at = Some(2);
+        assert_eq!(run_detail(&run), "Archived · 0/0 done · run-id");
+    }
+
     use nucleo_matcher::{
         Config, Matcher,
         pattern::{CaseMatching, Normalization, Pattern},

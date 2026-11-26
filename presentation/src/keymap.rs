@@ -51,6 +51,7 @@ pub enum Command {
     AgentExpand,
     ToggleFinished,
     EndWorker,
+    ArchiveRun,
     DagUp,
     DagDown,
     DagLeft,
@@ -232,7 +233,8 @@ const TABLE: &[Entry] = &[
     entry(S::AgentTree, "expand", C::AgentExpand, &["ctrl-l"], "Expand branch or select child"),
     entry(S::AgentTree, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide exited and done agents"),
     entry(S::AgentTree, "end", C::EndWorker, &["ctrl-x"], "End the selected worker's terminal session"),
-    entry(S::Runs, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide completed runs"),
+    entry(S::Runs, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide completed and archived runs"),
+    entry(S::Runs, "archive", C::ArchiveRun, &["ctrl-x"], "Archive or unarchive the selected run"),
     entry(S::Dag, "up", C::DagUp, &["up", "k"], "Select task above"),
     entry(S::Dag, "down", C::DagDown, &["down", "j"], "Select task below"),
     entry(S::Dag, "left", C::DagLeft, &["left", "h"], "Select task to the left"),
@@ -572,6 +574,7 @@ mod tests {
             (Scope::AgentTree, "ctrl-f", C::ToggleFinished),
             (Scope::AgentTree, "ctrl-x", C::EndWorker),
             (Scope::Runs, "ctrl-f", C::ToggleFinished),
+            (Scope::Runs, "ctrl-x", C::ArchiveRun),
             (Scope::Runs, "enter", C::PickerSelect),
             (Scope::Dag, "up", C::DagUp),
             (Scope::Dag, "k", C::DagUp),
@@ -594,8 +597,8 @@ mod tests {
         assert_eq!(keymap.command(Scope::AgentTree, &stroke("left")), None);
         assert_eq!(keymap.command(Scope::Picker, &stroke("ctrl-f")), None);
         assert_eq!(keymap.command(Scope::Runs, &stroke("f")), None);
-        assert_eq!(keymap.command(Scope::Runs, &stroke("ctrl-x")), None);
         assert_eq!(keymap.command(Scope::Picker, &stroke("ctrl-x")), None);
+        assert_eq!(keymap.command(Scope::Runs, &stroke("x")), None);
         let help = keymap.help();
         for (description, binding) in [
             ("Open DAG runs", "Ctrl+B then d"),
@@ -614,7 +617,14 @@ mod tests {
                 "Show or hide exited and done agents",
                 "In the agent tree: Ctrl+F",
             ),
-            ("Show or hide completed runs", "In the run picker: Ctrl+F"),
+            (
+                "Show or hide completed and archived runs",
+                "In the run picker: Ctrl+F",
+            ),
+            (
+                "Archive or unarchive the selected run",
+                "In the run picker: Ctrl+X",
+            ),
             (
                 "End the selected worker's terminal session",
                 "In the agent tree: Ctrl+X",

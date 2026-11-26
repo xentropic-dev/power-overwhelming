@@ -525,7 +525,10 @@ pub struct Run {
     pub title: String,
     pub coordinator: Coordinator,
     pub created_at: u64,
-    /// Derived by the daemon from the task states.
+    /// Unix seconds, while the run is archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<u64>,
+    /// Derived by the daemon from the task states, or `archived` while archived.
     #[serde(default)]
     pub status: RunStatus,
     /// In insertion order.
@@ -539,6 +542,7 @@ pub enum RunStatus {
     Active,
     Completed,
     Stalled,
+    Archived,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -567,6 +571,8 @@ pub enum RunEventKind {
     AttemptInterrupted,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
+    RunArchived,
+    RunUnarchived,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -794,6 +800,16 @@ pub enum DagRequest {
     GetRun {
         run: String,
     },
+    /// Hides the run from default listings. Refused while it has open attempts, unless
+    /// `force`.
+    ArchiveRun {
+        run: String,
+        #[serde(default)]
+        force: bool,
+    },
+    UnarchiveRun {
+        run: String,
+    },
     /// Adds tasks atomically. References may point at tasks in this batch or already in the
     /// run. Unknown references, duplicate IDs, and cycles reject the whole batch.
     AddTasks {
@@ -1015,6 +1031,8 @@ mod dag_dto {
         InputResolved,
         AttemptInterrupted,
         StaleReport,
+        RunArchived,
+        RunUnarchived,
     });
 
     struct_dto!(BoxInfo {
@@ -1083,7 +1101,8 @@ mod dag_dto {
     enum_dto!(RunStatus {
         Active,
         Completed,
-        Stalled
+        Stalled,
+        Archived
     });
     impl From<dag::Run> for Run {
         fn from(value: dag::Run) -> Self {
@@ -1094,6 +1113,7 @@ mod dag_dto {
                 title: value.title,
                 coordinator: value.coordinator.into(),
                 created_at: value.created_at,
+                archived_at: value.archived_at,
                 tasks: value.tasks.into_iter().map(Into::into).collect(),
             }
         }
@@ -1107,6 +1127,7 @@ mod dag_dto {
                 title: value.title,
                 coordinator: value.coordinator.into(),
                 created_at: value.created_at,
+                archived_at: value.archived_at,
                 tasks: value.tasks.into_iter().map(Into::into).collect(),
             }
         }

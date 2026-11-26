@@ -52,6 +52,8 @@ pub trait DagTransaction: DagReader {
     fn set_agent_exited(&self, id: &str) -> Result<()>;
     fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()>;
     fn insert_run(&self, run: &Run) -> Result<()>;
+    /// Sets or clears the run's archive time.
+    fn set_run_archived(&self, id: &str, archived_at: Option<u64>) -> Result<()>;
     fn insert_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<()>;
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()>;
@@ -320,10 +322,49 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 title,
                 coordinator,
                 created_at: now(),
+                archived_at: None,
                 tasks: Vec::new(),
             };
             db.insert_run(&run)?;
             db.event(&run.id, RunEventKind::RunCreated, None, None, None)?;
+            Ok(run)
+        })
+    }
+
+    /// Archives the run so default listings leave it out. A run with open attempts is refused
+    /// unless `force`, so live workers are not hidden by accident. Archiving an archived run
+    /// keeps its original archive time.
+    pub fn archive_run(&self, id: &str, force: bool) -> Result<Run> {
+        self.write(|db| {
+            let mut run = load_run(db, id)?;
+            if run.archived_at.is_some() {
+                return Ok(run);
+            }
+            let open = run.open_attempts().count();
+            ensure!(
+                force || open == 0,
+                "Run {id:?} has {open} open attempt{}. Finish {} first, or archive with --force",
+                if open == 1 { "" } else { "s" },
+                if open == 1 { "it" } else { "them" },
+            );
+            let archived_at = now();
+            db.set_run_archived(id, Some(archived_at))?;
+            db.event(id, RunEventKind::RunArchived, None, None, None)?;
+            run.archived_at = Some(archived_at);
+            Ok(run)
+        })
+    }
+
+    /// Restores an archived run to listings. Unarchiving a run that is not archived is a no-op.
+    pub fn unarchive_run(&self, id: &str) -> Result<Run> {
+        self.write(|db| {
+            let mut run = load_run(db, id)?;
+            if run.archived_at.is_none() {
+                return Ok(run);
+            }
+            db.set_run_archived(id, None)?;
+            db.event(id, RunEventKind::RunUnarchived, None, None, None)?;
+            run.archived_at = None;
             Ok(run)
         })
     }
@@ -1239,6 +1280,7 @@ fn sort_runs(runs: &mut [Run]) {
         RunStatus::Active => 0,
         RunStatus::Stalled => 1,
         RunStatus::Completed => 2,
+        RunStatus::Archived => 3,
     };
     runs.sort_by_key(|run| (rank(run.status()), std::cmp::Reverse(run.created_at)));
 }

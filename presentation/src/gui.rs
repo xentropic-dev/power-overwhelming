@@ -995,14 +995,16 @@ impl Workspace {
                     if !picker.show_finished {
                         runs.retain(|run| !run.status().is_finished());
                     }
-                    picker.message = runs.is_empty().then(|| {
-                        empty_message(
-                            "This box has no DAG runs.",
-                            "This box has no unfinished DAG runs.",
-                            picker.show_finished,
-                            &toggle(Scope::Runs),
-                            "completed runs",
-                        )
+                    picker.message = picker.run_notice.clone().or_else(|| {
+                        runs.is_empty().then(|| {
+                            empty_message(
+                                "This box has no DAG runs.",
+                                "This box has no unfinished DAG runs.",
+                                picker.show_finished,
+                                &toggle(Scope::Runs),
+                                "completed and archived runs",
+                            )
+                        })
                     });
                     picker.set_runs(runs);
                 }
@@ -1519,6 +1521,41 @@ impl Workspace {
                 {
                     this.choose(choice, window, cx);
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Archives the run picker's selected run, or unarchives it when `archived`. A refusal,
+    /// such as open attempts, shows in the picker message; there is no confirm step.
+    fn toggle_run_archive(
+        &mut self,
+        picker: u64,
+        run: String,
+        archived: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            if archived {
+                client::unarchive_run(run)
+            } else {
+                client::archive_run(run, false)
+            }
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker) else {
+                    return;
+                };
+                let action = if archived { "unarchive" } else { "archive" };
+                picker.run_notice = result
+                    .err()
+                    .map(|error| format!("Could not {action} run. {error:#}"));
+                picker.message = picker.run_notice.clone();
+                let _ = this.dag_refresh.try_send(());
                 cx.notify();
             });
         })
@@ -2434,6 +2471,15 @@ impl Workspace {
                         self.end_selected_worker(window, cx);
                     }
                 }
+                Some(Command::ArchiveRun) => {
+                    if !picker.waiting
+                        && let Some(run) = picker.selected_run()
+                    {
+                        let (picker_id, run, archived) =
+                            (picker.id, run.id.clone(), run.archived_at.is_some());
+                        self.toggle_run_archive(picker_id, run, archived, window, cx);
+                    }
+                }
                 Some(command @ (Command::AgentCollapse | Command::AgentExpand)) => {
                     if !picker.waiting {
                         picker.agent_branch(command == Command::AgentExpand);
@@ -3267,6 +3313,7 @@ mod tests {
                 agent: "coordinator".into(),
             },
             created_at: 0,
+            archived_at: None,
             tasks: Vec::new(),
         };
         assert_eq!(running_progress(&run), None);

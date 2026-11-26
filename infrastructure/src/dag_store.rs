@@ -29,7 +29,8 @@ impl SqliteDagStore {
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS runs (
                  id TEXT PRIMARY KEY, box_id TEXT NOT NULL, title TEXT NOT NULL,
-                 coordinator TEXT NOT NULL, created_at INTEGER NOT NULL
+                 coordinator TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 archived_at INTEGER
              );
              CREATE TABLE IF NOT EXISTS agents (
                  id TEXT PRIMARY KEY, box_id TEXT NOT NULL, worktree TEXT NOT NULL,
@@ -85,6 +86,14 @@ impl SqliteDagStore {
         if !has_model {
             db.execute("ALTER TABLE agents ADD COLUMN model TEXT", [])?;
         }
+        let has_archived_at: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name = 'archived_at')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_archived_at {
+            db.execute("ALTER TABLE runs ADD COLUMN archived_at INTEGER", [])?;
+        }
         Ok(Self(Mutex::new(db)))
     }
 }
@@ -110,7 +119,7 @@ impl DagDb<'_> {
     fn require_run(&self, id: &str) -> Result<Run> {
         self.0
             .query_row(
-                "SELECT id, box_id, title, coordinator, created_at FROM runs WHERE id = ?1",
+                "SELECT id, box_id, title, coordinator, created_at, archived_at FROM runs WHERE id = ?1",
                 [id],
                 run_from_row,
             )
@@ -258,7 +267,7 @@ impl DagReader for DagDb<'_> {
     fn list_runs(&self, box_id: Option<&str>) -> Result<Vec<Run>> {
         let mut runs = rows(
             self.0,
-            "SELECT id, box_id, title, coordinator, created_at FROM runs
+            "SELECT id, box_id, title, coordinator, created_at, archived_at FROM runs
              WHERE (?1 IS NULL OR box_id = ?1) ORDER BY rowid",
             [box_id],
             run_from_row,
@@ -409,9 +418,18 @@ impl DagTransaction for DagDb<'_> {
 
     fn insert_run(&self, run: &Run) -> Result<()> {
         self.0.execute(
-            "INSERT INTO runs (id, box_id, title, coordinator, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run.id, run.box_id, run.title, serde_json::to_string(&wire::Coordinator::from(run.coordinator.clone()))?, run.created_at],
+            "INSERT INTO runs (id, box_id, title, coordinator, created_at, archived_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run.id, run.box_id, run.title, serde_json::to_string(&wire::Coordinator::from(run.coordinator.clone()))?, run.created_at, run.archived_at],
         )?;
+        Ok(())
+    }
+
+    fn set_run_archived(&self, id: &str, archived_at: Option<u64>) -> Result<()> {
+        let updated = self.0.execute(
+            "UPDATE runs SET archived_at = ?2 WHERE id = ?1",
+            params![id, archived_at],
+        )?;
+        anyhow::ensure!(updated == 1, "Unknown run {id:?}");
         Ok(())
     }
 
@@ -562,6 +580,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
             .map_err(|error| invalid_column(3, error))?
             .into(),
         created_at: row.get(4)?,
+        archived_at: row.get(5)?,
         tasks: Vec::new(),
     })
 }
@@ -639,7 +658,8 @@ mod tests {
         store.0.lock().unwrap().execute_batch(
             r#"
             DROP TABLE IF EXISTS worktrees;
-            INSERT INTO runs VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
+            INSERT INTO runs (id, box_id, title, coordinator, created_at)
+                VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
             INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');
             INSERT INTO attempts VALUES
                 ('attempt-a', 'run', 'task', 1, 'a', 'failed', NULL, NULL, NULL, 1, 2),
@@ -668,6 +688,39 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn migrates_runs_without_archived_at_and_stores_it() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dag.sqlite3");
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            r#"CREATE TABLE runs (
+                 id TEXT PRIMARY KEY, box_id TEXT NOT NULL, title TEXT NOT NULL,
+                 coordinator TEXT NOT NULL, created_at INTEGER NOT NULL
+             );
+             INSERT INTO runs VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);"#,
+        )?;
+        let store = SqliteDagStore::initialize(db)?;
+        assert_eq!(store.read(|db| db.run("run"))?.archived_at, None);
+        store.write(|db| db.set_run_archived("run", Some(42)))?;
+        drop(store);
+
+        let store = SqliteDagStore::initialize(Connection::open(&path)?)?;
+        store.read(|db| {
+            assert_eq!(db.run("run")?.archived_at, Some(42));
+            assert_eq!(db.list_runs(Some("box"))?[0].archived_at, Some(42));
+            Ok(())
+        })?;
+        store.write(|db| db.set_run_archived("run", None))?;
+        assert_eq!(store.read(|db| db.run("run"))?.archived_at, None);
+        assert!(
+            store
+                .write(|db| db.set_run_archived("missing", Some(1)))
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]

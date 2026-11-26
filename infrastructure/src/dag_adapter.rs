@@ -78,6 +78,12 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::GetRun { run } => Reply::Run {
             run: application.run(&run)?.into(),
         },
+        DagRequest::ArchiveRun { run, force } => Reply::Run {
+            run: application.archive_run(&run, force)?.into(),
+        },
+        DagRequest::UnarchiveRun { run } => Reply::Run {
+            run: application.unarchive_run(&run)?.into(),
+        },
         DagRequest::AddTasks { run, tasks } => Reply::Run {
             run: application.add_tasks(&run, &convert(tasks))?.into(),
         },

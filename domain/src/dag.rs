@@ -34,12 +34,14 @@ pub enum RunStatus {
     Completed,
     /// Nothing is open, but not every task completed.
     Stalled,
+    /// Archived explicitly, whatever its task states.
+    Archived,
 }
 
 impl RunStatus {
-    /// Finished runs are hidden from default listings. Archived runs will join them.
+    /// Finished runs are hidden from default listings.
     pub fn is_finished(self) -> bool {
-        self == Self::Completed
+        matches!(self, Self::Completed | Self::Archived)
     }
 }
 
@@ -252,6 +254,8 @@ pub struct Run {
     pub title: String,
     pub coordinator: Coordinator,
     pub created_at: u64,
+    /// Unix seconds, while the run is archived.
+    pub archived_at: Option<u64>,
     /// In insertion order.
     pub tasks: Vec<Task>,
 }
@@ -271,6 +275,8 @@ pub enum RunEventKind {
     AttemptInterrupted,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
+    RunArchived,
+    RunUnarchived,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -430,9 +436,21 @@ impl Run {
         }
     }
 
-    /// Requires `derive_task_states` to have run.
+    /// Requires `derive_task_states` to have run. An archived run is `Archived` whatever its
+    /// task states.
     pub fn status(&self) -> RunStatus {
+        if self.archived_at.is_some() {
+            return RunStatus::Archived;
+        }
         run_status(self.tasks.iter().map(|task| task.state))
+    }
+
+    /// Attempts that are still active or waiting on input.
+    pub fn open_attempts(&self) -> impl Iterator<Item = &Attempt> {
+        self.tasks
+            .iter()
+            .flat_map(|task| &task.attempts)
+            .filter(|attempt| attempt.state.is_open())
     }
 
     pub fn completed_tasks(&self) -> usize {
@@ -637,6 +655,26 @@ mod tests {
             assert_eq!(run_status([T::Completed, closed]), R::Stalled);
             assert_eq!(run_status([closed]), R::Stalled);
         }
+    }
+
+    #[test]
+    fn archived_runs_are_archived_and_finished() {
+        let mut run = Run {
+            id: "run".into(),
+            box_id: "box".into(),
+            title: "Run".into(),
+            coordinator: Coordinator::External { label: "x".into() },
+            created_at: 1,
+            archived_at: None,
+            tasks: Vec::new(),
+        };
+        assert_eq!(run.status(), RunStatus::Active);
+        assert!(!run.status().is_finished());
+        run.archived_at = Some(2);
+        assert_eq!(run.status(), RunStatus::Archived);
+        assert!(run.status().is_finished());
+        assert!(RunStatus::Completed.is_finished());
+        assert!(!RunStatus::Stalled.is_finished());
     }
 
     #[test]

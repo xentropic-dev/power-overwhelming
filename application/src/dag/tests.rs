@@ -253,6 +253,17 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
+    fn set_run_archived(&self, id: &str, archived_at: Option<u64>) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .runs
+            .iter_mut()
+            .find(|run| run.id == id)
+            .context("Unknown run")?
+            .archived_at = archived_at;
+        Ok(())
+    }
+
     fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()> {
         let mut db = self.0.borrow_mut();
         let agent = db
@@ -1579,6 +1590,7 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
             label: "test".into(),
         },
         created_at,
+        archived_at: None,
         tasks: states
             .iter()
             .enumerate()
@@ -1604,6 +1616,10 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
             &[TaskState::Completed, TaskState::Interrupted],
         ),
         run("active-new", 6, &[]),
+        Run {
+            archived_at: Some(8),
+            ..run("archived-active", 7, &[TaskState::Working])
+        },
     ];
     sort_runs(&mut runs);
     let order: Vec<_> = runs.iter().map(|run| run.id.as_str()).collect();
@@ -1615,7 +1631,8 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
             "stalled-new",
             "stalled-old",
             "done-new",
-            "done-old"
+            "done-old",
+            "archived-active"
         ]
     );
 }
@@ -1645,6 +1662,83 @@ fn completed_runs_are_listed_only_when_finished_are_included() -> Result<()> {
     )?;
     assert!(ids(false)?.is_empty());
     assert_eq!(ids(true)?, [run]);
+    Ok(())
+}
+
+#[test]
+fn archiving_refuses_open_attempts_unless_forced() -> Result<()> {
+    let (dag, run) = setup()?;
+    let worker = dag.dispatch(command(&run, false))?;
+    let error = dag.archive_run(&run, false).unwrap_err().to_string();
+    assert!(error.contains("1 open attempt"), "{error}");
+    assert!(error.contains("--force"), "{error}");
+    assert_eq!(dag.run(&run)?.archived_at, None);
+
+    let archived = dag.archive_run(&run, true)?;
+    assert!(archived.archived_at.is_some());
+    assert_eq!(archived.status(), RunStatus::Archived);
+    // The worker is still live and can still report.
+    let reported = dag.report(
+        &run,
+        "work",
+        &worker.attempt.id,
+        ReportStatus::Success,
+        "Done",
+    )?;
+    assert!(reported.applied);
+    assert_eq!(dag.run(&run)?.status(), RunStatus::Archived);
+    Ok(())
+}
+
+#[test]
+fn archived_runs_are_hidden_by_default_and_sort_last() -> Result<()> {
+    let (dag, run) = setup()?;
+    let box_two = || BoxSelection {
+        selector: Some("2".into()),
+        caller: None,
+    };
+    let other = dag
+        .create_run(box_two(), "Newer".into(), Some("external".into()))?
+        .id;
+    let ids = |include_finished| -> Result<Vec<String>> {
+        Ok(dag
+            .list_runs(box_two(), include_finished)?
+            .into_iter()
+            .map(|run| run.id)
+            .collect())
+    };
+    let both = |mut ids: Vec<String>| {
+        ids.sort();
+        let mut expected = vec![run.clone(), other.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+    };
+    both(ids(false)?);
+
+    let archived_at = dag.archive_run(&other, false)?.archived_at;
+    assert!(archived_at.is_some());
+    // Archiving again keeps the original time.
+    assert_eq!(dag.archive_run(&other, false)?.archived_at, archived_at);
+    assert_eq!(ids(false)?, std::slice::from_ref(&run));
+    assert_eq!(ids(true)?, [run.clone(), other.clone()]);
+    let kinds: Vec<_> = dag
+        .events(EventScope::Run(&other, &[]), 0, Duration::ZERO)?
+        .events
+        .into_iter()
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(kinds, [RunEventKind::RunCreated, RunEventKind::RunArchived]);
+
+    let restored = dag.unarchive_run(&other)?;
+    assert_eq!(restored.archived_at, None);
+    assert_eq!(restored.status(), RunStatus::Active);
+    assert_eq!(dag.unarchive_run(&other)?.archived_at, None);
+    both(ids(false)?);
+    let events = dag.events(EventScope::Run(&other, &[]), 0, Duration::ZERO)?;
+    assert_eq!(
+        events.events.last().map(|event| event.kind),
+        Some(RunEventKind::RunUnarchived)
+    );
     Ok(())
 }
 
