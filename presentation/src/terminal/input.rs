@@ -42,13 +42,15 @@ impl TerminalView {
             return;
         }
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
-        self.selection = None;
-        self.pressed_link = None;
+        let had_selection = self.selection.take().is_some();
+        let had_pressed_link = self.pressed_link.take().is_some();
         if let Err(error) = self.commands.try_send(TerminalControl::Input(bytes)) {
             self.status = Some(format!("Could not send input. {error}"));
+            cx.notify();
         }
-        self.refresh();
-        cx.notify();
+        if self.refresh() || had_selection || had_pressed_link {
+            cx.notify();
+        }
     }
 
     fn mouse_input(
@@ -107,7 +109,7 @@ impl TerminalView {
                         } else {
                             clean.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
                         };
-                        self.input(bytes, cx);
+                        self.keyboard_input(bytes, cx);
                     }
                     return;
                 }
@@ -142,8 +144,15 @@ impl TerminalView {
         self.encoder.set_options_from_terminal(&self.terminal);
         let mut bytes = Vec::new();
         if self.encoder.encode_to_vec(&encoded, &mut bytes).is_ok() {
-            self.input(bytes, cx);
+            self.keyboard_input(bytes, cx);
         }
+    }
+
+    fn keyboard_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if !bytes.is_empty() {
+            self.typed_at = Some(std::time::Instant::now());
+        }
+        self.input(bytes, cx);
     }
 
     pub(super) fn hover(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {

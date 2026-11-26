@@ -270,6 +270,7 @@ struct Workspace {
 
 pub fn run() {
     Application::new().run(|cx| {
+        crate::terminal::bench::start();
         load_bundled_fonts(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -2966,6 +2967,7 @@ fn attention_fill(colors: &Colors, strength: u32) -> u32 {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::terminal::bench::count(&crate::terminal::bench::WINDOW);
         let colors = colors(cx);
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
