@@ -1,4 +1,4 @@
-use crate::{Application, Labels, ResumeCommand, SessionOptions, SessionRecord, TerminalRuntime};
+use crate::{Application, ResumeCommand, SessionOptions, SessionRecord, TerminalRuntime};
 use anyhow::Result;
 use domain::{
     agent::Resume,
@@ -99,12 +99,10 @@ impl<T: TerminalRuntime> Application<T> {
                 }
             }
         }
-        // Labels belong to an agent, so a shell with no agent to resume has none.
-        if matches!(record.foreground, Agent::Coding(_)) {
-            options.labels = Labels {
-                task: record.task.clone(),
-                model: record.model.clone(),
-            };
+        // Labels belong to the agent that reported them: the agent session itself, or the
+        // agent a shell resumes. A shell with nothing to resume has none to show.
+        if matches!(record.agent, Agent::Coding(_)) || options.resume.is_some() {
+            options.labels = record.labels.clone();
         }
         Ok(Plan::Launch(Box::new(options)))
     }
@@ -285,8 +283,7 @@ mod tests {
             foreground: agent,
             conversation: None,
             cwd: None,
-            task: None,
-            model: None,
+            labels: Labels::default(),
         }
     }
 
@@ -540,14 +537,19 @@ mod tests {
             worktree: worktree.path().into(),
             agent: Agent::Shell,
         })?;
-        application.record_labels(&agent.id, Some("Fix the build"), Some("opus"))?;
+        let reported = |task: &str, model: Option<&str>| Labels {
+            task: Some(task.into()),
+            model: model.map(Into::into),
+            model_reported: true,
+        };
+        application.record_labels(&agent.id, &reported("Fix the build", Some("opus")))?;
         application.record_foreground(&shell.id, &coding("claude"), None, None)?;
-        application.record_labels(&shell.id, Some("Review"), None)?;
+        application.record_labels(&shell.id, &reported("Review", None))?;
         let bare = application.start_session(StartSession {
             worktree: worktree.path().into(),
             agent: Agent::Shell,
         })?;
-        application.record_labels(&bare.id, Some("Stale"), Some("old"))?;
+        application.record_labels(&bare.id, &reported("Stale", Some("old")))?;
 
         let (restored, starts) = app(store);
         restored.restore_sessions()?;
@@ -557,10 +559,7 @@ mod tests {
             .iter()
             .map(|(session, options)| (session.id.clone(), options.labels.clone()))
             .collect();
-        let saved = |task: &str, model: Option<&str>| Labels {
-            task: Some(task.into()),
-            model: model.map(Into::into),
-        };
+        let saved = reported;
         assert_eq!(
             labels,
             [

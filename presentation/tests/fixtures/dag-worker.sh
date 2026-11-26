@@ -50,6 +50,12 @@ case "$1" in
         printf 'Fixture exiting before reporting a result\n' >&2
         exit 23
         ;;
+    label)
+        wait_for_marker "$2"
+        "$POWER_BIN" session task "$3"
+        wait_for_marker "$4"
+        exit 23
+        ;;
     *)
         printf 'Unknown worker mode: %s\n' "$1" >&2
         exit 2

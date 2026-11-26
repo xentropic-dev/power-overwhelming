@@ -140,9 +140,9 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
                 }
                 Ok(())
             }),
-            on_labels_changed: Arc::new(move |session, task, model| {
+            on_labels_changed: Arc::new(move |session, labels| {
                 if let Some(application) = labels_application.get().and_then(Weak::upgrade) {
-                    application.record_labels(session, task, model)?;
+                    application.record_labels(session, labels)?;
                 }
                 Ok(())
             }),

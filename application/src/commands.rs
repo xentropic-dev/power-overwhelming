@@ -21,6 +21,8 @@ pub struct SessionOptions {
     pub env: Vec<(OsString, Option<OsString>)>,
     /// Sent once at launch and never persisted, so a restore cannot replay it.
     pub initial_prompt: Option<OsString>,
+    /// Initial task label for a dispatched worker.
+    pub initial_task: Option<String>,
     /// Starting directory. Defaults to the worktree.
     pub cwd: Option<PathBuf>,
     /// Agent a restored shell runs once its integration has loaded.
@@ -33,10 +35,14 @@ pub struct SessionOptions {
     pub labels: Labels,
 }
 
+/// The task and model an agent reported.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Labels {
     pub task: Option<String>,
     pub model: Option<String>,
+    /// Whether the agent reported the model, even an empty one. Without a report the
+    /// model of a restored agent still comes from its launch flags.
+    pub model_reported: bool,
 }
 
 /// An agent wrapper call that a restored shell evaluates through `POWER_RESUME`.
@@ -90,8 +96,7 @@ impl<T: TerminalRuntime> Application<T> {
             foreground: session.agent.clone(),
             conversation: None,
             cwd: None,
-            task: None,
-            model: None,
+            labels: Labels::default(),
         })?;
         let id = session.id.clone();
         self.launch_into(&mut sessions, session, options)
@@ -148,8 +153,8 @@ impl<T: TerminalRuntime> Application<T> {
     }
 
     /// Saves the task and model an agent reported, so a restore can show them again.
-    pub fn record_labels(&self, id: &str, task: Option<&str>, model: Option<&str>) -> Result<()> {
-        self.records.update_labels(id, task, model)
+    pub fn record_labels(&self, id: &str, labels: &Labels) -> Result<()> {
+        self.records.update_labels(id, labels)
     }
 
     pub fn publish_artifact(&self, command: PublishArtifact) -> Result<ArtifactPublished> {
