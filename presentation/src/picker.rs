@@ -48,7 +48,10 @@ pub enum Kind {
     Links,
     /// Shell integration setup, with the lines that explain what it changes. `first_run`
     /// finishes onboarding when it closes; otherwise it returns to the previous view.
-    Setup { lines: Vec<String>, first_run: bool },
+    Setup {
+        lines: Vec<String>,
+        first_run: bool,
+    },
     ColorSchemes {
         first_run: bool,
     },
@@ -142,8 +145,12 @@ impl Kind {
             Self::End(_) => "End terminal session?",
             Self::Help(_) => "Keyboard shortcuts",
             Self::Links => "Open a link",
-            Self::Setup { first_run: true, .. } => "Welcome to Power Overwhelming",
-            Self::Setup { first_run: false, .. } => "Shell integration",
+            Self::Setup {
+                first_run: true, ..
+            } => "Welcome to Power Overwhelming",
+            Self::Setup {
+                first_run: false, ..
+            } => "Shell integration",
             Self::ColorSchemes { first_run: true } => "Choose a color scheme",
             Self::ColorSchemes { first_run: false } => "Color schemes",
         }

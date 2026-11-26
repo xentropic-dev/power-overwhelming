@@ -319,7 +319,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             // daemon hosts becomes the parent; otherwise the run's coordinating agent is.
             let parent = match run.coordinator {
                 Coordinator::External { .. } => None,
-                Coordinator::Agent { agent } => match self.hosted_caller(command.caller.as_deref()) {
+                Coordinator::Agent { agent } => match self.hosted_caller(command.caller.as_deref())
+                {
                     Some(session) => Some(self.register_caller(db, session, &box_id)?.id),
                     None => Some(agent),
                 },
@@ -551,7 +552,11 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
     /// Power terminal, which can belong to another daemon when a coordinator runs in a
     /// multiplexer inside Power and targets a different socket.
     fn hosted_caller<'a>(&self, caller: Option<&'a str>) -> Option<&'a str> {
-        caller.filter(|session| self.application.session_is_running(session).unwrap_or(false))
+        caller.filter(|session| {
+            self.application
+                .session_is_running(session)
+                .unwrap_or(false)
+        })
     }
 
     fn register_caller(

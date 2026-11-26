@@ -372,7 +372,10 @@ impl Workspace {
         ];
         let rows = match (shell, &rc) {
             (Some(shell), Some(rc)) if shell.installed() => {
-                lines.push(format!("Shell integration is installed in {}.", rc.display()));
+                lines.push(format!(
+                    "Shell integration is installed in {}.",
+                    rc.display()
+                ));
                 vec![Row {
                     label: "Close".into(),
                     detail: String::new(),
@@ -442,10 +445,15 @@ impl Workspace {
             );
             return;
         }
-        let first_run = self
-            .picker
-            .as_ref()
-            .is_none_or(|picker| matches!(picker.kind, Kind::Setup { first_run: true, .. }));
+        let first_run = self.picker.as_ref().is_none_or(|picker| {
+            matches!(
+                picker.kind,
+                Kind::Setup {
+                    first_run: true,
+                    ..
+                }
+            )
+        });
         self.picker = None;
         if !first_run {
             self.restore_focus(window, cx);
