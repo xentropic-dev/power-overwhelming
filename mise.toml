@@ -38,6 +38,27 @@ mv -f "$tmp" "$dest"
 trap - EXIT
 echo "Installed $dest"
 
+# Desktop entry so app launchers (Walker, GNOME, KDE, rofi) list Power.
+apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$apps_dir"
+cat > "$apps_dir/power.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Power Overwhelming
+GenericName=Agent Workspace
+Comment=Launch the Power GUI
+Exec=$dest
+TryExec=$dest
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+StartupNotify=true
+EOF
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$apps_dir" || true
+fi
+echo "Installed $apps_dir/power.desktop"
+
 # The daemon and client share one binary. Restart only a daemon running different bytes.
 # Restarting ends every session it hosts, including the tab this may run in.
 pattern='(^|/)power daemon$'
