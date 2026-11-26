@@ -9,7 +9,7 @@ use crate::{
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
     wire::{self, DagRequest, DagResponse, Request, Response},
-    workspace::LocalWorkspace,
+    workspace::{LocalWorkspace, LocalWorktreeRoot},
 };
 use anyhow::{Context, Result, bail, ensure};
 use application::{Application, PublishArtifact, ResolveArtifact, StartSession};
@@ -72,7 +72,7 @@ struct Server {
     dag: Arc<DaemonDag>,
 }
 
-pub fn serve(profiles: AgentProfiles) -> Result<()> {
+pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
         .parent()
@@ -144,12 +144,10 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
-    let dag = Arc::new(DaemonDag::new(
-        application.clone(),
-        store,
-        BoxesFile,
-        IconFiles::open()?,
-    ));
+    let dag = Arc::new(
+        DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
+            .with_worktree_root(worktree_root),
+    );
     terminal_application
         .set(Arc::downgrade(&application))
         .expect("connect terminal callbacks to the application once");

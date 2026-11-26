@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use domain::{artifact, dag, session};
+use domain::{artifact, dag, session, worktree};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{BufRead, BufReader, Write},
@@ -565,6 +565,154 @@ pub struct BoxAttention {
     pub agents: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorktreeRequest {
+    New {
+        branch: String,
+        base: Option<String>,
+    },
+    RetryManaged,
+    /// Existing paths retain the original string representation on the wire.
+    #[serde(untagged)]
+    Existing(PathBuf),
+}
+
+impl From<WorktreeRequest> for worktree::WorktreeRequest {
+    fn from(value: WorktreeRequest) -> Self {
+        match value {
+            WorktreeRequest::New { branch, base } => Self::New { branch, base },
+            WorktreeRequest::RetryManaged => Self::RetryManaged,
+            WorktreeRequest::Existing(path) => Self::Existing(path),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorktreeScope {
+    All,
+    Box { selector: String },
+    View { session: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ManagedWorktree {
+    pub box_id: String,
+    pub repository: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+    pub created_at: u64,
+    pub creator: WorktreeCreator,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorktreeCreator {
+    Attempt {
+        run: String,
+        task: String,
+        attempt: String,
+    },
+    View {
+        box_id: String,
+        session: String,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WorktreePruneEntry {
+    pub worktree: ManagedWorktree,
+    pub verdict: PruneVerdict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum PruneVerdict {
+    Remove,
+    Keep(KeepReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepReason {
+    Dirty,
+    Unmerged,
+    InUse,
+    NoLongerManaged,
+}
+
+impl From<worktree::ManagedWorktree> for ManagedWorktree {
+    fn from(value: worktree::ManagedWorktree) -> Self {
+        Self {
+            box_id: value.box_id,
+            repository: value.repository,
+            path: value.path,
+            branch: value.branch,
+            base_commit: value.base_commit,
+            created_at: value.created_at,
+            creator: match value.creator {
+                worktree::WorktreeCreator::Attempt { run, task, attempt } => {
+                    WorktreeCreator::Attempt { run, task, attempt }
+                }
+                worktree::WorktreeCreator::View { box_id, session } => {
+                    WorktreeCreator::View { box_id, session }
+                }
+            },
+        }
+    }
+}
+
+impl From<ManagedWorktree> for worktree::ManagedWorktree {
+    fn from(value: ManagedWorktree) -> Self {
+        Self {
+            box_id: value.box_id,
+            repository: value.repository,
+            path: value.path,
+            branch: value.branch,
+            base_commit: value.base_commit,
+            created_at: value.created_at,
+            creator: match value.creator {
+                WorktreeCreator::Attempt { run, task, attempt } => {
+                    worktree::WorktreeCreator::Attempt { run, task, attempt }
+                }
+                WorktreeCreator::View { box_id, session } => {
+                    worktree::WorktreeCreator::View { box_id, session }
+                }
+            },
+        }
+    }
+}
+
+impl From<worktree::PruneVerdict> for PruneVerdict {
+    fn from(value: worktree::PruneVerdict) -> Self {
+        match value {
+            worktree::PruneVerdict::Remove => Self::Remove,
+            worktree::PruneVerdict::Keep(reason) => Self::Keep(match reason {
+                worktree::KeepReason::Dirty => KeepReason::Dirty,
+                worktree::KeepReason::Unmerged => KeepReason::Unmerged,
+                worktree::KeepReason::InUse => KeepReason::InUse,
+                worktree::KeepReason::NoLongerManaged => KeepReason::NoLongerManaged,
+            }),
+        }
+    }
+}
+
+impl From<PruneVerdict> for worktree::PruneVerdict {
+    fn from(value: PruneVerdict) -> Self {
+        match value {
+            PruneVerdict::Remove => Self::Remove,
+            PruneVerdict::Keep(reason) => Self::Keep(match reason {
+                KeepReason::Dirty => worktree::KeepReason::Dirty,
+                KeepReason::Unmerged => worktree::KeepReason::Unmerged,
+                KeepReason::InUse => worktree::KeepReason::InUse,
+                KeepReason::NoLongerManaged => worktree::KeepReason::NoLongerManaged,
+            }),
+        }
+    }
+}
+
 /// DAG requests. They travel inside `Request::Dag`, so existing clients are unaffected.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -617,7 +765,7 @@ pub enum DagRequest {
         run: String,
         task: String,
         provider: Provider,
-        worktree: PathBuf,
+        worktree: WorktreeRequest,
         /// Required to start a new attempt after a failed or interrupted one.
         #[serde(default)]
         retry: bool,
@@ -625,6 +773,19 @@ pub enum DagRequest {
         #[serde(default)]
         args: Vec<String>,
         caller: Option<String>,
+    },
+    CreateViewWorktree {
+        box_sel: String,
+        from_session: String,
+        branch: String,
+    },
+    ListManagedWorktrees {
+        scope: WorktreeScope,
+    },
+    PruneWorktrees {
+        scope: WorktreeScope,
+        dry_run: bool,
+        delete_branch: bool,
     },
     Report {
         run: String,
@@ -678,6 +839,17 @@ pub enum DagResponse {
     Dispatched {
         attempt: Attempt,
         agent: Box<ManagedAgent>,
+        /// Present for a newly created or resumed managed checkout.
+        branch: Option<String>,
+    },
+    ViewWorktreeCreated {
+        path: PathBuf,
+    },
+    ManagedWorktrees {
+        worktrees: Vec<ManagedWorktree>,
+    },
+    WorktreesPruned {
+        entries: Vec<WorktreePruneEntry>,
     },
     Reported {
         applied: bool,
