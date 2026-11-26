@@ -4,7 +4,7 @@ mod picker;
 mod preview;
 mod settings;
 mod status_bar;
-mod terminal_view;
+mod terminal;
 
 use anyhow::{Context, Result};
 use application::{

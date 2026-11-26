@@ -1,4 +1,4 @@
-use crate::terminal_view::terminal_font_family;
+use crate::terminal::terminal_font_family;
 use gpui::{prelude::*, *};
 use infrastructure::plugins::{
     ActiveView,
