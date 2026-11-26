@@ -39,11 +39,16 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// The most columns or rows a PTY grid may have.
+    pub const MAX_CELLS: u16 = 500;
+    /// The widest or tallest a cell may be, in device pixels.
+    pub const MAX_CELL_PIXELS: u16 = 100;
+
     pub fn is_valid(self) -> bool {
-        (1..=500).contains(&self.cols)
-            && (1..=500).contains(&self.rows)
-            && (1..=100).contains(&self.cell_width)
-            && (1..=100).contains(&self.cell_height)
+        (1..=Self::MAX_CELLS).contains(&self.cols)
+            && (1..=Self::MAX_CELLS).contains(&self.rows)
+            && (1..=Self::MAX_CELL_PIXELS).contains(&self.cell_width)
+            && (1..=Self::MAX_CELL_PIXELS).contains(&self.cell_height)
     }
 }
 

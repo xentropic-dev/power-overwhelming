@@ -1,6 +1,6 @@
 use super::{
-    BoxRegistry, BranchStatus, DagApplication, DagStore, WorktreeCreator, default_worktree_path,
-    now, select_box,
+    BoxIcons, BoxRegistry, BranchStatus, DagApplication, DagStore, WorktreeCreator,
+    default_worktree_path, now, select_box,
 };
 use crate::TerminalRuntime;
 use anyhow::{Context, Result, bail, ensure};
@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
+impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplication<T, S, B, I> {
     pub fn create_view_worktree(
         &self,
         box_selector: &str,

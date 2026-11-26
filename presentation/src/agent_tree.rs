@@ -64,10 +64,11 @@ impl AgentTree {
                 .file_name()
                 .unwrap_or(agent.worktree.as_os_str());
             let text = format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 agent.label,
                 agent.task.as_deref().unwrap_or(""),
                 agent.provider.name(),
+                agent.model.as_deref().unwrap_or(""),
                 worktree.to_string_lossy()
             );
             if let Some(score) = pattern.score(Utf32Str::new(&text, &mut buffer), matcher) {
@@ -86,6 +87,25 @@ impl AgentTree {
             .filter_map(|(row, &(index, _))| Some((Reverse(scores[index]?), row)))
             .min()
             .map_or(0, |(_, row)| row)
+    }
+
+    pub fn replace(&mut self, agents: Vec<ManagedAgent>) -> bool {
+        if self.agents == agents {
+            return false;
+        }
+        let mut tree = Self::new(agents);
+        let collapsed: HashSet<_> = self
+            .collapsed
+            .iter()
+            .map(|&index| self.agents[index].id.as_str())
+            .collect();
+        tree.collapsed.extend(
+            tree.agents.iter().enumerate().filter_map(|(index, agent)| {
+                collapsed.contains(agent.id.as_str()).then_some(index)
+            }),
+        );
+        *self = tree;
+        true
     }
 
     fn rebuild(&mut self, included: impl Fn(usize) -> bool) {
@@ -161,6 +181,7 @@ mod tests {
             box_id: "box".into(),
             worktree: worktree.into(),
             provider,
+            model: None,
             parent: parent.map(str::to_owned),
             session: None,
             run: None,
@@ -174,13 +195,15 @@ mod tests {
 
     #[test]
     fn fuzzy_search_reveals_matches_and_ancestors_in_tree_order() {
+        let mut worker = agent(
+            "worker",
+            Some("delegate"),
+            Provider::Agent("claude".into()),
+            "/repo/api-fix",
+        );
+        worker.model = Some("sonnet-4".into());
         let mut tree = AgentTree::new(vec![
-            agent(
-                "worker",
-                Some("delegate"),
-                Provider::Agent("claude".into()),
-                "/repo/api-fix",
-            ),
+            worker,
             agent("delegator", None, Provider::Agent("codex".into()), "/repo"),
             agent(
                 "unrelated",
@@ -200,6 +223,7 @@ mod tests {
         assert_eq!(tree.branch(0, false), Some(0));
         assert_eq!(tree.rows().count(), 2);
         assert_eq!(tree.search("clade apfx", &mut matcher), 2);
+        assert_eq!(tree.search("sonnet-4", &mut matcher), 2);
         assert_eq!(
             tree.rows()
                 .map(|(agent, depth, _)| (agent.id.as_str(), depth))

@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use domain::agent::AgentProfile;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -12,10 +13,40 @@ pub struct SkillStub {
     pub shipped_hashes: &'static [&'static str],
 }
 
+/// Where an install writes: the shared folder, plus a link folder for each agent that does not
+/// read the shared folder natively.
 pub struct SkillTargets {
     pub shared: PathBuf,
-    pub claude: Option<PathBuf>,
+    pub links: Vec<PathBuf>,
     pub backups: PathBuf,
+}
+
+/// The `--agent` value that selects the shared folder alone.
+pub const UNIVERSAL_AGENT: &str = "universal";
+
+/// Profiles an install may link for. No request selects every profile; `universal` adds none.
+pub fn select_profiles<'a>(
+    profiles: &'a [AgentProfile],
+    requested: &[String],
+) -> Result<Vec<&'a AgentProfile>> {
+    if requested.is_empty() {
+        return Ok(profiles.iter().collect());
+    }
+    for id in requested {
+        if id != UNIVERSAL_AGENT && !profiles.iter().any(|profile| profile.id.as_str() == id) {
+            let known = profiles
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .chain([UNIVERSAL_AGENT])
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("Unknown agent {id:?}. Known agents: {known}");
+        }
+    }
+    Ok(profiles
+        .iter()
+        .filter(|profile| requested.iter().any(|id| id == profile.id.as_str()))
+        .collect())
 }
 
 pub enum SkillLocation {
@@ -236,12 +267,12 @@ impl InstallSkills<'_> {
                     )
             });
             outcomes.extend(shared_outcome);
-            if let Some(claude) = &targets.claude {
+            for links in &targets.links {
                 outcomes.extend(self.run_location(
                     files,
                     stub,
                     targets,
-                    &claude.join(name),
+                    &links.join(name),
                     Some((&shared, shared_available)),
                 ));
             }
@@ -306,6 +337,35 @@ impl InstallSkills<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::agent::Injection;
+
+    fn profile(id: &str) -> AgentProfile {
+        AgentProfile {
+            id: id.into(),
+            command: id.into(),
+            injection: Injection::None,
+            skip_subcommands: Vec::new(),
+            skip_if_args_contain: Vec::new(),
+            skills_dir: None,
+            resume: None,
+        }
+    }
+
+    #[test]
+    fn agent_selection_uses_profile_ids_and_universal() -> Result<()> {
+        let profiles = [profile("claude"), profile("grok")];
+        let ids = |selected: Vec<&AgentProfile>| -> Vec<String> {
+            selected
+                .into_iter()
+                .map(|profile| profile.id.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids(select_profiles(&profiles, &[])?), ["claude", "grok"]);
+        assert_eq!(ids(select_profiles(&profiles, &["grok".into()])?), ["grok"]);
+        assert!(select_profiles(&profiles, &["universal".into()])?.is_empty());
+        assert!(select_profiles(&profiles, &["cursor".into()]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn planner_requires_an_exact_hash_and_a_single_file() {

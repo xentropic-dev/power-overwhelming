@@ -1,5 +1,5 @@
 use super::*;
-use crate::WorktreeRoot;
+use crate::{MemorySessions, WorktreeRoot};
 use domain::worktree::{KeepReason, PruneVerdict, WorktreeCreator};
 use std::fs;
 
@@ -123,7 +123,8 @@ impl Drop for TempRoot {
 fn fixture(workspace: WorktreeWorkspace) -> Result<(TestDag, Session)> {
     static ID: AtomicU64 = AtomicU64::new(0);
     let application = Arc::new(Application::new(
-        FakeArtifacts,
+        FakeArtifacts::default(),
+        Arc::new(MemorySessions::default()),
         workspace,
         FakeTerminal::default(),
         Arc::new(FakeProfiles(Vec::new())),
@@ -134,6 +135,7 @@ fn fixture(workspace: WorktreeWorkspace) -> Result<(TestDag, Session)> {
         application,
         MemoryStore::default(),
         FakeRegistry(vec![source.id.clone()]),
+        FakeIcons::default(),
     );
     Ok((dag, source))
 }
@@ -269,12 +271,14 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 session: None,
                 worktree: worktree.path.clone(),
                 provider: Provider::Command,
+                model: None,
                 state,
                 summary: None,
                 blocker: None,
                 detail: None,
                 started_at: 0,
                 ended_at: None,
+                artifacts: Vec::new(),
             },
         )
     })
