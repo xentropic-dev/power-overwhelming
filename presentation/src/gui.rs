@@ -25,7 +25,8 @@ use infrastructure::{
     box_icons::icon_path,
     boxes::{Layout, Registry, SavedBox, SavedView},
     client::{
-        self, Attempt, ManagedAgent, ManagedWorktree, Run, Task, WorktreeCreator, WorktreeScope,
+        self, Attempt, ManagedAgent, ManagedWorktree, Run, RunStatus, Task, WorktreeCreator,
+        WorktreeScope,
     },
     plugins::ActiveView,
     shell::{self, Shell},
@@ -854,12 +855,15 @@ impl Workspace {
         } else if let Some(picker) = self.picker.as_mut().filter(|picker| picker.id == id) {
             let initial = std::mem::take(&mut picker.loading);
             match result {
-                Ok(DagSnapshot::Runs(mut runs)) => {
-                    if initial && runs.len() == 1 {
-                        if let Some(run) = runs.pop() {
+                Ok(DagSnapshot::Runs(runs)) => {
+                    if initial {
+                        let mut active =
+                            runs.iter().filter(|run| run.status() == RunStatus::Active);
+                        if let (Some(run), None) = (active.next(), active.next()) {
+                            let run = run.clone();
                             self.open_dag(run, window, cx);
+                            return;
                         }
-                        return;
                     }
                     picker.message = runs.is_empty().then(|| "This box has no DAG runs.".into());
                     picker.set_runs(runs);

@@ -340,7 +340,7 @@ pub fn ensure_daemon() -> Result<()> {
 pub use crate::wire::WorktreeScope;
 pub use domain::dag::{
     AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, ManagedAgent, Provider,
-    ReportStatus, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState,
+    ReportStatus, Run, RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState,
 };
 pub use domain::worktree::{KeepReason, ManagedWorktree, PruneVerdict, WorktreeCreator};
 
@@ -349,7 +349,7 @@ pub mod protocol {
     pub use crate::wire::{
         AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, DagRequest,
         DagResponse, ManagedAgent, ManagedWorktree, Provider, ReportStatus, Run, RunEvent,
-        RunEventKind, Task, TaskSpec, TaskState, WorktreeRequest, WorktreeScope,
+        RunEventKind, RunStatus, Task, TaskSpec, TaskState, WorktreeRequest, WorktreeScope,
     };
 }
 
