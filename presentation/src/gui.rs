@@ -24,11 +24,15 @@ use infrastructure::{
     agents::AgentProfiles,
     box_icons::icon_path,
     boxes::{Layout, Registry, SavedBox, SavedView},
-    client::{self, ManagedAgent, Run},
+    client::{
+        self, Attempt, ManagedAgent, ManagedWorktree, Run, Task, WorktreeCreator, WorktreeScope,
+    },
     plugins::ActiveView,
     shell::{self, Shell},
     theme::{self, Colors, Scheme},
-    workspace::{Checkout, main_checkout, repository_worktrees},
+    workspace::{
+        Checkout, WorktreeHead, main_checkout, repository_worktree_details, repository_worktrees,
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -55,14 +59,59 @@ enum Prefix {
 
 enum DagQuery {
     Runs(String),
-    Run(String),
+    Run { id: String, repository: PathBuf },
     Agents(String),
 }
 
 enum DagSnapshot {
     Runs(Vec<Run>),
-    Run(Run),
+    Run(Run, Box<DagWorktrees>),
     Agents(Vec<ManagedAgent>),
+}
+
+#[derive(Default, PartialEq)]
+struct DagWorktrees {
+    heads: HashMap<PathBuf, WorktreeHead>,
+    managed: Option<HashMap<PathBuf, ManagedWorktree>>,
+}
+
+impl DagWorktrees {
+    fn load(repository: &Path) -> Self {
+        Self {
+            heads: repository_worktree_details(repository)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|worktree| Some((worktree.path, worktree.head?)))
+                .collect(),
+            managed: managed_worktrees(repository).ok(),
+        }
+    }
+
+    fn details(&self, run: &str, task: &Task, attempt: &Attempt) -> (String, &'static str) {
+        let worktree = self
+            .managed
+            .as_ref()
+            .and_then(|worktrees| worktrees.get(&attempt.worktree));
+        let branch = match self.heads.get(&attempt.worktree) {
+            Some(WorktreeHead::Branch(branch)) => branch.clone(),
+            Some(WorktreeHead::Detached) => "Detached HEAD".into(),
+            None => {
+                worktree.map_or_else(|| "Unavailable".into(), |worktree| worktree.branch.clone())
+            }
+        };
+        let creator = match worktree.map(|worktree| &worktree.creator) {
+            Some(WorktreeCreator::Attempt {
+                run: creator_run,
+                task: creator_task,
+                ..
+            }) if creator_run == run && creator_task == &task.id => "Yes, for this task",
+            Some(WorktreeCreator::Attempt { .. }) => "Yes, for another task",
+            Some(WorktreeCreator::View { .. }) => "Yes, from a tab",
+            None if self.managed.is_some() => "No",
+            None => "Unavailable",
+        };
+        (branch, creator)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -712,7 +761,11 @@ impl Workspace {
                                 DagQuery::Runs(box_id) => {
                                     client::list_runs(Some(box_id), None).map(DagSnapshot::Runs)
                                 }
-                                DagQuery::Run(run) => client::get_run(run).map(DagSnapshot::Run),
+                                DagQuery::Run { id, repository } => {
+                                    let run = client::get_run(id)?;
+                                    let worktrees = DagWorktrees::load(&repository);
+                                    Ok(DagSnapshot::Run(run, Box::new(worktrees)))
+                                }
                                 DagQuery::Agents(box_id) => {
                                     client::list_agents(Some(box_id), None).map(DagSnapshot::Agents)
                                 }
@@ -754,7 +807,13 @@ impl Workspace {
 
     fn dag_query(&self) -> Option<(u64, DagQuery)> {
         if let Some(dag) = &self.dag {
-            return Some((dag.id, DagQuery::Run(dag.run.id.clone())));
+            return Some((
+                dag.id,
+                DagQuery::Run {
+                    id: dag.run.id.clone(),
+                    repository: self.active_box()?.repository.clone(),
+                },
+            ));
         }
         let picker = self.picker.as_ref()?;
         let query = match &picker.kind {
@@ -774,8 +833,9 @@ impl Workspace {
     ) {
         if let Some(dag) = self.dag.as_mut().filter(|dag| dag.id == id) {
             match result {
-                Ok(DagSnapshot::Run(run)) => {
-                    let changed = dag.refresh_error.take().is_some();
+                Ok(DagSnapshot::Run(run, worktrees)) => {
+                    let changed = dag.refresh_error.take().is_some() || dag.worktrees != *worktrees;
+                    dag.worktrees = *worktrees;
                     if dag.run != run {
                         dag.set_run(run);
                     } else if !changed {
@@ -1555,25 +1615,61 @@ impl Workspace {
             return;
         };
         let repository = entry.repository.clone();
-        let id = self.open_picker(Kind::Worktrees(entry.id.clone()), Vec::new(), window, cx);
+        let rows = entry
+            .active_view
+            .iter()
+            .map(|session| Row {
+                label: "New worktree".into(),
+                detail: String::new(),
+                choice: Choice::NewWorktree(session.clone()),
+            })
+            .collect();
+        let id = self.open_picker(Kind::Worktrees(entry.id.clone()), rows, window, cx);
         self.load_picker_rows(
             id,
             "Looking up worktrees…",
             "No available worktrees.",
             window,
             cx,
-            move || {
-                Ok(repository_worktrees(&repository)?
-                    .into_iter()
-                    .filter(|path| path != &repository && path.is_dir())
-                    .map(|path| Row {
-                        label: path_name(&path),
-                        detail: path.display().to_string(),
-                        choice: Choice::Worktree(path),
-                    })
-                    .collect())
-            },
+            move || worktree_rows(&repository),
         );
+    }
+
+    fn create_worktree(
+        &mut self,
+        box_id: String,
+        from_session: String,
+        branch: String,
+        picker_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let picker = self.picker.as_mut().unwrap();
+        picker.waiting = true;
+        picker.message = Some("Creating worktree…".into());
+        cx.notify();
+        let source_box = box_id.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::create_view_worktree(source_box, from_session, branch) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update_in(cx, |this, window, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|picker| picker.id == picker_id)
+                else {
+                    return;
+                };
+                picker.waiting = false;
+                match result {
+                    Ok(path) => {
+                        picker.worktree_created(path.clone());
+                        this.launch(path, Some(box_id), Some(picker_id), window, cx);
+                    }
+                    Err(error) => this.show_error(format!("{error:#}"), cx),
+                }
+            });
+        })
+        .detach();
     }
 
     fn open_status_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1656,8 +1752,8 @@ impl Workspace {
                 picker.loading = false;
                 match result {
                     Ok(rows) => {
-                        picker.message = rows.is_empty().then(|| empty.to_owned());
-                        picker.rows = rows;
+                        picker.rows.extend(rows);
+                        picker.message = picker.rows.is_empty().then(|| empty.to_owned());
                     }
                     Err(error) => picker.message = Some(format!("{error:#}")),
                 }
@@ -1735,8 +1831,39 @@ impl Workspace {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.dismiss_picker(window, cx);
             }
-            Choice::Worktree(path) => {
+            Choice::NewWorktree(from_session) => {
                 if let Kind::Worktrees(box_id) = &picker.kind {
+                    self.open_picker(
+                        Kind::NewWorktree {
+                            box_id: box_id.clone(),
+                            from_session,
+                            created: false,
+                        },
+                        Vec::new(),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Choice::CreateWorktree(branch) => {
+                if let Kind::NewWorktree {
+                    box_id,
+                    from_session,
+                    ..
+                } = &picker.kind
+                {
+                    self.create_worktree(
+                        box_id.clone(),
+                        from_session.clone(),
+                        branch,
+                        picker.id,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Choice::Worktree(path) => {
+                if let Kind::Worktrees(box_id) | Kind::NewWorktree { box_id, .. } = &picker.kind {
                     self.launch(path, Some(box_id.clone()), Some(picker.id), window, cx);
                 }
             }
@@ -2072,13 +2199,14 @@ impl Workspace {
                     if event.is_held || picker.waiting {
                         return;
                     }
-                    if picker.loading {
+                    let choice = picker.selection();
+                    if picker.loading && !matches!(choice, Some(Choice::NewWorktree(_))) {
                         picker.accept_pending = true;
                     } else if let Kind::End { session, .. } = &picker.kind {
                         let id = session.clone();
                         self.dismiss_picker(window, cx);
                         self.end_session(id, window, cx);
-                    } else if let Some(choice) = picker.selection() {
+                    } else if let Some(choice) = choice {
                         self.choose(choice, window, cx);
                     }
                 }
@@ -2464,6 +2592,53 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+}
+
+fn managed_worktrees(repository: &Path) -> Result<HashMap<PathBuf, ManagedWorktree>> {
+    Ok(client::list_managed_worktrees(WorktreeScope::All)?
+        .into_iter()
+        .filter(|worktree| worktree.repository == repository)
+        .map(|worktree| (worktree.path.clone(), worktree))
+        .collect())
+}
+
+fn worktree_rows(repository: &Path) -> Result<Vec<Row>> {
+    let paths = repository_worktrees(repository)?;
+    let managed = managed_worktrees(repository).unwrap_or_else(|error| {
+        eprintln!("Could not list Power-created worktrees. {error:#}");
+        HashMap::new()
+    });
+    let mut runs = HashMap::new();
+    Ok(paths
+        .into_iter()
+        .filter(|path| path != repository && path.is_dir())
+        .map(|path| {
+            let detail = match managed.get(&path) {
+                Some(worktree) => {
+                    let creator = match &worktree.creator {
+                        WorktreeCreator::View { .. } => "tab".into(),
+                        WorktreeCreator::Attempt { run, task, .. } => runs
+                            .entry(run)
+                            .or_insert_with(|| client::get_run(run.clone()).ok())
+                            .as_ref()
+                            .and_then(|run| run.tasks.iter().find(|entry| &entry.id == task))
+                            .map_or_else(|| format!("Task {task}"), |entry| entry.title.clone()),
+                    };
+                    format!(
+                        "Power-created · {} · {creator} · {}",
+                        worktree.branch,
+                        path.display()
+                    )
+                }
+                None => path.display().to_string(),
+            };
+            Row {
+                label: path_name(&path),
+                detail,
+                choice: Choice::Worktree(path),
+            }
+        })
+        .collect())
 }
 
 fn path_name(path: &Path) -> String {

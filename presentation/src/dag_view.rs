@@ -1,3 +1,4 @@
+use super::DagWorktrees;
 use crate::keymap::{Command, Keymap, Scope};
 use domain::dag::AttemptArtifact;
 use gpui::{prelude::*, *};
@@ -246,6 +247,7 @@ pub(super) struct DagView {
     pub opening: bool,
     pub message: Option<String>,
     pub refresh_error: Option<String>,
+    pub worktrees: DagWorktrees,
     /// Waiting for a digit that picks one of several listed artifacts.
     pub picking_artifact: bool,
     graph: GraphLayout,
@@ -265,6 +267,7 @@ impl DagView {
             opening: false,
             message: None,
             refresh_error: None,
+            worktrees: DagWorktrees::default(),
             picking_artifact: false,
             selected,
             viewport: GraphViewport::new(),
@@ -456,7 +459,14 @@ impl DagView {
                             .border_y_1()
                             .border_color(rgb(colors.border))
                             .child(self.graph_elements(colors, graph_action))
-                            .child(details(colors, task, self.picking_artifact, open_artifact))
+                            .child(details(
+                                colors,
+                                task,
+                                &self.worktrees,
+                                &self.run.id,
+                                self.picking_artifact,
+                                open_artifact,
+                            ))
                             .into_any_element()
                     } else {
                         div()
@@ -709,6 +719,8 @@ fn numbered_artifact(attempt: &Attempt, number: usize) -> Option<&AttemptArtifac
 fn details(
     colors: &Colors,
     task: &Task,
+    worktrees: &DagWorktrees,
+    run_id: &str,
     picking: bool,
     open_artifact: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
@@ -722,8 +734,11 @@ fn details(
         if let Some(model) = &attempt.model {
             fields.push(("Model", model.clone()));
         }
+        let (branch, creator) = worktrees.details(run_id, task, attempt);
         fields.extend([
             ("Worktree", attempt.worktree.display().to_string()),
+            ("Branch", branch),
+            ("Power-created", creator.into()),
             (
                 "Session",
                 attempt
