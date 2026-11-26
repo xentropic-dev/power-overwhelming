@@ -1,13 +1,13 @@
 //! Terminal cell metrics measured from the font, as Ghostty sizes its grid.
 //!
 //! Adapted from herdr-app `src/terminal.rs` (`font_cell_metrics`, `adjusted_cell_width`,
-//! `adjusted_cell_height`, `glyph_x` and `text_origin`), licensed under the Apache License,
+//! `adjusted_cell_height` and `glyph_x`), licensed under the Apache License,
 //! Version 2.0. herdr reads the font tables through a patched GPUI; this port finds the font
 //! file with `fontdb` and reads it with `ttf-parser`, and falls back to what stock GPUI
 //! reports when the file can't be found.
 
 use domain::session::Geometry;
-use gpui::{Font, FontId, LineLayout, Pixels, Point, Size, TextSystem, point, px, size};
+use gpui::{Font, FontId, Pixels, Point, Size, TextSystem, point, px, size};
 use std::{cell::RefCell, collections::HashMap, sync::LazyLock};
 
 /// The font the terminal grid is measured from.
@@ -110,14 +110,6 @@ impl CellMetrics {
                 self.size.height * row as f32,
             )
     }
-
-    /// Where shaped text paints from so that its baseline sits on the cell's, moved across by
-    /// `glyph_x`. GPUI centres a line's ascent and descent in the line height it paints with,
-    /// so pass the cell height as that line height.
-    pub fn text_origin(&self, line: &LineLayout, origin: Point<Pixels>) -> Point<Pixels> {
-        let gpui_baseline = (self.size.height - line.ascent - line.descent) / 2. + line.ascent;
-        origin + point(self.glyph_x, self.baseline - gpui_baseline)
-    }
 }
 
 /// Measures the grid for `font` at the window's scale. Results are cached per font, size,
@@ -183,16 +175,31 @@ struct FaceMetrics {
     advance: f32,
 }
 
-/// The system's fonts, for reading tables GPUI doesn't expose.
+/// The system's fonts and the bundled one, for reading tables GPUI doesn't expose.
 static FONT_FILES: LazyLock<fontdb::Database> = LazyLock::new(|| {
     let mut fonts = fontdb::Database::new();
     fonts.load_system_fonts();
+    fonts.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(
+        super::BUNDLED_FONT,
+    )));
     fonts
 });
 
 /// Loads the system font list on another thread, so the first measurement doesn't wait.
 pub fn preload_font_files() {
     std::thread::spawn(|| LazyLock::force(&FONT_FILES));
+}
+
+/// Whether the system's fonts or the bundled one have a face of `family`. GPUI's own font list
+/// appends its fallback names, so it can't answer this.
+pub fn has_family(family: &str) -> bool {
+    database_has_family(&FONT_FILES, family)
+}
+
+fn database_has_family(fonts: &fontdb::Database, family: &str) -> bool {
+    fonts
+        .faces()
+        .any(|face| face.families.iter().any(|(name, _)| name == family))
 }
 
 impl FaceMetrics {
@@ -442,6 +449,36 @@ mod tests {
 
     fn jetbrains_mono() -> FaceMetrics {
         FaceMetrics::from_face(&ttf_parser::Face::parse(JETBRAINS_MONO, 0).unwrap())
+    }
+
+    /// A database holding the bundled face renamed to each of `families`.
+    fn database_with(families: &[&str]) -> fontdb::Database {
+        let mut source = fontdb::Database::new();
+        source.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(JETBRAINS_MONO)));
+        let template = source.faces().next().unwrap().clone();
+        let mut fonts = fontdb::Database::new();
+        for family in families {
+            let mut face = template.clone();
+            face.families = vec![(family.to_string(), fontdb::Language::English_UnitedStates)];
+            fonts.push_face_info(face);
+        }
+        fonts
+    }
+
+    /// An installed family GPUI also lists in its fallback stack is still installed, and a
+    /// missing one isn't, whatever else the machine has.
+    #[test]
+    fn installed_families_are_found_in_fontdb_even_when_gpui_lists_them() {
+        let installed = database_with(&["Noto Sans", "Helvetica", "Liberation Mono"]);
+        for family in ["Noto Sans", "Helvetica", "Liberation Mono"] {
+            assert!(database_has_family(&installed, family), "{family}");
+        }
+        assert!(!database_has_family(&installed, "No Such Font"));
+        assert!(!database_has_family(&database_with(&[]), "Noto Sans"));
+        let liberation_only = database_with(&["Liberation Sans", "Liberation Mono"]);
+        for family in ["Noto Sans", "Helvetica"] {
+            assert!(!database_has_family(&liberation_only, family), "{family}");
+        }
     }
 
     /// Ghostty's grid for JetBrains Mono (1000 units per em, hhea 1020/-300/0, 600 advance,

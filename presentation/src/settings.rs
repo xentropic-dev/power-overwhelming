@@ -86,7 +86,7 @@ pub enum ClipboardWrite {
 /// The `terminal` table: font, grid and behaviour of terminal views.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalSettings {
-    /// A font family name; unset picks JetBrains Mono when installed, else `monospace`.
+    /// A font family name; unset, or one GPUI can't find, picks JetBrains Mono (bundled).
     pub font_family: Option<String>,
     /// In logical pixels, 6–72.
     pub font_size: f32,
