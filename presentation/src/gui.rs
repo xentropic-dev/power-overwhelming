@@ -24,7 +24,7 @@ use infrastructure::{
     agents::AgentProfiles,
     box_icons::icon_path,
     boxes::{Layout, Registry, SavedBox, SavedView},
-    client::{self, Run},
+    client::{self, ManagedAgent, Run},
     plugins::ActiveView,
     shell::{self, Shell},
     theme::{self, Colors, Scheme},
@@ -56,11 +56,13 @@ enum Prefix {
 enum DagQuery {
     Runs(String),
     Run(String),
+    Agents(String),
 }
 
 enum DagSnapshot {
     Runs(Vec<Run>),
     Run(Run),
+    Agents(Vec<ManagedAgent>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -675,6 +677,9 @@ impl Workspace {
                                     client::list_runs(Some(box_id), None).map(DagSnapshot::Runs)
                                 }
                                 DagQuery::Run(run) => client::get_run(run).map(DagSnapshot::Run),
+                                DagQuery::Agents(box_id) => {
+                                    client::list_agents(Some(box_id), None).map(DagSnapshot::Agents)
+                                }
                             }
                         })
                         .await;
@@ -716,10 +721,12 @@ impl Workspace {
             return Some((dag.id, DagQuery::Run(dag.run.id.clone())));
         }
         let picker = self.picker.as_ref()?;
-        if let Kind::Runs { box_id, .. } = &picker.kind {
-            return Some((picker.id, DagQuery::Runs(box_id.clone())));
-        }
-        None
+        let query = match &picker.kind {
+            Kind::Runs { box_id, .. } => DagQuery::Runs(box_id.clone()),
+            Kind::Agents { box_id, .. } => DagQuery::Agents(box_id.clone()),
+            _ => return None,
+        };
+        Some((picker.id, query))
     }
 
     fn update_dag(
@@ -760,17 +767,28 @@ impl Workspace {
                     }
                     picker.message = runs.is_empty().then(|| "This box has no DAG runs.".into());
                     picker.set_runs(runs);
-                    if std::mem::take(&mut picker.accept_pending)
-                        && let Some(choice) = picker.selection()
-                    {
-                        self.choose(choice, window, cx);
-                    }
+                }
+                Ok(DagSnapshot::Agents(agents)) => {
+                    picker.message = agents
+                        .is_empty()
+                        .then(|| "This box has no managed agents.".into());
+                    picker.set_agents(agents);
                 }
                 Err(error) => {
                     picker.accept_pending = false;
-                    picker.message = Some(format!("Could not list runs. {error:#}"));
+                    let name = if matches!(picker.kind, Kind::Agents { .. }) {
+                        "agents"
+                    } else {
+                        "runs"
+                    };
+                    picker.message = Some(format!("Could not list {name}. {error:#}"));
                 }
                 _ => return,
+            }
+            if std::mem::take(&mut picker.accept_pending)
+                && let Some(choice) = picker.selection()
+            {
+                self.choose(choice, window, cx);
             }
         } else {
             return;
@@ -1412,9 +1430,9 @@ impl Workspace {
         let Some(box_id) = self.layout.active_box.clone() else {
             return;
         };
-        let id = self.open_picker(
+        self.open_picker(
             Kind::Agents {
-                box_id: box_id.clone(),
+                box_id,
                 tree: AgentTree::default(),
             },
             Vec::new(),
@@ -1425,36 +1443,7 @@ impl Workspace {
             picker.loading = true;
             picker.message = Some("Looking up agents…".into());
         }
-        let agents = cx
-            .background_executor()
-            .spawn(async move { client::list_agents(Some(box_id), None) });
-        cx.spawn_in(window, async move |app, cx| {
-            let result = agents.await;
-            let _ = app.update_in(cx, |this, window, cx| {
-                let Some(picker) = this.picker.as_mut().filter(|picker| picker.id == id) else {
-                    return;
-                };
-                picker.loading = false;
-                match result {
-                    Ok(agents) => {
-                        picker.message = agents
-                            .is_empty()
-                            .then(|| "This box has no managed agents.".into());
-                        picker.set_agent_tree(AgentTree::new(agents));
-                    }
-                    Err(error) => {
-                        picker.message = Some(format!("Could not list agents. {error:#}"))
-                    }
-                }
-                if std::mem::take(&mut picker.accept_pending)
-                    && let Some(choice) = picker.selection()
-                {
-                    this.choose(choice, window, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        let _ = self.dag_refresh.try_send(());
     }
 
     fn open_worker(

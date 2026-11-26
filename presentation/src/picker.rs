@@ -2,7 +2,10 @@ use crate::{gui::agent_tree::AgentTree, keymap::Shortcut};
 use domain::session::Session;
 use gpui::{prelude::*, *};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use infrastructure::{client::Run, theme::Scheme};
+use infrastructure::{
+    client::{ManagedAgent, Run},
+    theme::Scheme,
+};
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{AtomKind, CaseMatching, Normalization, Pattern},
@@ -376,15 +379,18 @@ impl Picker {
         if let Kind::Agents { tree, .. } = &self.kind {
             return tree
                 .rows()
-                .map(|(agent, depth, marker)| Row {
-                    label: format!("{}{marker} {}", " ".repeat(depth), agent.label),
-                    detail: format!(
-                        "{}{} · {}",
-                        " ".repeat(depth),
-                        agent.provider.name(),
-                        agent.worktree.display(),
-                    ),
-                    choice: Choice::Agent(agent.id.clone()),
+                .map(|(agent, depth, marker)| {
+                    let indent = " ".repeat(depth);
+                    let provider = agent.provider.name();
+                    let detail = match &agent.model {
+                        Some(model) => format!("{provider} · {model}"),
+                        None => provider.to_owned(),
+                    };
+                    Row {
+                        label: format!("{indent}{marker} {}", agent.label),
+                        detail: format!("{indent}{detail} · {}", agent.worktree.display()),
+                        choice: Choice::Agent(agent.id.clone()),
+                    }
                 })
                 .collect();
         }
@@ -459,10 +465,19 @@ impl Picker {
         }
     }
 
-    pub fn set_agent_tree(&mut self, mut new_tree: AgentTree) {
+    pub fn set_agents(&mut self, agents: Vec<ManagedAgent>) {
         if let Kind::Agents { tree, .. } = &mut self.kind {
-            self.selected = new_tree.search(&self.query, &mut self.matcher);
-            *tree = new_tree;
+            let previous = tree
+                .rows()
+                .nth(self.selected)
+                .map(|(agent, _, _)| agent.id.clone());
+            if !tree.replace(agents) {
+                return;
+            }
+            let best = tree.search(&self.query, &mut self.matcher);
+            self.selected = previous
+                .and_then(|id| tree.rows().position(|(agent, _, _)| agent.id == id))
+                .unwrap_or(best);
             self.scroll.scroll_to_item(self.selected);
         }
     }

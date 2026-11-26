@@ -96,6 +96,10 @@ pub trait TerminalRuntime: Send + Sync {
     /// The agent currently in the foreground, which can differ from the launched one
     /// when a shell starts an agent.
     fn agent(&self, handle: &Self::Handle) -> Option<Agent>;
+    /// Model reported or requested for the given foreground agent, when known.
+    fn model(&self, _handle: &Self::Handle, _agent: &Agent) -> Option<String> {
+        None
+    }
 }
 
 struct Live<H> {

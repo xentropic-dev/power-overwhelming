@@ -16,6 +16,7 @@
   ],
   "right": [
     { "text": "{agent.task}", "bg": "surface" },
+    { "text": "{agent.model}", "fg": "muted", "bg": "surface" },
     { "text": "{agent.type}", "fg": "contrast", "bg": "agent", "bold": true }
   ]
 }

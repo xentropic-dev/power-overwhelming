@@ -389,6 +389,8 @@ pub struct ManagedAgent {
     pub box_id: String,
     pub worktree: PathBuf,
     pub provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The delegating Power agent, if any.
     pub parent: Option<String>,
     /// The daemon terminal session, while it has one.
@@ -444,6 +446,8 @@ pub struct Attempt {
     pub session: Option<String>,
     pub worktree: PathBuf,
     pub provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub state: AttemptState,
     /// Result summary from the worker's final report.
     pub summary: Option<String>,
@@ -508,6 +512,7 @@ pub enum RunEventKind {
     TaskAdded,
     TaskReady,
     AttemptStarted,
+    AgentModelChanged,
     AttemptSucceeded,
     AttemptFailed,
     NeedsInput,
@@ -758,6 +763,7 @@ mod dag_dto {
         TaskAdded,
         TaskReady,
         AttemptStarted,
+        AgentModelChanged,
         AttemptSucceeded,
         AttemptFailed,
         NeedsInput,
@@ -779,6 +785,7 @@ mod dag_dto {
         box_id,
         worktree,
         provider,
+        model,
         parent,
         session,
         run,
@@ -795,6 +802,7 @@ mod dag_dto {
         session,
         worktree,
         provider,
+        model,
         state,
         summary,
         blocker,

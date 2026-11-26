@@ -619,6 +619,86 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
 }
 
 #[test]
+fn worker_models_follow_reports_and_survive_restart() {
+    let mut fixture = Fixture::with_configure(|root| {
+        let program = root.join("codex");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+test "$1" = "--model=launch-model"
+fixture_dir="${POWER_SOCKET%/*}"
+for phase in update finish; do
+    for step in $(seq 400); do
+        test ! -f "$fixture_dir/$phase" || break
+        sleep 0.05
+    done
+    test -f "$fixture_dir/$phase"
+    case "$phase" in
+        update) "$POWER_BIN" session model actual-model ;;
+        finish) "$POWER_BIN" dag report success --summary "Done" ;;
+    esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            format!(
+                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
+                program.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    });
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "model");
+    let (attempt, agent) = dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "model",
+        "--provider",
+        "codex",
+        "--worktree",
+        fixture.worktrees[0].to_str().unwrap(),
+        "--",
+        "--model=launch-model",
+    ]));
+    assert_eq!(attempt.model.as_deref(), Some("launch-model"));
+    assert_eq!(agent.model, attempt.model);
+    fixture.release("update");
+    let updated = poll("the model change", || {
+        fixture
+            .events(&run, 0, &["agent_model_changed"])
+            .events
+            .pop()
+    });
+    assert_eq!(updated.attempt.as_deref(), Some(attempt.id.as_str()));
+    assert_eq!(updated.summary.as_deref(), Some("actual-model"));
+    assert_eq!(
+        task(&fixture.show(&run), "model").attempts[0]
+            .model
+            .as_deref(),
+        Some("actual-model")
+    );
+    assert_eq!(fixture.agents()[0].model.as_deref(), Some("actual-model"));
+    fixture.release("finish");
+    fixture.wait_for_state(&run, "model", TaskState::Completed);
+    fixture.restart();
+    assert_eq!(
+        task(&fixture.show(&run), "model").attempts[0]
+            .model
+            .as_deref(),
+        Some("actual-model")
+    );
+    assert_eq!(fixture.agents()[0].model.as_deref(), Some("actual-model"));
+}
+
+#[test]
 fn background_workers_unlock_dependent_task_only_after_both_succeed() {
     let fixture = Fixture::new();
     let boxes: Vec<BoxInfo> =
