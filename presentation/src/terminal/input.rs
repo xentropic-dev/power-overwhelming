@@ -1,4 +1,4 @@
-use super::{HEIGHT, OpenLink, TerminalView};
+use super::{OpenLink, TerminalView};
 use ghostty_vt::{
     key::{self, Key},
     mouse,
@@ -33,28 +33,39 @@ impl TerminalView {
         let Ok(mut event) = mouse::Event::new() else {
             return;
         };
-        let local = position - self.bounds.origin;
-        let geometry = self.geometry.unwrap_or_default();
+        // Ghostty encodes surface positions in device pixels, padding included.
+        let metrics = self.metrics;
+        let pad = px(self.settings.padding);
+        let surface = Bounds::new(
+            self.bounds.origin - point(pad, pad),
+            self.bounds.size + size(pad * 2., pad * 2.),
+        );
+        let local = position - surface.origin;
+        let cell = metrics.device_size();
+        let (pad_left, pad_top) = (metrics.device_pixels(pad), metrics.device_pixels(pad));
+        let grid_width = metrics.device_pixels(self.bounds.size.width);
+        let grid_height = metrics.device_pixels(self.bounds.size.height);
         event
             .set_action(action)
             .set_button(Some(button))
             .set_mods(terminal_modifiers(modifiers));
         event.set_position(mouse::Position {
-            x: local.x.into(),
-            y: local.y.into(),
+            x: f32::from(local.x) * metrics.scale,
+            y: f32::from(local.y) * metrics.scale,
         });
         self.mouse
             .set_options_from_terminal(&self.terminal)
             .set_any_button_pressed(self.reporting_mouse)
             .set_size(mouse::EncoderSize {
-                screen_width: u32::from(geometry.cols) * u32::from(geometry.cell_width),
-                screen_height: u32::from(geometry.rows) * u32::from(geometry.cell_height),
-                cell_width: geometry.cell_width.into(),
-                cell_height: geometry.cell_height.into(),
-                padding_top: 0,
-                padding_bottom: 0,
-                padding_right: 0,
-                padding_left: 0,
+                screen_width: metrics.device_pixels(surface.size.width),
+                screen_height: metrics.device_pixels(surface.size.height),
+                cell_width: cell.width.max(1),
+                cell_height: cell.height.max(1),
+                padding_top: pad_top,
+                padding_left: pad_left,
+                // The grid's leftover space past its last whole cell counts as padding.
+                padding_right: metrics.device_pixels(pad) + grid_width % cell.width.max(1),
+                padding_bottom: metrics.device_pixels(pad) + grid_height % cell.height.max(1),
             });
         let mut bytes = Vec::new();
         if self.mouse.encode_to_vec(&event, &mut bytes).is_ok() {
@@ -258,7 +269,9 @@ impl TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let amount = -(f32::from(event.delta.pixel_delta(px(HEIGHT)).y) / HEIGHT).round() as isize;
+        let line = self.metrics.size.height;
+        let amount =
+            -(f32::from(event.delta.pixel_delta(line).y) / f32::from(line)).round() as isize;
         if amount != 0 {
             if !event.modifiers.shift && self.terminal.is_mouse_tracking().unwrap_or(false) {
                 let button = if amount < 0 {

@@ -8,3 +8,11 @@ Terminal implementation reference for the presentation crate.
 
 Source: https://github.com/herdrdev/herdr-app/tree/3e6d56448272064fd06ed95f5b7dc2cf70ea67b4
 License: Apache License, Version 2.0 (licenses/herdr-app.txt)
+
+JetBrains Mono
+--------------
+
+Font bundled at presentation/assets/fonts/JetBrainsMono-Variable.ttf for terminal metric tests.
+
+Source: https://github.com/JetBrains/JetBrainsMono
+License: SIL Open Font License, Version 1.1 (licenses/JetBrainsMono-OFL.txt)
