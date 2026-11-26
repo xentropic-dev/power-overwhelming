@@ -51,6 +51,9 @@ pub struct ResumeCommand {
     /// Shell function name, which is the agent profile ID.
     pub program: String,
     pub args: Vec<OsString>,
+    /// Conversation being resumed. With the agent it identifies the owner of the saved
+    /// labels, which only the agent resumed with this conversation shows again.
+    pub conversation: Option<String>,
     /// Arguments for a second call that starts a new conversation when the resume
     /// exits right away. `None` runs no second call.
     pub fallback: Option<Vec<OsString>>,
@@ -140,19 +143,21 @@ impl<T: TerminalRuntime> Application<T> {
             .end(live.context("Terminal session is unavailable")?.terminal)
     }
 
-    /// Saves the foreground state a restore resumes from.
+    /// Saves the foreground state a restore resumes from. With `labels`, the agent's
+    /// labels are saved in the same write, so they never belong to a different agent.
     pub fn record_foreground(
         &self,
         id: &str,
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&Labels>,
     ) -> Result<()> {
         self.records
-            .update_foreground(id, foreground, conversation, cwd)
+            .update_foreground(id, foreground, conversation, cwd, labels)
     }
 
-    /// Saves the task and model an agent reported, so a restore can show them again.
+    /// Saves the task and model an agent session reported, so a restore can show them again.
     pub fn record_labels(&self, id: &str, labels: &Labels) -> Result<()> {
         self.records.update_labels(id, labels)
     }

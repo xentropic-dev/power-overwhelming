@@ -68,8 +68,13 @@ pub fn set_model(session: String, value: String) -> Result<()> {
     })
 }
 
-/// Reports the conversation an agent wrapper is about to start, so a restore can resume it.
-pub fn set_conversation(session: String, agent: String, conversation: String) -> Result<()> {
+/// Reports that an agent wrapper is about to start the agent, and the conversation when it
+/// is known, so a restore can resume it and identify the agent that owns its labels.
+pub fn set_conversation(
+    session: String,
+    agent: String,
+    conversation: Option<String>,
+) -> Result<()> {
     expect_ok(&Request::SetConversation {
         session,
         agent,

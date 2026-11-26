@@ -239,11 +239,31 @@ impl SessionStore for SqliteSessions {
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&Labels>,
     ) -> Result<()> {
-        self.0.lock().unwrap().execute(
-            "UPDATE sessions SET foreground = ?2, conversation = ?3, cwd = ?4 WHERE id = ?1",
-            params![id, foreground.as_str(), conversation, cwd.map(path_bytes)],
-        )?;
+        let db = self.0.lock().unwrap();
+        let (foreground, cwd) = (foreground.as_str(), cwd.map(path_bytes));
+        // One statement, so the saved agent and its labels never come from different owners.
+        match labels {
+            Some(labels) => db.execute(
+                "UPDATE sessions SET foreground = ?2, conversation = ?3, cwd = ?4,
+                    task = ?5, model = ?6, model_reported = ?7
+                 WHERE id = ?1",
+                params![
+                    id,
+                    foreground,
+                    conversation,
+                    cwd,
+                    labels.task,
+                    labels.model,
+                    labels.model_reported
+                ],
+            )?,
+            None => db.execute(
+                "UPDATE sessions SET foreground = ?2, conversation = ?3, cwd = ?4 WHERE id = ?1",
+                params![id, foreground, conversation, cwd],
+            )?,
+        };
         Ok(())
     }
 
@@ -486,13 +506,22 @@ mod tests {
             &record.foreground,
             record.conversation.as_deref(),
             record.cwd.as_deref(),
+            None,
         )?;
+        // Without labels the saved ones are kept.
         assert_eq!(store.list()?, [record.clone()]);
 
-        store.update_foreground(&record.id, &Agent::Shell, None, None)?;
+        store.update_foreground(
+            &record.id,
+            &Agent::Shell,
+            None,
+            None,
+            Some(&Labels::default()),
+        )?;
         record.foreground = Agent::Shell;
         record.conversation = None;
         record.cwd = None;
+        record.labels = Labels::default();
         assert_eq!(store.list()?, [record]);
         Ok(())
     }
@@ -551,7 +580,7 @@ mod tests {
 
         store.remove("id")?;
         store.remove("id")?;
-        store.update_foreground("id", &Agent::Shell, None, None)?;
+        store.update_foreground("id", &Agent::Shell, None, None, None)?;
         assert_eq!(store.list()?, [other]);
         Ok(())
     }

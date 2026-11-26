@@ -30,13 +30,15 @@ pub struct SessionRecord {
 pub trait SessionStore: Send + Sync {
     /// Inserts or replaces a record, preserving its original position.
     fn save(&self, record: &SessionRecord) -> Result<()>;
-    /// Updates the observed foreground state if the record exists.
+    /// Updates the foreground state if the record exists. With `labels`, they replace
+    /// the saved labels in the same write. Without them the saved labels are kept.
     fn update_foreground(
         &self,
         id: &str,
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&Labels>,
     ) -> Result<()>;
     /// Updates the reported task and model if the record exists.
     fn update_labels(&self, id: &str, labels: &Labels) -> Result<()>;
@@ -66,12 +68,16 @@ impl SessionStore for MemorySessions {
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&Labels>,
     ) -> Result<()> {
         let mut records = self.0.lock().unwrap();
         if let Some(record) = records.iter_mut().find(|record| record.id == id) {
             record.foreground = foreground.clone();
             record.conversation = conversation.map(str::to_owned);
             record.cwd = cwd.map(Path::to_path_buf);
+            if let Some(labels) = labels {
+                record.labels = labels.clone();
+            }
         }
         Ok(())
     }

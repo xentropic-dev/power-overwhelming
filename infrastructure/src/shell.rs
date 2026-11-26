@@ -267,15 +267,13 @@ fn quote_words(program: &str, args: &[OsString]) -> OsString {
 }
 
 /// Arguments that pin a new conversation ID, and the ID to record for a restore.
-/// Management subcommands and help or version queries start no conversation, so
-/// they get no ID and cannot replace the one a restore would resume.
+/// Management subcommands and help or version queries start no conversation, so they
+/// return `None` and cannot replace the one a restore would resume. A profile that
+/// cannot name its conversation still starts one, with no ID.
 pub(crate) fn assign_conversation(
     profile: &AgentProfile,
     user: &[OsString],
-) -> (Vec<OsString>, Option<String>) {
-    let Some(resume) = &profile.resume else {
-        return (Vec::new(), None);
-    };
+) -> Option<(Vec<OsString>, Option<String>)> {
     let skipped = user
         .first()
         .and_then(|arg| arg.to_str())
@@ -287,9 +285,12 @@ pub(crate) fn assign_conversation(
             )
         });
     if skipped {
-        return (Vec::new(), None);
+        return None;
     }
-    resume.launch(user, || uuid::Uuid::new_v4().to_string())
+    let Some(resume) = &profile.resume else {
+        return Some((Vec::new(), None));
+    };
+    Some(resume.launch(user, || uuid::Uuid::new_v4().to_string()))
 }
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
@@ -353,13 +354,12 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
         &args,
         &LocalInstalledSkills(&std::env::current_dir()?),
     )?);
-    {
-        let (assign, conversation) = assign_conversation(profile, &args);
+    if let Some((assign, conversation)) = assign_conversation(profile, &args) {
         command.args(assign);
-        if let (Some(conversation), Some(session)) =
-            (conversation, std::env::var_os("POWER_SESSION"))
-        {
-            // The agent starts either way. Without the report it restarts fresh.
+        // The report identifies this process, which the agent replaces, as the agent
+        // that owns the conversation and the labels it reports. The agent starts either
+        // way. Without the report it restarts fresh and its labels are not saved.
+        if let Some(session) = std::env::var_os("POWER_SESSION") {
             let _ = crate::client::set_conversation(
                 session.to_string_lossy().into_owned(),
                 profile.id.as_str().to_owned(),
@@ -565,19 +565,26 @@ mod tests {
         let claude = profiles.resolve(&"claude".into()).unwrap();
         let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
 
-        let (assign, conversation) = assign_conversation(claude, &args(&["--model", "opus"]));
+        let (assign, conversation) =
+            assign_conversation(claude, &args(&["--model", "opus"])).unwrap();
         let conversation = conversation.expect("an interactive launch gets an ID");
         assert_eq!(assign, args(&["--session-id", &conversation]));
+        // A resume reports the conversation it resumes.
+        assert_eq!(
+            assign_conversation(claude, &args(&["--resume", "conv"])),
+            Some((Vec::new(), Some("conv".into())))
+        );
 
         for skipped in [&["mcp", "list"][..], &["update"], &["--help"], &["-v"]] {
             assert_eq!(
                 assign_conversation(claude, &args(skipped)),
-                (Vec::new(), None),
+                None,
                 "{skipped:?}"
             );
         }
+        // Codex cannot name its conversation, but a launch still starts one.
         let codex = profiles.resolve(&"codex".into()).unwrap();
-        assert_eq!(assign_conversation(codex, &[]), (Vec::new(), None));
+        assert_eq!(assign_conversation(codex, &[]), Some((Vec::new(), None)));
     }
 
     #[test]
@@ -594,6 +601,7 @@ mod tests {
         let mut resume = ResumeCommand {
             program: "claude".into(),
             args: ["--resume", "conv"].map(OsString::from).into(),
+            conversation: Some("conv".into()),
             fallback: None,
         };
         assert_eq!(resume_command(&resume), "'claude' '--resume' 'conv'");
@@ -662,6 +670,7 @@ printf '<%s>\n' "$@"
         let resume = resume_command(&ResumeCommand {
             program: "claude".into(),
             args: args.into(),
+            conversation: None,
             fallback: Some(vec!["--fresh".into()]),
         });
         let expected =
@@ -722,6 +731,7 @@ test "$4" != --resume
         let resume = resume_command(&ResumeCommand {
             program: "claude".into(),
             args: ["--resume", "conv-1"].map(OsString::from).into(),
+            conversation: Some("conv-1".into()),
             fallback: Some(["--session-id", "conv-1"].map(OsString::from).into()),
         });
         let expected = concat!(

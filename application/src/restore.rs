@@ -87,6 +87,7 @@ impl<T: TerminalRuntime> Application<T> {
                             options.resume = Some(ResumeCommand {
                                 program: profile.id.as_str().to_owned(),
                                 args,
+                                conversation: record.conversation.clone(),
                                 fallback,
                             })
                         }
@@ -424,6 +425,7 @@ mod tests {
                         resume: Some(ResumeCommand {
                             program: "claude".into(),
                             args: os(&["--resume", "conv-2"]),
+                            conversation: Some("conv-2".into()),
                             fallback: Some(os(&["--session-id", "conv-2"])),
                         }),
                         ..SessionOptions::default()
@@ -487,17 +489,23 @@ mod tests {
             .iter()
             .map(|(_, options)| options.resume.clone().unwrap())
             .collect();
-        let resume = |program: &str, args: &[&str], fallback: Option<&[&str]>| ResumeCommand {
-            program: program.into(),
-            args: os(args),
-            fallback: fallback.map(os),
+        let resume = |program: &str,
+                      args: &[&str],
+                      conversation: Option<&str>,
+                      fallback: Option<&[&str]>| {
+            ResumeCommand {
+                program: program.into(),
+                args: os(args),
+                conversation: conversation.map(Into::into),
+                fallback: fallback.map(os),
+            }
         };
         assert_eq!(
             resumes,
             [
-                resume("codex", &["resume", "--last"], Some(&[])),
-                resume("claude", &["--continue"], Some(&[])),
-                resume("plain", &[], None),
+                resume("codex", &["resume", "--last"], Some("ignored"), Some(&[])),
+                resume("claude", &["--continue"], None, Some(&[])),
+                resume("plain", &[], Some("conv"), None),
             ]
         );
         Ok(())
@@ -516,6 +524,7 @@ mod tests {
             &coding("claude"),
             Some("conv"),
             Some(Path::new("/repo/sub")),
+            None,
         )?;
         let saved = &store.list()?[0];
         assert_eq!(saved.foreground, coding("claude"));
@@ -543,8 +552,13 @@ mod tests {
             model_reported: true,
         };
         application.record_labels(&agent.id, &reported("Fix the build", Some("opus")))?;
-        application.record_foreground(&shell.id, &coding("claude"), None, None)?;
-        application.record_labels(&shell.id, &reported("Review", None))?;
+        application.record_foreground(
+            &shell.id,
+            &coding("claude"),
+            None,
+            None,
+            Some(&reported("Review", None)),
+        )?;
         let bare = application.start_session(StartSession {
             worktree: worktree.path().into(),
             agent: Agent::Shell,

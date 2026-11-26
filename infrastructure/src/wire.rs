@@ -98,11 +98,13 @@ pub enum Request {
         field: MetadataField,
         value: String,
     },
-    /// Sent by an agent wrapper in a shell session before it starts the agent.
+    /// Sent by an agent wrapper in a shell session before it starts the agent, with the
+    /// conversation when the wrapper knows it.
     SetConversation {
         session: String,
         agent: String,
-        conversation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<String>,
     },
     Launch {
         worktree: PathBuf,
@@ -1052,7 +1054,7 @@ mod profile_tests {
         let request = Request::SetConversation {
             session: "session".into(),
             agent: "claude".into(),
-            conversation: "conversation".into(),
+            conversation: Some("conversation".into()),
         };
         let mut line = Vec::new();
         send(&mut line, &request)?;
@@ -1069,7 +1071,19 @@ mod profile_tests {
         assert!(matches!(
             decoded,
             Some(Request::SetConversation { session, agent, conversation })
-                if session == "session" && agent == "claude" && conversation == "conversation"
+                if session == "session" && agent == "claude"
+                    && conversation.as_deref() == Some("conversation")
+        ));
+        // An agent that cannot pin its conversation reports only its start.
+        let decoded = receive::<Request>(
+            &mut br#"{"request":"set_conversation","session":"s","agent":"codex"}"#.as_slice(),
+        )?;
+        assert!(matches!(
+            decoded,
+            Some(Request::SetConversation {
+                conversation: None,
+                ..
+            })
         ));
         Ok(())
     }

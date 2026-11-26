@@ -36,17 +36,19 @@ use std::{
 pub(crate) type ActiveScheme = Arc<RwLock<&'static Scheme>>;
 type ExitHandler = Arc<dyn Fn(&str, &str) + Send + Sync>;
 type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send + Sync>;
-/// Saves a session's reported task and model.
+/// Saves the task and model an agent session reported.
 type LabelsChanged = Arc<dyn Fn(&str, &Labels) -> Result<()> + Send + Sync>;
-/// Saves a session's foreground agent, its conversation and the shell's directory.
-type ForegroundChanged =
-    Arc<dyn Fn(&str, &Agent, Option<&str>, Option<&Path>) -> Result<()> + Send + Sync>;
+/// Saves a session's foreground agent, its conversation and the shell's directory, and
+/// with labels, that agent's labels in the same write.
+type ForegroundChanged = Arc<
+    dyn Fn(&str, &Agent, Option<&str>, Option<&Path>, Option<&Labels>) -> Result<()> + Send + Sync,
+>;
 
 /// How often a shell session's working directory is checked for a restore.
 const CWD_INTERVAL: Duration = Duration::from_secs(3);
-/// How long a shell stays in the foreground before its agent's conversation is
-/// forgotten. A reboot kills the agent before the daemon, and this keeps the
-/// conversation until the shutdown flush.
+/// How long the agent that owns a shell session's saved state may be out of the
+/// foreground before its conversation and labels are forgotten. A reboot kills the
+/// agent before the daemon, and this keeps them until the shutdown flush.
 const CLEAR_DELAY: Duration = Duration::from_secs(3);
 /// An agent restored with resume arguments that exits this soon after launch had
 /// nothing to resume, so it is started once more with its fallback arguments.
@@ -104,12 +106,15 @@ impl Lifecycle {
         agent: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&Labels>,
         flush: bool,
     ) {
         if !flush && self.shutting_down.load(Ordering::Acquire) {
             return;
         }
-        if let Err(error) = (self.on_foreground_changed)(&self.session, agent, conversation, cwd) {
+        if let Err(error) =
+            (self.on_foreground_changed)(&self.session, agent, conversation, cwd, labels)
+        {
             eprintln!(
                 "Could not save foreground state for {}. {error:#}",
                 self.session
@@ -117,8 +122,8 @@ impl Lifecycle {
         }
     }
 
-    /// Saves the reported labels. Shutdown kills the agents, which clears their labels,
-    /// so nothing is saved once it has begun.
+    /// Saves an agent session's reported labels. Shutdown kills the agents, which clears
+    /// their labels, so nothing is saved once it has begun.
     fn record_labels(&self, labels: &Labels) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -207,11 +212,12 @@ pub enum Command {
         value: Option<String>,
         reply: SyncSender<Result<bool>>,
     },
-    /// An agent wrapper in this shell session reports the conversation it starts.
+    /// An agent wrapper in this shell session reports the agent it starts, with the
+    /// conversation when it knows it. The wrapper's process becomes the agent.
     SetConversation {
         pid: u32,
         agent: Agent,
-        conversation: String,
+        conversation: Option<String>,
         reply: SyncSender<bool>,
     },
     Output(Vec<u8>),
@@ -303,7 +309,7 @@ fn launch(
         }
     };
     if conversation.is_some() {
-        lifecycle.record_foreground(&session.agent, conversation.as_deref(), None, false);
+        lifecycle.record_foreground(&session.agent, conversation.as_deref(), None, None, false);
     }
 
     let (tx, rx) = mpsc::sync_channel(128);
@@ -354,7 +360,7 @@ fn launch(
                 let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
                 let _ = waiter_tx.send(Command::Relaunched(pid));
                 if conversation.is_some() {
-                    waiter_lifecycle.record_foreground(&launched, conversation, None, false);
+                    waiter_lifecycle.record_foreground(&launched, conversation, None, None, false);
                 }
             },
         );
@@ -375,7 +381,14 @@ fn launch(
     }
     let launched_agent = session.agent.clone();
     let labels = options.labels.clone();
-    let restored_agent = options.resume.as_ref().map(|resume| resume.program.clone());
+    // A restored shell keeps the saved labels for the agent it resumes.
+    let restored = options.resume.as_ref().map(|resume| Owner {
+        identity: Identity {
+            agent: Agent::Coding(resume.program.clone().into()),
+            conversation: resume.conversation.clone(),
+        },
+        labels: options.labels.clone(),
+    });
     let actor_lifecycle = lifecycle.clone();
     let active_scheme = runtime.scheme.clone();
     let profiles = runtime.profiles.clone();
@@ -394,7 +407,7 @@ fn launch(
                 cwd,
                 initial_task: options.initial_task,
                 labels,
-                restored_agent,
+                restored,
             },
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
@@ -424,7 +437,8 @@ fn agent_command(
     let mut command = CommandBuilder::new(&profile.command);
     let installed = crate::skill_install::LocalInstalledSkills(worktree);
     command.args(crate::shell::instruction_args(profile, args, &installed)?);
-    let (assign, conversation) = crate::shell::assign_conversation(profile, args);
+    let (assign, conversation) =
+        crate::shell::assign_conversation(profile, args).unwrap_or_default();
     command.args(assign);
     command.args(args);
     Ok((command, conversation))
@@ -551,8 +565,8 @@ struct ActorEnv<'a> {
     initial_task: Option<String>,
     /// Labels saved before a restore.
     labels: Labels,
-    /// Agent a restored shell is resuming, which owns the saved labels.
-    restored_agent: Option<String>,
+    /// What a restored shell saved: the agent it resumes and that agent's labels.
+    restored: Option<Owner>,
 }
 
 fn terminal_actor(
@@ -571,7 +585,7 @@ fn terminal_actor(
         cwd,
         initial_task,
         labels,
-        restored_agent,
+        restored,
     } = env;
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
@@ -616,25 +630,22 @@ fn terminal_actor(
     } else {
         shell_pid.map(|pid| (pid, launched_agent.clone()))
     };
-    // Whether the agent in `run` is what a restore resumes. Without job control a
-    // background agent shares the shell's group, but Bash gives it /dev/null for input,
-    // so only an agent that reads the shell's terminal is saved.
-    let mut recorded = run.is_some();
     // A command worker owns its task label even as foreground programs change.
     let command_worker = launched_agent == Agent::Shell && initial_task.is_some();
     // A restored agent session shows its saved labels at once. A restored shell keeps its
-    // saved labels pending until the agent they belong to is back in the foreground.
+    // saved labels until the agent resumed with their conversation is in the foreground.
     let agent_session = launched_agent != Agent::Shell;
     let mut metadata = SessionMetadata {
         task: initial_task.or_else(|| labels.task.clone().filter(|_| agent_session)),
         model: lifecycle.foreground.lock().unwrap().model.clone(),
     };
     let mut model_reported = agent_session && labels.model_reported;
-    let mut pending_labels = restored_agent
-        .filter(|_| !agent_session)
-        .map(|agent| (agent, labels.clone()));
 
-    let mut restore = RestoreState::new(launched_agent.clone(), cwd);
+    let mut restore = RestoreState::new(
+        launched_agent.clone(),
+        cwd,
+        restored.filter(|_| !agent_session),
+    );
 
     let mut output_closed = false;
     let mut process_exit: Option<PendingExit> = None;
@@ -706,21 +717,24 @@ fn terminal_actor(
                 profiles,
             );
             if current != run {
-                let was_recorded = recorded;
                 run = current;
-                recorded = run.as_ref().is_some_and(|(pid, _)| {
-                    shell_pid.is_some_and(|shell| shares_input(*pid, shell))
-                });
                 let current = run
                     .as_ref()
                     .map_or(Agent::Shell, |(_, agent)| agent.clone());
                 let initial_model = run
                     .as_ref()
                     .and_then(|(pid, agent)| process_model(*pid, agent));
+                // Detection alone never changes what is saved. Only an agent known from a
+                // report, its wrapper's start or its own labels, claims the session.
+                let claimed = run
+                    .as_ref()
+                    .and_then(|(pid, agent)| Some((*pid, restore.known(*pid, agent)?)));
+                let restored = claimed
+                    .as_ref()
+                    .and_then(|(pid, identity)| restore.labels_for(*pid, identity));
                 let (next, reported) = foreground_labels(
                     command_worker.then(|| metadata.task.clone()).flatten(),
-                    pending_labels.take_if(|_| recorded),
-                    &current,
+                    restored,
                     initial_model,
                 );
                 model_reported = reported;
@@ -745,17 +759,14 @@ fn terminal_actor(
                     metadata = next;
                     notify_metadata(&metadata, &mut clients);
                 }
-                // A background agent coming or going leaves the saved foreground alone.
-                if recorded || was_recorded {
-                    restore.foreground_changed(
-                        run.as_ref().filter(|_| recorded).map(|(_, agent)| agent),
+                match claimed {
+                    Some((pid, identity)) => restore.claim(
+                        pid,
+                        identity,
+                        current_labels(&metadata, model_reported),
                         lifecycle,
-                    );
-                }
-                // A shell in the foreground leaves the saved labels to the restore grace
-                // period, as it does the saved agent.
-                if recorded {
-                    restore.set_labels(current_labels(&metadata, model_reported), lifecycle);
+                    ),
+                    None => restore.foreground_changed(run.as_ref().map(|(pid, _)| *pid)),
                 }
             }
         }
@@ -837,7 +848,7 @@ fn terminal_actor(
                         }
                         _ => run.as_ref().map(|(owner, agent)| (*owner, agent)),
                     };
-                    let Some((_, agent)) =
+                    let Some((owner, agent)) =
                         owner.filter(|(owner, _)| !exited && descends_from(pid, *owner))
                     else {
                         return Ok(false);
@@ -861,8 +872,17 @@ fn terminal_actor(
                     if is_model {
                         model_reported = true;
                     }
-                    if recorded {
-                        restore.set_labels(current_labels(&metadata, model_reported), lifecycle);
+                    let labels = current_labels(&metadata, model_reported);
+                    if agent_session {
+                        restore.set_labels(labels, lifecycle);
+                    } else if matches!(agent, Agent::Coding(_)) {
+                        // The agent that passed the check owns these labels, under the
+                        // conversation its wrapper reported.
+                        let identity = restore.known(owner, agent).unwrap_or_else(|| Identity {
+                            agent: agent.clone(),
+                            conversation: None,
+                        });
+                        restore.claim(owner, identity, labels, lifecycle);
                     }
                     Ok(true)
                 })();
@@ -888,7 +908,7 @@ fn terminal_actor(
             }
             Command::Poll => {
                 if !exited {
-                    restore.poll(!recorded, shell_pid, lifecycle);
+                    restore.poll(run.as_ref().map(|(pid, _)| *pid), shell_pid, lifecycle);
                 }
             }
             Command::SetConversation {
@@ -902,8 +922,13 @@ fn terminal_actor(
                     && launched_agent == Agent::Shell
                     && shell_pid.is_some_and(|shell| pid != shell && descends_from(pid, shell));
                 if accepted {
-                    let foreground = run.as_ref().filter(|_| recorded).map(|(_, agent)| agent);
-                    restore.set_conversation(agent, conversation, foreground, lifecycle);
+                    restore.started(
+                        pid,
+                        Identity {
+                            agent,
+                            conversation,
+                        },
+                    );
                 }
                 let _ = reply.send(accepted);
             }
@@ -992,38 +1017,72 @@ impl PendingExit {
     }
 }
 
+/// The agent that owns a shell session's saved labels: its kind and its conversation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Identity {
+    agent: Agent,
+    conversation: Option<String>,
+}
+
+/// What a shell session saves for a restore. The agent, its conversation and its labels
+/// change together and are saved in one write, so labels never outlive their agent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Owner {
+    identity: Identity,
+    labels: Labels,
+}
+
+impl Owner {
+    fn shell() -> Self {
+        Self {
+            identity: Identity {
+                agent: Agent::Shell,
+                conversation: None,
+            },
+            labels: Labels::default(),
+        }
+    }
+}
+
 /// What a shell session last saved for a restore.
+///
+/// The saved state belongs to the agent that last reported: its wrapper announced its
+/// start, or it reported labels while it was the active agent. Seeing an agent in the
+/// foreground never changes the saved state on its own, so a job that never reported
+/// cannot become what a restore resumes.
 struct RestoreState {
     shell: bool,
-    /// Foreground agent and conversation as saved.
-    saved: (Agent, Option<String>),
-    /// Conversation reported by the agent wrapper, possibly before the agent runs.
-    conversation: Option<(Agent, String)>,
+    /// The owner as saved, or as the record of a restored session holds it.
+    saved: Owner,
+    /// Process of the owner in `saved`, once it has reported in this run.
+    owner_pid: Option<u32>,
+    /// A restored session's saved owner, until the agent resumed with that conversation
+    /// claims its labels.
+    restored: Option<Owner>,
+    /// Agents whose wrappers reported their start, newest last.
+    started: Vec<(u32, Identity)>,
     cwd: Option<PathBuf>,
     cwd_checked: Instant,
-    /// When a shell in the foreground makes the saved agent stale.
+    /// When the owner being out of the foreground makes the saved state stale.
     clear_at: Option<Instant>,
     /// Whether this actor has saved anything. Until then, the record of a restored
     /// session keeps the agent it is about to resume.
     touched: bool,
-    /// Labels as this actor last saved them. They follow the saved agent, so a shell
-    /// takes them away only when it takes the agent away. `None` until the first save:
-    /// the record may hold labels this actor never showed, such as a dispatch title shown
-    /// before any report or labels left by an agent that was not resumed.
+    /// An agent session's labels as this actor last saved them. `None` until the first
+    /// save, so a first report matching a dispatch title is still saved.
     labels: Option<Labels>,
 }
 
-/// The labels shown once `agent` takes the foreground, and whether its model was reported.
-/// Saved labels apply only to the agent that reported them. Otherwise the task is the
-/// one a command worker keeps and the model is what the process was started with.
+/// The labels shown once an agent takes the foreground, and whether its model was
+/// reported. Labels saved for that agent come back. Otherwise the task is the one a
+/// command worker keeps and the model is what the process was started with.
 fn foreground_labels(
     kept_task: Option<String>,
-    saved: Option<(String, Labels)>,
-    agent: &Agent,
+    saved: Option<Labels>,
     process_model: Option<String>,
 ) -> (SessionMetadata, bool) {
-    match saved.filter(|(owner, _)| owner == agent.as_str()) {
-        Some((_, saved)) => (
+    match saved {
+        Some(saved) => (
             SessionMetadata {
                 model: if saved.model_reported {
                     saved.model
@@ -1062,26 +1121,44 @@ fn current_labels(metadata: &SessionMetadata, model_reported: bool) -> Labels {
     }
 }
 
+/// Wrapper starts kept for processes that have not become the active agent yet.
+const STARTED_LIMIT: usize = 16;
+
 impl RestoreState {
-    fn new(launched: Agent, cwd: PathBuf) -> Self {
+    fn new(launched: Agent, cwd: PathBuf, restored: Option<Owner>) -> Self {
+        let shell = launched == Agent::Shell;
+        let saved = match &restored {
+            Some(restored) => restored.clone(),
+            None if shell => Owner::shell(),
+            None => Owner {
+                identity: Identity {
+                    agent: launched,
+                    conversation: None,
+                },
+                labels: Labels::default(),
+            },
+        };
         Self {
-            labels: None,
-            shell: launched == Agent::Shell,
-            saved: (launched, None),
-            conversation: None,
+            shell,
+            saved,
+            owner_pid: None,
+            restored,
+            started: Vec::new(),
             cwd: Some(cwd),
             cwd_checked: Instant::now(),
             clear_at: None,
             touched: false,
+            labels: None,
         }
     }
 
     fn save(&mut self, lifecycle: &Lifecycle, flush: bool) {
         self.touched = true;
         lifecycle.record_foreground(
-            &self.saved.0,
-            self.saved.1.as_deref(),
+            &self.saved.identity.agent,
+            self.saved.identity.conversation.as_deref(),
             self.cwd.as_deref(),
+            Some(&self.saved.labels),
             flush,
         );
     }
@@ -1093,45 +1170,70 @@ impl RestoreState {
         }
     }
 
-    fn foreground_changed(&mut self, foreground: Option<&Agent>, lifecycle: &Lifecycle) {
-        if let Some(agent) = foreground {
-            self.clear_at = None;
-            let conversation = self
-                .conversation
-                .as_ref()
-                .filter(|(owner, _)| owner == agent)
-                .map(|(_, id)| id.clone());
-            self.saved = (agent.clone(), conversation);
+    /// Records an agent wrapper's start. The wrapper's process becomes the agent.
+    fn started(&mut self, pid: u32, identity: Identity) {
+        self.started
+            .retain(|(pid, _)| Path::new(&format!("/proc/{pid}")).exists());
+        if self.started.len() >= STARTED_LIMIT {
+            self.started.remove(0);
+        }
+        self.started.push((pid, identity));
+    }
+
+    /// The identity a report established for the agent process `pid`: its wrapper's
+    /// start, or its own earlier labels.
+    fn known(&self, pid: u32, agent: &Agent) -> Option<Identity> {
+        self.started
+            .iter()
+            .rev()
+            .find(|(start, identity)| identity.agent == *agent && descends_from(pid, *start))
+            .map(|(_, identity)| identity.clone())
+            .or_else(|| {
+                (self.owner_pid == Some(pid) && self.saved.identity.agent == *agent)
+                    .then(|| self.saved.identity.clone())
+            })
+    }
+
+    /// Labels saved for the agent `pid` with `identity`: its own, when the owner comes
+    /// back, or a restored owner's, when this agent resumed that conversation.
+    fn labels_for(&mut self, pid: u32, identity: &Identity) -> Option<Labels> {
+        if self.owner_pid == Some(pid) && self.saved.identity == *identity {
+            return Some(self.saved.labels.clone());
+        }
+        self.restored
+            .take_if(|restored| restored.identity == *identity)
+            .map(|restored| restored.labels)
+    }
+
+    /// Makes the agent `pid` the owner of the saved state, with its current labels.
+    fn claim(&mut self, pid: u32, identity: Identity, labels: Labels, lifecycle: &Lifecycle) {
+        self.owner_pid = Some(pid);
+        self.clear_at = None;
+        let owner = Owner { identity, labels };
+        if !self.touched || self.saved != owner {
+            self.saved = owner;
             self.save(lifecycle, false);
+        }
+    }
+
+    /// Starts the grace period when the owner leaves the foreground, and ends it when the
+    /// owner is back. Any other process in the foreground leaves the saved state alone.
+    fn foreground_changed(&mut self, active: Option<u32>) {
+        if self.owner_pid.is_some() && active != self.owner_pid {
+            self.clear_at.get_or_insert(Instant::now() + CLEAR_DELAY);
         } else {
-            // A conversation reported from now on belongs to the next agent.
-            self.conversation = None;
-            self.clear_at = Some(Instant::now() + CLEAR_DELAY);
+            self.clear_at = None;
         }
     }
 
-    fn set_conversation(
-        &mut self,
-        agent: Agent,
-        conversation: String,
-        foreground: Option<&Agent>,
-        lifecycle: &Lifecycle,
-    ) {
-        if foreground == Some(&agent) {
-            self.saved = (agent.clone(), Some(conversation.clone()));
-            self.save(lifecycle, false);
-        }
-        self.conversation = Some((agent, conversation));
-    }
-
-    fn poll(&mut self, shell_foreground: bool, shell_pid: Option<u32>, lifecycle: &Lifecycle) {
+    fn poll(&mut self, active: Option<u32>, shell_pid: Option<u32>, lifecycle: &Lifecycle) {
         let now = Instant::now();
         if self.clear_at.is_some_and(|at| now >= at) {
             self.clear_at = None;
-            if shell_foreground {
-                self.saved = (Agent::Shell, None);
+            if active != self.owner_pid {
+                self.owner_pid = None;
+                self.saved = Owner::shell();
                 self.save(lifecycle, false);
-                self.set_labels(Labels::default(), lifecycle);
             }
         }
         if now >= self.cwd_checked + CWD_INTERVAL {
@@ -1351,18 +1453,6 @@ fn foreground_agent(
         pid = parent_pid(current);
     }
     None
-}
-
-/// Whether both processes read the same open input, such as the session's terminal.
-fn shares_input(pid: u32, other: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let input = |pid: u32| {
-        std::fs::metadata(format!("/proc/{pid}/fd/0"))
-            .ok()
-            .map(|metadata| (metadata.dev(), metadata.ino()))
-    };
-    input(pid).is_some_and(|own| input(other) == Some(own))
 }
 
 /// Shell initialization can start an agent before job control is enabled. Search only
@@ -1652,7 +1742,7 @@ mod tests {
                 model: None,
             }),
             on_model_changed: Arc::new(|_, _, _| Ok(())),
-            on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
+            on_foreground_changed: Arc::new(|_, _, _, _, _| Ok(())),
             on_labels_changed: Arc::new(|_, _| Ok(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
@@ -1865,19 +1955,27 @@ mod tests {
         assert_eq!(parent, std::os::unix::process::parent_id());
     }
 
-    fn saved(task: &str, model: Option<&str>, model_reported: bool) -> (String, Labels) {
-        (
-            "claude".into(),
-            Labels {
-                task: Some(task.into()),
-                model: model.map(Into::into),
-                model_reported,
-            },
-        )
-    }
-
     fn claude() -> Agent {
         Agent::Coding("claude".into())
+    }
+
+    fn codex() -> Agent {
+        Agent::Coding("codex".into())
+    }
+
+    fn labels(task: &str, model: Option<&str>) -> Labels {
+        Labels {
+            task: Some(task.into()),
+            model: model.map(Into::into),
+            model_reported: true,
+        }
+    }
+
+    fn identity(agent: Agent, conversation: Option<&str>) -> Identity {
+        Identity {
+            agent,
+            conversation: conversation.map(Into::into),
+        }
     }
 
     #[test]
@@ -1899,56 +1997,27 @@ mod tests {
     }
 
     #[test]
-    fn saved_labels_apply_only_to_the_agent_that_reported_them() {
-        let (shown, reported) =
-            foreground_labels(None, Some(saved("Task", Some("m"), true)), &claude(), None);
-        assert_eq!(
-            (shown.task.as_deref(), shown.model.as_deref()),
-            (Some("Task"), Some("m"))
-        );
-        assert!(reported);
-
-        // Another agent in the foreground gets none of them, and a shell has no labels.
-        let other = Agent::Coding("codex".into());
-        let (shown, reported) = foreground_labels(
-            None,
-            Some(saved("Task", Some("m"), true)),
-            &other,
-            Some("own".into()),
-        );
-        assert_eq!(
-            shown,
-            SessionMetadata {
-                task: None,
-                model: Some("own".into())
-            }
-        );
-        assert!(!reported);
-    }
-
-    #[test]
     fn a_saved_clear_is_not_refilled_from_the_process_model() {
-        let (shown, _) = foreground_labels(
-            None,
-            Some(saved("Task", None, true)),
-            &claude(),
-            Some("flag".into()),
-        );
+        let cleared = Labels {
+            model: None,
+            ..labels("Task", None)
+        };
+        let (shown, _) = foreground_labels(None, Some(cleared.clone()), Some("flag".into()));
         assert_eq!(shown.model, None);
-        let (shown, _) = foreground_labels(
-            None,
-            Some(saved("Task", None, false)),
-            &claude(),
-            Some("flag".into()),
-        );
+        let unreported = Labels {
+            model_reported: false,
+            ..cleared
+        };
+        let (shown, _) = foreground_labels(None, Some(unreported), Some("flag".into()));
         assert_eq!(shown.model.as_deref(), Some("flag"));
     }
 
     #[test]
     fn a_foreground_agent_keeps_a_command_workers_dispatch_task() {
-        let (shown, _) = foreground_labels(Some("Dispatch".into()), None, &claude(), None);
+        let (shown, reported) = foreground_labels(Some("Dispatch".into()), None, None);
         assert_eq!(shown.task.as_deref(), Some("Dispatch"));
-        let (shown, _) = foreground_labels(None, None, &claude(), None);
+        assert!(!reported);
+        let (shown, _) = foreground_labels(None, None, None);
         assert_eq!(shown.task, None);
     }
 
@@ -1992,8 +2061,14 @@ mod tests {
         assert_eq!(found.map(|(_, agent)| agent), Some(claude()));
     }
 
-    fn recording_lifecycle() -> (Lifecycle, Arc<Mutex<Vec<Labels>>>) {
+    /// One save of a shell session's restore state: agent, conversation and labels.
+    type Saved = (Agent, Option<String>, Option<Labels>);
+
+    type Recorded<T> = Arc<Mutex<Vec<T>>>;
+
+    fn recording_lifecycle() -> (Lifecycle, Recorded<Saved>, Recorded<Labels>) {
         let saved = Arc::new(Mutex::new(Vec::new()));
+        let agent_labels = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
             running: AtomicBool::new(true),
             session: "shell".into(),
@@ -2003,23 +2078,48 @@ mod tests {
                 model: None,
             }),
             on_model_changed: Arc::new(|_, _, _| Ok(())),
-            on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
-            on_labels_changed: {
+            on_foreground_changed: {
                 let saved = saved.clone();
+                Arc::new(
+                    move |_: &str,
+                          agent: &Agent,
+                          conversation: Option<&str>,
+                          _,
+                          labels: Option<&Labels>| {
+                        saved.lock().unwrap().push((
+                            agent.clone(),
+                            conversation.map(Into::into),
+                            labels.cloned(),
+                        ));
+                        Ok(())
+                    },
+                )
+            },
+            on_labels_changed: {
+                let agent_labels = agent_labels.clone();
                 Arc::new(move |_: &str, labels: &Labels| {
-                    saved.lock().unwrap().push(labels.clone());
+                    agent_labels.lock().unwrap().push(labels.clone());
                     Ok(())
                 })
             },
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
-        (lifecycle, saved)
+        (lifecycle, saved, agent_labels)
+    }
+
+    fn shell_restore(restored: Option<Owner>) -> RestoreState {
+        RestoreState::new(Agent::Shell, PathBuf::from("/"), restored)
+    }
+
+    /// This test process stands in for an agent, which descends from its own start.
+    fn me() -> u32 {
+        std::process::id()
     }
 
     #[test]
     fn a_first_report_of_the_dispatch_title_is_saved() {
-        let (lifecycle, saved) = recording_lifecycle();
-        let mut restore = RestoreState::new(claude(), PathBuf::from("/"));
+        let (lifecycle, _, saved) = recording_lifecycle();
+        let mut restore = RestoreState::new(claude(), PathBuf::from("/"), None);
         // The dispatch title is already shown, but nothing has saved it yet.
         let labels = Labels {
             task: Some("Dispatch title".into()),
@@ -2031,54 +2131,174 @@ mod tests {
     }
 
     #[test]
-    fn another_agent_taking_the_foreground_clears_labels_it_never_showed() {
-        let (lifecycle, saved) = recording_lifecycle();
-        // The record holds a previous agent's labels that this boot did not resume.
-        let mut restore = RestoreState::new(Agent::Shell, PathBuf::from("/"));
-        restore.foreground_changed(Some(&Agent::Coding("codex".into())), &lifecycle);
-        restore.set_labels(Labels::default(), &lifecycle);
-        assert_eq!(*saved.lock().unwrap(), [Labels::default()]);
+    fn an_agent_that_never_reported_is_never_saved() {
+        // Detection may attribute the foreground to a background job. Without a start or
+        // label report from that job, the saved state does not change.
+        let (lifecycle, saved, _) = recording_lifecycle();
+        let mut restore = shell_restore(None);
+        assert_eq!(restore.known(me(), &claude()), None);
+        restore.foreground_changed(Some(me()));
+        restore.poll(Some(me()), None, &lifecycle);
+        restore.foreground_changed(None);
+        restore.flush(None, &lifecycle);
+        assert!(saved.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn a_background_job_does_not_share_the_shells_input() {
-        // Without job control, sh gives an asynchronous command /dev/null for input.
-        let mut shell = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30 & sleep 31; true")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let pid = shell.id();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let children = loop {
-            let children: Vec<_> = child_pids(Path::new(&format!("/proc/{pid}")))
-                .into_iter()
-                .filter_map(|child| {
-                    let cmdline = std::fs::read(format!("/proc/{child}/cmdline")).ok()?;
-                    Some((String::from_utf8_lossy(&cmdline).replace('\0', " "), child))
-                })
-                .filter(|(cmdline, _)| cmdline.starts_with("sleep"))
-                .collect();
-            if children.len() == 2 || Instant::now() > deadline {
-                break children;
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        let shares = |name: &str| {
-            children
-                .iter()
-                .find(|(cmdline, _)| cmdline.trim() == name)
-                .map(|(_, child)| shares_input(*child, pid))
-        };
-        let result = (shares("sleep 30"), shares("sleep 31"));
-        let _ = shell.kill();
-        for (_, child) in &children {
-            let _ = std::process::Command::new("kill")
-                .arg(child.to_string())
-                .status();
-        }
-        let _ = shell.wait();
-        assert_eq!(result, (Some(false), Some(true)));
+    fn a_wrapper_start_identifies_the_agent_and_its_conversation() {
+        let mut restore = shell_restore(None);
+        restore.started(me(), identity(claude(), Some("conv")));
+        assert_eq!(restore.known(me(), &codex()), None);
+        assert_eq!(
+            restore.known(me(), &claude()),
+            Some(identity(claude(), Some("conv")))
+        );
+        // A process that is not the started one, nor its descendant, is unknown.
+        assert_eq!(restore.known(1, &claude()), None);
+    }
+
+    #[test]
+    fn restored_labels_go_only_to_the_agent_resumed_with_their_conversation() {
+        let saved = labels("Saved task", Some("saved-model"));
+        let mut restore = shell_restore(Some(Owner {
+            identity: identity(claude(), Some("conv-a")),
+            labels: saved.clone(),
+        }));
+        // Another agent, or the same agent in another conversation, gets none of them.
+        assert_eq!(
+            restore.labels_for(me(), &identity(codex(), Some("conv-a"))),
+            None
+        );
+        assert_eq!(
+            restore.labels_for(me(), &identity(claude(), Some("conv-b"))),
+            None
+        );
+        assert_eq!(restore.labels_for(me(), &identity(claude(), None)), None);
+        assert_eq!(
+            restore.labels_for(me(), &identity(claude(), Some("conv-a"))),
+            Some(saved)
+        );
+        // They are handed over once.
+        assert_eq!(
+            restore.labels_for(2, &identity(claude(), Some("conv-a"))),
+            None
+        );
+    }
+
+    #[test]
+    fn the_owner_gets_its_labels_back_when_it_returns_to_the_foreground() {
+        let (lifecycle, _, _) = recording_lifecycle();
+        let mut restore = shell_restore(None);
+        let own = identity(claude(), Some("conv"));
+        restore.claim(me(), own.clone(), labels("Task", None), &lifecycle);
+        assert_eq!(restore.known(me(), &claude()), Some(own.clone()));
+        assert_eq!(restore.labels_for(me(), &own), Some(labels("Task", None)));
+        // Another process with the same identity is not the owner.
+        assert_eq!(restore.labels_for(2, &own), None);
+    }
+
+    #[test]
+    fn a_new_owner_replaces_the_agent_and_its_labels_in_one_write() {
+        let (lifecycle, saved, _) = recording_lifecycle();
+        let mut restore = shell_restore(None);
+        restore.claim(
+            me(),
+            identity(claude(), Some("conv-a")),
+            labels("Claude task", Some("opus")),
+            &lifecycle,
+        );
+        // Claude exits and Codex takes the foreground. Seeing Codex changes nothing.
+        restore.foreground_changed(None);
+        restore.foreground_changed(Some(2));
+        // A reboot now flushes Claude with its own labels.
+        lifecycle.shutting_down.store(true, Ordering::Release);
+        restore.flush(None, &lifecycle);
+        lifecycle.shutting_down.store(false, Ordering::Release);
+        // Once Codex reports, it replaces both together.
+        restore.claim(
+            2,
+            identity(codex(), None),
+            labels("Codex task", None),
+            &lifecycle,
+        );
+        lifecycle.shutting_down.store(true, Ordering::Release);
+        restore.flush(None, &lifecycle);
+        let claude_saved = (
+            claude(),
+            Some("conv-a".into()),
+            Some(labels("Claude task", Some("opus"))),
+        );
+        let codex_saved = (codex(), None, Some(labels("Codex task", None)));
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [
+                claude_saved.clone(),
+                claude_saved,
+                codex_saved.clone(),
+                codex_saved
+            ]
+        );
+    }
+
+    #[test]
+    fn the_owner_keeps_its_labels_through_the_grace_period() {
+        let (lifecycle, saved, _) = recording_lifecycle();
+        let mut restore = shell_restore(None);
+        restore.claim(
+            me(),
+            identity(claude(), None),
+            labels("Task", None),
+            &lifecycle,
+        );
+        restore.foreground_changed(None);
+        restore.poll(None, None, &lifecycle);
+        assert_eq!(saved.lock().unwrap().len(), 1);
+        // The grace period ends with the owner still gone.
+        restore.clear_at = Some(Instant::now());
+        restore.poll(None, None, &lifecycle);
+        assert_eq!(
+            saved.lock().unwrap().last(),
+            Some(&(Agent::Shell, None, Some(Labels::default())))
+        );
+    }
+
+    #[test]
+    fn the_owner_returning_ends_the_grace_period() {
+        let (lifecycle, saved, _) = recording_lifecycle();
+        let mut restore = shell_restore(None);
+        restore.claim(
+            me(),
+            identity(claude(), None),
+            labels("Task", None),
+            &lifecycle,
+        );
+        restore.foreground_changed(None);
+        restore.foreground_changed(Some(me()));
+        assert_eq!(restore.clear_at, None);
+        restore.foreground_changed(Some(2));
+        restore.foreground_changed(None);
+        restore.clear_at = Some(Instant::now());
+        // The owner is back when the grace period ends, so nothing is cleared.
+        restore.poll(Some(me()), None, &lifecycle);
+        assert_eq!(saved.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_restored_record_is_kept_until_an_agent_claims_the_session() {
+        // A resume that never ran, or a profile that was removed, leaves the record as it
+        // was. Its labels stay with their own agent and conversation.
+        let (lifecycle, saved, _) = recording_lifecycle();
+        let mut restore = shell_restore(Some(Owner {
+            identity: identity(claude(), Some("conv-a")),
+            labels: labels("Saved", None),
+        }));
+        restore.foreground_changed(Some(2));
+        restore.flush(None, &lifecycle);
+        assert!(saved.lock().unwrap().is_empty());
+        restore.claim(2, identity(codex(), None), Labels::default(), &lifecycle);
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [(codex(), None, Some(Labels::default()))]
+        );
     }
 }
