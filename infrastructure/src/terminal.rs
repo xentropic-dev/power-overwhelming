@@ -368,6 +368,7 @@ fn launch(
                 active_scheme,
                 profiles: profiles.as_ref(),
                 cwd,
+                initial_task: options.initial_task,
             },
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
@@ -521,6 +522,7 @@ struct ActorEnv<'a> {
     profiles: &'a dyn AgentProfileRegistry,
     /// Directory the session started in.
     cwd: PathBuf,
+    initial_task: Option<String>,
 }
 
 fn terminal_actor(
@@ -537,6 +539,7 @@ fn terminal_actor(
         active_scheme,
         profiles,
         cwd,
+        initial_task,
     } = env;
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
@@ -581,9 +584,11 @@ fn terminal_actor(
     } else {
         shell_pid.map(|pid| (pid, launched_agent.clone()))
     };
+    // A command worker owns its task label even as foreground programs change.
+    let command_worker = launched_agent == Agent::Shell && initial_task.is_some();
     let mut metadata = SessionMetadata {
+        task: initial_task,
         model: lifecycle.foreground.lock().unwrap().model.clone(),
-        ..SessionMetadata::default()
     };
 
     let mut restore = RestoreState::new(launched_agent.clone(), cwd);
@@ -683,7 +688,11 @@ fn terminal_actor(
                 }
                 let next = SessionMetadata {
                     model: initial_model,
-                    task: None,
+                    task: if command_worker {
+                        metadata.task.clone()
+                    } else {
+                        None
+                    },
                 };
                 if next != metadata {
                     metadata = next;
@@ -764,9 +773,14 @@ fn terminal_actor(
                 reply,
             } => {
                 let result = (|| {
-                    let Some((_, agent)) = run
-                        .as_ref()
-                        .filter(|(owner, _)| !exited && descends_from(pid, *owner))
+                    let owner = match field {
+                        MetadataField::Task if command_worker => {
+                            shell_pid.map(|owner| (owner, &launched_agent))
+                        }
+                        _ => run.as_ref().map(|(owner, agent)| (*owner, agent)),
+                    };
+                    let Some((_, agent)) =
+                        owner.filter(|(owner, _)| !exited && descends_from(pid, *owner))
                     else {
                         return Ok(false);
                     };
