@@ -21,8 +21,12 @@ envelope identifies three other senders separately:
   user wrote it.
 - **Power** is the daemon.
 
-Power maps `POWER_SESSION` to the sending session. It rejects a session ID
-that matches no Power session rather than sending with the user's authority.
+Power maps `POWER_SESSION` to the live sending session. A coding session is
+always a peer, including one started with `power session start`, which Power
+registers as an agent in its box on its first Talk command. Only a plain shell
+session sends as the user's shell. Power rejects a session ID that matches no
+live session, or a coding session it cannot register, rather than sending with
+the user's authority.
 
 ## Addressing
 

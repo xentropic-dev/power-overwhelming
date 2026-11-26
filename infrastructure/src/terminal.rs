@@ -174,6 +174,9 @@ impl Handle {
         state.ready_only |= ready_only;
         state.hook = hook;
         state.reported_at = now;
+        if hook == HookState::Ready {
+            state.awaiting_turn_end = false;
+        }
         if hook == HookState::Busy {
             state.active_since = now;
         }
@@ -203,8 +206,10 @@ impl Handle {
         if notice.is_some() {
             state.last_notice = now;
             // A notice submits a prompt, so a provider that reports turn starts is busy
-            // until it reports again. Notify-only providers wait for output quiet instead.
-            if state.hook == HookState::Ready && !state.ready_only {
+            // until it reports again. A notify-only provider reports only the turn's end.
+            if state.ready_only {
+                state.awaiting_turn_end = true;
+            } else if state.hook == HookState::Ready {
                 state.hook = HookState::Busy;
                 state.reported_at = now;
             }
@@ -341,6 +346,8 @@ fn launch(
                 last_output: started_at,
                 active_since: started_at,
                 ready_only,
+                // The initial prompt (including a restore continuation) starts a turn.
+                awaiting_turn_end: ready_only && options.initial_prompt.is_some(),
                 ..Activity::default()
             },
             writer: Some(write_tx.clone()),
@@ -795,6 +802,7 @@ fn terminal_actor(
                 if run.is_none() {
                     let mut input = lifecycle.input.lock().unwrap();
                     input.activity.ready_only = false;
+                    input.activity.awaiting_turn_end = false;
                     input.activity.hook = HookState::Unknown;
                     input.activity.revision = input.activity.revision.wrapping_add(1);
                 }
@@ -948,6 +956,12 @@ fn terminal_actor(
             }
             Command::Relaunched(pid) => {
                 shell_pid = pid;
+                // The fresh start never repeats the initial prompt, so no turn is running.
+                {
+                    let mut input = lifecycle.input.lock().unwrap();
+                    input.activity.awaiting_turn_end = false;
+                    input.activity.revision = input.activity.revision.wrapping_add(1);
+                }
                 if launched_agent != Agent::Shell {
                     run = pid.map(|pid| (pid, launched_agent.clone()));
                 }

@@ -13,6 +13,7 @@ use application::{
     dag::BoxSelection,
     talk::{Caller, LogFilter, Notifier, Reply, SendMessage, SessionActivity, Talk},
 };
+use domain::session::Agent;
 use domain::talk::{
     Activity, Address, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
 };
@@ -32,6 +33,10 @@ impl SessionActivity for Terminal {
     fn activity(&self, session: &str) -> Option<Activity> {
         let terminal = self.0.terminal(session).ok()?;
         terminal.is_running().then(|| terminal.activity())
+    }
+
+    fn agent(&self, session: &str) -> Option<Agent> {
+        self.0.live_agent(session)
     }
 
     fn report_turn(&self, session: &str, state: HookState, ready_only: bool) -> Result<()> {
@@ -122,6 +127,12 @@ pub(crate) fn request(
     dag: &DaemonDag,
     request: TalkRequest,
 ) -> Result<TalkResponse> {
+    if let Some(session) = &request.session
+        && !matches!(request.command, TalkCommand::Turn { .. })
+    {
+        // A coding session is a peer, never the user, even without a managed-agent row.
+        dag.register_coding_session(session)?;
+    }
     let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
     let items = |messages: Vec<Message>| TalkResponse::Messages {
         messages: messages.into_iter().map(Into::into).collect(),

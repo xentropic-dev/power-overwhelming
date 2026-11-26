@@ -168,6 +168,14 @@ impl SessionActivity for Arc<Terminal> {
             .contains(&session)
             .then(|| *self.activity.lock().unwrap())
     }
+    fn agent(&self, session: &str) -> Option<Agent> {
+        match session {
+            "a-session" | "b-session" => Some(Agent::Coding("fixture".into())),
+            "shell-session" => Some(Agent::Shell),
+            "coding-session" => Some(Agent::Coding("codex".into())),
+            _ => None,
+        }
+    }
     fn report_turn(&self, _: &str, hook: HookState, _: bool) -> Result<()> {
         self.activity.lock().unwrap().hook = hook;
         Ok(())
@@ -371,6 +379,16 @@ fn sessions_without_an_agent_need_a_live_session_and_send_as_the_shell() -> Resu
         ..caller(Some("shell-session"))
     };
     assert_eq!(send(&talk, claimed, "claimed")?.sender, Sender::Shell);
+    // A live coding session is never the user. Without a peer identity it cannot send.
+    let error = send(&talk, caller(Some("coding-session")), "as the user?").unwrap_err();
+    assert!(
+        error.to_string().contains("has no Power agent identity"),
+        "{error}"
+    );
+    assert!(
+        talk.inbox(caller(Some("coding-session")), false, true)
+            .is_err()
+    );
     Ok(())
 }
 

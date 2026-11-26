@@ -1,4 +1,5 @@
 use anyhow::Result;
+use domain::session::Agent;
 use domain::talk::{
     Activity, AgentTalkSummary, Directory, HookState, Message, MessageId, NoticePolicy, Queued,
     Recipient, Sender, Target, ThreadId,
@@ -38,6 +39,9 @@ pub trait TalkTransaction: TalkReader {
 pub trait SessionActivity: Send + Sync {
     /// None if the session is unknown or no longer running.
     fn activity(&self, session: &str) -> Option<Activity>;
+    /// The agent the running session hosts now (see `Application::live_agent`). None if
+    /// the session is unknown or no longer running.
+    fn agent(&self, session: &str) -> Option<Agent>;
     /// `ready_only` marks a provider that reports turn ends but not turn starts.
     fn report_turn(&self, session: &str, state: HookState, ready_only: bool) -> Result<()>;
 }
@@ -130,11 +134,11 @@ struct Actor<'a> {
 }
 
 impl<'a> Actor<'a> {
-    /// `live` reports whether a session without an agent is a running Power session.
+    /// `live` resolves what a session without an agent row hosts right now.
     fn new(
         caller: &'a Caller,
         directory: &'a Directory,
-        live: impl FnOnce(&str) -> bool,
+        live: impl FnOnce(&str) -> Option<Agent>,
     ) -> Result<Self> {
         let agent = caller.session.as_deref().and_then(|session| {
             directory
@@ -145,11 +149,19 @@ impl<'a> Actor<'a> {
         if let Some(session) = caller.session.as_deref()
             && agent.is_none()
         {
-            // A stale or mistyped POWER_SESSION must not fall back to the user's authority.
-            ensure!(
-                live(session),
-                "Unknown Power session {session:?}. Unset POWER_SESSION to send from this shell"
-            );
+            // Authority comes from the live session. A stale or mistyped POWER_SESSION, or a
+            // coding session without a peer identity, must not fall back to the user's.
+            match live(session) {
+                Some(Agent::Shell) => {}
+                Some(Agent::Coding(id)) => bail!(
+                    "Coding session {session:?} ({}) has no Power agent identity. Talk \
+                     treats coding sessions as peers, never as the user",
+                    id.as_str()
+                ),
+                None => bail!(
+                    "Unknown Power session {session:?}. Unset POWER_SESSION to send from this shell"
+                ),
+            }
         }
         Ok(Self {
             agent,
@@ -257,9 +269,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     fn actor<'a>(&self, caller: &'a Caller, directory: &'a Directory) -> Result<Actor<'a>> {
-        Actor::new(caller, directory, |session| {
-            self.activity.activity(session).is_some()
-        })
+        Actor::new(caller, directory, |session| self.activity.agent(session))
     }
 
     pub fn send(&self, command: SendMessage) -> Result<Vec<Message>> {

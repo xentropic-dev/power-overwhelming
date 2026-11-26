@@ -396,3 +396,51 @@ fn turn_reports_separate_from_output_and_keystrokes() {
         Hold(Busy)
     );
 }
+
+#[test]
+fn notify_only_submission_holds_notices_until_the_turn_end_report() {
+    use HoldReason::*;
+    use NoticeDecision::*;
+    let policy = NoticePolicy::default();
+    let msg = message().queued();
+    // A notice (or the initial prompt) started a turn long ago and the output went quiet,
+    // but the provider has not reported the turn's end.
+    let submitted = Activity {
+        hook: HookState::Ready,
+        ready_only: true,
+        awaiting_turn_end: true,
+        reported_at: 100_000,
+        last_notice: 100_500,
+        last_output: 101_000,
+        ..Activity::default()
+    };
+    assert_eq!(
+        policy.decide(submitted, false, false, &msg, 1_000_000),
+        Hold(Busy)
+    );
+    let initial = Activity {
+        hook: HookState::Unknown,
+        reported_at: 0,
+        last_notice: 0,
+        ..submitted
+    };
+    assert_eq!(
+        policy.decide(initial, false, false, &msg, 1_000_000),
+        Hold(Busy)
+    );
+    // Urgent user messages still interrupt.
+    let mut urgent = message();
+    urgent.urgent = true;
+    urgent.sender = Sender::User;
+    assert_eq!(
+        policy.decide(submitted, false, false, &urgent.queued(), 1_000_000),
+        Notify
+    );
+    // The turn-end report clears the submission.
+    let ended = Activity {
+        awaiting_turn_end: false,
+        reported_at: 900_000,
+        ..submitted
+    };
+    assert_eq!(policy.decide(ended, false, false, &msg, 1_000_000), Notify);
+}

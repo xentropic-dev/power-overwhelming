@@ -487,6 +487,10 @@ pub struct Activity {
     /// The provider reports only turn ends (Codex `notify`), so output after a ready
     /// report may be a trailing repaint or a new turn. Delivery waits for output quiet.
     pub ready_only: bool,
+    /// A known prompt submission (a notice or the initial prompt) started a turn on a
+    /// notify-only provider that has not reported its end. Redraws and draft keystrokes
+    /// never set it, and only the next turn-end report clears it.
+    pub awaiting_turn_end: bool,
     pub restoring: bool,
     pub paused: bool,
     /// Changes with each input, output or hook report, even within one millisecond.
@@ -561,16 +565,19 @@ impl NoticePolicy {
         let output_quiet = now.saturating_sub(activity.last_output.max(activity.last_notice))
             >= self.idle_after_ms;
         let user_quiet = now.saturating_sub(activity.last_input) >= self.user_quiet_ms;
-        let idle = match activity.hook {
-            HookState::Busy => false,
-            // Typing after the turn ended may be a draft or navigation. Wait for the user to
-            // pause instead of treating the session as busy until the next report.
-            HookState::Ready => {
-                (activity.last_input <= activity.reported_at || user_quiet)
-                    && (!activity.ready_only || output_quiet)
-            }
-            HookState::Unknown => output_quiet && user_quiet,
-        };
+        // A notify-only provider cannot report the turn a submission started, so quiet output
+        // never proves it ended. One notice per turn: hold until the turn-end callback.
+        let idle = !activity.awaiting_turn_end
+            && match activity.hook {
+                HookState::Busy => false,
+                // Typing after the turn ended may be a draft or navigation. Wait for the user to
+                // pause instead of treating the session as busy until the next report.
+                HookState::Ready => {
+                    (activity.last_input <= activity.reported_at || user_quiet)
+                        && (!activity.ready_only || output_quiet)
+                }
+                HookState::Unknown => output_quiet && user_quiet,
+            };
         if !idle {
             return Hold(Busy);
         }

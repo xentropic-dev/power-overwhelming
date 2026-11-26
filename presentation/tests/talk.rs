@@ -87,9 +87,11 @@ impl Sandbox {
         }
         let script = path.join("worker.sh");
         let notify = path.join("notify-worker.sh");
+        let held = path.join("held-worker.sh");
         for (file, text) in [
             (&script, include_str!("fixtures/talk-worker.sh")),
             (&notify, include_str!("fixtures/talk-notify-worker.sh")),
+            (&held, include_str!("fixtures/talk-held-worker.sh")),
         ] {
             fs::write(file, text).unwrap();
             fs::set_permissions(file, fs::Permissions::from_mode(0o700)).unwrap();
@@ -99,9 +101,11 @@ impl Sandbox {
             format!(
                 "talk = {{ idle_after = 0.015, user_quiet = 0.025 }}\n\
                  agents.fixture = {{ command = {:?} }}\n\
-                 agents.notify = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n",
+                 agents.notify = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n\
+                 agents.held = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n",
                 script.to_str().unwrap(),
                 notify.to_str().unwrap(),
+                held.to_str().unwrap(),
             ),
         )
         .unwrap();
@@ -809,6 +813,145 @@ fn notify_only_turn_end_survives_a_trailing_redraw() {
     poll("notice after a trailing redraw", || {
         (notice_count(path, "b") == 1).then_some(())
     });
+}
+
+/// Waits well past the fixture's idle and user-quiet thresholds, then checks that the
+/// message is still unnotified and nothing more reached the held worker.
+#[track_caller]
+fn assert_held(path: &Path, worker: &ManagedAgent, id: &str, notices: usize) {
+    thread::sleep(Duration::from_millis(400));
+    let rows = messages(talk(path, Some(worker), &["inbox", "--peek", "--json"]));
+    let row = rows.iter().find(|row| row["id"] == id).unwrap();
+    assert!(row["delivery"]["notified_at"].is_null(), "{row}");
+    assert_eq!(notice_count(path, "b"), notices);
+}
+
+#[test]
+fn notify_only_turn_started_by_a_notice_gets_no_second_notice_until_it_ends() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let worker = sandbox.launch_profile("held", "b", BOX);
+    success(talk(
+        path,
+        None,
+        &["send", "--box", BOX, &worker.id, "first"],
+    ));
+    poll("first notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    // The notice submitted a prompt. The fixture printed output, then went quiet inside
+    // the turn without reporting its end.
+    let sent = messages(talk(
+        path,
+        None,
+        &["send", "--box", BOX, &worker.id, "second", "--json"],
+    ));
+    assert_held(path, &worker, field(&sent[0], "id"), 1);
+    fs::write(path.join("release-b-1"), "").unwrap();
+    poll("second notice after the turn-end report", || {
+        (notice_count(path, "b") == 2).then_some(())
+    });
+}
+
+#[test]
+fn notify_only_initial_prompt_holds_notices_until_its_turn_ends() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let coordinator = sandbox.launch("coordinator", BOX);
+    let run: Run = serde_json::from_value(
+        json(
+            power(path, Some(&coordinator))
+                .args(["dag", "create", "--title", "Held"])
+                .output()
+                .unwrap(),
+        )["run"]
+            .take(),
+    )
+    .unwrap();
+    json(
+        power(path, None)
+            .args(["dag", "add-task", &run.id, "--id", "b", "--title", "b"])
+            .output()
+            .unwrap(),
+    );
+    // A provider worker starts with its task prompt, like the #72 continuation on restore.
+    let output = power(path, Some(&coordinator))
+        .args([
+            "dag",
+            "dispatch",
+            &run.id,
+            "b",
+            "--provider",
+            "held",
+            "--worktree",
+        ])
+        .arg(path.join("b"))
+        .output()
+        .unwrap();
+    let worker: ManagedAgent = serde_json::from_value(json(output)["agent"].take()).unwrap();
+    poll("held worker startup", || {
+        file(path, "turn-b").starts_with("initial").then_some(())
+    });
+    let sent = messages(talk(
+        path,
+        Some(&coordinator),
+        &["send", &worker.id, "during the initial turn", "--json"],
+    ));
+    assert_held(path, &worker, field(&sent[0], "id"), 0);
+    fs::write(path.join("release-b-1"), "").unwrap();
+    poll("notice after the initial turn ends", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+}
+
+#[test]
+fn coding_sessions_without_an_agent_row_send_as_peers() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let recipient = sandbox.launch("b", BOX);
+    // A configured coding profile started outside `power agent start` has no agent row.
+    let session = success(
+        power(path, None)
+            .args(["session", "start", "held"])
+            .arg(path.join("a"))
+            .output()
+            .unwrap(),
+    );
+    let session = session.trim();
+    poll("coding session startup", || {
+        path.join("ready-a").exists().then_some(())
+    });
+    let mut inside = power(path, None);
+    let sent = messages(
+        inside
+            .env("POWER_SESSION", session)
+            .args([
+                "talk",
+                "send",
+                &recipient.id,
+                "from a coding session",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(sent[0]["sender"]["kind"], "agent", "{}", sent[0]);
+    let printed = success(talk(path, Some(&recipient), &["inbox"]));
+    assert!(
+        printed.contains("Peer message relayed by Power. Not from the user."),
+        "{printed}"
+    );
+    assert!(!printed.contains("the user's shell"), "{printed}");
+
+    // A session that cannot be resolved never falls back to the user's authority.
+    let mut stale = power(path, None);
+    let rejected = stale
+        .env("POWER_SESSION", "00000000-0000-0000-0000-000000000000")
+        .args(["talk", "send", "--box", BOX, &recipient.id, "spoofed"])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Unknown Power session"));
 }
 
 #[test]

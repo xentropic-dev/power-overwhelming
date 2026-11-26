@@ -210,6 +210,39 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         self.store.read(|db| self.resolve_box(db, &selection))
     }
 
+    /// Gives a live coding session without an agent row (one started with `power session
+    /// start`, or a provider running in a shell session's foreground) its peer identity in
+    /// its box. A plain shell session or an unknown session is left alone.
+    pub fn register_coding_session(&self, session: &str) -> Result<Option<ManagedAgent>> {
+        let Ok(live) = self.application.session(session) else {
+            return Ok(None);
+        };
+        if live.agent == Agent::Shell {
+            return Ok(None);
+        }
+        self.store
+            .write(|db| {
+                if let Some(agent) = db.session_agent(session)? {
+                    return Ok(agent);
+                }
+                ensure!(
+                    self.application.session_is_running(session)?,
+                    "Caller session has exited"
+                );
+                // A session started outside the strip (`power session start`) has no view,
+                // so its box is the one whose repository holds its worktree.
+                let box_id = match self.view_box(session) {
+                    Ok(id) => id,
+                    Err(_) => self.worktree_box(&live.worktree)?,
+                };
+                self.insert_session_agent(db, session, &box_id)
+            })
+            .map(Some)
+            .with_context(|| {
+                format!("Coding session {session:?} has no Power agent identity to send as")
+            })
+    }
+
     /// Sets the selected box's icon from an image on disk, or restores the identicon when
     /// `source` is absent. Returns the box ID.
     pub fn set_box_icon(&self, selection: BoxSelection, source: Option<PathBuf>) -> Result<String> {
@@ -890,6 +923,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(None)
     }
 
+    fn worktree_box(&self, worktree: &Path) -> Result<String> {
+        let mut boxes = self.registry.boxes()?.into_iter().filter(|entry| {
+            self.application
+                .workspace
+                .validate_box_worktree(&entry.info.repository, worktree)
+                .is_ok()
+        });
+        match (boxes.next(), boxes.next()) {
+            (Some(entry), None) => Ok(entry.info.id),
+            (Some(_), Some(_)) => bail!("{} belongs to several boxes", worktree.display()),
+            (None, _) => bail!("{} does not belong to a Power box", worktree.display()),
+        }
+    }
+
     fn view_box(&self, session: &str) -> Result<String> {
         self.registry
             .boxes()?
@@ -930,6 +977,15 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             self.view_box(session)? == box_id,
             "Caller session is in another box"
         );
+        self.insert_session_agent(db, session, box_id)
+    }
+
+    fn insert_session_agent(
+        &self,
+        db: &dyn DagTransaction,
+        session: &str,
+        box_id: &str,
+    ) -> Result<ManagedAgent> {
         let session = self.application.session(session)?;
         let provider = match session.agent.clone() {
             Agent::Coding(id) => Provider::Agent(id),

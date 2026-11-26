@@ -169,6 +169,20 @@ impl<T: TerminalRuntime> Application<T> {
             .context("Terminal session is unavailable")
     }
 
+    /// The agent of a running session: its launched coding agent, or for a shell session,
+    /// whichever agent holds its foreground. None if the session is unknown or has exited.
+    pub fn live_agent(&self, id: &str) -> Option<Agent> {
+        let sessions = self.sessions.lock().unwrap();
+        let live = sessions.get(id)?;
+        if !self.runtime.is_running(&live.terminal) {
+            return None;
+        }
+        Some(match &live.session.agent {
+            Agent::Coding(_) => live.session.agent.clone(),
+            Agent::Shell => self.current(live).agent,
+        })
+    }
+
     fn session_is_running(&self, id: &str) -> Result<bool> {
         Ok(self.runtime.is_running(&self.terminal(id)?))
     }
