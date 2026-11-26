@@ -21,12 +21,14 @@ use infrastructure::{
         self,
         protocol::{
             DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec, TaskState,
+            WorktreeRequest,
         },
     },
     config, daemon,
     shell::{self, Shell},
     skill_install::{LocalSkillFilesystem, install_targets},
     skills::EmbeddedSkillCatalog,
+    workspace::LocalWorktreeRoot,
 };
 use serde_json::{Value, json};
 use std::{ffi::OsString, io::Write as _, path::PathBuf, time::Duration};
@@ -99,6 +101,11 @@ enum Action {
         #[command(subcommand)]
         command: DagAction,
     },
+    /// List and prune Power-managed Git worktrees.
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeAction,
+    },
     /// Read and install skills bundled with this Power release.
     #[command(after_help = AGENT_HELP_FOOTER)]
     Skills {
@@ -135,6 +142,33 @@ enum SessionAction {
     End {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum WorktreeAction {
+    /// Print managed worktrees as JSON.
+    List(WorktreeScopeArgs),
+    /// Remove clean, merged, unused worktrees.
+    Prune {
+        #[command(flatten)]
+        scope: WorktreeScopeArgs,
+        /// Show what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete the branch of each removed worktree.
+        #[arg(long)]
+        delete_branch: bool,
+    },
+}
+
+#[derive(Args)]
+struct WorktreeScopeArgs {
+    /// Select a box by ID, shortcut, or repository name. Defaults to the current Power box.
+    #[arg(long = "box", value_name = "BOX", conflicts_with = "all")]
+    box_sel: Option<String>,
+    /// Include managed worktrees from every box.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -217,7 +251,10 @@ fn main() -> Result<()> {
         error.exit()
     });
     match cli.command {
-        Some(Action::Daemon) => daemon::serve(configured_agents()),
+        Some(Action::Daemon) => daemon::serve(
+            configured_agents(),
+            LocalWorktreeRoot::new(settings::Settings::defaults()),
+        ),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
         }) => {
@@ -368,6 +405,10 @@ fn main() -> Result<()> {
         Some(Action::Dag { command }) => {
             client::ensure_daemon()?;
             run_dag(command)
+        }
+        Some(Action::Worktree { command }) => {
+            client::ensure_daemon()?;
+            run_worktree(command)
         }
         None | Some(Action::Gui) => {
             gui::run();
@@ -521,8 +562,15 @@ struct DispatchArgs {
     /// Coding agent profile ID, or `command` to run an executable directly.
     #[arg(long)]
     provider: String,
-    #[arg(long)]
-    worktree: PathBuf,
+    /// Existing checkout or `new`. A retry defaults to the previous managed checkout.
+    #[arg(long, value_name = "PATH|new")]
+    worktree: Option<PathBuf>,
+    /// Name of the branch for `--worktree new`.
+    #[arg(long, value_name = "NAME", required_if_eq("worktree", "new"))]
+    branch: Option<String>,
+    /// Starting revision for `--worktree new`. Required outside Power.
+    #[arg(long, value_name = "REV")]
+    base: Option<String>,
     #[arg(last = true)]
     args: Vec<String>,
 }
@@ -748,7 +796,16 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
                 .collect();
             json!({"runs": runs, "links": links})
         }
-        DagResponse::Dispatched { attempt, agent } => json!({"attempt": attempt, "agent": agent}),
+        DagResponse::Dispatched {
+            attempt,
+            agent,
+            branch,
+        } => json!({
+            "worktree": attempt.worktree,
+            "branch": branch,
+            "attempt": attempt,
+            "agent": agent,
+        }),
         DagResponse::Reported { applied, reason } => json!({"applied": applied, "reason": reason}),
         DagResponse::Events { events, cursor } => json!({"events": events, "cursor": cursor}),
         _ => anyhow::bail!("Unexpected daemon response"),
@@ -763,15 +820,100 @@ fn report_arg(value: Option<String>, env: &str, flag: &str) -> Result<String> {
 }
 
 fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
+    let worktree = match launch.worktree {
+        Some(path) if path.as_os_str() == "new" => WorktreeRequest::New {
+            branch: launch
+                .branch
+                .context("Specify --branch with --worktree new")?,
+            base: launch.base,
+        },
+        path => {
+            anyhow::ensure!(
+                launch.branch.is_none() && launch.base.is_none(),
+                "--branch and --base require --worktree new"
+            );
+            match path {
+                Some(path) => {
+                    WorktreeRequest::Existing(path.canonicalize().context("Open worktree")?)
+                }
+                None if retry => WorktreeRequest::RetryManaged,
+                None => anyhow::bail!("Specify --worktree <PATH|new> when dispatching a task"),
+            }
+        }
+    };
     Ok(DagRequest::Dispatch {
         run: launch.run,
         task: launch.task,
         provider: launch.provider.into(),
-        worktree: launch.worktree.canonicalize().context("Open worktree")?,
+        worktree,
         retry,
         args: launch.args,
         caller: caller_session(),
     })
+}
+
+fn worktree_scope(args: WorktreeScopeArgs) -> Result<client::WorktreeScope> {
+    use client::WorktreeScope;
+    if args.all {
+        return Ok(WorktreeScope::All);
+    }
+    if let Some(selector) = args.box_sel {
+        return Ok(WorktreeScope::Box { selector });
+    }
+    let session = caller_session()
+        .context("Select a box with --box, pass --all, or run from a Power terminal")?;
+    if let Ok(selector) = std::env::var("POWER_BOX")
+        && !selector.is_empty()
+    {
+        return Ok(WorktreeScope::Box { selector });
+    }
+    Ok(WorktreeScope::View { session })
+}
+
+fn run_worktree(command: WorktreeAction) -> Result<()> {
+    use client::{KeepReason, PruneVerdict};
+
+    match command {
+        WorktreeAction::List(scope) => {
+            let request = DagRequest::ListManagedWorktrees {
+                scope: worktree_scope(scope)?,
+            };
+            match client::dag(request, PROTOCOL_TIMEOUT)? {
+                DagResponse::ManagedWorktrees { worktrees } => {
+                    print_json(json!({"worktrees": worktrees}))
+                }
+                _ => anyhow::bail!("Unexpected daemon response"),
+            }
+        }
+        WorktreeAction::Prune {
+            scope,
+            dry_run,
+            delete_branch,
+        } => {
+            let entries = client::prune_worktrees(worktree_scope(scope)?, dry_run, delete_branch)?;
+            let mut stdout = std::io::stdout().lock();
+            for (worktree, verdict) in entries {
+                let path = worktree.path.display();
+                let branch = worktree.branch;
+                match verdict {
+                    PruneVerdict::Remove => {
+                        let action = if dry_run { "Would remove" } else { "Removed" };
+                        writeln!(stdout, "{action} {path} ({branch})")?;
+                    }
+                    PruneVerdict::Keep(reason) => {
+                        let reason = match reason {
+                            KeepReason::Dirty => "uncommitted or untracked changes",
+                            KeepReason::Unmerged => "branch has not merged into the default branch",
+                            KeepReason::InUse => "in use by a live session or active attempt",
+                            KeepReason::NoLongerManaged => "checkout no longer managed by Power",
+                        };
+                        writeln!(stdout, "Kept {path} ({branch}) — {reason}")?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn run_dag(command: DagAction) -> Result<()> {

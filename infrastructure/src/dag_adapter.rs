@@ -3,10 +3,12 @@ use crate::{
     boxes::BoxesFile,
     dag_store::SqliteDagStore,
     terminal::PtyRuntime,
-    wire::{self, DagRequest, DagResponse, Response},
+    wire::{self, DagRequest, DagResponse, Response, WorktreePruneEntry, WorktreeScope},
 };
-use anyhow::Result;
-use application::dag::{BoxSelection, DagApplication, Dispatch, EventScope, StartAgent};
+use anyhow::{Context, Result};
+use application::dag::{
+    BoxRegistry, BoxSelection, DagApplication, Dispatch, EventScope, StartAgent,
+};
 use domain::worktree::WorktreeRequest;
 use std::{os::unix::net::UnixStream, time::Duration};
 
@@ -107,7 +109,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
                 run,
                 task,
                 provider: provider.into(),
-                worktree: WorktreeRequest::Existing(worktree),
+                worktree: worktree.into(),
                 retry,
                 args,
                 caller,
@@ -115,6 +117,37 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             Reply::Dispatched {
                 attempt: result.attempt.into(),
                 agent: Box::new(result.agent.into()),
+                branch: result.branch,
+            }
+        }
+        DagRequest::CreateViewWorktree {
+            box_sel,
+            from_session,
+            branch,
+        } => Reply::ViewWorktreeCreated {
+            path: application.create_view_worktree(&box_sel, &from_session, &branch)?,
+        },
+        DagRequest::ListManagedWorktrees { scope } => {
+            let box_id = worktree_box(application, scope)?;
+            Reply::ManagedWorktrees {
+                worktrees: convert(application.list_managed_worktrees(box_id.as_deref())?),
+            }
+        }
+        DagRequest::PruneWorktrees {
+            scope,
+            dry_run,
+            delete_branch,
+        } => {
+            let box_id = worktree_box(application, scope)?;
+            Reply::WorktreesPruned {
+                entries: application
+                    .prune(box_id.as_deref(), dry_run, delete_branch)?
+                    .into_iter()
+                    .map(|(worktree, verdict)| WorktreePruneEntry {
+                        worktree: worktree.into(),
+                        verdict: verdict.into(),
+                    })
+                    .collect(),
             }
         }
         DagRequest::Report {
@@ -153,6 +186,19 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::Watch { .. } => unreachable!("DAG watches use the streaming handler"),
     };
     Ok(response)
+}
+
+fn worktree_box(application: &DaemonDag, scope: WorktreeScope) -> Result<Option<String>> {
+    match scope {
+        WorktreeScope::All => Ok(None),
+        WorktreeScope::Box { selector } => application.select_box(&selector).map(Some),
+        WorktreeScope::View { session } => BoxesFile
+            .boxes()?
+            .into_iter()
+            .find(|entry| entry.sessions.contains(&session))
+            .map(|entry| Some(entry.info.id))
+            .with_context(|| format!("Power session {session:?} does not belong to a box")),
+    }
 }
 
 pub(crate) fn watch(

@@ -337,17 +337,19 @@ pub fn ensure_daemon() -> Result<()> {
 // for callers that speak the JSON contract directly, such as the CLI.
 // ---------------------------------------------------------------------------
 
+pub use crate::wire::WorktreeScope;
 pub use domain::dag::{
     AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, ManagedAgent, Provider,
     ReportStatus, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState,
 };
+pub use domain::worktree::{KeepReason, ManagedWorktree, PruneVerdict, WorktreeCreator};
 
 /// The DAG wire contract, for callers that print or forward its JSON.
 pub mod protocol {
     pub use crate::wire::{
         AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, DagRequest,
-        DagResponse, ManagedAgent, Provider, ReportStatus, Run, RunEvent, RunEventKind, Task,
-        TaskSpec, TaskState,
+        DagResponse, ManagedAgent, ManagedWorktree, Provider, ReportStatus, Run, RunEvent,
+        RunEventKind, Task, TaskSpec, TaskState, WorktreeRequest, WorktreeScope,
     };
 }
 
@@ -418,6 +420,53 @@ pub fn list_runs(box_sel: Option<String>, caller: Option<String>) -> Result<Vec<
 pub fn get_run(run: String) -> Result<Run> {
     match dag(DagRequest::GetRun { run }, DAG_TIMEOUT)? {
         DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Creates a checkout based on the source view's HEAD and returns its path.
+pub fn create_view_worktree(
+    box_sel: String,
+    from_session: String,
+    branch: String,
+) -> Result<PathBuf> {
+    match dag(
+        DagRequest::CreateViewWorktree {
+            box_sel,
+            from_session,
+            branch,
+        },
+        DAG_TIMEOUT,
+    )? {
+        DagResponse::ViewWorktreeCreated { path } => Ok(path),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn list_managed_worktrees(scope: WorktreeScope) -> Result<Vec<ManagedWorktree>> {
+    match dag(DagRequest::ListManagedWorktrees { scope }, DAG_TIMEOUT)? {
+        DagResponse::ManagedWorktrees { worktrees } => Ok(domain_list(worktrees)),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn prune_worktrees(
+    scope: WorktreeScope,
+    dry_run: bool,
+    delete_branch: bool,
+) -> Result<Vec<(ManagedWorktree, PruneVerdict)>> {
+    match dag(
+        DagRequest::PruneWorktrees {
+            scope,
+            dry_run,
+            delete_branch,
+        },
+        DAG_TIMEOUT,
+    )? {
+        DagResponse::WorktreesPruned { entries } => Ok(entries
+            .into_iter()
+            .map(|entry| (entry.worktree.into(), entry.verdict.into()))
+            .collect()),
         _ => bail!("Unexpected daemon response"),
     }
 }
