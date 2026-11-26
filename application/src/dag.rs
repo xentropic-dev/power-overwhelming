@@ -1,4 +1,6 @@
-use crate::{Application, SessionOptions, StartSession, TerminalRuntime};
+use crate::{
+    Application, BranchStatus, SessionOptions, StartSession, TerminalRuntime, WorktreeRoot,
+};
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
@@ -7,7 +9,7 @@ use domain::{
         TaskState, can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
-    worktree::{ManagedWorktree, WorktreeRequest},
+    worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
 };
 use std::{
     collections::BTreeMap,
@@ -128,6 +130,7 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry> {
     application: Arc<Application<T>>,
     store: S,
     registry: B,
+    worktree_root: Option<Box<dyn WorktreeRoot>>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
@@ -152,9 +155,16 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             application,
             store,
             registry,
+            worktree_root: None,
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
+    }
+
+    /// Enables managed worktree dispatch for stores and workspaces that support it.
+    pub fn with_worktree_root(mut self, root: impl WorktreeRoot + 'static) -> Self {
+        self.worktree_root = Some(Box::new(root));
+        self
     }
 
     pub fn boxes(&self) -> Result<Vec<BoxInfo>> {
@@ -846,6 +856,9 @@ fn report(
         reason: None,
     })
 }
+
+#[path = "worktrees.rs"]
+mod worktrees;
 
 #[cfg(test)]
 mod tests;

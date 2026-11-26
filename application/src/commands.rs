@@ -46,13 +46,15 @@ impl<T: TerminalRuntime> Application<T> {
             Agent::Shell => None,
             Agent::Coding(id) => Some(self.agents.resolve(id)?),
         };
+        // Prune holds this lock from its live-session check through removal.
+        let mut sessions = self.sessions.lock().unwrap();
         let session = Session {
             id: (self.new_id)(),
             worktree: self.workspace.open_worktree(&command.worktree)?,
             agent: command.agent,
         };
         let terminal = self.runtime.start(&session, options, profile)?;
-        self.sessions.lock().unwrap().insert(
+        sessions.insert(
             session.id.clone(),
             Live {
                 session: session.clone(),

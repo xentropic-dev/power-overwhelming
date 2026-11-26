@@ -18,11 +18,15 @@ use std::{
     thread,
 };
 
+#[path = "../worktrees/tests.rs"]
+mod worktrees;
+
 #[derive(Clone, Default)]
 struct Records {
     agents: Vec<ManagedAgent>,
     runs: Vec<Run>,
     events: Vec<RunEvent>,
+    worktrees: Vec<ManagedWorktree>,
 }
 
 #[derive(Default)]
@@ -46,16 +50,29 @@ impl DagStore for MemoryStore {
 }
 
 impl DagReader for MemoryDb {
-    fn list_worktrees(&self, _box_id: Option<&str>) -> Result<Vec<ManagedWorktree>> {
-        bail!("Unexpected managed worktree lookup")
+    fn list_worktrees(&self, box_id: Option<&str>) -> Result<Vec<ManagedWorktree>> {
+        Ok(self
+            .0
+            .borrow()
+            .worktrees
+            .iter()
+            .filter(|worktree| box_id.is_none_or(|id| worktree.box_id == id))
+            .cloned()
+            .collect())
     }
 
     fn find_worktree_by_attempt(&self, _attempt: &str) -> Result<Option<ManagedWorktree>> {
         bail!("Unexpected managed worktree lookup")
     }
 
-    fn find_worktree_by_path(&self, _path: &Path) -> Result<Option<ManagedWorktree>> {
-        bail!("Unexpected managed worktree lookup")
+    fn find_worktree_by_path(&self, path: &Path) -> Result<Option<ManagedWorktree>> {
+        Ok(self
+            .0
+            .borrow()
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == path)
+            .cloned())
     }
 
     fn agent(&self, id: &str) -> Result<ManagedAgent> {
@@ -160,12 +177,31 @@ impl DagReader for MemoryDb {
 }
 
 impl DagTransaction for MemoryDb {
-    fn insert_worktree(&self, _worktree: &ManagedWorktree) -> Result<()> {
-        bail!("Unexpected managed worktree insert")
+    fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()> {
+        ensure!(
+            self.find_worktree_by_path(&worktree.path)?.is_none(),
+            "Duplicate worktree"
+        );
+        if let WorktreeCreator::Attempt { run, task, attempt } = &worktree.creator {
+            let run = self.run(run)?;
+            ensure!(
+                find_task(&run, task)?
+                    .attempts
+                    .iter()
+                    .any(|entry| &entry.id == attempt),
+                "Worktree creator attempt must be recorded first"
+            );
+        }
+        self.0.borrow_mut().worktrees.push(worktree.clone());
+        Ok(())
     }
 
-    fn remove_worktree(&self, _path: &Path) -> Result<()> {
-        bail!("Unexpected managed worktree removal")
+    fn remove_worktree(&self, path: &Path) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .worktrees
+            .retain(|record| record.path != path);
+        Ok(())
     }
 
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
