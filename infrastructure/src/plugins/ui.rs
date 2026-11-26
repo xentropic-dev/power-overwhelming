@@ -202,14 +202,18 @@ impl Runtime {
         home: Option<&str>,
         scheme: &'static Scheme,
     ) -> Result<Option<Row>> {
-        let view = self::ActiveViewInput::from_view(view, home);
         let fields = fields
             .iter()
             .map(|(name, value)| Field {
                 name: name.clone(),
                 value: value.clone(),
             })
+            .chain(view.dag_progress.iter().map(|value| Field {
+                name: "@dag.progress".into(),
+                value: value.clone(),
+            }))
             .collect::<Vec<_>>();
+        let view = self::ActiveViewInput::from_view(view, home);
         let time = plugin.clock.as_ref().map(Clock::value);
         self.watchdog.send(())?;
         plugin.store.data_mut().scheme = Some(scheme);
@@ -534,6 +538,7 @@ mod tests {
             agent_type: "Codex".into(),
             agent_task: Some("Fix WebM playback".into()),
             agent_model: None,
+            dag_progress: None,
         }
     }
 
@@ -560,6 +565,7 @@ mod tests {
         assert_eq!(row.right[1].bg.as_deref(), Some("bright-blue"));
         let mut with_model = view();
         with_model.agent_model = Some("gpt-6".into());
+        with_model.dag_progress = Some("DAG 1/6 done".into());
         let model_row = runtime
             .render(
                 &mut plugin,
@@ -569,8 +575,9 @@ mod tests {
                 theme::default_scheme(),
             )?
             .context("Missing model row")?;
-        assert_eq!(model_row.right[1].text, "gpt-6");
-        assert_eq!(model_row.right[2].text, "Codex");
+        assert_eq!(model_row.right[0].text, "DAG 1/6 done");
+        assert_eq!(model_row.right[2].text, "gpt-6");
+        assert_eq!(model_row.right[3].text, "Codex");
         let mut shell = view();
         shell.agent_type = "Shell".into();
         shell.agent_task = None;

@@ -15,6 +15,7 @@
     { "icon": "", "text": "{worktree.name}", "bg": "raised" }
   ],
   "right": [
+    { "text": "{dag.progress}", "bg": "raised" },
     { "text": "{agent.task}", "bg": "surface" },
     { "text": "{agent.model}", "fg": "muted", "bg": "surface" },
     { "text": "{agent.type}", "fg": "contrast", "bg": "agent", "bold": true }

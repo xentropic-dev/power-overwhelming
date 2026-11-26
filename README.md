@@ -2,7 +2,51 @@
 
 # Power Overwhelming
 
-A native Wayland desktop multiplexer for coding agents such as Claude Code, Codex, and Grok. The local daemon keeps terminals and agents running when the GPUI window closes. Artifact links open in a closable pane beside the terminal.
+Power is a native Wayland desktop multiplexer for coding agents such as Claude Code, Codex, and Grok. Close the GPUI window and the local daemon keeps your terminals and agents running. Artifact links open in a preview pane you can close independently of the terminal.
+
+Contributions are welcome. See the [contribution guide](CONTRIBUTING.md) for the project's design principles and how to get started.
+
+## Feature tour
+
+### Agent status at a glance
+
+The bundled [Power-bar plugin](#power-bar) puts the active worktree, task label, model, and agent type in the same places across providers. The top bar shows Codex working on this README. The bottom bar shows a Claude Code worker in a separate worktree and its DAG progress.
+
+![Power-bar crops comparing the Codex README session and a Claude Code worker, with worktree, task, model, and provider in both and DAG progress on the worker](docs/screenshots/power-bar.png)
+
+### Live DAG orchestration
+
+Coordinators [dispatch workers and track dependencies](#dag-orchestration) in Power. In the run below, the run-status change is complete. Two workers are active and their dependent tasks are waiting. Select a node to inspect its attempt or open the worker's terminal.
+
+![Live DAG for the picker improvements, with dependency arrows and completed, working, and waiting tasks](docs/screenshots/dag-orchestration.png)
+
+### Theme picker
+
+Press Ctrl+B then `t` to search [color schemes](#color-schemes) and see their palettes. The selected scheme applies to the app and its terminals.
+
+![Color scheme picker showing Tokyo Night variants and their palette swatches over a Claude Code session](docs/screenshots/theme-picker.png)
+
+### Boxes and tabs
+
+The Maple Street Donuts box groups two sessions, one for the product render and one for the pickup menu. The menu agent drew the donut icon and set it in the box rail with `power box icon ./donut-box.png`.
+
+![The bakery's donut icon in the box rail, two Codex tabs, and the command that set the icon](docs/screenshots/boxes-and-tabs.png)
+
+### Video and web previews
+
+One Codex session modeled a maple-glazed donut in Blender and [published a review copy of the turntable](#preview-an-artifact). Open the link from that session to play the video beside the agent's final response.
+
+![Codex's final response and published turntable link beside the open video preview](docs/screenshots/video-preview.png)
+
+To open the alternating turntable from the keyboard, press Ctrl+S, then `o`, then the number shown on the artifact link. In this session, the link is `1`.
+
+![Power numbers the agent's artifact link, then opens the animated donut beside the terminal when 1 is pressed](docs/screenshots/donut-preview-shortcuts.gif)
+
+![Maple-glazed donut turning once around Blender's X axis, then once around its Y axis](docs/screenshots/donut-turntable.gif)
+
+The other Codex session used a still from that render on the pickup menu. It ran a local server and published the page, so the link opens the live menu beside the conversation.
+
+![Codex's final response and published pickup menu link beside the open website preview](docs/screenshots/website-preview.png)
 
 ## Build and run
 
@@ -13,17 +57,25 @@ mise run release
 ./target/release/power gui
 ```
 
-Run `power` or `power gui` from any directory. Enter a Git checkout path in the picker to create a box with a shell tab. As you type, the picker searches every directory up to six levels below the path before the last separator with fzf’s algorithm and query syntax: space-separated terms must all match, and `'exact`, `^prefix`, `suffix$`, and `!exclude` work as in fzf. Lowercase queries ignore case. Matches in the final folder name rank first. The search skips hidden directories and anything `.gitignore` excludes, and does not enter `node_modules` or `target`. Tab completes the selected result, and Enter opens it. Type `codex`, `claude`, or `grok` in the shell to start an installed agent. Tabs show their number and what is running, such as `1 shell` or `2 claude`, and update when an agent starts or exits.
+Run `power` or `power gui` from any directory. Enter a Git checkout path in the picker to create a box with a shell tab. Tab completes the selected result. Enter opens it.
+
+The picker searches up to six directory levels below the path before the last separator. It uses fzf's matching algorithm and query syntax. Every space-separated term must match, and `'exact`, `^prefix`, `suffix$`, and `!exclude` work as in fzf. Lowercase queries ignore case. Matches in the final folder name rank first. The search skips hidden directories, paths excluded by `.gitignore`, `node_modules`, and `target`.
+
+Type `codex`, `claude`, or `grok` in the shell to start an installed agent. Tab labels show the number and what's running, such as `1 shell` or `2 claude`. They update when an agent starts or exits.
 
 ## Shell integration
 
-On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines a shell function for each agent profile. Profiles with launch instructions tell agents how to load bundled Power skills (see [Skills](#skills)). Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Sessions survive a daemon restart or a reboot. When the daemon starts again, it recreates each open session under the same ID, in the same worktree. Shells reopen in their last directory with their scrollback. An agent continues its conversation when its profile has a `resume` spec (see [Agent profiles](#agent-profiles)), including an agent started from a shell when shell integration is installed. Power never re-runs one-off commands, and drops sessions whose worktree is gone. Closing a tab ends its session for good. The GUI then reopens the last box and its active tab.
+On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). The line defines a shell function for each agent profile only inside Power terminals. Profiles with launch instructions tell agents how to load the bundled skills. See [Skills](#skills).
+
+To install the integration later, press `ctrl-b i` in the app or run `power setup`. Preview the change with `power setup --dry-run`. To remove it, delete the line and the comment above it.
+
+After a daemon restart or reboot, Power restores each open session with its original ID and worktree. Shells reopen in their last directory with their scrollback. Agents with a `resume` spec pick up their conversations, including agents started from a shell with the integration installed. See [Agent profiles](#agent-profiles). Power skips one-off commands and drops sessions whose worktree is gone. Closing a tab ends its session. When the GUI reopens, it shows the last box and its active tab.
 
 Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
 
 ## Skills
 
-Power bundles skills that teach agents its workflows: `power-dag` for DAG orchestration and `power-artifacts` for publishing previews. They ship inside the `power` binary, so the guide always matches the release, and reading them needs no daemon.
+Power ships `power-dag` for DAG orchestration and `power-artifacts` for publishing previews. The skills live in the `power` binary. You can read the guides for your installed release with the daemon stopped.
 
 ```sh
 power skills list                           # name and description of each skill
@@ -37,7 +89,7 @@ Add `--json` to any of these for machine-readable output.
 
 ### Discovery
 
-Agents find skills in two ways. `power --help`, `power dag --help`, and `power skills --help` end with a short footer that points agents at `power skills list`. Agents that Power starts with a profile that has launch instructions, from a shell wrapper, `power session start`, or `power dag dispatch`, also get a short block naming each bundled skill and how to load it. The same instructions ask agents to report their task and active model. Skills already installed in the agent's native skill folder are left out of the block.
+`power --help`, `power dag --help`, and `power skills --help` point agents to `power skills list`. For profiles with launch instructions, Power also names the bundled skills and tells the agent how to load them. This applies to the shell wrapper, `power session start`, and `power dag dispatch`. Power skips skills already in the agent's native skill folder and asks the agent to report its task and active model.
 
 ### Native installs
 
@@ -94,9 +146,9 @@ For a new profile, `command` defaults to the ID and `injection` defaults to `{ k
 
 Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings.
 
-`model_callback` registers `power session model --json` with the agent for each launch, so it reports its model without changes to your config files (see [Report models from provider callbacks](#report-models-from-provider-callbacks)). `{ kind = "claude_status_line" }` passes Claude Code a `--settings` status line; the Claude profile uses it. `{ kind = "args", args = { ... } }` passes the listed arguments, replacing `{command}` with the callback command. `{ kind = "none" }`, the default for Codex, Grok and new profiles, adds nothing. Power skips the callback on the same subcommands and arguments as the launch instructions.
+`model_callback` registers `power session model --json` at launch so the agent can report its model without changing your config files. The Claude profile uses `{ kind = "claude_status_line" }` to pass a status line through `--settings`. `{ kind = "args", args = { ... } }` passes the listed arguments and replaces `{command}` with the callback command. Codex, Grok, and new profiles default to `{ kind = "none" }`. The callback and launch instructions use the same skip rules for subcommands and arguments. See [Report models from provider callbacks](#report-models-from-provider-callbacks).
 
-`skills_dir` is the folder where the agent reads user skills natively; a leading `~` means your home directory. The same path relative to home is the project skill folder, so `~/.claude/skills` also means `.claude/skills` in the worktree and its parents. `power skills install` links skills into it, and launch instructions leave out skills already there. Set it to `~/.agents/skills` for an agent that reads the shared folder, and leave it out when the agent has no skill folder.
+`skills_dir` is the folder where the agent reads user skills. A leading `~` means your home directory. Power uses the same relative path for project skills, so `~/.claude/skills` also maps to `.claude/skills` in the worktree and its parents. `power skills install` links skills into that folder. Launch instructions omit skills already there. Set `skills_dir` to `~/.agents/skills` for an agent that reads the shared folder. Leave it out if the agent has no skill folder.
 
 The optional `resume` table describes how the agent accepts conversation IDs. `assign` supplies launch arguments that pin a new ID, and `resume` supplies arguments to reopen a known ID. Both replace `{id}` with the conversation ID. `resume_last` supplies fallback arguments when the ID is unknown or the `resume` list is empty. An exact argument match in `conflicts` skips assignment and lets Power pick up a conversation ID from a pair such as `--resume <id>`. Omitted lists inherit their built-in values, and an empty list `{}` clears the corresponding value. Codex uses `resume --last` to select the most recent conversation for the working directory.
 
@@ -116,7 +168,7 @@ The Lua setting takes precedence at startup and when you reload with Ctrl+B then
 
 ## Terminal font
 
-Power sizes the terminal grid from the font, as Ghostty does: the cell is the widest ASCII advance by the font's ascent, descent and line gap, rounded to whole device pixels. Set the font and grid in the `terminal` table of `config.lua`:
+Power sizes terminal cells the way Ghostty does. The widest ASCII advance sets the width. Ascent, descent, and line gap set the height. Power rounds both to whole device pixels. Configure the font and grid in the `terminal` table of `config.lua`.
 
 ```lua
 terminal.font_family = "JetBrains Mono"  -- default: JetBrains Mono when installed, else monospace
@@ -139,7 +191,11 @@ Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` 
 
 ## Power-bar
 
-The status bar shows the main checkout and active worktree folder names with distinct icons, followed by the foreground agent, its model when known, and its task when reported. Press Ctrl+S then `y` to copy either full path. Power’s launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"` and `{agent.model}` with `power session model "Model name"` when they can verify the active model. Agents should update these labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok.
+The status bar shows the main checkout, active worktree, and foreground agent type. It also shows the agent's model and task when available. Press Ctrl+S then `y` to copy either full path.
+
+`{dag.progress}` shows a count such as `DAG 1/6 done` on the coordinator's and workers' tabs while the run has ready, working, or input-blocked tasks. If a coordinator has several live runs, its tab shows the newest.
+
+Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok.
 
 Set `power_bar` in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua` and press Ctrl+B then `r` to reload. The default uses colored Powerline joins and changes the rightmost accent with the active agent. Set `separator` to `""` for rounded joins or to Unicode text such as `" │ "` for a plain separator. Each segment can set an `icon`, foreground, and background. [Bundled defaults](plugins/power-bar/defaults.json)
 
@@ -151,6 +207,7 @@ power_bar.left = {
 }
 power_bar.agent_colors.Codex = "#62a0ea"
 power_bar.right = {
+  { text = "{dag.progress}", bg = "raised" },
   { text = "{agent.task}", bg = "surface" },
   { text = "{agent.model}", fg = "muted", bg = "surface" },
   { icon = "◷", text = "{time}", fg = "muted", bg = "raised" },
@@ -164,7 +221,9 @@ To add template fields, put components implementing the [status fields interface
 
 ### Report models from provider callbacks
 
-When Power launches **Claude Code** through shell integration, it passes `--settings` with a status line that runs `power session model --json` for that launch only. Power skips this when your managed, user, project or local Claude Code settings already define a `statusLine`, or when you pass `--settings` yourself; set up the callback by hand as shown below in those cases. Codex and Grok need the manual setup. Codex runs hooks from any source, `-c` overrides included, only after you review and trust them, and Grok's `GROK_CONFIG` overlay cannot set `[ui.status_line]`.
+When Power launches Claude Code through shell integration, it passes `--settings` with a status line that runs `power session model --json` for that launch. If any managed, user, project, or local Claude Code setting already defines a `statusLine`, or you pass `--settings` yourself, use the manual setup below.
+
+Codex and Grok also use the manual setup. Codex runs hooks from any source, including `-c` overrides, only after you review and trust them. Set `[ui.status_line]` in Grok's config file. The `GROK_CONFIG` overlay cannot set it.
 
 Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
 
@@ -231,7 +290,7 @@ power artifact publish './out/my video.mp4' --title 'Demo'
 power artifact publish http://localhost:3000/
 ```
 
-Publishing returns a `pwr://artifact/…` link backed by a reference to the file or server. Keep the file in place and the preview server running while you want the link to work. HTML file previews serve sibling assets from the file’s directory. The browser helper runs offscreen on Wayland and uses an ephemeral browsing context.
+Publishing returns a `pwr://artifact/…` link that points to the file or server. Leave the file in place or keep the server running so the link keeps working. HTML file previews serve sibling assets from the file's directory. The browser helper runs offscreen on Wayland in an ephemeral browsing context.
 
 The vendored WebKitGTK helper comes from Zeron. Its license is in [vendor/webkit/LICENSE](vendor/webkit/LICENSE).
 
@@ -253,7 +312,7 @@ mise exec zig@0.17.1 -- cargo build --release --locked -p infrastructure --featu
 POWER_PLUGIN_DIR=/absolute/path/to/plugins ./target/release/power gui
 ```
 
-Set `POWER_PLUGIN_DIR` in the daemon's environment. A GUI that attaches to an existing daemon uses that daemon's configuration. The directory opts its regular `.wasm` files into the [versioned artifact WIT interface](infrastructure/wit/artifact-plugin.wit). The host loads these components on the first publish, delivers best-effort notifications after the database write, and allows each callback to resolve the current artifact. Restart the daemon to reload the directory. The notification path uses a bounded background queue and the separate host applies execution, memory, and query limits.
+Set `POWER_PLUGIN_DIR` in the daemon's environment. A GUI that attaches to an existing daemon uses that daemon's configuration. The host loads regular `.wasm` files in that directory on the first publish. After writing to the database, it sends best-effort notifications through a bounded background queue. Each callback can resolve the current artifact. The separate host enforces execution, memory, and query limits. Restart the daemon to reload the directory. See the [versioned artifact WIT interface](infrastructure/wit/artifact-plugin.wit).
 
 To compare daemon startup, reattachment, and PTY round-trip latency on the same machine, run the benchmark against both builds. Pass `--plugin-dir` to exercise artifact delivery during input.
 
