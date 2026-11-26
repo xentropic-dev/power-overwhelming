@@ -8,10 +8,7 @@ use domain::{
     dag::BoxInfo,
     worktree::{KeepReason, ManagedWorktree, PruneStatus, PruneVerdict, prune_verdict},
 };
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, path::PathBuf};
 
 impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplication<T, S, B, I> {
     pub fn create_view_worktree(
