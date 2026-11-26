@@ -418,6 +418,71 @@ fn dispatches_from_a_view_and_an_explicit_base_and_records_creators() {
 }
 
 #[test]
+fn workers_default_to_a_new_worktree_and_need_an_opt_in_for_the_main_checkout() {
+    let fixture = Fixture::new();
+    let run_id = fixture.external_run("7");
+    for task in ["default", "main"] {
+        fixture.add_task(&run_id, task, &[]);
+    }
+    let created = parse(
+        fixture
+            .worker("dispatch", &run_id, "default")
+            .args(["--branch", "worker/default", "--base", "main"])
+            .args(["--", "/bin/sh", "-ec", REPORT_SUCCESS]),
+    );
+    assert_eq!(
+        checkout(&created, "worker/default"),
+        fixture.default_root().join("repo/worker-default")
+    );
+    fixture.wait_for_state(&run_id, "default", "completed");
+
+    let main = fixture.repo.canonicalize().unwrap();
+    let dispatch = || fixture.worker("dispatch", &run_id, "main");
+    rejected(
+        dispatch().args(["--", "/bin/true"]).output().unwrap(),
+        "Specify --branch <name>",
+    );
+    let error = rejected(
+        dispatch()
+            .arg("--worktree")
+            .arg(&main)
+            .args(["--", "/bin/true"])
+            .output()
+            .unwrap(),
+        "is the repository's main checkout",
+    );
+    assert!(error.contains("--allow-main-checkout"), "{error}");
+    rejected(
+        dispatch()
+            .args(["--branch", "x", "--allow-main-checkout"])
+            .output()
+            .unwrap(),
+        "--worktree",
+    );
+    fixture.wait_for_state(&run_id, "main", "ready");
+    let reused = parse(
+        dispatch()
+            .arg("--worktree")
+            .arg(&main)
+            .arg("--allow-main-checkout")
+            .args(["--", "/bin/sh", "-ec", REPORT_SUCCESS]),
+    );
+    assert_eq!(reused["attempt"]["worktree"], main.to_str().unwrap());
+    fixture.wait_for_state(&run_id, "main", "completed");
+
+    let start = || {
+        let mut command = fixture.command();
+        command.args(["agent", "start", "--box", "7", "--provider", "codex"]);
+        command
+    };
+    rejected(start().output().unwrap(), "Specify --branch <name>");
+    rejected(
+        start().arg("--worktree").arg(&main).output().unwrap(),
+        "is the repository's main checkout",
+    );
+}
+
+#[test]
 fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     let fixture = Fixture::new();
     let run_id = fixture.external_run("7");

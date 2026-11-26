@@ -381,6 +381,8 @@ fn main() -> Result<()> {
                 prompt,
                 args,
             } => {
+                let allow_main_checkout = worktree.allow_main_checkout;
+                let worktree = worktree.request(false, "starting an agent")?;
                 client::ensure_daemon()?;
                 anyhow::ensure!(
                     provider != "command",
@@ -392,7 +394,8 @@ fn main() -> Result<()> {
                         box_sel,
                         caller: caller_session(),
                         provider: Provider::Agent(provider),
-                        worktree: worktree.canonicalize().context("Open worktree")?,
+                        worktree,
+                        allow_main_checkout,
                         parent,
                         label,
                         prompt,
@@ -459,8 +462,8 @@ enum AgentAction {
         /// Coding agent profile ID.
         #[arg(long)]
         provider: String,
-        #[arg(long)]
-        worktree: PathBuf,
+        #[command(flatten)]
+        worktree: WorktreeArgs,
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
@@ -562,17 +565,63 @@ struct DispatchArgs {
     /// Coding agent profile ID, or `command` to run an executable directly.
     #[arg(long)]
     provider: String,
-    /// Existing checkout or `new`. A retry defaults to the previous managed checkout.
-    #[arg(long, value_name = "PATH|new")]
-    worktree: Option<PathBuf>,
-    /// Name of the branch for `--worktree new`.
-    #[arg(long, value_name = "NAME", required_if_eq("worktree", "new"))]
-    branch: Option<String>,
-    /// Starting revision for `--worktree new`. Required outside Power.
-    #[arg(long, value_name = "REV")]
-    base: Option<String>,
+    #[command(flatten)]
+    worktree: WorktreeArgs,
     #[arg(last = true)]
     args: Vec<String>,
+}
+
+// Where a worker runs. Without `--worktree`, Power creates a worktree on `--branch`, and a
+// retry without either reuses the previous managed worktree. A doc comment here would
+// replace the help text of every command that flattens these arguments.
+#[derive(Args)]
+struct WorktreeArgs {
+    /// Existing checkout to reuse, or `new` (the default) for a Power-managed worktree.
+    #[arg(long, value_name = "PATH|new")]
+    worktree: Option<PathBuf>,
+    /// Name of the branch for a new worktree.
+    #[arg(long, value_name = "NAME", required_if_eq("worktree", "new"))]
+    branch: Option<String>,
+    /// Starting revision for a new worktree. Required outside Power.
+    #[arg(long, value_name = "REV")]
+    base: Option<String>,
+    /// Allow `--worktree` to be the repository's main checkout, for read-only work.
+    #[arg(long, requires = "worktree")]
+    allow_main_checkout: bool,
+}
+
+impl WorktreeArgs {
+    fn request(self, retry: bool, action: &str) -> Result<WorktreeRequest> {
+        Ok(match self.worktree {
+            Some(path) if path.as_os_str() != "new" => {
+                anyhow::ensure!(
+                    self.branch.is_none() && self.base.is_none(),
+                    "--branch and --base create a new worktree, so they can't be used with an \
+                     existing --worktree path"
+                );
+                WorktreeRequest::Existing(path.canonicalize().context("Open worktree")?)
+            }
+            worktree => {
+                anyhow::ensure!(
+                    !self.allow_main_checkout,
+                    "--allow-main-checkout requires an existing --worktree path"
+                );
+                match self.branch {
+                    Some(branch) => WorktreeRequest::New {
+                        branch,
+                        base: self.base,
+                    },
+                    None if retry && worktree.is_none() && self.base.is_none() => {
+                        WorktreeRequest::RetryManaged
+                    }
+                    None => anyhow::bail!(
+                        "Specify --branch <name> for a new worktree when {action}, or \
+                         --worktree <PATH> to reuse an existing one"
+                    ),
+                }
+            }
+        })
+    }
 }
 
 #[derive(Args)]
@@ -820,32 +869,14 @@ fn report_arg(value: Option<String>, env: &str, flag: &str) -> Result<String> {
 }
 
 fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
-    let worktree = match launch.worktree {
-        Some(path) if path.as_os_str() == "new" => WorktreeRequest::New {
-            branch: launch
-                .branch
-                .context("Specify --branch with --worktree new")?,
-            base: launch.base,
-        },
-        path => {
-            anyhow::ensure!(
-                launch.branch.is_none() && launch.base.is_none(),
-                "--branch and --base require --worktree new"
-            );
-            match path {
-                Some(path) => {
-                    WorktreeRequest::Existing(path.canonicalize().context("Open worktree")?)
-                }
-                None if retry => WorktreeRequest::RetryManaged,
-                None => anyhow::bail!("Specify --worktree <PATH|new> when dispatching a task"),
-            }
-        }
-    };
+    let allow_main_checkout = launch.worktree.allow_main_checkout;
+    let worktree = launch.worktree.request(retry, "dispatching a task")?;
     Ok(DagRequest::Dispatch {
         run: launch.run,
         task: launch.task,
         provider: launch.provider.into(),
         worktree,
+        allow_main_checkout,
         retry,
         args: launch.args,
         caller: caller_session(),

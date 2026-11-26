@@ -53,6 +53,8 @@ pub trait Workspace: Send + Sync {
     fn open_worktree(&self, directory: &Path) -> Result<PathBuf>;
     fn list_worktrees(&self, directory: &Path) -> Result<Vec<PathBuf>>;
     fn validate_box_worktree(&self, repository: &Path, worktree: &Path) -> Result<PathBuf>;
+    /// The canonical path of the repository's main checkout, if it has one.
+    fn main_checkout(&self, repository: &Path) -> Result<Option<PathBuf>>;
     /// The full commit ID at the worktree's HEAD.
     fn head(&self, worktree: &Path) -> Result<String>;
     /// Looks up a local branch and reports where it is checked out, if anywhere.

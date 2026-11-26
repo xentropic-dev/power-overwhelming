@@ -3,8 +3,8 @@
 On `failed` or `interrupted`, use `power dag show "$RUN"` to inspect the attempt summary or exit detail. To start a new attempt, use `power dag retry` or `dispatch` with `--retry`.
 
 - If Power created the worktree for the previous attempt, run `power dag retry "$RUN" "$TASK" --provider "$PROFILE"`. The worker resumes in the same worktree and branch, with any uncommitted changes still in place.
-- If you dispatched to an existing checkout by path, pass that path again with `--worktree "$WORKTREE"`.
-- To retry in a fresh worktree, pass `--worktree new --branch "$BRANCH"` with an unused branch name. Outside Power, also pass `--base` with the starting commit or branch. The earlier worktree stays available until pruned.
+- If you dispatched to an existing checkout by path, pass that path again with `--worktree "$WORKTREE"`, plus `--allow-main-checkout` if you used it.
+- To retry in a fresh worktree, pass `--branch "$BRANCH"` with an unused branch name. Outside Power, also pass `--base` with the starting commit or branch. The earlier worktree stays available until pruned.
 
 Use `show` to confirm all tasks are `completed` before calling the run complete.
 

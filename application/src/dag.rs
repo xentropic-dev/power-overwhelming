@@ -347,8 +347,27 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .store
             .read(|db| self.resolve_box(db, &command.selection))?
             .context("Choose a box with --box or start the agent from a Power terminal")?;
-        let worktree = self.validate_worktree(&box_id, &command.worktree)?;
-        self.worker_transaction(|db, launched| {
+        let entry = self.registered_box(&box_id)?;
+        let caller = self.hosted_caller(command.selection.caller.as_deref());
+        let (worktree, new_branch) = match &command.worktree {
+            WorktreeRequest::Existing {
+                path,
+                allow_main_checkout,
+            } => (
+                self.existing_worktree(&entry.info.repository, path, *allow_main_checkout)?,
+                None,
+            ),
+            WorktreeRequest::New { branch, base } => {
+                let (path, base) =
+                    self.plan_new_worktree(&entry.info, branch, base.as_deref(), caller)?;
+                (path, Some((branch.clone(), base)))
+            }
+            WorktreeRequest::RetryManaged => {
+                bail!("Specify --branch or --worktree when starting an agent")
+            }
+        };
+        let mut created_path = None;
+        let result = self.worker_transaction(|db, launched| {
             let parent = if let Some(id) = command.parent {
                 ensure!(
                     db.agent(&id)?.box_id == box_id,
@@ -361,12 +380,55 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .transpose()?
                     .map(|agent| agent.id)
             };
-            let mut agent =
-                self.new_agent(box_id, worktree, command.provider, parent, command.label);
+            let mut agent = self.new_agent(
+                box_id.clone(),
+                worktree,
+                command.provider,
+                parent,
+                command.label,
+            );
+            let created = match new_branch {
+                Some((branch, base)) => {
+                    let created = self.application.workspace.create_worktree(
+                        &entry.info.repository,
+                        &agent.worktree,
+                        &branch,
+                        &base,
+                    )?;
+                    created_path = Some(created.path.clone());
+                    agent.worktree.clone_from(&created.path);
+                    Some((branch, created))
+                }
+                None => None,
+            };
             self.launch_worker(&mut agent, command.args, command.prompt, None, launched)?;
             db.insert_agent(&agent)?;
+            if let Some((branch, created)) = created {
+                // The agent's terminal session is the creator, as for a worktree made from a tab.
+                let session = agent
+                    .session
+                    .clone()
+                    .context("Started agent has no session")?;
+                db.insert_worktree(&ManagedWorktree {
+                    box_id: box_id.clone(),
+                    repository: entry.info.repository.clone(),
+                    path: created.path,
+                    branch,
+                    base_commit: created.base_commit,
+                    created_at: now(),
+                    creator: WorktreeCreator::View { box_id, session },
+                })?;
+            }
             Ok(agent)
-        })
+        });
+        if result.is_err()
+            && let Some(path) = created_path
+            && let Err(cleanup) = self.application.workspace.remove_worktree(&path, true)
+        {
+            return result
+                .with_context(|| format!("Could not undo worktree creation: {cleanup:#}"));
+        }
+        result
     }
 
     pub fn dispatch(&self, command: Dispatch) -> Result<DispatchResult> {
@@ -788,14 +850,25 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(self.application.runtime.model(&terminal, &session.agent))
     }
 
-    fn validate_worktree(&self, box_id: &str, request: &WorktreeRequest) -> Result<PathBuf> {
-        let WorktreeRequest::Existing(worktree) = request else {
-            bail!("Worktree provisioning is unavailable");
-        };
-        let entry = self.registered_box(box_id)?;
-        self.application
-            .workspace
-            .validate_box_worktree(&entry.info.repository, worktree)
+    /// Validates an existing worktree of the box, refusing the main checkout unless allowed.
+    fn existing_worktree(
+        &self,
+        repository: &Path,
+        path: &Path,
+        allow_main_checkout: bool,
+    ) -> Result<PathBuf> {
+        let workspace = &self.application.workspace;
+        let worktree = workspace.validate_box_worktree(repository, path)?;
+        if !allow_main_checkout
+            && workspace.main_checkout(repository)?.as_deref() == Some(worktree.as_path())
+        {
+            bail!(
+                "{} is the repository's main checkout. Pass --branch <name> to give the agent \
+                 its own worktree, or --allow-main-checkout for read-only work",
+                worktree.display()
+            );
+        }
+        Ok(worktree)
     }
 
     fn registered_box(&self, box_id: &str) -> Result<RegisteredBox> {
@@ -817,12 +890,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         let workspace = &self.application.workspace;
         let repository = &box_info.repository;
         match &command.worktree {
-            WorktreeRequest::Existing(path) => Ok(DispatchWorktree {
-                path: workspace.validate_box_worktree(repository, path)?,
+            WorktreeRequest::Existing {
+                path,
+                allow_main_checkout,
+            } => Ok(DispatchWorktree {
+                path: self.existing_worktree(repository, path, *allow_main_checkout)?,
                 kind: DispatchWorktreeKind::Existing,
             }),
             WorktreeRequest::RetryManaged => {
-                ensure!(command.retry, "Specify --worktree when starting a task");
+                ensure!(
+                    command.retry,
+                    "Specify --branch or --worktree when starting a task"
+                );
                 let previous = task
                     .attempts
                     .last()
@@ -830,7 +909,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 let worktree = db
                     .find_worktree_by_path(&previous.worktree)?
                     .filter(|worktree| worktree.box_id == box_info.id)
-                    .context("Specify --worktree to retry an attempt without a managed worktree")?;
+                    .context("Specify --branch or --worktree to retry an attempt without a managed worktree")?;
                 let path = workspace.validate_box_worktree(repository, &worktree.path)?;
                 ensure!(
                     workspace.owns_worktree(&worktree),
@@ -844,42 +923,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 })
             }
             WorktreeRequest::New { branch, base } => {
-                ensure!(
-                    !branch.trim().is_empty(),
-                    "Specify --branch when using --worktree new"
-                );
-                ensure!(
-                    !matches!(branch.as_str(), "." | ".."),
-                    "Invalid branch name {branch:?}"
-                );
-                let root = self
-                    .worktree_root
-                    .as_ref()
-                    .context("Worktree provisioning is unavailable")?;
-                if let BranchStatus::Exists { checked_out_at } =
-                    workspace.branch_exists(repository, branch)?
-                {
-                    if let Some(path) = checked_out_at {
-                        bail!(
-                            "Branch {branch:?} already exists and is checked out at {}",
-                            path.display()
-                        );
-                    }
-                    bail!("Branch {branch:?} already exists");
-                }
-                let base = match base {
-                    Some(base) => base.clone(),
-                    None => {
-                        let caller = caller.context(
-                            "Specify --base when dispatching a new worktree from outside Power",
-                        )?;
-                        workspace.head(&self.application.session(caller)?.worktree)?
-                    }
-                };
-                let path =
-                    default_worktree_path(&root.worktree_root()?, &box_info.name, branch, |path| {
-                        path.symlink_metadata().is_ok()
-                    });
+                let (path, base) =
+                    self.plan_new_worktree(box_info, branch, base.as_deref(), caller)?;
                 Ok(DispatchWorktree {
                     path,
                     kind: DispatchWorktreeKind::New {
@@ -889,6 +934,54 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 })
             }
         }
+    }
+
+    /// Checks a new branch name and chooses the worktree path and starting commit. Without
+    /// `base`, the branch starts at the Power caller's HEAD.
+    fn plan_new_worktree(
+        &self,
+        box_info: &BoxInfo,
+        branch: &str,
+        base: Option<&str>,
+        caller: Option<&str>,
+    ) -> Result<(PathBuf, String)> {
+        let workspace = &self.application.workspace;
+        let repository = &box_info.repository;
+        ensure!(
+            !branch.trim().is_empty(),
+            "Specify a branch name with --branch"
+        );
+        ensure!(
+            !matches!(branch, "." | ".."),
+            "Invalid branch name {branch:?}"
+        );
+        let root = self
+            .worktree_root
+            .as_ref()
+            .context("Worktree provisioning is unavailable")?;
+        if let BranchStatus::Exists { checked_out_at } =
+            workspace.branch_exists(repository, branch)?
+        {
+            if let Some(path) = checked_out_at {
+                bail!(
+                    "Branch {branch:?} already exists and is checked out at {}",
+                    path.display()
+                );
+            }
+            bail!("Branch {branch:?} already exists");
+        }
+        let base = match base {
+            Some(base) => base.to_owned(),
+            None => {
+                let caller =
+                    caller.context("Specify --base when creating a worktree from outside Power")?;
+                workspace.head(&self.application.session(caller)?.worktree)?
+            }
+        };
+        let path = default_worktree_path(&root.worktree_root()?, &box_info.name, branch, |path| {
+            path.symlink_metadata().is_ok()
+        });
+        Ok((path, base))
     }
 
     fn new_id(&self) -> String {

@@ -22,9 +22,9 @@ cat > "$TASKS_FILE" <<'JSON'
 JSON
 power dag apply "$RUN" --file "$TASKS_FILE"
 power dag ready "$RUN"  # setup, usage, and review
-power dag dispatch "$RUN" setup --provider "$PROFILE" --worktree new --branch docs/setup --base origin/main
-power dag dispatch "$RUN" usage --provider "$PROFILE" --worktree new --branch docs/usage --base origin/main
-power dag dispatch "$RUN" review --provider "$PROFILE" --worktree "$WORKTREE"
+power dag dispatch "$RUN" setup --provider "$PROFILE" --branch docs/setup --base origin/main
+power dag dispatch "$RUN" usage --provider "$PROFILE" --branch docs/usage --base origin/main
+power dag dispatch "$RUN" review --provider "$PROFILE" --worktree "$WORKTREE"  # add --allow-main-checkout if this is the main checkout
 CURSOR=0
 power dag wait "$RUN" --since "$CURSOR" --timeout 60
 ```
@@ -32,7 +32,7 @@ power dag wait "$RUN" --since "$CURSOR" --timeout 60
 After each wait, update `CURSOR` from the response. Repeat until all three tasks succeed and `power dag ready "$RUN"` lists `combine`. Use `--base docs/setup` to start from the setup task's branch. The combine task then brings in the usage changes.
 
 ```sh
-power dag dispatch "$RUN" combine --provider "$PROFILE" --worktree new --branch docs/combined --base docs/setup
+power dag dispatch "$RUN" combine --provider "$PROFILE" --branch docs/combined --base docs/setup
 power dag wait "$RUN" --since "$CURSOR" --timeout 60
 power dag show "$RUN"
 ```

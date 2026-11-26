@@ -356,6 +356,7 @@ struct FakeWorktrees {
     creation_requests: Vec<(PathBuf, String, String)>,
     creation_error: Option<&'static str>,
     missing: BTreeSet<PathBuf>,
+    removed: Vec<PathBuf>,
 }
 
 impl Workspace for FakeWorkspace {
@@ -372,6 +373,7 @@ impl Workspace for FakeWorkspace {
         ensure!(
             repository == Path::new("/repo")
                 && (worktree == Path::new("/worktree")
+                    || worktree == Path::new("/main")
                     || worktrees
                         .branches
                         .values()
@@ -380,6 +382,11 @@ impl Workspace for FakeWorkspace {
             "Wrong worktree"
         );
         Ok(worktree.to_owned())
+    }
+
+    fn main_checkout(&self, repository: &Path) -> Result<Option<PathBuf>> {
+        assert_eq!(repository, Path::new("/repo"));
+        Ok(Some("/main".into()))
     }
 
     fn head(&self, worktree: &Path) -> Result<String> {
@@ -433,8 +440,10 @@ impl Workspace for FakeWorkspace {
         bail!("Unexpected worktree status lookup")
     }
 
-    fn remove_worktree(&self, _path: &Path, _delete_branch: bool) -> Result<()> {
-        bail!("Unexpected worktree removal")
+    fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()> {
+        assert!(delete_branch, "Undoing a creation also deletes its branch");
+        self.0.lock().unwrap().removed.push(path.to_owned());
+        Ok(())
     }
 
     fn worktree_exists(&self, path: &Path) -> bool {
@@ -637,7 +646,10 @@ fn command(run: &str, retry: bool) -> Dispatch {
         run: run.into(),
         task: "work".into(),
         provider: Provider::Command,
-        worktree: WorktreeRequest::Existing("/worktree".into()),
+        worktree: WorktreeRequest::Existing {
+            path: "/worktree".into(),
+            allow_main_checkout: false,
+        },
         retry,
         args: vec!["worker".into()],
         caller: None,
@@ -1290,7 +1302,10 @@ fn starting_an_agent_ignores_a_caller_session_this_daemon_does_not_host() -> Res
             caller: Some("session-from-another-daemon".into()),
         },
         provider: Provider::Agent("codex".into()),
-        worktree: WorktreeRequest::Existing("/worktree".into()),
+        worktree: WorktreeRequest::Existing {
+            path: "/worktree".into(),
+            allow_main_checkout: false,
+        },
         parent: None,
         label: "coordinator".into(),
         prompt: None,
@@ -1298,6 +1313,138 @@ fn starting_an_agent_ignores_a_caller_session_this_daemon_does_not_host() -> Res
     })?;
     assert_eq!(agent.parent, None);
     assert!(agent.session.is_some());
+    Ok(())
+}
+
+fn start_agent(worktree: WorktreeRequest) -> StartAgent {
+    StartAgent {
+        selection: BoxSelection {
+            selector: Some("2".into()),
+            caller: None,
+        },
+        provider: Provider::Agent("codex".into()),
+        worktree,
+        parent: None,
+        label: "background".into(),
+        prompt: None,
+        args: Vec::new(),
+    }
+}
+
+fn main_checkout(allow_main_checkout: bool) -> WorktreeRequest {
+    WorktreeRequest::Existing {
+        path: "/main".into(),
+        allow_main_checkout,
+    }
+}
+
+#[test]
+fn workers_need_an_explicit_opt_in_for_the_main_checkout() -> Result<()> {
+    let (dag, run) = setup()?;
+    let refused = |result: Result<()>| {
+        let error = format!("{:#}", result.expect_err("main checkout accepted"));
+        assert!(
+            error.contains("/main is the repository's main checkout"),
+            "{error}"
+        );
+        assert!(error.contains("--branch"), "{error}");
+    };
+    refused(
+        dag.dispatch(Dispatch {
+            worktree: main_checkout(false),
+            ..command(&run, false)
+        })
+        .map(|_| ()),
+    );
+    assert_eq!(dag.run(&run)?.tasks[0].state, TaskState::Ready);
+    refused(
+        dag.start_agent(start_agent(main_checkout(false)))
+            .map(|_| ()),
+    );
+    assert!(
+        dag.list_agents(BoxSelection {
+            selector: Some("2".into()),
+            caller: None,
+        })?
+        .is_empty()
+    );
+
+    let worker = dag.dispatch(Dispatch {
+        worktree: main_checkout(true),
+        ..command(&run, false)
+    })?;
+    assert_eq!(worker.worktree, Path::new("/main"));
+    let agent = dag.start_agent(start_agent(main_checkout(true)))?;
+    assert_eq!(agent.worktree, Path::new("/main"));
+    Ok(())
+}
+
+#[test]
+fn started_agents_can_get_a_managed_worktree() -> Result<()> {
+    let (dag, workspace) = managed_setup();
+    let agent = dag.start_agent(start_agent(WorktreeRequest::New {
+        branch: "agent/notes".into(),
+        base: Some("main".into()),
+    }))?;
+    let path = Path::new("/canonical/managed-worktrees/test-repo/agent-notes");
+    assert_eq!(agent.worktree, path);
+    assert_eq!(
+        workspace.0.lock().unwrap().creation_requests,
+        [(
+            "/managed-worktrees/test-repo/agent-notes".into(),
+            "agent/notes".into(),
+            "main".into()
+        )]
+    );
+    let record = dag
+        .store
+        .read(|db| db.find_worktree_by_path(path))?
+        .context("Ownership record missing")?;
+    assert_eq!(record.branch, "agent/notes");
+    assert_eq!(record.base_commit, "resolved-main");
+    assert_eq!(
+        record.creator,
+        WorktreeCreator::View {
+            box_id: agent.box_id.clone(),
+            session: agent.session.clone().unwrap(),
+        }
+    );
+
+    // Outside Power there is no caller HEAD to start from.
+    let error = dag
+        .start_agent(start_agent(WorktreeRequest::New {
+            branch: "agent/other".into(),
+            base: None,
+        }))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Specify --base"), "{error:#}");
+    Ok(())
+}
+
+#[test]
+fn a_failed_agent_start_removes_its_new_worktree() -> Result<()> {
+    let (dag, workspace) = managed_setup();
+    let error = dag
+        .start_agent(StartAgent {
+            provider: Provider::Command,
+            ..start_agent(WorktreeRequest::New {
+                branch: "agent/broken".into(),
+                base: Some("main".into()),
+            })
+        })
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Specify a command"),
+        "{error:#}"
+    );
+    assert_eq!(workspace.0.lock().unwrap().creation_requests.len(), 1);
+    assert_eq!(
+        workspace.0.lock().unwrap().removed,
+        [PathBuf::from(
+            "/canonical/managed-worktrees/test-repo/agent-broken"
+        )]
+    );
+    assert!(dag.store.read(|db| db.list_worktrees(None))?.is_empty());
     Ok(())
 }
 
