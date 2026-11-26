@@ -458,6 +458,15 @@ impl Picker {
         self.choice(self.selected)
     }
 
+    /// Fills the branch prompt with a suggested name, selected so typing replaces it.
+    pub fn suggest_branch(&mut self, name: String) {
+        if let Kind::NewWorktree { created: false, .. } = &self.kind {
+            self.cursor = name.len();
+            self.query = name;
+            self.select_all = true;
+        }
+    }
+
     pub fn worktree_created(&mut self, path: PathBuf) {
         if let Kind::NewWorktree { created, .. } = &mut self.kind {
             *created = true;
