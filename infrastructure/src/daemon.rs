@@ -72,7 +72,13 @@ struct Server {
     dag: Arc<DaemonDag>,
 }
 
-pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Result<()> {
+/// Runs the daemon. `finished_worker_grace` is how long a DAG worker runs after its
+/// terminal report before its session ends, or `None` to leave it running.
+pub fn serve(
+    profiles: AgentProfiles,
+    worktree_root: LocalWorktreeRoot,
+    finished_worker_grace: Option<Duration>,
+) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
         .parent()
@@ -146,7 +152,8 @@ pub fn serve(profiles: AgentProfiles, worktree_root: LocalWorktreeRoot) -> Resul
     ));
     let dag = Arc::new(
         DaemonDag::new(application.clone(), store, BoxesFile, IconFiles::open()?)
-            .with_worktree_root(worktree_root),
+            .with_worktree_root(worktree_root)
+            .with_finished_worker_grace(finished_worker_grace),
     );
     terminal_application
         .set(Arc::downgrade(&application))

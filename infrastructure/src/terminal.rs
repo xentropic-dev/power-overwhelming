@@ -1,5 +1,6 @@
 use crate::{
     persistence::state_directory,
+    process_tree::ProcessTree,
     theme::Scheme,
     wire::{MetadataField, Response, SessionMetadata},
 };
@@ -58,6 +59,11 @@ const OUTPUT_DRAIN: Duration = Duration::from_millis(150);
 /// the agents and the daemon at once, and the wait lets shutdown begin first, so a
 /// session that will be restored is not reported as ended.
 const AGENT_EXIT_GRACE: Duration = Duration::from_secs(1);
+/// How long an ended session's processes have to exit after SIGTERM before they
+/// are killed.
+const END_GRACE: Duration = Duration::from_secs(3);
+/// How long an ended session waits for its process tree before reporting the exit.
+const END_WAIT: Duration = Duration::from_secs(10);
 
 pub struct PtyRuntime {
     pub socket: PathBuf,
@@ -316,6 +322,7 @@ fn launch(
     });
     let waiter_tx = tx.clone();
     let (stop_tx, stop_rx) = mpsc::channel();
+    let (ended_tx, ended_rx) = mpsc::channel::<()>();
     let waiter_lifecycle = lifecycle.clone();
     let launched = session.agent.clone();
     thread::spawn(move || {
@@ -341,6 +348,7 @@ fn launch(
             Err(error) => format!("Could not wait for worker process ({error})"),
         };
         let _ = waiter_tx.send(Command::ProcessExited(detail));
+        let _ = ended_tx.send(());
     });
     if session.agent == Agent::Shell {
         let poll_tx = tx.clone();
@@ -373,6 +381,9 @@ fn launch(
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
             let _ = stop_tx.send(());
+            // Report the exit only once the process tree is gone, so an exited agent
+            // never has live processes.
+            let _ = ended_rx.recv_timeout(END_WAIT);
             let detail = match result {
                 Ok(detail) => detail.unwrap_or_else(|| "Terminal session ended".into()),
                 Err(error) => {
@@ -499,6 +510,11 @@ fn wait_process(
         }
         match stop.recv_timeout(Duration::from_millis(100)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The actor normally ended the tree already. This covers a root
+                // whose actor stopped without ending it.
+                if let Some(pid) = process.process_id() {
+                    ProcessTree::new(pid).terminate(END_GRACE);
+                }
                 let _ = process.kill();
                 return process.wait();
             }
@@ -876,6 +892,13 @@ fn terminal_actor(
                     );
                 }
                 if !exited {
+                    // Ending a session ends everything it started, not only its root:
+                    // an agent's MCP servers, shells and their background jobs too.
+                    // This runs before the PTY closes, since the hangup would kill the
+                    // root first and orphan descendants that left its session.
+                    if let Some(pid) = shell_pid {
+                        ProcessTree::new(pid).terminate(END_GRACE);
+                    }
                     return Ok(Some(with_terminal_tail(
                         &terminal,
                         "Terminal session ended".into(),

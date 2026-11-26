@@ -1,5 +1,6 @@
 use crate::{
-    Application, BranchStatus, SessionOptions, StartSession, TerminalRuntime, WorktreeRoot,
+    Application, BranchStatus, RestoreChoice, SessionOptions, StartSession, TerminalRuntime,
+    WorktreeRoot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
@@ -143,12 +144,18 @@ pub struct ReportResult {
     pub reason: Option<String>,
 }
 
+/// How long a worker keeps running after it reports success or failure, so it can
+/// finish its last message before its session ends.
+pub const FINISHED_WORKER_GRACE: Duration = Duration::from_secs(10);
+
 pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> {
     application: Arc<Application<T>>,
     store: S,
     registry: B,
     icons: I,
     worktree_root: Option<Box<dyn WorktreeRoot>>,
+    /// When to end a worker's session after its terminal report. `None` keeps it.
+    finished_worker_grace: Option<Duration>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
@@ -179,6 +186,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             registry,
             icons,
             worktree_root: None,
+            finished_worker_grace: Some(FINISHED_WORKER_GRACE),
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
@@ -187,6 +195,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Enables managed worktree dispatch for stores and workspaces that support it.
     pub fn with_worktree_root(mut self, root: impl WorktreeRoot + 'static) -> Self {
         self.worktree_root = Some(Box::new(root));
+        self
+    }
+
+    /// Sets how long a worker runs after reporting success or failure before its
+    /// session ends. `None` leaves finished workers running, for debugging.
+    pub fn with_finished_worker_grace(mut self, grace: Option<Duration>) -> Self {
+        self.finished_worker_grace = grace;
         self
     }
 
@@ -706,8 +721,39 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         attempt: &str,
         status: ReportStatus,
         summary: &str,
-    ) -> Result<ReportResult> {
-        self.write(|db| report(db, run, task, attempt, status, summary))
+    ) -> Result<ReportResult>
+    where
+        T: 'static,
+    {
+        let (result, finished) =
+            self.write(|db| report(db, run, task, attempt, status, summary))?;
+        if let (Some(session), Some(grace)) = (finished, self.finished_worker_grace) {
+            self.end_finished_session(session, grace);
+        }
+        Ok(result)
+    }
+
+    /// Ends a finished worker's session after `grace`, which also forgets its record so
+    /// a restart cannot bring it back. Ending takes the whole process tree down.
+    fn end_finished_session(&self, session: String, grace: Duration)
+    where
+        T: 'static,
+    {
+        let application = self.application.clone();
+        let spawned = std::thread::Builder::new()
+            .name("end-finished-worker".into())
+            .spawn(move || {
+                std::thread::sleep(grace);
+                // A session that already ended has nothing left to stop.
+                if application.terminal(&session).is_ok()
+                    && let Err(error) = application.end_session(&session)
+                {
+                    eprintln!("Could not end finished worker session {session}. {error:#}");
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("Could not schedule the end of a finished worker. {error:#}");
+        }
     }
 
     pub fn agent_model_changed(
@@ -753,19 +799,37 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Restores saved sessions on daemon start, then reconciles attempts with them.
     /// A resumed conversation waits for input, so a worker whose attempt is still active
     /// is told to continue, and its run records `AttemptResumed`. Workers waiting on the
-    /// user, coordinators and plain sessions resume without a prompt.
+    /// user, coordinators and plain sessions resume without a prompt. A worker whose
+    /// attempt already succeeded, failed or was interrupted is forgotten, not restored.
     pub fn restore(&self) -> Result<Vec<String>> {
-        let active: BTreeMap<String, OpenAttempt> = self.store.read(|db| {
-            Ok(db
-                .open_attempts(None)?
-                .into_iter()
-                .filter(|open| open.attempt.state == AttemptState::Active)
-                .filter_map(|open| Some((open.attempt.session.clone()?, open)))
-                .collect())
+        let (open, finished): (BTreeMap<String, OpenAttempt>, BTreeSet<String>) =
+            self.store.read(|db| {
+                let open: BTreeMap<_, _> = db
+                    .open_attempts(None)?
+                    .into_iter()
+                    .filter_map(|open| Some((open.attempt.session.clone()?, open)))
+                    .collect();
+                // A worker whose attempt is no longer open has nothing left to do.
+                let finished = db
+                    .list_agents(None)?
+                    .into_iter()
+                    .filter(|agent| agent.attempt.is_some())
+                    .filter_map(|agent| agent.session)
+                    .filter(|session| !open.contains_key(session))
+                    .collect();
+                Ok((open, finished))
+            })?;
+        let active: BTreeMap<String, OpenAttempt> = open
+            .into_iter()
+            .filter(|(_, open)| open.attempt.state == AttemptState::Active)
+            .collect();
+        let restored = self.application.restore_sessions_with(|session| {
+            if finished.contains(session) {
+                RestoreChoice::Forget("its DAG attempt already finished")
+            } else {
+                RestoreChoice::Resume(active.get(session).map(continuation_prompt))
+            }
         })?;
-        let restored = self
-            .application
-            .restore_sessions_with(|session| active.get(session).map(continuation_prompt))?;
         let resumed: Vec<_> = restored
             .iter()
             .filter(|session| session.prompted)
@@ -1357,7 +1421,7 @@ fn report(
     attempt_id: &str,
     status: ReportStatus,
     summary: &str,
-) -> Result<ReportResult> {
+) -> Result<(ReportResult, Option<String>)> {
     use RunEventKind as Event;
     let run = load_run(db, run_id)?;
     let task = find_task(&run, task_id)?;
@@ -1377,22 +1441,31 @@ fn report(
     ) {
         ReportTransition::Stale => {
             emit(Event::StaleReport)?;
-            return Ok(ReportResult {
-                applied: false,
-                reason: Some("stale attempt".into()),
-            });
+            return Ok((
+                ReportResult {
+                    applied: false,
+                    reason: Some("stale attempt".into()),
+                },
+                None,
+            ));
         }
         ReportTransition::AlreadyReported => {
-            return Ok(ReportResult {
-                applied: false,
-                reason: Some("already reported".into()),
-            });
+            return Ok((
+                ReportResult {
+                    applied: false,
+                    reason: Some("already reported".into()),
+                },
+                None,
+            ));
         }
         ReportTransition::Unchanged => {
-            return Ok(ReportResult {
-                applied: true,
-                reason: None,
-            });
+            return Ok((
+                ReportResult {
+                    applied: true,
+                    reason: None,
+                },
+                None,
+            ));
         }
         ReportTransition::Update {
             state,
@@ -1430,10 +1503,16 @@ fn report(
             }
         }
     }
-    Ok(ReportResult {
-        applied: true,
-        reason: None,
-    })
+    let finished = matches!(status, ReportStatus::Success | ReportStatus::Failed)
+        .then(|| attempt.session.clone())
+        .flatten();
+    Ok((
+        ReportResult {
+            applied: true,
+            reason: None,
+        },
+        finished,
+    ))
 }
 
 #[path = "worktrees.rs"]

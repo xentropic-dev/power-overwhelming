@@ -254,6 +254,7 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
+            finished_worker_grace(),
         ),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
@@ -435,6 +436,13 @@ fn configured_agents() -> AgentProfiles {
     config::load_agent_profiles(settings::Settings::defaults()).unwrap_or_else(|error| {
         eprintln!("Could not load agent profiles. {error:#}");
         AgentProfiles::default()
+    })
+}
+
+fn finished_worker_grace() -> Option<std::time::Duration> {
+    config::load_finished_worker_grace(settings::Settings::defaults()).unwrap_or_else(|error| {
+        eprintln!("Could not load dag settings. {error:#}");
+        Some(application::dag::FINISHED_WORKER_GRACE)
     })
 }
 

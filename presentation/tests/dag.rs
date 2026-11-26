@@ -1247,6 +1247,68 @@ fn agent_end_interrupts_a_working_worker() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("No agent no-such-agent"));
 }
 
+/// Whether the process runs. A zombie has exited.
+fn process_running(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            .is_some_and(|state| !matches!(state, "Z" | "X"))
+    })
+}
+
+#[test]
+fn a_finished_worker_and_its_descendants_end_after_the_grace() {
+    let fixture = Fixture::with_configure(|root| {
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            "dag.end_finished_workers_after = 0.5\n",
+        )
+        .unwrap();
+    });
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "linger");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "linger",
+        &fixture.worktrees[0],
+        false,
+        &["linger", "linger-go", "Done, still running", "linger-pids"],
+    ));
+    fixture.release("linger-go");
+    let pids_file = fixture.root().join("linger-pids");
+    let pids: Vec<u32> = poll("worker to record its processes", || {
+        let pids: Vec<u32> = fs::read_to_string(&pids_file)
+            .ok()?
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        (pids.len() == 3).then_some(pids)
+    });
+    let completed = fixture.wait_for_state(&run, "linger", TaskState::Completed);
+
+    // Half a second of grace, then SIGTERM, which these processes obey.
+    poll("finished worker processes to end", || {
+        pids.iter().all(|pid| !process_running(*pid)).then_some(())
+    });
+    poll("finished agent to exit", || {
+        fixture
+            .agents()
+            .into_iter()
+            .find(|listed| listed.id == agent.id && json!(listed.state) == "exited")
+    });
+    let task = task(&fixture.show(&run), "linger").clone();
+    assert_eq!(task.state, TaskState::Completed);
+    assert_eq!(task.attempts, completed.attempts);
+    assert_eq!(task.attempts[0].id, attempt.id);
+    assert_eq!(task.attempts[0].state, AttemptState::Succeeded);
+    assert_eq!(
+        task.attempts[0].summary.as_deref(),
+        Some("Done, still running")
+    );
+}
+
 #[test]
 fn dispatch_rejects_a_worktree_from_another_repository() {
     let fixture = Fixture::new();

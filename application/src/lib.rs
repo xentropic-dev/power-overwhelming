@@ -11,7 +11,7 @@ pub use commands::{
     ArtifactPublished, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
 };
 pub use queries::ResolveArtifact;
-pub use restore::RestoredSession;
+pub use restore::{RestoreChoice, RestoredSession};
 pub use sessions::{MemorySessions, SessionRecord, SessionStore};
 
 use anyhow::{Context, Result};

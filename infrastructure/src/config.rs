@@ -10,12 +10,14 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
 pub(crate) const WORKTREES_SECTION: &str = "worktrees";
+pub(crate) const DAG_SECTION: &str = "dag";
 
 fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     defaults.entry("power_bar".into()).or_insert_with(|| {
@@ -29,6 +31,37 @@ fn with_bundled_defaults(mut defaults: Sections) -> Sections {
         .entry(WORKTREES_SECTION.into())
         .or_insert_with(|| json!({}));
     defaults
+        .entry(DAG_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
+}
+
+/// How long a DAG worker runs after reporting success or failure, from
+/// `dag.end_finished_workers_after` in seconds. `false` keeps finished workers running.
+pub fn load_finished_worker_grace(defaults: Sections) -> Result<Option<Duration>> {
+    finished_worker_grace(&load(with_bundled_defaults(defaults))?)
+}
+
+pub(crate) fn finished_worker_grace(sections: &Sections) -> Result<Option<Duration>> {
+    let default = Some(application::dag::FINISHED_WORKER_GRACE);
+    let Some(value) = sections.get(DAG_SECTION) else {
+        return Ok(default);
+    };
+    let table = value.as_object().context("dag must be a table")?;
+    for name in table.keys() {
+        if name != "end_finished_workers_after" {
+            bail!("dag.{name} is not a setting");
+        }
+    }
+    match table.get("end_finished_workers_after") {
+        None | Some(JsonValue::Null) => Ok(default),
+        Some(JsonValue::Bool(false)) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && (0.0..=86_400.0).contains(seconds))
+            .map(|seconds| Some(Duration::from_secs_f64(seconds)))
+            .context("dag.end_finished_workers_after must be seconds from 0 to 86400, or false"),
+    }
 }
 
 /// Load profiles from the same config as the desktop, with the bundled plugin defaults.
@@ -307,6 +340,31 @@ mod tests {
     use super::*;
     use application::agents::AgentProfileRegistry;
     use serde_json::json;
+
+    #[test]
+    fn finished_worker_grace_reads_seconds_or_false() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("config.lua");
+        let grace = |source: &str| {
+            fs::write(&path, source)?;
+            finished_worker_grace(&load_from(&path, with_bundled_defaults(Sections::new()))?)
+        };
+        assert_eq!(grace("")?, Some(application::dag::FINISHED_WORKER_GRACE));
+        assert_eq!(
+            grace("dag.end_finished_workers_after = 2.5")?,
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(grace("dag.end_finished_workers_after = false")?, None);
+        for invalid in [
+            "dag.end_finished_workers_after = -1",
+            "dag.end_finished_workers_after = true",
+            "dag.end_finished_workers_after = 'soon'",
+            "dag.unknown = 1",
+        ] {
+            assert!(grace(invalid).is_err(), "{invalid} was accepted");
+        }
+        Ok(())
+    }
 
     #[test]
     fn lua_extends_and_overrides_builtin_profiles() -> Result<()> {

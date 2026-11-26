@@ -42,6 +42,19 @@ case "$1" in
             wait_for_marker "$4"
         fi
         ;;
+    linger)
+        # Reports success, then keeps running with a child and a grandchild that
+        # left the session, the way an agent keeps its MCP servers and shells.
+        wait_for_marker "$2"
+        sleep 600 &
+        child=$!
+        setsid sleep 600 &
+        escaped=$!
+        printf '%s %s %s\n' "$$" "$child" "$escaped" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        wait
+        ;;
     input)
         report needs-input "Which option should I use?"
         wait_for_marker "$2"

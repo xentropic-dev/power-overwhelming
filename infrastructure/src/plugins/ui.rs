@@ -162,9 +162,11 @@ impl Runtime {
             let api = TerminalBottomWithPalette::instantiate(&mut store, &component, &self.linker)?;
             store.set_epoch_deadline(CALL_EPOCHS);
             let mut defaults = defaults.clone();
-            defaults
-                .entry(config::WORKTREES_SECTION.into())
-                .or_insert_with(|| serde_json::json!({}));
+            for section in [config::WORKTREES_SECTION, config::DAG_SECTION] {
+                defaults
+                    .entry(section.into())
+                    .or_insert_with(|| serde_json::json!({}));
+            }
             let settings = api.call_settings(&mut store)?;
             if let Some(settings) = &settings {
                 ensure!(

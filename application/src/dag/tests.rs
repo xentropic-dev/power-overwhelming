@@ -1349,6 +1349,176 @@ fn restore_tells_only_workers_with_active_attempts_to_continue() -> Result<()> {
 }
 
 #[test]
+fn restore_brings_back_only_workers_whose_attempt_is_open() -> Result<()> {
+    let application = application();
+    let caller = application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Coding("claude".into()),
+    })?;
+    let dag = TestDag::new(
+        application,
+        MemoryStore::default(),
+        FakeRegistry(vec![caller.id.clone()]),
+        FakeIcons::default(),
+    )
+    // Keep finished sessions alive, as before a restart that interrupts their grace.
+    .with_finished_worker_grace(None);
+    let run = dag.create_run(
+        BoxSelection {
+            selector: None,
+            caller: Some(caller.id.clone()),
+        },
+        "Restart".into(),
+        None,
+    )?;
+    let tasks = ["active", "blocked", "succeeded", "failed"];
+    dag.add_tasks(&run.id, &tasks.map(|id| spec(id, &[])))?;
+    let mut sessions = BTreeMap::new();
+    for task in tasks {
+        let dispatched = dag.dispatch(Dispatch {
+            task: task.into(),
+            provider: Provider::Agent("claude".into()),
+            args: Vec::new(),
+            caller: Some(caller.id.clone()),
+            ..command(&run.id, false)
+        })?;
+        let status = match task {
+            "active" => None,
+            "blocked" => Some(ReportStatus::NeedsInput),
+            "succeeded" => Some(ReportStatus::Success),
+            _ => Some(ReportStatus::Failed),
+        };
+        if let Some(status) = status {
+            dag.report(&run.id, task, &dispatched.attempt.id, status, task)?;
+        }
+        sessions.insert(task, dispatched.agent.session.unwrap());
+    }
+    let worktree = tempfile::tempdir()?;
+    for mut record in dag.application.records.list()? {
+        record.worktree = worktree.path().into();
+        dag.application.records.save(&record)?;
+    }
+    let launched = dag.application.runtime.launches.lock().unwrap().len();
+
+    let restored = dag.restore()?;
+
+    let expected: BTreeSet<_> = [&caller.id, &sessions["active"], &sessions["blocked"]]
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(restored.iter().cloned().collect::<BTreeSet<_>>(), expected);
+    let relaunched: BTreeSet<_> = dag.application.runtime.launches.lock().unwrap()[launched..]
+        .iter()
+        .map(|(session, _)| session.id.clone())
+        .collect();
+    assert_eq!(relaunched, expected);
+    let saved: BTreeSet<_> = dag
+        .application
+        .records
+        .list()?
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(saved, expected, "finished workers' records are forgotten");
+    let snapshot = dag.run(&run.id)?;
+    let state = |task: &str| {
+        snapshot
+            .tasks
+            .iter()
+            .find(|candidate| candidate.id == task)
+            .unwrap()
+            .attempts[0]
+            .state
+    };
+    assert_eq!(state("active"), AttemptState::Active);
+    assert_eq!(state("blocked"), AttemptState::NeedsInput);
+    assert_eq!(state("succeeded"), AttemptState::Succeeded);
+    assert_eq!(state("failed"), AttemptState::Failed);
+    for task in ["succeeded", "failed"] {
+        let agent = dag
+            .store
+            .read(|db| db.session_agent(&sessions[task]))?
+            .unwrap();
+        assert_eq!(agent.state, AgentState::Exited);
+    }
+    Ok(())
+}
+
+#[test]
+fn terminal_reports_end_the_worker_session_after_the_grace() -> Result<()> {
+    let (dag, run) = setup()?;
+    let dag = dag.with_finished_worker_grace(Some(Duration::from_millis(50)));
+    dag.add_tasks(&run, &[spec("failing", &[]), spec("waiting", &[])])?;
+    let mut ended = Vec::new();
+    for (task, status) in [
+        ("work", ReportStatus::Success),
+        ("failing", ReportStatus::Failed),
+    ] {
+        let dispatched = dag.dispatch(Dispatch {
+            task: task.into(),
+            ..command(&run, false)
+        })?;
+        let session = dispatched.agent.session.unwrap();
+        let handle = dag.application.terminal(&session)?;
+        assert!(
+            dag.report(&run, task, &dispatched.attempt.id, status, task)?
+                .applied
+        );
+        // The worker can still finish its last message.
+        assert!(handle.load(Ordering::Acquire));
+        ended.push((session, handle));
+    }
+    let waiting = dag.dispatch(Dispatch {
+        task: "waiting".into(),
+        ..command(&run, false)
+    })?;
+    let waiting_session = waiting.agent.session.unwrap();
+    dag.report(
+        &run,
+        "waiting",
+        &waiting.attempt.id,
+        ReportStatus::NeedsInput,
+        "question",
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ended
+        .iter()
+        .any(|(_, handle)| handle.load(Ordering::Acquire))
+    {
+        assert!(Instant::now() < deadline, "finished sessions never ended");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let saved: Vec<_> = dag
+        .application
+        .records
+        .list()?
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(saved, std::slice::from_ref(&waiting_session));
+    for (session, _) in &ended {
+        assert!(dag.application.terminal(session).is_err());
+    }
+    assert!(dag.application.session_is_running(&waiting_session)?);
+    let snapshot = dag.run(&run)?;
+    let states: Vec<_> = snapshot
+        .tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.attempts[0].state))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("work", AttemptState::Succeeded),
+            ("failing", AttemptState::Failed),
+            ("waiting", AttemptState::NeedsInput),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     let application = application();
     let caller = application.start_session(StartSession {
