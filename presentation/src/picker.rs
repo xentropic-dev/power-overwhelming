@@ -129,6 +129,8 @@ pub struct Picker {
     pub waiting: bool,
     pub loading: bool,
     pub accept_pending: bool,
+    /// Whether the run picker and agent tree list finished items too.
+    pub show_finished: bool,
     pub focus: FocusHandle,
     query: String,
     cursor: usize,
@@ -208,6 +210,7 @@ impl Picker {
             waiting: false,
             loading: false,
             accept_pending: false,
+            show_finished: false,
             focus,
             query: String::new(),
             cursor: 0,

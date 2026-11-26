@@ -36,6 +36,13 @@ pub enum RunStatus {
     Stalled,
 }
 
+impl RunStatus {
+    /// Finished runs are hidden from default listings. Archived runs will join them.
+    pub fn is_finished(self) -> bool {
+        self == Self::Completed
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptState {
     Active,
@@ -111,6 +118,11 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    /// Finished agents are hidden from default listings.
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Exited | Self::Done)
+    }
+
     pub fn derive(state: AgentState, attempt: Option<AttemptState>) -> Self {
         match (state, attempt) {
             (AgentState::Exited, _) => Self::Exited,

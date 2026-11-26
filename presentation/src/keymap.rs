@@ -49,6 +49,7 @@ pub enum Command {
     DialogDown,
     AgentCollapse,
     AgentExpand,
+    ToggleFinished,
     DagUp,
     DagDown,
     DagLeft,
@@ -93,6 +94,8 @@ pub enum Scope {
     Dialog,
     /// In the searchable agent tree, in addition to `Picker`.
     AgentTree,
+    /// In the DAG run picker, in addition to `Picker`.
+    Runs,
     /// On the task graph.
     Dag,
     /// While the preview pane has focus.
@@ -110,6 +113,7 @@ impl Scope {
             Self::Picker => "picker",
             Self::Dialog => "dialog",
             Self::AgentTree => "agent_tree",
+            Self::Runs => "runs",
             Self::Dag => "dag",
             Self::Preview => "preview",
             Self::Hints => "hints",
@@ -225,6 +229,8 @@ const TABLE: &[Entry] = &[
     ),
     entry(S::AgentTree, "collapse", C::AgentCollapse, &["ctrl-h"], "Collapse branch or select parent"),
     entry(S::AgentTree, "expand", C::AgentExpand, &["ctrl-l"], "Expand branch or select child"),
+    entry(S::AgentTree, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide exited and done agents"),
+    entry(S::Runs, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide completed runs"),
     entry(S::Dag, "up", C::DagUp, &["up", "k"], "Select task above"),
     entry(S::Dag, "down", C::DagDown, &["down", "j"], "Select task below"),
     entry(S::Dag, "left", C::DagLeft, &["left", "h"], "Select task to the left"),
@@ -410,7 +416,7 @@ impl Keymap {
             let keys = keys.with_context(|| path.clone())?;
             for key in &keys {
                 let scopes: &[Scope] = match entry.scope {
-                    Scope::Picker => &[Scope::Picker, Scope::Dialog, Scope::AgentTree],
+                    Scope::Picker => &[Scope::Picker, Scope::Dialog, Scope::AgentTree, Scope::Runs],
                     _ => std::slice::from_ref(&entry.scope),
                 };
                 for scope in scopes {
@@ -438,7 +444,9 @@ impl Keymap {
                 .map(|(_, command, _)| *command)
         };
         match scope {
-            Scope::Dialog | Scope::AgentTree => find(Scope::Picker).or_else(|| find(scope)),
+            Scope::Dialog | Scope::AgentTree | Scope::Runs => {
+                find(Scope::Picker).or_else(|| find(scope))
+            }
             scope => find(scope),
         }
     }
@@ -495,6 +503,7 @@ impl Keymap {
                 Scope::Picker => format!("In pickers: {keys}"),
                 Scope::Dialog => format!("In dialogs without search: {keys}"),
                 Scope::AgentTree => format!("In the agent tree: {keys}"),
+                Scope::Runs => format!("In the run picker: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
@@ -558,6 +567,9 @@ mod tests {
             (Scope::AgentTree, "ctrl-l", C::AgentExpand),
             (Scope::AgentTree, "enter", C::PickerSelect),
             (Scope::AgentTree, "escape", C::PickerCancel),
+            (Scope::AgentTree, "ctrl-f", C::ToggleFinished),
+            (Scope::Runs, "ctrl-f", C::ToggleFinished),
+            (Scope::Runs, "enter", C::PickerSelect),
             (Scope::Dag, "up", C::DagUp),
             (Scope::Dag, "k", C::DagUp),
             (Scope::Dag, "down", C::DagDown),
@@ -577,6 +589,8 @@ mod tests {
         }
         assert_eq!(keymap.command(Scope::AgentTree, &stroke("h")), None);
         assert_eq!(keymap.command(Scope::AgentTree, &stroke("left")), None);
+        assert_eq!(keymap.command(Scope::Picker, &stroke("ctrl-f")), None);
+        assert_eq!(keymap.command(Scope::Runs, &stroke("f")), None);
         let help = keymap.help();
         for (description, binding) in [
             ("Open DAG runs", "Ctrl+B then d"),
@@ -591,6 +605,11 @@ mod tests {
                 "Preview the selected task's artifact, then 1–9 to pick",
                 "In the task graph: p",
             ),
+            (
+                "Show or hide exited and done agents",
+                "In the agent tree: Ctrl+F",
+            ),
+            ("Show or hide completed runs", "In the run picker: Ctrl+F"),
         ] {
             assert!(
                 help.iter()
@@ -605,7 +624,8 @@ mod tests {
             "tab": { "next": ["n", "j"] },
             "box": { "runs": "g" },
             "dag": { "open": "space", "artifact": "a" },
-            "agent_tree": { "expand": "ctrl-f" },
+            "agent_tree": { "expand": "ctrl-e" },
+            "runs": { "show_finished": "ctrl-g" },
             "prefix": { "tab": "ctrl-a" },
         }))
         .unwrap();
@@ -631,8 +651,17 @@ mod tests {
         );
         assert_eq!(keymap.command(Scope::Dag, &stroke("p")), None);
         assert_eq!(
-            keymap.command(Scope::AgentTree, &stroke("ctrl-f")),
+            keymap.command(Scope::AgentTree, &stroke("ctrl-e")),
             Some(C::AgentExpand)
+        );
+        assert_eq!(
+            keymap.command(Scope::Runs, &stroke("ctrl-g")),
+            Some(C::ToggleFinished)
+        );
+        assert_eq!(keymap.command(Scope::Runs, &stroke("ctrl-f")), None);
+        assert_eq!(
+            keymap.command(Scope::AgentTree, &stroke("ctrl-f")),
+            Some(C::ToggleFinished)
         );
         assert!(
             keymap
@@ -655,6 +684,10 @@ mod tests {
                 "bound to both",
             ),
             (json!({ "dag": { "artifact": "o" } }), "bound to both"),
+            (
+                json!({ "runs": { "show_finished": "ctrl-n" } }),
+                "bound to both",
+            ),
             (json!({ "tab": { "next": "hyper-j" } }), "Unknown modifier"),
             (json!({ "tab": { "next": 3 } }), "must be a key name"),
         ] {

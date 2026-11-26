@@ -368,9 +368,9 @@ fn main() -> Result<()> {
         Some(Action::Agent { command }) => match command {
             AgentAction::Codex { args } => exec_agent("codex", args),
             AgentAction::Claude { args } => exec_agent("claude", args),
-            AgentAction::List { box_sel } => {
+            AgentAction::List { box_sel, all } => {
                 client::ensure_daemon()?;
-                print_json(json!({"agents": protocol_agents(box_sel)?}))
+                print_json(json!({"agents": protocol_agents(box_sel, all)?}))
             }
             AgentAction::Start {
                 box_sel,
@@ -452,9 +452,13 @@ enum BoxAction {
 
 #[derive(Subcommand)]
 enum AgentAction {
+    /// List the box's live agents.
     List {
         #[arg(long = "box")]
         box_sel: Option<String>,
+        /// Include exited and done agents.
+        #[arg(long)]
+        all: bool,
     },
     Start {
         #[arg(long = "box")]
@@ -497,9 +501,13 @@ enum DagAction {
         #[arg(long)]
         coordinator: Option<String>,
     },
+    /// List the box's unfinished runs.
     List {
         #[arg(long = "box")]
         box_sel: Option<String>,
+        /// Include completed runs.
+        #[arg(long)]
+        all: bool,
     },
     Show {
         run: String,
@@ -964,9 +972,10 @@ fn run_dag(command: DagAction) -> Result<()> {
             title,
             coordinator,
         },
-        DagAction::List { box_sel } => DagRequest::ListRuns {
+        DagAction::List { box_sel, all } => DagRequest::ListRuns {
             box_sel,
             caller: caller_session(),
+            include_finished: all,
         },
         DagAction::Show { run } => DagRequest::GetRun { run },
         DagAction::AddTask {
@@ -1086,10 +1095,14 @@ fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
     }
 }
 
-fn protocol_agents(box_sel: Option<String>) -> Result<Vec<client::protocol::ManagedAgent>> {
+fn protocol_agents(
+    box_sel: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<client::protocol::ManagedAgent>> {
     let request = DagRequest::ListAgents {
         box_sel,
         caller: caller_session(),
+        include_finished,
     };
     match client::dag(request, PROTOCOL_TIMEOUT)? {
         DagResponse::Agents { agents } => Ok(agents),

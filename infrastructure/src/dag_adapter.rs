@@ -32,17 +32,31 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
                 path,
             )?,
         },
-        DagRequest::ListAgents { box_sel, caller } => Reply::Agents {
-            agents: convert(application.list_agents(BoxSelection {
-                selector: box_sel,
-                caller,
-            })?),
+        DagRequest::ListAgents {
+            box_sel,
+            caller,
+            include_finished,
+        } => Reply::Agents {
+            agents: convert(application.list_agents(
+                BoxSelection {
+                    selector: box_sel,
+                    caller,
+                },
+                include_finished,
+            )?),
         },
-        DagRequest::ListRuns { box_sel, caller } => Reply::Runs {
-            runs: convert(application.list_runs(BoxSelection {
-                selector: box_sel,
-                caller,
-            })?),
+        DagRequest::ListRuns {
+            box_sel,
+            caller,
+            include_finished,
+        } => Reply::Runs {
+            runs: convert(application.list_runs(
+                BoxSelection {
+                    selector: box_sel,
+                    caller,
+                },
+                include_finished,
+            )?),
         },
         DagRequest::CreateRun {
             box_sel,
