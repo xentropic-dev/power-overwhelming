@@ -9,10 +9,13 @@ use application::{
 };
 use domain::agent::{AgentProfile, Injection};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::process::CommandExt,
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
 };
 
@@ -73,11 +76,12 @@ impl Shell {
         }
     }
 
-    /// Shell functions that start configured agents with Power's instructions.
+    /// Defines the agent wrappers and runs any pending resume command.
     pub fn init_script(self, registry: &impl AgentProfileRegistry) -> String {
-        registry.profiles().iter().map(|profile| {
+        let mut script = String::new();
+        for profile in registry.profiles() {
             let name = profile.id.as_str();
-            match self {
+            script.push_str(&match self {
                 Self::Bash | Self::Zsh => {
                     // `function name` keeps a user's alias from expanding in the definition.
                     format!("function {name} {{ \"$POWER_BIN\" exec-agent {name} -- \"$@\"; }}\n")
@@ -85,8 +89,29 @@ impl Shell {
                 Self::Fish => format!(
                     "function {name} --wraps {name}\n    \"$POWER_BIN\" exec-agent {name} -- $argv\nend\n"
                 ),
+            });
+        }
+        script.push_str(match self {
+            Self::Bash | Self::Zsh => {
+                r#"if [ -n "${POWER_RESUME-}" ]; then
+    function __power_resume_once {
+        local power_resume_command="$POWER_RESUME"
+        unset -f __power_resume_once
+        unset POWER_RESUME && eval "$power_resume_command"
+    }
+    __power_resume_once
+fi
+"#
             }
-        }).collect()
+            Self::Fish => {
+                r#"if test -n "$POWER_RESUME"
+    set -l power_resume_command "$POWER_RESUME"
+    set -e POWER_RESUME; and eval "$power_resume_command"
+end
+"#
+            }
+        });
+        script
     }
 
     pub fn installed(self) -> bool {
@@ -127,6 +152,28 @@ impl Shell {
 
 fn has_marker(path: &Path) -> bool {
     fs::read_to_string(path).is_ok_and(|contents| contents.contains(MARKER))
+}
+
+/// Quotes a program and its arguments for evaluation by Bash, Zsh, or Fish.
+#[allow(dead_code, reason = "The session restore path will call this helper")]
+pub(crate) fn resume_command(program: &str, args: &[OsString]) -> OsString {
+    let mut command = Vec::new();
+    for word in std::iter::once(OsStr::new(program)).chain(args.iter().map(OsString::as_os_str)) {
+        if !command.is_empty() {
+            command.push(b' ');
+        }
+        command.push(b'\'');
+        for &byte in word.as_bytes() {
+            // Both characters can be escaped outside single quotes in all three shells.
+            if matches!(byte, b'\'' | b'\\') {
+                command.extend_from_slice(&[b'\'', b'\\', byte, b'\'']);
+            } else {
+                command.push(byte);
+            }
+        }
+        command.push(b'\'');
+    }
+    OsString::from_vec(command)
 }
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
@@ -228,7 +275,9 @@ mod tests {
     use super::*;
     use crate::agents::AgentProfiles;
     use application::skills::ListSkills;
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet, io::ErrorKind, os::unix::fs::PermissionsExt, process::Command,
+    };
 
     struct Installed(BTreeSet<String>);
 
@@ -379,5 +428,101 @@ mod tests {
         assert_eq!(contents.matches(MARKER).count(), 1);
         assert!(contents.starts_with("export A=1\n\n"));
         assert!(has_marker(&rc));
+    }
+
+    #[test]
+    fn quotes_resume_command_words() {
+        let args = ["--resume", "two words", "a'b", r"a\b", ""].map(OsString::from);
+        assert_eq!(
+            resume_command("my agent", &args),
+            r"'my agent' '--resume' 'two words' 'a'\''b' 'a'\\'b' ''"
+        );
+    }
+
+    #[test]
+    fn init_script_appends_resume_trailer_after_wrappers() {
+        let profiles = AgentProfiles::default();
+        for (shell, guard, unset) in [
+            (
+                Shell::Bash,
+                r#"if [ -n "${POWER_RESUME-}" ]"#,
+                "unset POWER_RESUME",
+            ),
+            (
+                Shell::Zsh,
+                r#"if [ -n "${POWER_RESUME-}" ]"#,
+                "unset POWER_RESUME",
+            ),
+            (
+                Shell::Fish,
+                r#"if test -n "$POWER_RESUME""#,
+                "set -e POWER_RESUME",
+            ),
+        ] {
+            let script = shell.init_script(&profiles);
+            let (wrappers, trailer) = script.split_once(guard).unwrap();
+            assert!(wrappers.contains("function claude"), "{shell:?}");
+            let (_, after_unset) = trailer.split_once(unset).unwrap();
+            assert!(
+                after_unset.contains(r#"eval "$power_resume_command""#),
+                "{shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_hooks_run_resume_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stub = temp.path().join("power stub");
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+if [ "$1" = shell-init ]; then
+    exec cat "$POWER_TEST_INIT"
+fi
+test "${POWER_RESUME+x}" != x || exit 1
+printf '<%s>\n' "$@"
+"#,
+        )?;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700))?;
+
+        let profiles = AgentProfiles::default();
+        let init = temp.path().join("init");
+        let args = ["--resume", "two words", r#"a\'b"c"#, r"a\\b\", ""].map(OsString::from);
+        let resume = resume_command("claude", &args);
+        let expected =
+            "<exec-agent>\n<claude>\n<-->\n<--resume>\n<two words>\n<a\\'b\"c>\n<a\\\\b\\>\n<>\n";
+        for (shell, flags, is_unset) in [
+            (
+                Shell::Bash,
+                &["--noprofile", "--norc"][..],
+                r#"[ -z "${POWER_RESUME+x}" ]"#,
+            ),
+            (Shell::Zsh, &["-f"][..], r#"[ -z "${POWER_RESUME+x}" ]"#),
+            (Shell::Fish, &["--no-config"][..], "not set -q POWER_RESUME"),
+        ] {
+            fs::write(&init, shell.init_script(&profiles))?;
+            let hook = shell.hook();
+            let output = Command::new(shell.name())
+                .args(flags)
+                .arg("-c")
+                .arg(format!("{hook}\n{hook}\n{is_unset}"))
+                .env_remove("BASH_ENV")
+                .env("POWER_BIN", &stub)
+                .env("POWER_TEST_INIT", &init)
+                .env("POWER_RESUME", &resume)
+                .output();
+            let output = match output {
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                output => output?,
+            };
+            assert!(
+                output.status.success(),
+                "{shell:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::str::from_utf8(&output.stdout)?, expected, "{shell:?}");
+        }
+        Ok(())
     }
 }
