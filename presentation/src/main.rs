@@ -126,7 +126,11 @@ enum SessionAction {
     },
     /// Report this terminal's active model from a provider integration.
     Model {
-        name: String,
+        #[arg(required_unless_present = "stdin_json")]
+        name: Option<String>,
+        /// Read provider hook or status-line JSON from stdin. Skip reports with no model.
+        #[arg(long = "json", conflicts_with = "name")]
+        stdin_json: bool,
     },
     End {
         id: String,
@@ -266,10 +270,7 @@ fn main() -> Result<()> {
                     std::env::var("POWER_SESSION").context("Set a task from a Power terminal")?,
                     label,
                 )?,
-                SessionAction::Model { name } => client::set_model(
-                    std::env::var("POWER_SESSION").context("Set a model from a Power terminal")?,
-                    name,
-                )?,
+                SessionAction::Model { name, .. } => report_model(name)?,
             }
             Ok(())
         }
@@ -547,6 +548,29 @@ fn caller_session() -> Option<String> {
     std::env::var("POWER_SESSION")
         .ok()
         .filter(|id| !id.is_empty())
+}
+
+fn report_model(name: Option<String>) -> Result<()> {
+    if let Some(name) = name {
+        return client::set_model(
+            caller_session().context("Set a model from a Power terminal")?,
+            name,
+        );
+    }
+
+    // Read the payload even outside Power so status-line callers can finish writing it.
+    let payload: Value = serde_json::from_reader(std::io::stdin().lock())
+        .context("Read provider model report from stdin")?;
+    let model = &payload["model"];
+    let name = [model, &model["id"], &model["display_name"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|name| !name.is_empty());
+    if let (Some(session), Some(name)) = (caller_session(), name) {
+        client::set_model(session, name.to_owned())?;
+    }
+    Ok(())
 }
 
 fn parse_event_kind(value: &str) -> Result<RunEventKind, serde_json::Error> {

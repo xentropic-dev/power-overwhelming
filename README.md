@@ -35,7 +35,7 @@ Add `--json` to any of these for machine-readable output.
 
 ### Discovery
 
-Agents find skills in two ways. `power --help`, `power dag --help`, and `power skills --help` end with a short footer that points agents at `power skills list`. Agents that Power starts with a profile that has launch instructions, from a shell wrapper, `power session start`, or `power dag dispatch`, also get a short block naming each bundled skill and how to load it, plus a request to label the session with `power session task`. Skills already installed in the agent's native skill folder are left out of that block, and when every skill is installed, the block keeps only the `power session task` line.
+Agents find skills in two ways. `power --help`, `power dag --help`, and `power skills --help` end with a short footer that points agents at `power skills list`. Agents that Power starts with a profile that has launch instructions, from a shell wrapper, `power session start`, or `power dag dispatch`, also get a short block naming each bundled skill and how to load it. The same instructions ask agents to report their task and active model. Skills already installed in the agent's native skill folder are left out of the block.
 
 ### Native installs
 
@@ -112,7 +112,7 @@ Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` 
 
 ## Power-bar
 
-The status bar shows the main checkout and active worktree folder names with distinct icons, followed by the foreground agent, its model when known, and its task when reported. Press Ctrl+S then `y` to copy either full path. Power’s launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"` and update it as their work changes. Power reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok. An integration running under the active agent can report the model or a switch with `power session model "Model name"`. Provider defaults and in-session switches need a report to appear.
+The status bar shows the main checkout and active worktree folder names with distinct icons, followed by the foreground agent, its model when known, and its task when reported. Press Ctrl+S then `y` to copy either full path. Power’s launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"` and `{agent.model}` with `power session model "Model name"` when they can verify the active model. Agents should update these labels as their work or model changes. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok.
 
 Set `power_bar` in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua` and press Ctrl+B then `r` to reload. The default uses colored Powerline joins and changes the rightmost accent with the active agent. Set `separator` to `""` for rounded joins or to Unicode text such as `" │ "` for a plain separator. Each segment can set an `icon`, foreground, and background. [Bundled defaults](plugins/power-bar/defaults.json)
 
@@ -134,6 +134,45 @@ power_bar.right = {
 The bar omits segments with unavailable fields. Set `power_bar.enabled = false` to hide it. Power-bar is a [bundled Wasm plugin](plugins/power-bar/README.md). To replace it, put a component implementing the [terminal UI interface](plugins/wit/terminal-ui.wit) next to `config.lua` as `terminal-bottom.wasm` and reload.
 
 To add template fields, put components implementing the [status fields interface](infrastructure/wit/status-bar.wit) in the `status-plugins` folder next to `config.lua`, or set `POWER_STATUS_PLUGIN_DIR` before starting the desktop. With the optional plugin host built, Power-bar reads their values as `{custom.name}`. Values defined in `power_bar.params` take precedence.
+
+### Report models from provider callbacks
+
+Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
+
+For **Codex**, add these entries to the corresponding hook arrays in `~/.codex/hooks.json`, then review and trust the hooks in `/hooks`. Codex reports the model on session start and on the next submitted prompt after a model switch. [Codex hooks](https://learn.chatgpt.com/docs/hooks)
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "power session model --json" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "power session model --json" }] }
+    ]
+  }
+}
+```
+
+For **Claude Code**, add this setting to `~/.claude/settings.json`. The refresh interval also checks for changes while the session is idle. [Claude Code status line](https://code.claude.com/docs/en/statusline)
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "power session model --json",
+    "refreshInterval": 5
+  }
+}
+```
+
+For **Grok**, add this section to `~/.grok/config.toml` and relaunch Grok. Its status-line command runs when the session's model changes. If you already use a Claude or Grok status-line command, pass the provider's JSON to Power from your existing script and keep printing your usual status line. [Grok status line](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/25-status-line.md)
+
+```toml
+[ui.status_line]
+type = "command"
+command = "power session model --json"
+```
 
 ## Key bindings
 

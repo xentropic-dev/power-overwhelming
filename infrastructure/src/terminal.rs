@@ -542,9 +542,11 @@ fn terminal_actor(
                     let field = match field {
                         MetadataField::Task => &mut metadata.task,
                         MetadataField::Model => {
-                            lifecycle
-                                .set_model(agent, value.clone())
-                                .context("Could not save agent model")?;
+                            if metadata.model != value {
+                                lifecycle
+                                    .set_model(agent, value.clone())
+                                    .context("Could not save agent model")?;
+                            }
                             &mut metadata.model
                         }
                     };
