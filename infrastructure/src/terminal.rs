@@ -1328,36 +1328,24 @@ fn process_directory(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-/// Walks from the foreground process group leader up to the shell, looking for an agent.
+/// Finds the agent that owns the foreground job, including one sharing the shell's group.
 fn foreground_agent(
     leader: Option<u32>,
     shell: Option<u32>,
     profiles: &dyn AgentProfileRegistry,
 ) -> Option<(u32, Agent)> {
-    // Bash starts a command such as a resumed agent in its own process group while it
-    // runs the prompt hook, so the shell leads the foreground group with the agent
-    // among its children.
-    if leader.is_some() && leader == shell {
-        let mut queue = child_pids(shell?);
-        let mut index = 0;
-        while let Some(&pid) = queue.get(index).filter(|_| index < 64) {
-            index += 1;
-            if process_group(pid) != leader {
-                continue;
-            }
-            if let Some(agent) = process_agent(pid, profiles) {
-                return Some((pid, agent));
-            }
-            queue.extend(child_pids(pid));
-        }
-        return None;
+    let proc = Path::new("/proc");
+    if let Some(shell) = shell
+        && leader == Some(shell)
+    {
+        return shell_group_agent(proc, shell, profiles);
     }
     let mut pid = leader;
     for _ in 0..32 {
         let Some(current) = pid.filter(|current| Some(*current) != shell && *current > 1) else {
             break;
         };
-        if let Some(agent) = process_agent(current, profiles) {
+        if let Some(agent) = process_agent(&proc.join(current.to_string()), profiles) {
             return Some((current, agent));
         }
         pid = parent_pid(current);
@@ -1377,6 +1365,59 @@ fn shares_input(pid: u32, other: u32) -> bool {
     input(pid).is_some_and(|own| input(other) == Some(own))
 }
 
+/// Shell initialization can start an agent before job control is enabled. Search only
+/// the shell's foreground group so a background job cannot own the session's metadata.
+fn shell_group_agent(
+    proc: &Path,
+    shell: u32,
+    profiles: &dyn AgentProfileRegistry,
+) -> Option<(u32, Agent)> {
+    let mut newest = None;
+    let mut parents = vec![shell];
+    while let Some(parent) = parents.pop() {
+        for pid in child_pids(&proc.join(parent.to_string())) {
+            let process = proc.join(pid.to_string());
+            let Some(started) = group_child_start(&process, parent, shell) else {
+                continue;
+            };
+            parents.push(pid);
+            if let Some(agent) = process_agent(&process, profiles)
+                && newest.as_ref().is_none_or(|(key, _)| (started, pid) > *key)
+            {
+                newest = Some(((started, pid), agent));
+            }
+        }
+    }
+    newest.map(|((_, pid), agent)| (pid, agent))
+}
+
+fn child_pids(process: &Path) -> Vec<u32> {
+    let mut children = Vec::new();
+    // Linux records children under the thread that spawned them.
+    if let Ok(threads) = fs::read_dir(process.join("task")) {
+        for thread in threads.flatten() {
+            if let Ok(pids) = fs::read_to_string(thread.path().join("children")) {
+                children.extend(
+                    pids.split_whitespace()
+                        .filter_map(|pid| pid.parse::<u32>().ok()),
+                );
+            }
+        }
+    }
+    children
+}
+
+fn group_child_start(process: &Path, parent: u32, group: u32) -> Option<u64> {
+    let stat = fs::read_to_string(process.join("stat")).ok()?;
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    // proc_pid_stat(5): ppid (4), pgrp (5), starttime (22).
+    if fields.nth(1)?.parse::<u32>().ok()? != parent || fields.next()?.parse::<u32>().ok()? != group
+    {
+        return None;
+    }
+    fields.nth(16)?.parse().ok()
+}
+
 fn descends_from(mut pid: u32, owner: u32) -> bool {
     for _ in 0..64 {
         if pid == owner {
@@ -1390,8 +1431,8 @@ fn descends_from(mut pid: u32, owner: u32) -> bool {
     false
 }
 
-fn process_agent(pid: u32, profiles: &dyn AgentProfileRegistry) -> Option<Agent> {
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+fn process_agent(process: &Path, profiles: &dyn AgentProfileRegistry) -> Option<Agent> {
+    let cmdline = fs::read(process.join("cmdline")).ok()?;
     let cmdline = String::from_utf8_lossy(&cmdline);
     let mut args = cmdline.split('\0').filter(|arg| !arg.is_empty());
     let program = args.next()?;
@@ -1482,27 +1523,6 @@ fn agent_for_program(program: &str, profiles: &dyn AgentProfileRegistry) -> Opti
                 .find(|profile| program_name(&profile.command) == name)
         })
         .map(|profile| Agent::Coding(profile.id.clone()))
-}
-
-fn child_pids(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .map(|children| {
-            children
-                .split_whitespace()
-                .filter_map(|child| child.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn process_group(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(2)?
-        .parse()
-        .ok()
 }
 
 fn parent_pid(pid: u32) -> Option<u32> {
@@ -1806,6 +1826,40 @@ mod tests {
     }
 
     #[test]
+    fn shell_group_selects_the_newest_matching_descendant() -> Result<()> {
+        let proc = tempfile::tempdir()?;
+        let process = |pid: u32, parent, group, started, cmdline, children| -> Result<()> {
+            let path = proc.path().join(pid.to_string());
+            let thread = path.join(format!("task/{pid}"));
+            fs::create_dir_all(&thread)?;
+            fs::write(thread.join("children"), children)?;
+            fs::write(path.join("cmdline"), cmdline)?;
+            fs::write(
+                path.join("stat"),
+                format!(
+                    "{pid} (a ) name) S {parent} {group} {} {started}",
+                    "0 ".repeat(16)
+                ),
+            )?;
+            Ok(())
+        };
+        process(10, 1, 10, 1, "bash", "80 20 30 40")?;
+        process(80, 10, 10, 2, "claude", "")?;
+        process(20, 10, 10, 3, "wrapper", "21")?;
+        process(21, 20, 10, 4, "node\0/bin/codex.js", "")?;
+        process(30, 10, 30, 5, "claude", "")?; // background job
+        process(40, 10, 10, 6, "sleep", "")?;
+        let profiles = crate::agents::AgentProfiles::default();
+        let detect = || shell_group_agent(proc.path(), 10, &profiles);
+        assert_eq!(detect(), Some((21, Agent::Coding("codex".into()))));
+        fs::remove_dir_all(proc.path().join("21"))?;
+        assert_eq!(detect(), Some((80, Agent::Coding("claude".into()))));
+        fs::remove_dir_all(proc.path().join("80"))?;
+        assert_eq!(detect(), None);
+        Ok(())
+    }
+
+    #[test]
     fn reads_parent_of_current_process() {
         let parent = parent_pid(std::process::id()).unwrap();
         assert_eq!(parent, std::os::unix::process::parent_id());
@@ -1998,7 +2052,7 @@ mod tests {
         let pid = shell.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let children = loop {
-            let children: Vec<_> = child_pids(pid)
+            let children: Vec<_> = child_pids(Path::new(&format!("/proc/{pid}")))
                 .into_iter()
                 .filter_map(|child| {
                     let cmdline = std::fs::read(format!("/proc/{child}/cmdline")).ok()?;
@@ -2020,7 +2074,9 @@ mod tests {
         let result = (shares("sleep 30"), shares("sleep 31"));
         let _ = shell.kill();
         for (_, child) in &children {
-            let _ = std::process::Command::new("kill").arg(child.to_string()).status();
+            let _ = std::process::Command::new("kill")
+                .arg(child.to_string())
+                .status();
         }
         let _ = shell.wait();
         assert_eq!(result, (Some(false), Some(true)));
