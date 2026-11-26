@@ -219,11 +219,9 @@ fn launch(
             &options.args,
             &installed,
         )?);
-        if let Some(resume) = &profile.resume {
-            let (assign, id) = resume.launch(&options.args, || uuid::Uuid::new_v4().to_string());
-            command.args(assign);
-            conversation = id;
-        }
+        let (assign, id) = crate::shell::assign_conversation(profile, &options.args);
+        command.args(assign);
+        conversation = id;
         command.args(&options.args);
         command
     } else if let Some((program, args)) = options.args.split_first() {

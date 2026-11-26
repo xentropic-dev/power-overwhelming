@@ -175,6 +175,32 @@ pub(crate) fn resume_command(program: &str, args: &[OsString]) -> OsString {
     OsString::from_vec(command)
 }
 
+/// Arguments that pin a new conversation ID, and the ID to record for a restore.
+/// Management subcommands and help or version queries start no conversation, so
+/// they get no ID and cannot replace the one a restore would resume.
+pub(crate) fn assign_conversation(
+    profile: &AgentProfile,
+    user: &[OsString],
+) -> (Vec<OsString>, Option<String>) {
+    let Some(resume) = &profile.resume else {
+        return (Vec::new(), None);
+    };
+    let skipped = user
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
+        || user.iter().any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("-h" | "--help" | "-v" | "-V" | "--version")
+            )
+        });
+    if skipped {
+        return (Vec::new(), None);
+    }
+    resume.launch(user, || uuid::Uuid::new_v4().to_string())
+}
+
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
 /// Skills the agent already discovers natively are left out of the list.
 pub(crate) fn instruction_args(
@@ -236,8 +262,8 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
         &args,
         &LocalInstalledSkills(&std::env::current_dir()?),
     )?);
-    if let Some(resume) = &profile.resume {
-        let (assign, conversation) = resume.launch(&args, || uuid::Uuid::new_v4().to_string());
+    {
+        let (assign, conversation) = assign_conversation(profile, &args);
         command.args(assign);
         if let (Some(conversation), Some(session)) =
             (conversation, std::env::var_os("POWER_SESSION"))
@@ -440,6 +466,27 @@ mod tests {
         assert_eq!(contents.matches(MARKER).count(), 1);
         assert!(contents.starts_with("export A=1\n\n"));
         assert!(has_marker(&rc));
+    }
+
+    #[test]
+    fn assigns_conversations_only_to_interactive_agent_launches() {
+        let profiles = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into()).unwrap();
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+
+        let (assign, conversation) = assign_conversation(claude, &args(&["--model", "opus"]));
+        let conversation = conversation.expect("an interactive launch gets an ID");
+        assert_eq!(assign, args(&["--session-id", &conversation]));
+
+        for skipped in [&["mcp", "list"][..], &["update"], &["--help"], &["-v"]] {
+            assert_eq!(
+                assign_conversation(claude, &args(skipped)),
+                (Vec::new(), None),
+                "{skipped:?}"
+            );
+        }
+        let codex = profiles.resolve(&"codex".into()).unwrap();
+        assert_eq!(assign_conversation(codex, &[]), (Vec::new(), None));
     }
 
     #[test]
