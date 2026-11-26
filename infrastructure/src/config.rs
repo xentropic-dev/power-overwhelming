@@ -77,6 +77,10 @@ pub fn agent_profiles(sections: &Sections) -> Result<AgentProfiles> {
     let entries = section
         .as_object()
         .context("agents must be a table keyed by profile ID")?;
+    // Lua tables iterate in no stable order. Read entries by name so user-defined
+    // profiles follow the built-ins (which keep their fixed order) sorted by name.
+    let mut entries: Vec<_> = entries.iter().collect();
+    entries.sort_by_key(|(id, _)| id.as_str());
     for (id, value) in entries {
         let profile = read_agent_profile(id, value.clone(), &profiles)
             .with_context(|| format!("Read agents[{id:?}] from config.lua"))?;
@@ -436,6 +440,25 @@ mod tests {
                 resume_last: vec!["reopen".into(), "--last".into()],
                 conflicts: vec!["--id".into(), "reopen".into()],
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lists_builtin_profiles_first_then_user_profiles_by_name() -> Result<()> {
+        let sections = BTreeMap::from([(
+            AGENTS_SECTION.to_owned(),
+            json!({ "zeta": {}, "codex": {}, "alpha": {}, "mid": {}, "beta": {} }),
+        )]);
+        let profiles = agent_profiles(&sections)?;
+        let ids: Vec<_> = profiles
+            .0
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["claude", "codex", "grok", "alpha", "beta", "mid", "zeta"]
         );
         Ok(())
     }
