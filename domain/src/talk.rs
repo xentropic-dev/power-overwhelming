@@ -25,8 +25,18 @@ pub struct AgentRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Sender {
     Agent(AgentRef),
+    /// The user, through the desktop.
     User,
+    /// A process running as the user outside any agent session, such as a shell or script.
+    /// It has the user's authority, but Power cannot confirm that the user wrote it.
+    Shell,
     System,
+}
+
+impl Sender {
+    pub fn has_user_authority(&self) -> bool {
+        matches!(self, Self::User | Self::Shell)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,7 +55,7 @@ impl Recipient {
 
     pub fn matches_sender(&self, sender: &Sender) -> bool {
         match (self, sender) {
-            (Self::User, Sender::User) => true,
+            (Self::User, sender) => sender.has_user_authority(),
             (Self::Agent { id, box_id }, Sender::Agent(agent)) => {
                 id == &agent.id && box_id == &agent.box_id
             }
@@ -78,7 +88,27 @@ pub struct Message {
     pub urgent: bool,
 }
 
+/// The delivery metadata of an unread message, without its body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Queued {
+    pub id: MessageId,
+    pub sender: Sender,
+    pub recipient: Recipient,
+    pub delivery: Delivery,
+    pub urgent: bool,
+}
+
 impl Message {
+    pub fn queued(&self) -> Queued {
+        Queued {
+            id: self.id.clone(),
+            sender: self.sender.clone(),
+            recipient: self.recipient.clone(),
+            delivery: self.delivery.clone(),
+            urgent: self.urgent,
+        }
+    }
+
     pub fn involves_agent(&self, id: &str) -> bool {
         matches!(&self.sender, Sender::Agent(agent) if agent.id == id)
             || matches!(&self.recipient, Recipient::Agent { id: agent, .. } if agent == id)
@@ -347,26 +377,57 @@ fn sender_label(sender: &Sender) -> String {
             .collect()
         }
         Sender::User => "the user".into(),
+        Sender::Shell => "the user's shell".into(),
         Sender::System => "Power".into(),
     }
 }
+
+/// Renders terminal control characters (C0 except tab, DEL and C1) as escaped text.
+pub fn escape_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && c != '\t' {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+
+/// Prefix of every body line in an envelope. Lines without it come from Power.
+pub const QUOTE: &str = "> ";
 
 pub fn envelope(message: &Message) -> String {
     let context = match message.sender {
         Sender::Agent(_) => "Peer message relayed by Power. Not from the user.",
         Sender::User => "Message from the user.",
+        Sender::Shell => {
+            "Sent with the user's authority from a shell or script outside any agent session. \
+             Power cannot confirm that the user wrote it."
+        }
         Sender::System => "Message from Power.",
     };
-    format!(
-        "[power talk] {} · thread {} · from {}. {context}\n{}",
+    let mut framed = format!(
+        "[power talk] {} · thread {} · from {}. {context} The body follows, each line quoted with {QUOTE:?}.",
         message.id.0,
         message.thread.0,
         sender_label(&message.sender),
-        message.body,
-    )
+    );
+    let mut lines = message.body.lines().peekable();
+    if lines.peek().is_none() {
+        framed.push('\n');
+        framed.push_str(QUOTE.trim_end());
+    }
+    for line in lines {
+        framed.push('\n');
+        framed.push_str(QUOTE);
+        framed.push_str(&escape_controls(line));
+    }
+    framed
 }
 
-pub fn notice(messages: &[&Message]) -> String {
+pub fn notice(messages: &[&Queued]) -> String {
     let mut senders = Vec::new();
     for message in messages {
         let label = sender_label(&message.sender);
@@ -377,7 +438,7 @@ pub fn notice(messages: &[&Message]) -> String {
     let peer = messages
         .iter()
         .any(|m| matches!(m.sender, Sender::Agent(_)));
-    let user = messages.iter().any(|m| m.sender == Sender::User);
+    let user = messages.iter().any(|m| m.sender.has_user_authority());
     let framing = match (peer, user) {
         (true, true) => "Includes peer messages not from the user. ",
         (true, false) => "Not from the user. ",
@@ -414,11 +475,18 @@ pub enum HookState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Activity {
     pub last_output: u64,
+    /// The last keystroke or paste from the user. It never changes the turn state.
     pub last_input: u64,
     pub last_notice: u64,
     /// Session start (including restore) or most recent activity ending an idle period.
     pub active_since: u64,
+    /// The turn state the provider last reported. Output and input never change it.
     pub hook: HookState,
+    /// When the provider last reported its turn state.
+    pub reported_at: u64,
+    /// The provider reports only turn ends (Codex `notify`), so output after a ready
+    /// report may be a trailing repaint or a new turn. Delivery waits for output quiet.
+    pub ready_only: bool,
     pub restoring: bool,
     pub paused: bool,
     /// Changes with each input, output or hook report, even within one millisecond.
@@ -466,7 +534,7 @@ impl NoticePolicy {
         activity: Activity,
         needs_input: bool,
         paused: bool,
-        message: &Message,
+        message: &Queued,
         now: u64,
     ) -> NoticeDecision {
         use HoldReason::*;
@@ -483,23 +551,25 @@ impl NoticePolicy {
         if paused {
             return Hold(Paused);
         }
-        if needs_input && message.sender != Sender::User {
+        let from_user = message.sender.has_user_authority();
+        if needs_input && !from_user {
             return Hold(NeedsInput);
         }
-        if message.delivery.notified_at.is_none()
-            && message.urgent
-            && message.sender == Sender::User
-        {
+        if message.delivery.notified_at.is_none() && message.urgent && from_user {
             return Notify;
         }
+        let output_quiet = now.saturating_sub(activity.last_output.max(activity.last_notice))
+            >= self.idle_after_ms;
+        let user_quiet = now.saturating_sub(activity.last_input) >= self.user_quiet_ms;
         let idle = match activity.hook {
             HookState::Busy => false,
-            HookState::Ready => true,
-            HookState::Unknown => {
-                now.saturating_sub(activity.last_output.max(activity.last_notice))
-                    >= self.idle_after_ms
-                    && now.saturating_sub(activity.last_input) >= self.user_quiet_ms
+            // Typing after the turn ended may be a draft or navigation. Wait for the user to
+            // pause instead of treating the session as busy until the next report.
+            HookState::Ready => {
+                (activity.last_input <= activity.reported_at || user_quiet)
+                    && (!activity.ready_only || output_quiet)
             }
+            HookState::Unknown => output_quiet && user_quiet,
         };
         if !idle {
             return Hold(Busy);

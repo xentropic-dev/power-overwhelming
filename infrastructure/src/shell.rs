@@ -310,7 +310,7 @@ fn skips_injection(profile: &AgentProfile, user: &[OsString]) -> bool {
 /// The command an agent's hook or status line runs to report its model to Power.
 pub(crate) const MODEL_CALLBACK: &str = "power session model --json";
 
-/// Launcher hooks and whether terminal output should mark the turn busy.
+/// Launcher hooks and whether the provider reports only turn ends (Codex `notify`).
 pub(crate) fn launch_callbacks(
     profile: &AgentProfile,
     user: &[OsString],
@@ -609,18 +609,9 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
         external_profile.turn_hook = TurnHook::None;
         &external_profile
     };
-    let (callbacks, output_sets_busy) = launch_callbacks(callback_profile, &args, &cwd);
+    // A notify-only provider marks the session with its first ready report.
+    let (callbacks, _) = launch_callbacks(callback_profile, &args, &cwd);
     command.args(callbacks);
-    if output_sets_busy && let Some(session) = session {
-        let _ = crate::client::talk::turn(
-            crate::client::talk::Caller {
-                session: Some(session),
-                box_sel: None,
-            },
-            false,
-            true,
-        );
-    }
     {
         let (assign, conversation) = assign_conversation(profile, &args);
         command.args(assign);

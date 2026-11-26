@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 pub struct TalkRequest {
     pub session: Option<String>,
     pub box_sel: Option<String>,
+    /// Set by the desktop. Other session-less callers send as the user's shell.
+    #[serde(default)]
+    pub desktop: bool,
     #[serde(flatten)]
     pub command: TalkCommand,
 }
@@ -33,7 +36,9 @@ pub enum TalkCommand {
     },
     Wait {
         threads: Vec<String>,
-        after: Option<String>,
+        /// Only a reply to one of these messages ends the wait.
+        #[serde(default)]
+        reply_to: Vec<String>,
         seconds: u64,
     },
     Log {
@@ -44,8 +49,9 @@ pub enum TalkCommand {
     },
     Turn {
         ready: bool,
+        /// The provider reports turn ends but not turn starts.
         #[serde(default)]
-        output_sets_busy: bool,
+        ready_only: bool,
     },
     Summary,
     Watch,
@@ -88,6 +94,7 @@ pub enum TalkSender {
         run: Option<String>,
     },
     User,
+    Shell,
     System,
 }
 

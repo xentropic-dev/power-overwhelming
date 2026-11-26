@@ -6,8 +6,8 @@ use application::talk::{
 };
 use domain::dag::ManagedAgent;
 use domain::talk::{
-    AgentRef, AgentTalkSummary, Delivery, Directory, Message, MessageId, Recipient, RunRef, Sender,
-    ThreadId,
+    AgentRef, AgentTalkSummary, Delivery, Directory, Message, MessageId, Queued, Recipient, RunRef,
+    Sender, ThreadId,
 };
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use std::time::Instant;
@@ -76,7 +76,8 @@ const COLUMNS: &str =
      recipient_agent, body, thread, reply_to, broadcast, run, created_at, queued_at,
      notified_at, reminded_at, read_at, urgent";
 
-fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
+/// Reads sender and recipient from columns 1–7 of COLUMNS or QUEUED_COLUMNS.
+fn parties(row: &Row<'_>) -> rusqlite::Result<(String, Sender, Recipient)> {
     let box_id: String = row.get(1)?;
     let sender = match row.get::<_, String>(2)?.as_str() {
         "agent" => Sender::Agent(AgentRef {
@@ -87,6 +88,7 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
             run: row.get(6)?,
         }),
         "user" => Sender::User,
+        "shell" => Sender::Shell,
         "system" => Sender::System,
         kind => return Err(rusqlite::Error::InvalidParameterName(kind.into())),
     };
@@ -97,6 +99,31 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
         },
         None => Recipient::User,
     };
+    Ok((box_id, sender, recipient))
+}
+
+const QUEUED_COLUMNS: &str =
+    "id, box_id, sender_kind, sender_agent, sender_provider, sender_role, sender_run,
+     recipient_agent, queued_at, notified_at, reminded_at, read_at, urgent";
+
+fn queued_from_row(row: &Row<'_>) -> rusqlite::Result<Queued> {
+    let (_, sender, recipient) = parties(row)?;
+    Ok(Queued {
+        id: MessageId(row.get(0)?),
+        sender,
+        recipient,
+        delivery: Delivery {
+            queued_at: row.get(8)?,
+            notified_at: row.get(9)?,
+            reminded_at: row.get(10)?,
+            read_at: row.get(11)?,
+        },
+        urgent: row.get(12)?,
+    })
+}
+
+fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
+    let (box_id, sender, recipient) = parties(row)?;
     Ok(Message {
         id: MessageId(row.get(0)?),
         box_id,
@@ -134,10 +161,11 @@ impl TalkDb<'_> {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    fn event(&self, message: &Message, kind: &str) -> Result<()> {
+    fn event(&self, message: &MessageId, kind: &str) -> Result<()> {
         self.0.execute(
-            "INSERT INTO talk_events(box_id, message, kind) VALUES (?1, ?2, ?3)",
-            params![message.box_id, message.id.0, kind],
+            "INSERT INTO talk_events(box_id, message, kind)
+             SELECT box_id, id, ?2 FROM talk_messages WHERE id = ?1",
+            params![message.0, kind],
         )?;
         Ok(())
     }
@@ -243,6 +271,17 @@ impl TalkReader for TalkDb<'_> {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    fn queued(&self, recipient: &Recipient, box_id: &str) -> Result<Vec<Queued>> {
+        Ok(self
+            .0
+            .prepare(&format!(
+                "SELECT {QUEUED_COLUMNS} FROM talk_messages
+                 WHERE recipient_agent IS ?1 AND box_id = ?2 AND read_at IS NULL ORDER BY rowid"
+            ))?
+            .query_map(params![recipient_id(recipient), box_id], queued_from_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     fn agent(&self, id: &str) -> Result<ManagedAgent> {
         DagDb(self.0).agent(id)
     }
@@ -333,6 +372,7 @@ impl TalkTransaction for TalkDb<'_> {
         let (kind, agent) = match &message.sender {
             Sender::Agent(agent) => ("agent", Some(agent)),
             Sender::User => ("user", None),
+            Sender::Shell => ("shell", None),
             Sender::System => ("system", None),
         };
         self.0.execute(
@@ -363,10 +403,10 @@ impl TalkTransaction for TalkDb<'_> {
                 message.urgent
             ],
         )?;
-        self.event(message, "talk_message")
+        self.event(&message.id, "talk_message")
     }
 
-    fn mark(&self, messages: &[&Message], change: DeliveryChange, at: u64) -> Result<()> {
+    fn mark(&self, messages: &[&MessageId], change: DeliveryChange, at: u64) -> Result<()> {
         let (column, event) = match change {
             DeliveryChange::Notified => ("notified_at", "talk_delivery"),
             DeliveryChange::Reminded => ("reminded_at", "talk_delivery"),
@@ -376,7 +416,7 @@ impl TalkTransaction for TalkDb<'_> {
             "UPDATE talk_messages SET {column} = ?1 WHERE id = ?2 AND {column} IS NULL"
         ))?;
         for message in messages {
-            if statement.execute(params![at, message.id.0])? != 0 {
+            if statement.execute(params![at, message.0])? != 0 {
                 self.event(message, event)?;
             }
         }
@@ -403,7 +443,7 @@ mod tests {
         let message = Message {
             id: MessageId("hello".into()),
             box_id: "box".into(),
-            sender: Sender::System,
+            sender: Sender::Shell,
             recipient: Recipient::User,
             body: "hello".into(),
             thread: ThreadId("hello".into()),
@@ -421,7 +461,7 @@ mod tests {
         assert!(
             store
                 .write(|db| -> Result<()> {
-                    db.mark(&[&message], DeliveryChange::Read, 5)?;
+                    db.mark(&[&message.id], DeliveryChange::Read, 5)?;
                     anyhow::bail!("roll back")
                 })
                 .is_err()
@@ -439,7 +479,9 @@ mod tests {
                 std::slice::from_ref(&message)
             );
             assert_eq!(db.cursor()?, 1);
-            db.mark(&[&message], DeliveryChange::Read, 6)?;
+            assert_eq!(db.queued(&Recipient::User, "box")?, vec![message.queued()]);
+            assert!(db.queued(&Recipient::User, "other")?.is_empty());
+            db.mark(&[&message.id], DeliveryChange::Read, 6)?;
             assert!(db.inbox(&Recipient::User, None, false)?.is_empty());
             assert_eq!(db.message(&message.id)?.unwrap().delivery.read_at, Some(6));
             assert_eq!(db.events(1, Some("box"))?[0].kind, TalkEventKind::Read);

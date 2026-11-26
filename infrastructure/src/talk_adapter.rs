@@ -34,10 +34,8 @@ impl SessionActivity for Terminal {
         terminal.is_running().then(|| terminal.activity())
     }
 
-    fn report_turn(&self, session: &str, state: HookState, output_sets_busy: bool) -> Result<()> {
-        self.0
-            .terminal(session)?
-            .report_turn(state, output_sets_busy);
+    fn report_turn(&self, session: &str, state: HookState, ready_only: bool) -> Result<()> {
+        self.0.terminal(session)?.report_turn(state, ready_only);
         Ok(())
     }
 }
@@ -89,7 +87,12 @@ pub(crate) fn start(
     talk
 }
 
-fn caller(dag: &DaemonDag, session: Option<String>, selector: Option<String>) -> Result<Caller> {
+fn caller(
+    dag: &DaemonDag,
+    session: Option<String>,
+    selector: Option<String>,
+    desktop: bool,
+) -> Result<Caller> {
     let box_id = if selector.is_some() {
         dag.box_for(BoxSelection {
             selector,
@@ -107,7 +110,11 @@ fn caller(dag: &DaemonDag, session: Option<String>, selector: Option<String>) ->
     } else {
         None
     };
-    Ok(Caller { session, box_id })
+    Ok(Caller {
+        session,
+        box_id,
+        desktop,
+    })
 }
 
 pub(crate) fn request(
@@ -115,7 +122,7 @@ pub(crate) fn request(
     dag: &DaemonDag,
     request: TalkRequest,
 ) -> Result<TalkResponse> {
-    let caller = caller(dag, request.session, request.box_sel)?;
+    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
     let items = |messages: Vec<Message>| TalkResponse::Messages {
         messages: messages.into_iter().map(Into::into).collect(),
     };
@@ -155,7 +162,7 @@ pub(crate) fn request(
         TalkCommand::Show { id, read } => items(talk.show(caller, MessageId(id), read)?),
         TalkCommand::Wait {
             threads,
-            after,
+            reply_to,
             seconds,
         } => {
             let deadline = Instant::now()
@@ -166,7 +173,7 @@ pub(crate) fn request(
                     .wait_for_reply(
                         caller,
                         threads.into_iter().map(ThreadId).collect(),
-                        after.map(MessageId),
+                        reply_to.into_iter().map(MessageId).collect(),
                         deadline,
                     )?
                     .map(|message| Box::new(message.into())),
@@ -187,10 +194,7 @@ pub(crate) fn request(
                 ..LogFilter::default()
             },
         )?),
-        TalkCommand::Turn {
-            ready,
-            output_sets_busy,
-        } => {
+        TalkCommand::Turn { ready, ready_only } => {
             talk.report_turn(
                 caller,
                 if ready {
@@ -198,7 +202,7 @@ pub(crate) fn request(
                 } else {
                     HookState::Busy
                 },
-                output_sets_busy,
+                ready_only,
             )?;
             TalkResponse::Ok
         }
@@ -215,7 +219,7 @@ pub(crate) fn watch(
     request: TalkRequest,
     mut socket: &UnixStream,
 ) -> Result<()> {
-    let caller = caller(dag, request.session, request.box_sel)?;
+    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
     let mut cursor = talk.cursor()?;
     wire::send(
         &mut socket,

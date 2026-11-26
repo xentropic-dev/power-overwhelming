@@ -84,6 +84,7 @@ pub fn caller(box_id: String) -> talk::Caller {
     talk::Caller {
         box_sel: Some(box_id),
         session: None,
+        desktop: true,
     }
 }
 
@@ -434,6 +435,7 @@ fn metadata(message: &Message) -> String {
     let sender = match &message.sender {
         Sender::Agent(agent) => &agent.id,
         Sender::User => "You",
+        Sender::Shell => "Your shell",
         Sender::System => "Power",
     };
     let recipient = match &message.recipient {

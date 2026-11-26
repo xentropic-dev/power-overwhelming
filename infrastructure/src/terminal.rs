@@ -88,7 +88,6 @@ struct Lifecycle {
 #[derive(Default)]
 struct TerminalInput {
     activity: Activity,
-    output_sets_busy: bool,
     writer: Option<SyncSender<Vec<u8>>>,
 }
 
@@ -98,15 +97,13 @@ struct Foreground {
 }
 
 impl Lifecycle {
+    /// Output never changes the reported turn state. A repaint after a ready report only
+    /// delays delivery for providers that need output quiet.
     fn record_output(&self) {
         let mut input = self.input.lock().unwrap();
-        let output_sets_busy = input.output_sets_busy;
         let state = &mut input.activity;
         let now = crate::talk_adapter::now_ms();
         state.last_output = now;
-        if output_sets_busy {
-            state.hook = HookState::Busy;
-        }
         state.active_since = now;
         state.revision = state.revision.wrapping_add(1);
     }
@@ -170,13 +167,15 @@ impl Handle {
         self.lifecycle.input.lock().unwrap().activity
     }
 
-    pub(crate) fn report_turn(&self, hook: HookState, output_sets_busy: bool) {
+    pub(crate) fn report_turn(&self, hook: HookState, ready_only: bool) {
         let mut input = self.lifecycle.input.lock().unwrap();
-        input.output_sets_busy |= output_sets_busy;
+        let now = crate::talk_adapter::now_ms();
         let state = &mut input.activity;
+        state.ready_only |= ready_only;
         state.hook = hook;
+        state.reported_at = now;
         if hook == HookState::Busy {
-            state.active_since = crate::talk_adapter::now_ms();
+            state.active_since = now;
         }
         state.revision = state.revision.wrapping_add(1);
         let _ = self.lifecycle.talk_wake.try_send(());
@@ -199,18 +198,20 @@ impl Handle {
             Err(error) => return Err(error.into()),
         }
         let now = crate::talk_adapter::now_ms();
-        let output_sets_busy = input.output_sets_busy;
         let state = &mut input.activity;
+        state.active_since = now;
         if notice.is_some() {
             state.last_notice = now;
+            // A notice submits a prompt, so a provider that reports turn starts is busy
+            // until it reports again. Notify-only providers wait for output quiet instead.
+            if state.hook == HookState::Ready && !state.ready_only {
+                state.hook = HookState::Busy;
+                state.reported_at = now;
+            }
         } else {
+            // User keystrokes may be navigation or a draft. They delay delivery until the
+            // user pauses but never make the turn busy.
             state.last_input = now;
-        }
-        state.active_since = now;
-        // A notice submits a new prompt. Explicitly tracked turns also become
-        // busy as soon as the user starts typing into the terminal.
-        if output_sets_busy || state.hook == HookState::Ready {
-            state.hook = HookState::Busy;
         }
         state.revision = state.revision.wrapping_add(1);
         let _ = self.lifecycle.talk_wake.try_send(());
@@ -301,10 +302,10 @@ fn launch(
         .clone()
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
-    let mut output_sets_busy = false;
+    let mut ready_only = false;
     let mut process = if let Some(profile) = profile {
-        let (command, id, track_output) = agent_command(profile, &cwd, &options.args)?;
-        output_sets_busy = track_output;
+        let (command, id, notify_only) = agent_command(profile, &cwd, &options.args)?;
+        ready_only = notify_only;
         conversation = id;
         command
     } else if let Some((program, args)) = options.args.split_first() {
@@ -339,9 +340,9 @@ fn launch(
             activity: Activity {
                 last_output: started_at,
                 active_since: started_at,
+                ready_only,
                 ..Activity::default()
             },
-            output_sets_busy,
             writer: Some(write_tx.clone()),
         }),
         talk_wake: runtime.talk_wake.clone(),
@@ -489,12 +490,12 @@ fn agent_command(
     let mut command = CommandBuilder::new(&profile.command);
     let installed = crate::skill_install::LocalInstalledSkills(worktree);
     command.args(crate::shell::instruction_args(profile, args, &installed)?);
-    let (callbacks, output_sets_busy) = crate::shell::launch_callbacks(profile, args, worktree);
+    let (callbacks, ready_only) = crate::shell::launch_callbacks(profile, args, worktree);
     command.args(callbacks);
     let (assign, conversation) = crate::shell::assign_conversation(profile, args);
     command.args(assign);
     command.args(args);
-    Ok((command, conversation, output_sets_busy))
+    Ok((command, conversation, ready_only))
 }
 
 /// Sets the environment and directory every process in a Power terminal starts with.
@@ -793,7 +794,7 @@ fn terminal_actor(
                 }
                 if run.is_none() {
                     let mut input = lifecycle.input.lock().unwrap();
-                    input.output_sets_busy = false;
+                    input.activity.ready_only = false;
                     input.activity.hook = HookState::Unknown;
                     input.activity.revision = input.activity.revision.wrapping_add(1);
                 }

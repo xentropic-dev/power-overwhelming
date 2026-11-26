@@ -61,9 +61,13 @@ enum Action {
     },
     /// Display the thread containing a message.
     Show { id: String },
-    /// Wait for the first reply in a thread.
+    /// Wait for the first reply in one or more threads.
     Wait {
-        thread: String,
+        #[arg(required = true, value_name = "THREAD")]
+        threads: Vec<String>,
+        /// Accept only a reply to this message. Repeat for several messages.
+        #[arg(long = "reply-to", value_name = "MESSAGE")]
+        reply_to: Vec<String>,
         #[arg(long, default_value_t = DEFAULT_TIMEOUT, value_name = "SECS")]
         timeout: u64,
     },
@@ -97,6 +101,7 @@ pub fn run(args: TalkArgs) -> Result<()> {
     let caller = Caller {
         session: super::caller_session(),
         box_sel: args.box_sel,
+        desktop: false,
     };
     let json = args.json;
     if !matches!(args.command, Action::Ready { .. } | Action::Busy) {
@@ -137,10 +142,15 @@ pub fn run(args: TalkArgs) -> Result<()> {
             json,
             true,
         ),
-        Action::Wait { thread, timeout } => {
-            let threads = vec![ThreadId(thread)];
-            let reply = talk::wait(caller, threads.clone(), None, timeout)?;
-            wait_output(&threads, reply, json)
+        Action::Wait {
+            threads,
+            reply_to,
+            timeout,
+        } => {
+            let threads: Vec<_> = threads.into_iter().map(ThreadId).collect();
+            let reply_to: Vec<_> = reply_to.into_iter().map(MessageId).collect();
+            let reply = talk::wait(caller, threads.clone(), reply_to.clone(), timeout)?;
+            wait_output(&threads, &reply_to, reply, json)
         }
         Action::Ready { event } => {
             let from_notify = event.is_some();
@@ -222,7 +232,8 @@ fn sent(
         .iter()
         .map(|message| message.thread.clone())
         .collect();
-    let after = (messages.len() == 1).then(|| messages[0].id.clone());
+    // Only a reply to one of these messages ends the wait, even if the thread has others.
+    let reply_to: Vec<_> = messages.iter().map(|message| message.id.clone()).collect();
     if !json {
         let mut stdout = io::stdout().lock();
         for message in &messages {
@@ -247,7 +258,7 @@ fn sent(
     let reply = talk::wait(
         caller,
         threads.clone(),
-        after,
+        reply_to.clone(),
         timeout.unwrap_or(DEFAULT_TIMEOUT),
     )?;
     if json {
@@ -256,33 +267,59 @@ fn sent(
             "messages": json_messages(messages),
             "reply": reply.map(talk::json),
             "timed_out": timed_out,
-            "threads": thread_names(&threads),
+            "threads": names(&threads),
+            "reply_to": message_names(&reply_to),
+            "resume": timed_out.then(|| resume(&threads, &reply_to)),
         }))?;
         if timed_out {
             std::process::exit(3);
         }
         Ok(())
     } else {
-        wait_output(&threads, reply, false)
+        wait_output(&threads, &reply_to, reply, false)
     }
 }
 
-fn thread_names(threads: &[ThreadId]) -> Vec<&str> {
+fn names(threads: &[ThreadId]) -> Vec<&str> {
     threads.iter().map(|id| id.0.as_str()).collect()
 }
 
-fn wait_output(threads: &[ThreadId], reply: Option<Message>, json: bool) -> Result<()> {
+fn message_names(messages: &[MessageId]) -> Vec<&str> {
+    messages.iter().map(|id| id.0.as_str()).collect()
+}
+
+/// The command that resumes a timed-out wait with the same reply filter.
+fn resume(threads: &[ThreadId], reply_to: &[MessageId]) -> String {
+    let mut command = format!("power talk wait {}", names(threads).join(" "));
+    for id in reply_to {
+        command.push_str(" --reply-to ");
+        command.push_str(&id.0);
+    }
+    command
+}
+
+fn wait_output(
+    threads: &[ThreadId],
+    reply_to: &[MessageId],
+    reply: Option<Message>,
+    json: bool,
+) -> Result<()> {
     let timed_out = reply.is_none();
     if json {
         super::print_json(json!({
-            "reply": reply.map(talk::json), "timed_out": timed_out, "threads": thread_names(threads),
+            "reply": reply.map(talk::json),
+            "timed_out": timed_out,
+            "threads": names(threads),
+            "reply_to": message_names(reply_to),
+            "resume": timed_out.then(|| resume(threads, reply_to)),
         }))?;
     } else if let Some(reply) = reply {
         println!("{}", envelope(&reply));
     } else {
         eprintln!(
-            "Timed out waiting for a reply. Thread: {}",
-            thread_names(threads).join(", ")
+            "Timed out waiting for a reply. Thread: {}. Resume with: {}",
+            names(threads).join(", "),
+            resume(threads, reply_to)
         );
     }
     if timed_out {

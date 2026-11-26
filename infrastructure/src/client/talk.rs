@@ -10,6 +10,7 @@ use std::{io::BufReader, os::unix::net::UnixStream, time::Duration};
 pub struct Caller {
     pub session: Option<String>,
     pub box_sel: Option<String>,
+    pub desktop: bool,
 }
 
 fn request(caller: Caller, command: TalkCommand) -> Request {
@@ -17,6 +18,7 @@ fn request(caller: Caller, command: TalkCommand) -> Request {
         talk: TalkRequest {
             session: caller.session,
             box_sel: caller.box_sel,
+            desktop: caller.desktop,
             command,
         },
     }
@@ -101,13 +103,10 @@ pub fn log(caller: Caller, filter: LogFilter) -> Result<Vec<Message>> {
     )
 }
 
-pub fn turn(caller: Caller, ready: bool, output_sets_busy: bool) -> Result<()> {
+pub fn turn(caller: Caller, ready: bool, ready_only: bool) -> Result<()> {
     match decode(wire::request(&request(
         caller,
-        TalkCommand::Turn {
-            ready,
-            output_sets_busy,
-        },
+        TalkCommand::Turn { ready, ready_only },
     ))?)? {
         TalkResponse::Ok => Ok(()),
         _ => bail!("Unexpected talk response"),
@@ -117,14 +116,14 @@ pub fn turn(caller: Caller, ready: bool, output_sets_busy: bool) -> Result<()> {
 pub fn wait(
     caller: Caller,
     threads: Vec<ThreadId>,
-    after: Option<MessageId>,
+    reply_to: Vec<MessageId>,
     seconds: u64,
 ) -> Result<Option<Message>> {
     let mut socket = connect(
         caller,
         TalkCommand::Wait {
             threads: threads.into_iter().map(|id| id.0).collect(),
-            after: after.map(|id| id.0),
+            reply_to: reply_to.into_iter().map(|id| id.0).collect(),
             seconds,
         },
         Duration::from_secs(seconds.saturating_add(10)),
@@ -174,6 +173,7 @@ impl From<Message> for TalkMessage {
             box_id: message.box_id,
             sender: match message.sender {
                 Sender::User => TalkSender::User,
+                Sender::Shell => TalkSender::Shell,
                 Sender::System => TalkSender::System,
                 Sender::Agent(agent) => TalkSender::Agent {
                     id: agent.id,
@@ -212,6 +212,7 @@ impl From<TalkMessage> for Message {
             box_id: message.box_id,
             sender: match message.sender {
                 TalkSender::User => Sender::User,
+                TalkSender::Shell => Sender::Shell,
                 TalkSender::System => Sender::System,
                 TalkSender::Agent {
                     id,

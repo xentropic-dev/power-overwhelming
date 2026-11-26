@@ -1,7 +1,7 @@
 use anyhow::Result;
 use domain::talk::{
-    Activity, AgentTalkSummary, Directory, HookState, Message, MessageId, NoticePolicy, Recipient,
-    Sender, Target, ThreadId,
+    Activity, AgentTalkSummary, Directory, HookState, Message, MessageId, NoticePolicy, Queued,
+    Recipient, Sender, Target, ThreadId,
 };
 use std::{sync::Arc, time::Instant};
 
@@ -20,6 +20,8 @@ pub trait TalkReader {
     -> Result<Vec<Message>>;
     fn summary(&self, box_id: &str) -> Result<Vec<AgentTalkSummary>>;
     fn pending_agents(&self, remind_before: u64) -> Result<Vec<String>>;
+    /// Delivery metadata of the recipient's unread messages, in queue order, without bodies.
+    fn queued(&self, recipient: &Recipient, box_id: &str) -> Result<Vec<Queued>>;
     fn agent(&self, id: &str) -> Result<ManagedAgent>;
     fn thread(&self, id: &ThreadId) -> Result<Vec<Message>>;
     fn log(&self, filter: &LogFilter) -> Result<Vec<Message>>;
@@ -30,12 +32,14 @@ pub trait TalkReader {
 
 pub trait TalkTransaction: TalkReader {
     fn insert(&self, message: &Message) -> Result<()>;
-    fn mark(&self, messages: &[&Message], change: DeliveryChange, at: u64) -> Result<()>;
+    fn mark(&self, messages: &[&MessageId], change: DeliveryChange, at: u64) -> Result<()>;
 }
 
 pub trait SessionActivity: Send + Sync {
+    /// None if the session is unknown or no longer running.
     fn activity(&self, session: &str) -> Option<Activity>;
-    fn report_turn(&self, session: &str, state: HookState, output_sets_busy: bool) -> Result<()>;
+    /// `ready_only` marks a provider that reports turn ends but not turn starts.
+    fn report_turn(&self, session: &str, state: HookState, ready_only: bool) -> Result<()>;
 }
 
 pub trait Notifier: Send + Sync {
@@ -79,6 +83,9 @@ pub struct LogFilter {
 pub struct Caller {
     pub session: Option<String>,
     pub box_id: Option<String>,
+    /// The request comes from the desktop rather than a shell. Only a caller without a
+    /// session can be the desktop.
+    pub desktop: bool,
 }
 
 pub struct SendMessage {
@@ -118,24 +125,40 @@ use domain::{
 struct Actor<'a> {
     agent: Option<&'a ManagedAgent>,
     box_id: Option<&'a str>,
+    desktop: bool,
     directory: &'a Directory,
 }
 
 impl<'a> Actor<'a> {
-    fn new(caller: &'a Caller, directory: &'a Directory) -> Self {
+    /// `live` reports whether a session without an agent is a running Power session.
+    fn new(
+        caller: &'a Caller,
+        directory: &'a Directory,
+        live: impl FnOnce(&str) -> bool,
+    ) -> Result<Self> {
         let agent = caller.session.as_deref().and_then(|session| {
             directory
                 .agents
                 .iter()
                 .find(|agent| agent.session.as_deref() == Some(session))
         });
-        Self {
+        if let Some(session) = caller.session.as_deref()
+            && agent.is_none()
+        {
+            // A stale or mistyped POWER_SESSION must not fall back to the user's authority.
+            ensure!(
+                live(session),
+                "Unknown Power session {session:?}. Unset POWER_SESSION to send from this shell"
+            );
+        }
+        Ok(Self {
             agent,
             box_id: agent
                 .map(|agent| agent.box_id.as_str())
                 .or(caller.box_id.as_deref()),
+            desktop: caller.desktop && caller.session.is_none(),
             directory,
-        }
+        })
     }
 
     fn coordinated_runs(&self) -> impl Iterator<Item = &str> {
@@ -164,7 +187,11 @@ impl<'a> Actor<'a> {
 
     fn sender(&self, run: Option<&str>) -> Sender {
         let Some(agent) = self.agent else {
-            return Sender::User;
+            return if self.desktop {
+                Sender::User
+            } else {
+                Sender::Shell
+            };
         };
         let coordinator_of = run.filter(|id| self.coordinated_runs().any(|r| r == *id));
         let role = if let Some(task) = &agent.task {
@@ -229,11 +256,17 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         }
     }
 
+    fn actor<'a>(&self, caller: &'a Caller, directory: &'a Directory) -> Result<Actor<'a>> {
+        Actor::new(caller, directory, |session| {
+            self.activity.activity(session).is_some()
+        })
+    }
+
     pub fn send(&self, command: SendMessage) -> Result<Vec<Message>> {
         validate_body(&command.body)?;
         self.store.write(|db| {
             let directory = db.directory()?;
-            let actor = Actor::new(&command.caller, &directory);
+            let actor = self.actor(&command.caller, &directory)?;
             let run = command.run.as_deref().or_else(|| actor.default_run());
             let recipients = resolve(
                 SenderContext {
@@ -299,10 +332,10 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         validate_body(&command.body)?;
         self.store.write(|db| {
             let directory = db.directory()?;
-            let actor = Actor::new(&command.caller, &directory);
+            let actor = self.actor(&command.caller, &directory)?;
             let parent = require_message(db, &command.message)?;
             let sender = actor.sender(parent.run.as_deref());
-            let from_me = parent.sender == Sender::User && sender == Sender::User
+            let from_me = parent.sender.has_user_authority() && sender.has_user_authority()
                 || matches!((&parent.sender, &sender), (Sender::Agent(from), Sender::Agent(me)) if from.id == me.id);
             ensure!(
                 actor.agent.is_none() || from_me || parent.recipient.matches_sender(&sender),
@@ -317,7 +350,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             } else {
                 match &parent.sender {
                     Sender::Agent(agent) => Recipient::Agent { id: agent.id.clone(), box_id: agent.box_id.clone() },
-                    Sender::User => Recipient::User,
+                    Sender::User | Sender::Shell => Recipient::User,
                     Sender::System => bail!("Power messages do not accept replies"),
                 }
             };
@@ -339,7 +372,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     fn build(&self, db: &dyn TalkReader, outgoing: Outgoing, now: u64) -> Result<Message> {
         authorize(&outgoing.sender, &outgoing.recipient)?;
         ensure!(
-            !outgoing.urgent || outgoing.sender == Sender::User,
+            !outgoing.urgent || outgoing.sender.has_user_authority(),
             "--urgent is only available to the user"
         );
         let recent = db.recent_sends(
@@ -376,7 +409,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     pub fn inbox(&self, caller: Caller, all: bool, peek: bool) -> Result<Vec<Message>> {
         let read = |db: &dyn TalkReader| {
             let directory = db.directory()?;
-            let actor = Actor::new(&caller, &directory);
+            let actor = self.actor(&caller, &directory)?;
             db.inbox(&actor.recipient(), actor.box_id, all)
         };
         if peek {
@@ -393,7 +426,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     pub fn show(&self, caller: Caller, message: MessageId, read: bool) -> Result<Vec<Message>> {
         let show = |db: &dyn TalkReader| {
             let directory = db.directory()?;
-            let actor = Actor::new(&caller, &directory);
+            let actor = self.actor(&caller, &directory)?;
             let selected = require_message(db, &message)?;
             ensure!(
                 actor.may_view(&selected),
@@ -426,45 +459,58 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             .iter_mut()
             .filter(|message| message.delivery.read_at.is_none() && filter(message))
             .collect();
-        let borrowed: Vec<_> = unread.iter().map(|message| &**message).collect();
-        db.mark(&borrowed, DeliveryChange::Read, now)?;
+        let ids: Vec<_> = unread.iter().map(|message| &message.id).collect();
+        db.mark(&ids, DeliveryChange::Read, now)?;
         for message in &mut unread {
             message.delivery.read_at = Some(now);
         }
         Ok(())
     }
 
+    /// With `reply_to`, only a reply to one of those messages ends the wait. Without it,
+    /// any reply after the caller's last message in the threads does.
     pub fn wait_for_reply(
         &self,
         caller: Caller,
         threads: Vec<ThreadId>,
-        after: Option<MessageId>,
+        reply_to: Vec<MessageId>,
         deadline: Instant,
     ) -> Result<Option<Message>> {
         ensure!(!threads.is_empty(), "Specify a talk thread");
         loop {
             let (reply, cursor) = self.store.read(|db| {
                 let directory = db.directory()?;
-                let actor = Actor::new(&caller, &directory);
+                let actor = self.actor(&caller, &directory)?;
                 let recipient = actor.recipient();
                 let sent = |message: &Message| recipient.matches_sender(&message.sender);
                 let mut replies = Vec::new();
+                let mut found = 0;
                 for thread in &threads {
                     let messages = db.thread(thread)?;
-                    let from = messages
-                        .iter()
-                        .rposition(|message| {
-                            sent(message) && after.as_ref().is_none_or(|id| message.id == *id)
-                        })
-                        .with_context(|| {
+                    let from = if reply_to.is_empty() {
+                        messages.iter().rposition(sent).with_context(|| {
                             format!("You have no sent message in thread {:?}", thread.0)
-                        })?;
-                    replies.extend(messages.into_iter().skip(from + 1).find(|message| {
-                        message.reply_to.is_some()
-                            && message.recipient == recipient
+                        })?
+                    } else {
+                        found += messages
+                            .iter()
+                            .filter(|message| reply_to.contains(&message.id) && sent(message))
+                            .count();
+                        0
+                    };
+                    replies.extend(messages.into_iter().skip(from).find(|message| {
+                        message.recipient == recipient
                             && !sent(message)
+                            && message
+                                .reply_to
+                                .as_ref()
+                                .is_some_and(|id| reply_to.is_empty() || reply_to.contains(id))
                     }));
                 }
+                ensure!(
+                    found == reply_to.len(),
+                    "Wait for replies to messages you sent in the given threads"
+                );
                 Ok((
                     replies.into_iter().min_by_key(|message| message.created_at),
                     db.cursor()?,
@@ -480,7 +526,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     pub fn log(&self, caller: Caller, mut filter: LogFilter) -> Result<Vec<Message>> {
         self.store.read(|db| {
             let directory = db.directory()?;
-            let actor = Actor::new(&caller, &directory);
+            let actor = self.actor(&caller, &directory)?;
             if actor.agent.is_some() {
                 let runs: Vec<_> = actor.coordinated_runs().map(str::to_owned).collect();
                 ensure!(
@@ -515,7 +561,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     pub fn summary(&self, caller: Caller) -> Result<Vec<AgentTalkSummary>> {
         self.store.read(|db| {
             let directory = db.directory()?;
-            let actor = Actor::new(&caller, &directory);
+            let actor = self.actor(&caller, &directory)?;
             ensure!(
                 actor.agent.is_none(),
                 "Talk summaries are available to the user"
@@ -524,16 +570,11 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         })
     }
 
-    pub fn report_turn(
-        &self,
-        caller: Caller,
-        state: HookState,
-        output_sets_busy: bool,
-    ) -> Result<()> {
+    pub fn report_turn(&self, caller: Caller, state: HookState, ready_only: bool) -> Result<()> {
         let session = caller
             .session
             .context("POWER_SESSION is required to report a turn")?;
-        self.activity.report_turn(&session, state, output_sets_busy)
+        self.activity.report_turn(&session, state, ready_only)
     }
 
     pub fn cursor(&self) -> Result<u64> {
@@ -544,7 +585,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         loop {
             let (events, cursor) = self.store.read(|db| {
                 let directory = db.directory()?;
-                let actor = Actor::new(caller, &directory);
+                let actor = self.actor(caller, &directory)?;
                 ensure!(actor.agent.is_none(), "Talk watch is available to the user");
                 Ok((db.events(after, actor.box_id)?, db.cursor()?))
             })?;
@@ -555,17 +596,34 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         }
     }
 
+    /// Holds read only the delivery metadata under a read. Only a deliverable batch takes
+    /// a write transaction, which rechecks it before typing the notice and stamping it.
     pub fn deliver_pending(&self) -> Result<()> {
         let remind_before = (self.clock)().saturating_sub(REMINDER_AFTER_MS);
-        let pending = self.store.read(|db| db.pending_agents(remind_before))?;
-        let mut first_error = None;
-        for id in pending {
-            let result = self.store.write(|db| {
-                let agent = db.agent(&id)?;
-                if agent.status == AgentStatus::Exited {
-                    return Ok(());
+        let deliverable = self.store.read(|db| {
+            let mut deliverable = Vec::new();
+            for id in db.pending_agents(remind_before)? {
+                if self.plan(db, &id)?.is_some() {
+                    deliverable.push(id);
                 }
-                self.deliver(db, &agent)
+            }
+            Ok(deliverable)
+        })?;
+        let mut first_error = None;
+        for id in deliverable {
+            let result = self.store.write(|db| {
+                let Some(plan) = self.plan(db, &id)? else {
+                    return Ok(());
+                };
+                let included: Vec<_> = plan.notify.iter().chain(&plan.remind).collect();
+                if self
+                    .notifier
+                    .notify(&plan.session, plan.activity, &notice(&included))?
+                {
+                    db.mark(&ids(&plan.notify), DeliveryChange::Notified, plan.now)?;
+                    db.mark(&ids(&plan.remind), DeliveryChange::Reminded, plan.now)?;
+                }
+                Ok(())
             });
             if let Err(error) = result {
                 first_error.get_or_insert(error);
@@ -574,40 +632,50 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn deliver(&self, db: &dyn TalkTransaction, agent: &ManagedAgent) -> Result<()> {
-        let Some(session) = agent.session.as_deref() else {
-            return Ok(());
+    fn plan(&self, db: &dyn TalkReader, id: &str) -> Result<Option<Plan>> {
+        let agent = db.agent(id)?;
+        if agent.status == AgentStatus::Exited {
+            return Ok(None);
+        }
+        let Some(session) = agent.session.clone() else {
+            return Ok(None);
         };
-        let Some(activity) = self.activity.activity(session) else {
-            return Ok(());
+        let Some(activity) = self.activity.activity(&session) else {
+            return Ok(None);
         };
-        let messages = db.inbox(&Recipient::agent(agent), Some(&agent.box_id), false)?;
         let needs_input = agent.status == AgentStatus::NeedsInput;
         let now = (self.clock)();
-        let mut notify = Vec::new();
-        let mut remind = Vec::new();
-        let mut included = Vec::new();
-        for message in &messages {
+        let mut plan = Plan {
+            session,
+            activity,
+            now,
+            notify: Vec::new(),
+            remind: Vec::new(),
+        };
+        for message in db.queued(&Recipient::agent(&agent), &agent.box_id)? {
             match self
                 .policy
-                .decide(activity, needs_input, activity.paused, message, now)
+                .decide(activity, needs_input, activity.paused, &message, now)
             {
-                NoticeDecision::Notify => notify.push(message),
-                NoticeDecision::Remind => remind.push(message),
-                NoticeDecision::Hold(_) => continue,
+                NoticeDecision::Notify => plan.notify.push(message),
+                NoticeDecision::Remind => plan.remind.push(message),
+                NoticeDecision::Hold(_) => {}
             }
-            included.push(message);
         }
-        if !included.is_empty()
-            && self
-                .notifier
-                .notify(session, activity, &notice(&included))?
-        {
-            db.mark(&notify, DeliveryChange::Notified, now)?;
-            db.mark(&remind, DeliveryChange::Reminded, now)?;
-        }
-        Ok(())
+        Ok((!plan.notify.is_empty() || !plan.remind.is_empty()).then_some(plan))
     }
+}
+
+struct Plan {
+    session: String,
+    activity: Activity,
+    now: u64,
+    notify: Vec<Queued>,
+    remind: Vec<Queued>,
+}
+
+fn ids(batch: &[Queued]) -> Vec<&MessageId> {
+    batch.iter().map(|message| &message.id).collect()
 }
 
 fn require_message(db: &dyn TalkReader, id: &MessageId) -> Result<Message> {
