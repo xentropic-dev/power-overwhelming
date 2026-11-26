@@ -162,6 +162,9 @@ impl Runtime {
             let api = TerminalBottomWithPalette::instantiate(&mut store, &component, &self.linker)?;
             store.set_epoch_deadline(CALL_EPOCHS);
             let mut defaults = defaults.clone();
+            defaults
+                .entry(config::WORKTREES_SECTION.into())
+                .or_insert_with(|| serde_json::json!({}));
             let settings = api.call_settings(&mut store)?;
             if let Some(settings) = &settings {
                 ensure!(
@@ -175,6 +178,7 @@ impl Runtime {
                 Some(directory) => config::load_from(&directory.join("config.lua"), defaults)?,
                 None => defaults,
             };
+            config::worktree_root(&sections)?;
             let config = settings.map_or_else(
                 || "{}".into(),
                 |settings| sections[&settings.key].to_string(),

@@ -92,6 +92,19 @@ pub(crate) fn state_directory() -> Result<PathBuf> {
     Ok(base.join("power-overwhelming"))
 }
 
+pub(crate) fn data_directory() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        })
+        .context("Set XDG_DATA_HOME or HOME")?;
+    Ok(base.join("power-overwhelming"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

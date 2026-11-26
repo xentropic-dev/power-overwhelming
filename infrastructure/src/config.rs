@@ -15,9 +15,9 @@ use std::{
 pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
+pub(crate) const WORKTREES_SECTION: &str = "worktrees";
 
-/// Load profiles from the same config as the desktop, with the bundled plugin defaults.
-pub fn load_agent_profiles(mut defaults: Sections) -> Result<AgentProfiles> {
+fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     defaults.entry("power_bar".into()).or_insert_with(|| {
         serde_json::from_str(include_str!("../../plugins/power-bar/defaults.json"))
             .expect("bundled Power Bar defaults are valid JSON")
@@ -25,7 +25,47 @@ pub fn load_agent_profiles(mut defaults: Sections) -> Result<AgentProfiles> {
     defaults
         .entry(AGENTS_SECTION.into())
         .or_insert_with(|| json!({}));
-    agent_profiles(&load(defaults)?)
+    defaults
+        .entry(WORKTREES_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
+}
+
+/// Load profiles from the same config as the desktop, with the bundled plugin defaults.
+pub fn load_agent_profiles(defaults: Sections) -> Result<AgentProfiles> {
+    agent_profiles(&load(with_bundled_defaults(defaults))?)
+}
+
+pub(crate) fn load_worktree_root(defaults: Sections) -> Result<Option<PathBuf>> {
+    worktree_root(&load(with_bundled_defaults(defaults))?)
+}
+
+/// Validate and expand the configured root without touching the filesystem.
+pub(crate) fn worktree_root(sections: &Sections) -> Result<Option<PathBuf>> {
+    let Some(value) = sections.get(WORKTREES_SECTION) else {
+        return Ok(None);
+    };
+    let table = value.as_object().context("worktrees must be a table")?;
+    for name in table.keys() {
+        if name != "root" {
+            bail!("worktrees.{name} is not a setting");
+        }
+    }
+    let Some(value) = table.get("root") else {
+        return Ok(None);
+    };
+    let root = value
+        .as_str()
+        .filter(|root| !root.is_empty() && !root.contains('\0'))
+        .context("worktrees.root must be a non-empty path string")?;
+    let path = Path::new(root);
+    if let Ok(relative) = path.strip_prefix("~") {
+        let home = env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .context("Set HOME to expand worktrees.root")?;
+        return Ok(Some(PathBuf::from(home).join(relative)));
+    }
+    Ok(Some(path.to_owned()))
 }
 
 /// Apply Lua profile fields over the built-in profiles.
