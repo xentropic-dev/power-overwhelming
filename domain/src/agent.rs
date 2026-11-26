@@ -92,6 +92,17 @@ impl Resume {
         }
     }
 
+    /// Return arguments that start a new conversation in place of a failed resume.
+    /// A profile that can pin IDs reuses the conversation ID, which is free because
+    /// the failed resume found no transcript under it. Otherwise nothing is added,
+    /// so the agent starts fresh with no resume arguments.
+    pub fn fresh_args(&self, conversation: Option<&str>) -> Vec<OsString> {
+        match conversation {
+            Some(id) if !self.assign.is_empty() => Self::substitute(&self.assign, id),
+            _ => Vec::new(),
+        }
+    }
+
     fn substitute(args: &[String], id: &str) -> Vec<OsString> {
         args.iter()
             .map(|arg| arg.replace("{id}", id).into())
@@ -176,6 +187,22 @@ mod tests {
             )),
             (vec![], Some("existing-id".into()))
         );
+    }
+
+    #[test]
+    fn fresh_args_pin_the_same_id_only_when_the_profile_can_assign() {
+        let spec = resume_spec();
+        assert_eq!(
+            spec.fresh_args(Some("existing-id")),
+            ["--session-id", "existing-id"].map(OsString::from)
+        );
+        assert!(spec.fresh_args(None).is_empty());
+        let codex = Resume {
+            resume_last: vec!["resume".into(), "--last".into()],
+            ..Resume::default()
+        };
+        assert!(codex.fresh_args(Some("existing-id")).is_empty());
+        assert!(codex.fresh_args(None).is_empty());
     }
 
     #[test]

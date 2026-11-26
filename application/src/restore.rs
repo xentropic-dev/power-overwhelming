@@ -1,6 +1,10 @@
 use crate::{Application, ResumeCommand, SessionOptions, SessionRecord, TerminalRuntime};
 use anyhow::Result;
-use domain::session::{Agent, Session};
+use domain::{
+    agent::Resume,
+    session::{Agent, Session},
+};
+use std::ffi::OsString;
 
 /// What to do with one saved session on daemon start.
 enum Plan {
@@ -54,10 +58,13 @@ impl<T: TerminalRuntime> Application<T> {
         match &record.agent {
             Agent::Coding(id) => {
                 let profile = self.agents.resolve(id)?;
-                options.args = match &profile.resume {
-                    Some(resume) => resume.resume_args(record.conversation.as_deref()),
-                    None => Vec::new(),
-                };
+                if let Some((resume, mut fresh)) =
+                    restart_args(profile.resume.as_ref(), record.conversation.as_deref())
+                {
+                    fresh.extend(record.args.iter().cloned());
+                    options.args = resume;
+                    options.fallback_args = Some(fresh);
+                }
                 options.args.extend(record.args.iter().cloned());
             }
             // Command fixtures are never re-run, since their argv can be anything.
@@ -69,11 +76,18 @@ impl<T: TerminalRuntime> Application<T> {
                 if let Agent::Coding(id) = &record.foreground {
                     match self.agents.resolve(id) {
                         Ok(profile) => {
+                            let restart = restart_args(
+                                profile.resume.as_ref(),
+                                record.conversation.as_deref(),
+                            );
+                            let (args, fallback) = match restart {
+                                Some((resume, fresh)) => (resume, Some(fresh)),
+                                None => (Vec::new(), None),
+                            };
                             options.resume = Some(ResumeCommand {
                                 program: profile.id.as_str().to_owned(),
-                                args: profile.resume.as_ref().map_or_else(Vec::new, |resume| {
-                                    resume.resume_args(record.conversation.as_deref())
-                                }),
+                                args,
+                                fallback,
                             })
                         }
                         Err(error) => eprintln!(
@@ -87,6 +101,18 @@ impl<T: TerminalRuntime> Application<T> {
         }
         Ok(Plan::Launch(options))
     }
+}
+
+/// Arguments that resume the conversation, and arguments that start a new one in
+/// its place when the resume fails. `None` when the profile adds no resume arguments,
+/// since then there is nothing to fall back from.
+fn restart_args(
+    resume: Option<&Resume>,
+    conversation: Option<&str>,
+) -> Option<(Vec<OsString>, Vec<OsString>)> {
+    let resume = resume?;
+    let args = resume.resume_args(conversation);
+    (!args.is_empty()).then(|| (args, resume.fresh_args(conversation)))
 }
 
 #[cfg(test)]
@@ -358,6 +384,8 @@ mod tests {
                     &SessionOptions {
                         args: os(&["--resume", "conv-1", "--model", "opus"]),
                         env: env.clone(),
+                        // No transcript exists under the ID if the resume fails.
+                        fallback_args: Some(os(&["--session-id", "conv-1", "--model", "opus"])),
                         ..SessionOptions::default()
                     }
                 ),
@@ -366,6 +394,8 @@ mod tests {
                     &SessionOptions {
                         args: os(&["resume", "--last"]),
                         env: env.clone(),
+                        // Codex cannot pin an ID, so it starts with no resume arguments.
+                        fallback_args: Some(Vec::new()),
                         ..SessionOptions::default()
                     }
                 ),
@@ -385,6 +415,7 @@ mod tests {
                         resume: Some(ResumeCommand {
                             program: "claude".into(),
                             args: os(&["--resume", "conv-2"]),
+                            fallback: Some(os(&["--session-id", "conv-2"])),
                         }),
                         ..SessionOptions::default()
                     }
@@ -418,6 +449,48 @@ mod tests {
         );
         assert!(application.terminal("shell-tab").is_ok());
         assert_eq!(store.list()?[3].args, Vec::<OsString>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn restored_shells_fall_back_to_a_fresh_agent_only_after_a_resume() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        for (id, agent, conversation) in [
+            ("codex-shell", "codex", Some("ignored")),
+            ("fresh-claude-shell", "claude", None),
+            ("plain-shell", "plain", Some("conv")),
+        ] {
+            let mut shell = record(id, root, Agent::Shell, &[]);
+            shell.foreground = coding(agent);
+            shell.conversation = conversation.map(Into::into);
+            store.save(&shell)?;
+        }
+        let (application, starts) = app(store);
+
+        application.restore_sessions()?;
+
+        let resumes: Vec<_> = starts
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, options)| options.resume.clone().unwrap())
+            .collect();
+        let resume = |program: &str, args: &[&str], fallback: Option<&[&str]>| ResumeCommand {
+            program: program.into(),
+            args: os(args),
+            fallback: fallback.map(os),
+        };
+        assert_eq!(
+            resumes,
+            [
+                resume("codex", &["resume", "--last"], Some(&[])),
+                resume("claude", &["--continue"], Some(&[])),
+                resume("plain", &[], None),
+            ]
+        );
         Ok(())
     }
 
