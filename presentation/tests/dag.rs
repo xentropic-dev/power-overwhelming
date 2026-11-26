@@ -825,6 +825,61 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
 }
 
 #[test]
+fn show_lists_artifacts_published_from_each_attempts_session() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "work");
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "work",
+        &fixture.worktrees[0],
+        false,
+        &["success", "finish", "done"],
+    ));
+    let session = agent.session.unwrap();
+    let publish = |session: &str, file: &str, title: &str| {
+        fs::write(fixture.worktrees[0].join(file), b"fixture").unwrap();
+        let published = output(
+            power(fixture.root())
+                .current_dir(&fixture.worktrees[0])
+                .args(["artifact", "publish", file, "--title", title])
+                .env("POWER_SESSION", session),
+        );
+        assert_success(&published);
+        String::from_utf8(published.stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let first = publish(&session, "first.png", "First screenshot");
+    let second = publish(&session, "second.png", "Second screenshot");
+    let shown = fixture.json(&["dag", "show", &run]);
+    let artifacts = &shown["run"]["tasks"][0]["attempts"][0]["artifacts"];
+    let listed: Vec<_> = artifacts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| {
+            let id = artifact["id"].as_str().unwrap();
+            assert_eq!(artifact["link"], format!("pwr://artifact/{id}"));
+            (
+                artifact["link"].as_str().unwrap().to_owned(),
+                artifact["title"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (first, "First screenshot".to_owned()),
+            (second, "Second screenshot".to_owned()),
+        ]
+    );
+    fixture.release("finish");
+    fixture.wait_for_state(&run, "work", TaskState::Completed);
+}
+
+#[test]
 fn worker_input_request_appears_in_attention_until_work_resumes() {
     let fixture = Fixture::new();
     let run = fixture.create_run().id;

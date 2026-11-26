@@ -463,6 +463,18 @@ pub struct Attempt {
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Artifacts published from the attempt's session, in publish order, newest last.
+    #[serde(default)]
+    pub artifacts: Vec<AttemptArtifact>,
+}
+
+/// An artifact published from an attempt's session.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AttemptArtifact {
+    pub id: String,
+    pub title: String,
+    /// `pwr://artifact/<id>`; derived from `id` when decoding.
+    pub link: String,
 }
 
 /// A task as the coordinator defines it.
@@ -815,7 +827,24 @@ mod dag_dto {
         detail,
         started_at,
         ended_at,
-    });
+    } lists { artifacts });
+    impl From<dag::AttemptArtifact> for AttemptArtifact {
+        fn from(value: dag::AttemptArtifact) -> Self {
+            Self {
+                link: value.link(),
+                id: value.id,
+                title: value.title,
+            }
+        }
+    }
+    impl From<AttemptArtifact> for dag::AttemptArtifact {
+        fn from(value: AttemptArtifact) -> Self {
+            Self {
+                id: value.id,
+                title: value.title,
+            }
+        }
+    }
     struct_dto!(TaskSpec {
         id,
         title,

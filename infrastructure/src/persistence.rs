@@ -1,9 +1,10 @@
 use crate::wire;
 use anyhow::{Context, Result};
-use application::{ArtifactStore, RecentArtifact, SessionRecord, SessionStore};
+use application::{ArtifactStore, RecentArtifact, SessionArtifact, SessionRecord, SessionStore};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     artifact::{ArtifactRecord, ResolvedArtifact, URI_PREFIX},
+    dag::AttemptArtifact,
     session::Agent,
 };
 use rusqlite::{Connection, Row, params};
@@ -28,7 +29,10 @@ impl SqliteArtifacts {
             .recursive(true)
             .mode(0o700)
             .create(db_path.parent().context("Invalid database path")?)?;
-        let db = Connection::open(db_path)?;
+        Self::initialize(Connection::open(db_path)?)
+    }
+
+    fn initialize(db: Connection) -> Result<Self> {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS artifacts (
                 id TEXT PRIMARY KEY, session TEXT NOT NULL, worktree TEXT NOT NULL,
@@ -89,6 +93,30 @@ impl ArtifactStore for SqliteArtifacts {
                 uri: format!("{URI_PREFIX}{}", row.get::<_, String>(0)?),
                 session: row.get(1)?,
                 title: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn published(&self, sessions: &[String]) -> Result<Vec<SessionArtifact>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; sessions.len()].join(", ");
+        // Rows are never updated, so rowid order is publish order.
+        let query = format!(
+            "SELECT id, session, title FROM artifacts WHERE session IN ({placeholders})
+             ORDER BY rowid ASC"
+        );
+        let db = self.0.lock().unwrap();
+        let mut statement = db.prepare(&query)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(sessions), |row| {
+            Ok(SessionArtifact {
+                session: row.get(1)?,
+                artifact: AttemptArtifact {
+                    id: row.get(0)?,
+                    title: row.get(2)?,
+                },
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -298,6 +326,49 @@ mod tests {
             artifact.target,
             Target::Html("/tmp/worktree/old report.html".into())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lists_published_artifacts_for_sessions_in_publish_order() -> Result<()> {
+        let store = SqliteArtifacts::initialize(Connection::open_in_memory()?)?;
+        // IDs sort opposite to publish order, so only rowid order passes.
+        for (id, session, title) in [
+            ("z-first", "worker", "First"),
+            ("m-other", "other", "Other session"),
+            ("a-second", "worker", "Second"),
+            ("b-third", "reviewer", "Third"),
+        ] {
+            store.insert(ArtifactRecord {
+                id: id.into(),
+                session: session.into(),
+                worktree: "/repo".into(),
+                artifact: ResolvedArtifact {
+                    title: title.into(),
+                    target: Target::Loopback("http://localhost:3000/".into()),
+                },
+            })?;
+        }
+        let published = store.published(&["worker".into(), "reviewer".into()])?;
+        let listed: Vec<_> = published
+            .iter()
+            .map(|entry| {
+                (
+                    entry.session.as_str(),
+                    entry.artifact.id.as_str(),
+                    entry.artifact.title.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("worker", "z-first", "First"),
+                ("worker", "a-second", "Second"),
+                ("reviewer", "b-third", "Third"),
+            ]
+        );
+        assert!(store.published(&[])?.is_empty());
         Ok(())
     }
 
