@@ -584,7 +584,7 @@ fn application() -> Arc<Application<FakeTerminal>> {
 
 fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeTerminal>> {
     static ID: AtomicU64 = AtomicU64::new(0);
-    let profiles = ["claude", "codex"]
+    let profiles = ["claude", "codex", "custom"]
         .into_iter()
         .map(|id| AgentProfile {
             id: id.into(),
@@ -1388,28 +1388,159 @@ fn explicit_providers_and_model_args_override_the_plan() -> Result<()> {
         &run,
         &[
             planned("other", Some("codex"), Some("gpt")),
-            planned("same", Some("codex"), Some("gpt")),
             planned("args", Some("codex"), Some("gpt")),
         ],
     )?;
     dag.dispatch(planned_dispatch(&run, "other", Some("claude"), &[]))?;
     assert_eq!(last_launch(&dag), (Agent::Coding("claude".into()), vec![]));
-    dag.dispatch(planned_dispatch(&run, "same", Some("codex"), &[]))?;
-    assert_eq!(last_launch(&dag).1, ["--model", "gpt"].map(OsString::from));
     dag.dispatch(planned_dispatch(&run, "args", None, &["-m=mini"]))?;
     assert_eq!(last_launch(&dag).1, [OsString::from("-m=mini")]);
     Ok(())
 }
 
 #[test]
-fn a_planned_model_for_an_unknown_flag_needs_explicit_args() -> Result<()> {
+fn an_explicit_planned_provider_keeps_the_planned_model() -> Result<()> {
     let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("same", Some("codex"), Some("gpt")),
+            planned("same-args", Some("codex"), Some("gpt")),
+        ],
+    )?;
+    // Naming the planned provider is not an override: only model arguments replace the model.
+    dag.dispatch(planned_dispatch(
+        &run,
+        "same",
+        Some("codex"),
+        &["--full-auto"],
+    ))?;
+    assert_eq!(
+        last_launch(&dag).1,
+        ["--model", "gpt", "--full-auto"].map(OsString::from)
+    );
+    dag.dispatch(planned_dispatch(
+        &run,
+        "same-args",
+        Some("codex"),
+        &["--model", "mini"],
+    ))?;
+    assert_eq!(last_launch(&dag).1, ["--model", "mini"].map(OsString::from));
+    Ok(())
+}
+
+#[test]
+fn an_attached_model_value_replaces_the_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    let ids = ["short", "short-eq", "long-eq"];
+    dag.add_tasks(
+        &run,
+        &ids.map(|id| planned(id, Some("codex"), Some("plan-model"))),
+    )?;
+    for (id, arg) in ids
+        .into_iter()
+        .zip(["-mother-model", "-m=other-model", "--model=other-model"])
+    {
+        dag.dispatch(planned_dispatch(&run, id, None, &[arg]))?;
+        let args = last_launch(&dag).1;
+        assert_eq!(args, [OsString::from(arg)], "{id}");
+        assert_eq!(
+            domain::agent::requested_model("codex", &args).as_deref(),
+            Some("other-model")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unrelated_args_never_drop_a_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    // Power cannot pass a model to a profile whose model flag it does not know.
+    assert!(
+        dag.add_tasks(&run, &[planned("custom", Some("custom"), Some("big"))])
+            .is_err()
+    );
+    assert!(
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "work".into(),
+            clear: false,
+            provider: Some(Provider::Agent("custom".into())),
+            model: Some("big".into()),
+        })
+        .is_err()
+    );
+    // A plan stored before that check, or a model-only plan dispatched to such a profile,
+    // fails instead of launching without the model.
     let mut task = find_task(&dag.run(&run)?, "work")?.clone();
     task.provider = Some(Provider::Agent("custom".into()));
     task.model = Some("big".into());
-    assert!(planned_launch(&task, None, &[]).is_err());
-    let args = ["--size".to_owned(), "big".to_owned()];
-    assert_eq!(planned_launch(&task, None, &args)?.1, args);
+    for args in [vec![], vec!["--verbose".to_owned()]] {
+        let error = planned_launch(&run, &task, None, &args).err().unwrap();
+        assert!(format!("{error:#}").contains("--model ''"), "{error:#}");
+    }
+    task.provider = None;
+    let verbose = ["--verbose".to_owned()];
+    assert!(
+        planned_launch(
+            &run,
+            &task,
+            Some(Provider::Agent("custom".into())),
+            &verbose
+        )
+        .is_err()
+    );
+    assert!(planned_launch(&run, &task, Some(Provider::Command), &verbose).is_err());
+    // Codex adds the planned model in front of unrelated arguments.
+    dag.add_tasks(&run, &[planned("codex", Some("codex"), Some("big"))])?;
+    dag.dispatch(planned_dispatch(&run, "codex", None, &["--verbose"]))?;
+    assert_eq!(
+        last_launch(&dag).1,
+        ["--model", "big", "--verbose"].map(OsString::from)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_model_only_plan_launches_with_an_explicit_provider() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[planned("solo", None, Some("solo-model"))])?;
+    let replanned = dag.plan_task(PlanTask {
+        run: run.clone(),
+        task: "work".into(),
+        clear: false,
+        provider: None,
+        model: Some("work-model".into()),
+    })?;
+    let work = find_task(&replanned, "work")?;
+    assert_eq!(
+        (&work.provider, work.model.as_deref()),
+        (&None, Some("work-model"))
+    );
+    for (task, model) in [("solo", "solo-model"), ("work", "work-model")] {
+        let error = dag
+            .dispatch(planned_dispatch(&run, task, None, &[]))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("Pass --provider"),
+            "{error:#}"
+        );
+        let worker = dag.dispatch(planned_dispatch(
+            &run,
+            task,
+            Some("codex"),
+            &["--full-auto"],
+        ))?;
+        assert_eq!(worker.attempt.provider, Provider::Agent("codex".into()));
+        assert_eq!(
+            last_launch(&dag),
+            (
+                Agent::Coding("codex".into()),
+                ["--model", model, "--full-auto"].map(OsString::from).into()
+            )
+        );
+    }
     Ok(())
 }
 

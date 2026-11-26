@@ -422,10 +422,19 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .with_context(|| format!("Invalid model name {value:?}"))?,
             ),
         };
-        ensure!(
-            model.is_none() || provider != Some(Provider::Command),
-            "The command provider takes no planned model"
-        );
+        if let Some(model) = &model {
+            match &provider {
+                Some(Provider::Command) => bail!("The command provider takes no planned model"),
+                Some(Provider::Agent(id)) => ensure!(
+                    domain::agent::model_args(id.as_str(), model).is_some(),
+                    "Power does not know the model flag of {:?}, so it cannot launch a \
+                     planned model. Plan the provider alone and pass the model after --",
+                    id.as_str()
+                ),
+                // Dispatch names the provider and Power checks its model flag then.
+                None => {}
+            }
+        }
         Ok((provider, model))
     }
 
@@ -480,7 +489,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .checked_add(1)
                     .context("Too many attempts for this task")
             })?;
-            let (provider, args) = planned_launch(task, command.provider.clone(), &command.args)?;
+            let (provider, args) =
+                planned_launch(&run.id, task, command.provider.clone(), &command.args)?;
             let entry = self.registered_box(&run.box_id)?;
             let caller = self.hosted_caller(command.caller.as_deref());
             let DispatchWorktree { path, kind } =
@@ -1186,37 +1196,65 @@ fn provider_id(provider: &Provider) -> &str {
     }
 }
 
-/// The provider and launch arguments for an attempt. An explicit provider replaces the
-/// planned one. The planned model applies to the planned provider unless the arguments
-/// already choose a model.
+/// The provider and launch arguments for an attempt.
+///
+/// Without `explicit`, the attempt uses the planned provider. An explicit provider replaces
+/// the plan for this attempt when it differs from the planned one. An explicit provider equal
+/// to the planned one keeps the planned model, so `--provider codex` on a `codex / gpt` plan
+/// still launches `gpt`; pass model arguments to run another model. A plan with a model and
+/// no provider applies its model to whichever provider the dispatch names. Arguments that do
+/// not select a model never drop the planned model: when Power does not know the provider's
+/// model flag, the launch fails rather than run without the planned model.
 fn planned_launch(
+    run: &str,
     task: &Task,
     explicit: Option<Provider>,
     args: &[String],
 ) -> Result<(Provider, Vec<String>)> {
-    let provider = match explicit {
-        Some(provider) => provider,
-        None => task.provider.clone().with_context(|| {
-            format!(
-                "Specify --provider, or plan one with `power dag plan <run> {} --provider <id>`",
-                task.id
-            )
-        })?,
+    let clear_model = || format!("`power dag plan {run} {} --model ''`", task.id);
+    let provider = match (explicit, &task.provider, &task.model) {
+        (Some(provider), _, _) => provider,
+        (None, Some(planned), _) => planned.clone(),
+        (None, None, Some(model)) => bail!(
+            "Task {:?} plans the model {model:?} without a provider. Pass --provider <id> to \
+             launch it with that provider, or plan one with `power dag plan {run} {} --provider <id>`",
+            task.id,
+            task.id
+        ),
+        (None, None, None) => bail!(
+            "Specify --provider, or plan one with `power dag plan {run} {} --provider <id>`",
+            task.id
+        ),
     };
-    let mut launch = args.to_vec();
-    if let (Some(model), Provider::Agent(id)) = (&task.model, &provider)
-        && task.provider.as_ref() == Some(&provider)
-        && !domain::agent::passes_model_flag(id.as_str(), args)
+    let Some(model) = &task.model else {
+        return Ok((provider, args.to_vec()));
+    };
+    if task
+        .provider
+        .as_ref()
+        .is_some_and(|planned| planned != &provider)
     {
-        match domain::agent::model_args(id.as_str(), model) {
-            Some(model_args) => launch.splice(0..0, model_args).for_each(drop),
-            None => ensure!(
-                !args.is_empty(),
-                "Power does not know the model flag of {:?}. Pass the planned model {model:?} after --",
-                id.as_str()
-            ),
-        }
+        return Ok((provider, args.to_vec()));
     }
+    let Provider::Agent(id) = &provider else {
+        bail!(
+            "The command provider takes no model. Clear the planned model {model:?} with {}",
+            clear_model()
+        )
+    };
+    if domain::agent::passes_model_flag(id.as_str(), args) {
+        return Ok((provider, args.to_vec()));
+    }
+    let model_args = domain::agent::model_args(id.as_str(), model).with_context(|| {
+        format!(
+            "Power does not know the model flag of {:?}, so it cannot pass the planned model \
+             {model:?}. Clear it with {} and pass the model after --",
+            id.as_str(),
+            clear_model()
+        )
+    })?;
+    let mut launch = model_args;
+    launch.extend_from_slice(args);
     Ok((provider, launch))
 }
 

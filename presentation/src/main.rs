@@ -516,7 +516,7 @@ enum DagAction {
         /// Planned coding agent profile ID, or `command`, for dispatches without --provider.
         #[arg(long)]
         provider: Option<String>,
-        /// Planned model for the planned provider.
+        /// Planned model for the planned provider. Power must know the provider's model flag.
         #[arg(long, requires = "provider")]
         model: Option<String>,
     },
@@ -537,7 +537,8 @@ enum DagAction {
         /// New planned provider. Without --model, it also clears the planned model.
         #[arg(long)]
         provider: Option<String>,
-        /// New planned model. An empty value clears it.
+        /// New planned model. An empty value clears it. A model without a provider applies to
+        /// the provider that dispatch names with --provider.
         #[arg(long)]
         model: Option<String>,
         /// Clear the plan before applying --provider and --model.
@@ -580,7 +581,10 @@ struct DispatchArgs {
     run: String,
     task: String,
     /// Coding agent profile ID, or `command` to run an executable directly. Defaults to the
-    /// task's planned provider and model.
+    /// task's planned provider and model. A provider other than the planned one ignores the
+    /// plan for this attempt. The planned provider itself keeps the planned model unless the
+    /// arguments after -- select a model. A plan with only a model needs --provider and
+    /// launches that provider with the planned model.
     #[arg(long)]
     provider: Option<String>,
     /// Existing checkout or `new`. A retry defaults to the previous managed checkout.

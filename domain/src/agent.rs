@@ -149,13 +149,23 @@ fn model_flags(agent: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// The model that launch arguments select for the agent, if Power knows its model flag.
-pub fn requested_model(
+/// How launch arguments select a model.
+#[derive(Default)]
+struct ModelSelection {
+    /// A model flag appears before any `--`, with or without a usable value.
+    flagged: bool,
+    /// The model the last model flag selects, if its value is usable.
+    model: Option<String>,
+}
+
+/// Parses model flags as `--model VALUE`, `--model=VALUE`, `-m VALUE`, `-m=VALUE` and
+/// `-mVALUE`. Returns `None` for agents whose model flag Power does not know.
+fn model_selection(
     agent: &str,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
-) -> Option<String> {
+) -> Option<ModelSelection> {
     let flags = model_flags(agent)?;
-    let mut model = None;
+    let mut selection = ModelSelection::default();
     let mut expecting_value = false;
     for arg in args {
         let arg = arg.as_ref();
@@ -163,37 +173,51 @@ pub fn requested_model(
             break;
         }
         if std::mem::take(&mut expecting_value) {
-            model = arg
+            selection.model = arg
                 .to_str()
                 .filter(|value| !value.starts_with('-'))
                 .and_then(model_name);
         }
         if flags.iter().any(|flag| arg == *flag) {
+            selection.flagged = true;
             expecting_value = true;
-        } else if let Some((flag, value)) = arg.to_str().and_then(|arg| arg.split_once('='))
-            && flags.contains(&flag)
-        {
-            model = model_name(value);
+        } else if let Some(value) = arg.to_str().and_then(|arg| attached_value(flags, arg)) {
+            selection.flagged = true;
+            selection.model = model_name(value);
         }
     }
-    if expecting_value { None } else { model }
+    if expecting_value {
+        selection.model = None;
+    }
+    Some(selection)
+}
+
+/// The value attached to a model flag in one argument: `--model=VALUE`, `-m=VALUE` or
+/// `-mVALUE`.
+fn attached_value<'a>(flags: &[&str], arg: &'a str) -> Option<&'a str> {
+    flags.iter().find_map(|flag| {
+        let rest = arg.strip_prefix(flag)?;
+        if let Some(value) = rest.strip_prefix('=') {
+            Some(value)
+        } else {
+            // Only a short flag takes its value without a separator.
+            (!flag.starts_with("--") && !rest.is_empty()).then_some(rest)
+        }
+    })
+}
+
+/// The model that launch arguments select for the agent, if Power knows its model flag.
+pub fn requested_model(
+    agent: &str,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Option<String> {
+    model_selection(agent, args)?.model
 }
 
 /// True when the launch arguments pass a model flag the agent accepts, with or without a
 /// usable value. Unknown agents report false.
 pub fn passes_model_flag(agent: &str, args: &[impl AsRef<OsStr>]) -> bool {
-    let Some(flags) = model_flags(agent) else {
-        return false;
-    };
-    args.iter()
-        .map(AsRef::as_ref)
-        .take_while(|arg| *arg != "--")
-        .filter_map(OsStr::to_str)
-        .any(|arg| {
-            flags
-                .iter()
-                .any(|flag| arg == *flag || arg.split_once('=').is_some_and(|(f, _)| f == *flag))
-        })
+    model_selection(agent, args).is_some_and(|selection| selection.flagged)
 }
 
 /// Launch arguments that select `model`, for agents whose model flag Power knows.
@@ -312,6 +336,29 @@ mod tests {
     }
 
     #[test]
+    fn attached_model_values_select_the_model() {
+        for agent in ["codex", "grok"] {
+            for args in [
+                ["-mother-model"],
+                ["-m=other-model"],
+                ["--model=other-model"],
+            ] {
+                assert!(passes_model_flag(agent, &args), "{agent} {args:?}");
+                assert_eq!(requested_model(agent, args), Some("other-model".into()));
+            }
+        }
+        assert!(passes_model_flag("claude", &["--model=opus"]));
+        assert_eq!(
+            requested_model("claude", ["--model=opus"]),
+            Some("opus".into())
+        );
+        assert_eq!(
+            requested_model("codex", ["--model", "gpt", "-mmini"]),
+            Some("mini".into())
+        );
+    }
+
+    #[test]
     fn model_flags_are_detected_and_built_for_known_agents() {
         assert_eq!(requested_model("codex", ["-m", "gpt"]), Some("gpt".into()));
         assert_eq!(requested_model("claude", ["-m", "opus"]), None);
@@ -321,6 +368,8 @@ mod tests {
         assert!(!passes_model_flag("codex", &["--", "--model"]));
         assert!(!passes_model_flag("claude", &["--models"]));
         assert!(!passes_model_flag("custom", &["--model", "x"]));
+        assert!(!passes_model_flag("codex", &["--modelx"]));
+        assert!(!passes_model_flag("claude", &["-mopus"]));
         assert_eq!(
             model_args("grok", "grok-5"),
             Some(vec!["--model".into(), "grok-5".into()])
