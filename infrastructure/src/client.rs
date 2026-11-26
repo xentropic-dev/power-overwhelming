@@ -444,6 +444,21 @@ pub fn get_run(run: String) -> Result<Run> {
     }
 }
 
+/// Archives a run. Refused while it has open attempts, unless `force`.
+pub fn archive_run(run: String, force: bool) -> Result<Run> {
+    match dag(DagRequest::ArchiveRun { run, force }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn unarchive_run(run: String) -> Result<Run> {
+    match dag(DagRequest::UnarchiveRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
 /// Creates a checkout based on the source view's HEAD and returns its path.
 pub fn create_view_worktree(
     box_sel: String,

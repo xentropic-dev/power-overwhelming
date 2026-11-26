@@ -522,11 +522,22 @@ enum DagAction {
     List {
         #[arg(long = "box")]
         box_sel: Option<String>,
-        /// Include completed runs.
+        /// Include completed and archived runs.
         #[arg(long)]
         all: bool,
     },
     Show {
+        run: String,
+    },
+    /// Hide a run from default listings, such as an abandoned one.
+    Archive {
+        run: String,
+        /// Archive even while attempts are still open.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Return an archived run to default listings.
+    Unarchive {
         run: String,
     },
     AddTask {
@@ -995,6 +1006,8 @@ fn run_dag(command: DagAction) -> Result<()> {
             include_finished: all,
         },
         DagAction::Show { run } => DagRequest::GetRun { run },
+        DagAction::Archive { run, force } => DagRequest::ArchiveRun { run, force },
+        DagAction::Unarchive { run } => DagRequest::UnarchiveRun { run },
         DagAction::AddTask {
             run,
             id,

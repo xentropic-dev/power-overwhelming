@@ -20,7 +20,7 @@ The steps below are for coordinators.
 
 - Outside Power, use `power box list` to find the repository's box. Pass `--box "$BOX"` to `power dag list` and `power dag create`. The selector can be a box ID, unique ID prefix, shortcut digit, or unique repository folder name. On create, supply `--coordinator "$LABEL"` to identify the external coordinator, for example `herdr:w6J:p3`.
 - Inside Power, omit both flags to use your terminal's box and register or reuse its agent as the coordinator on create.
-- To reopen a run, find its ID with `power dag list` (add `--all` to include completed runs) and load it with `power dag show "$RUN"`. To start one, use `power dag create --title "Task plan"` with the appropriate flags and save `run.id` as `RUN`.
+- To reopen a run, find its ID with `power dag list` (add `--all` to include completed and archived runs) and load it with `power dag show "$RUN"`. To start one, use `power dag create --title "Task plan"` with the appropriate flags and save `run.id` as `RUN`.
 
 Both `power dag create` and `power dag show` return JSON with `run` and `link` fields (`{"run":Run,"link":"pwr://dag/<id>"}`). After creating or reopening a run, include the returned `link` verbatim on its own line in your reply. The user can click it or press Ctrl+S then `o` to open the live graph.
 
@@ -49,6 +49,8 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 
 3. Run `power dag wait "$RUN" --since "$CURSOR" --timeout 60`. Start `CURSOR` at `0` for a new run. Process the returned `events`, then save the returned `cursor` and pass it as `--since` on the next wait. A timeout returns an empty event list with the same cursor. After results, check `power dag ready "$RUN"` again and dispatch newly ready tasks.
 4. On `needs_input`, surface the worker's question to the user. They can open the worker from the graph (Ctrl+B then `d`) or the agent tree (Ctrl+B then `a`) and answer in that worker's terminal. The worker reports `working` once answered, clearing the request.
+
+To set aside a run you have abandoned, run `power dag archive "$RUN"`. Archived runs leave `power dag list` and the run picker until `power dag unarchive "$RUN"`, but `power dag show` still loads them. Power refuses to archive a run with open attempts so live workers stay visible; pass `--force` only when the user confirms those workers can be hidden.
 
 When retrying, Power reuses the task's Power-created worktree and branch by default. See the recovery reference for retry commands. To preview which Power-created worktrees can be removed, run `power worktree prune --dry-run`. Outside Power, also select a box with `--box "$BOX"` or use `--all`.
 

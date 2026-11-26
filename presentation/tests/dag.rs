@@ -507,6 +507,58 @@ fn create_show_and_list_include_links_for_each_run() {
 }
 
 #[test]
+fn archive_hides_a_run_and_refuses_open_attempts_unless_forced() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "work");
+    let listed = |all: bool| -> Vec<Value> {
+        let mut args = vec!["dag", "list", "--box", BOX_ID];
+        if all {
+            args.push("--all");
+        }
+        fixture.json(&args)["runs"].as_array().unwrap().clone()
+    };
+    assert_eq!(listed(false).len(), 1);
+    dispatched(fixture.dispatch(
+        &run,
+        "work",
+        &fixture.worktrees[0],
+        false,
+        &["success", "go", "Done"],
+    ));
+    fixture.wait_for_state(&run, "work", TaskState::Working);
+
+    let refused = fixture.command(&["dag", "archive", &run]);
+    assert_rejected(&refused);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("open attempt") && stderr.contains("--force"),
+        "{stderr}"
+    );
+    assert_eq!(listed(false).len(), 1);
+
+    let archived = fixture.json(&["dag", "archive", &run, "--force"]);
+    assert_eq!(archived["run"]["status"], "archived");
+    assert!(archived["run"]["archived_at"].is_u64());
+    assert!(listed(false).is_empty());
+    let all = listed(true);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0]["status"], "archived");
+    assert_eq!(
+        fixture.show(&run).archived_at,
+        archived["run"]["archived_at"].as_u64()
+    );
+
+    let restored = fixture.json(&["dag", "unarchive", &run]);
+    assert_eq!(restored["run"]["status"], "active");
+    assert!(restored["run"].get("archived_at").is_none());
+    assert_eq!(listed(false).len(), 1);
+
+    fixture.release("go");
+    fixture.wait_for_state(&run, "work", TaskState::Completed);
+}
+
+#[test]
 fn legacy_agent_aliases_use_the_configured_profiles() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();

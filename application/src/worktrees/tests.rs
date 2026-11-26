@@ -275,6 +275,7 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 label: "fixture".into(),
             },
             created_at: 0,
+            archived_at: None,
             tasks: Vec::new(),
         })?;
         db.insert_tasks(&worktree.branch, &[spec("work", &[])])?;
