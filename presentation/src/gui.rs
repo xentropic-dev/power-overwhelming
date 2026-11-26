@@ -1845,8 +1845,36 @@ impl Workspace {
             .active_box()
             .and_then(|entry| entry.active_view.clone())
         {
-            self.open_picker(Kind::End(id), Vec::new(), window, cx);
+            let message = self.end_session_message();
+            self.open_picker(
+                Kind::End {
+                    session: id,
+                    message,
+                },
+                Vec::new(),
+                window,
+                cx,
+            );
         }
+    }
+
+    /// Confirmation text for ending a session, naming the keys the user has bound.
+    fn end_session_message(&self) -> String {
+        let key = |scope, command| self.keymap.first(scope, command);
+        let mut message = format!(
+            "{} ends the session and removes its tab. {} cancels.",
+            key(Scope::Picker, Command::PickerSelect),
+            key(Scope::Picker, Command::PickerCancel),
+        );
+        let bound = |scope, command| !self.keymap.keys(scope, command).is_empty();
+        if bound(Scope::Prefix, Command::TabPrefix) && bound(Scope::Tab, Command::TabDetach) {
+            message.push_str(&format!(
+                " To close the tab and keep the session running, use {} then {}.",
+                key(Scope::Prefix, Command::TabPrefix),
+                key(Scope::Tab, Command::TabDetach),
+            ));
+        }
+        message
     }
 
     fn detach_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1976,8 +2004,8 @@ impl Workspace {
                     }
                     if picker.loading {
                         picker.accept_pending = true;
-                    } else if let Kind::End(id) = &picker.kind {
-                        let id = id.clone();
+                    } else if let Kind::End { session, .. } = &picker.kind {
+                        let id = session.clone();
                         self.dismiss_picker(window, cx);
                         self.end_session(id, window, cx);
                     } else if let Some(choice) = picker.selection() {

@@ -44,7 +44,11 @@ pub enum Kind {
     },
     StatusActions(String),
     Sessions(String),
-    End(String),
+    End {
+        session: String,
+        /// Confirmation text, with keys from the current keymap.
+        message: String,
+    },
     /// Keyboard shortcuts, generated from the keymap.
     Help(Vec<Shortcut>),
     /// Links visible in the active terminal.
@@ -145,7 +149,7 @@ impl Kind {
             Self::Agents { .. } => "Agent tree",
             Self::StatusActions(title) => title,
             Self::Sessions(_) => "Recover a session",
-            Self::End(_) => "End terminal session?",
+            Self::End { .. } => "End terminal session?",
             Self::Help(_) => "Keyboard shortcuts",
             Self::Links => "Open a link",
             Self::Setup {
@@ -171,7 +175,7 @@ impl Kind {
             Self::Help(_) => Some("Search shortcuts"),
             Self::Links => Some("Search links"),
             Self::ColorSchemes { .. } => Some("Search color schemes"),
-            Self::End(_) | Self::Setup { .. } | Self::StatusActions(_) | Self::RunLink => None,
+            Self::End { .. } | Self::Setup { .. } | Self::StatusActions(_) | Self::RunLink => None,
         }
     }
 }
@@ -918,9 +922,13 @@ impl Picker {
                             )
                         },
                     )
-                    .when(matches!(self.kind, Kind::End(_)), |panel| {
-                        panel.child("Enter ends the session and removes its tab. Escape cancels.")
-                    })
+                    .when_some(
+                        match &self.kind {
+                            Kind::End { message, .. } => Some(message.clone()),
+                            _ => None,
+                        },
+                        |panel, message| panel.child(message),
+                    )
                     .when_some(
                         match &self.kind {
                             Kind::Setup { lines, .. } => Some(lines.clone()),
