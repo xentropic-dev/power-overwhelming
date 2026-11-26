@@ -466,7 +466,9 @@ pub(crate) fn instruction_args(
     instructions.push_str(concat!(
         "\nWhen you understand the user's objective, run ",
         "`power session task 'Short task label'` from this terminal. ",
-        "Use a short, concrete label and update it when the objective changes.\n\n",
+        "Use a short, concrete label and update it when the objective changes. ",
+        "On long work, update it at major milestones so it shows current progress, e.g. ",
+        "'Port sprites: 3/5 done'.\n\n",
         "When you can verify the active model for this session, run ",
         "`power session model 'Verified model name'` from this terminal at the start of your work ",
         "and again when the model changes. Leave it unset if the model is unknown.\n\n",
@@ -565,7 +567,9 @@ mod tests {
     const TASK_LINE: &str = concat!(
         "When you understand the user's objective, run ",
         "`power session task 'Short task label'` from this terminal. ",
-        "Use a short, concrete label and update it when the objective changes.",
+        "Use a short, concrete label and update it when the objective changes. ",
+        "On long work, update it at major milestones so it shows current progress, e.g. ",
+        "'Port sprites: 3/5 done'.",
     );
 
     const MODEL_LINE: &str = concat!(
