@@ -621,6 +621,16 @@ mod tests {
                 let font = terminal_font(&settings, cx).font;
                 assert!(font.family.contains("JetBrains"), "{family:?}: {font:?}");
             }
+            // A family the machine has is used as named, even one GPUI's fallback stack lists.
+            for family in ["Noto Sans", "Helvetica", "Liberation Mono"] {
+                if crate::terminal::has_family(family) {
+                    let settings = TerminalSettings {
+                        font_family: Some(family.into()),
+                        ..TerminalSettings::default()
+                    };
+                    assert_eq!(terminal_font(&settings, cx).font.family.as_ref(), family);
+                }
+            }
             let settings = TerminalSettings {
                 font_family: Some("No Such Font".into()),
                 ..TerminalSettings::default()

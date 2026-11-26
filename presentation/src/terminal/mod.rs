@@ -7,6 +7,8 @@ mod paint;
 mod runs;
 mod selection;
 
+#[cfg(test)]
+pub(crate) use self::metrics::has_family;
 use self::metrics::preload_font_files;
 pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
@@ -48,34 +50,12 @@ pub(crate) fn terminal_font_family(cx: &App) -> &'static str {
         .unwrap_or(BUNDLED_FAMILY)
 }
 
-/// Names GPUI 0.2.2's `all_font_names` lists whether or not they're installed: its fallback
-/// stack, `.SystemUIFont` and the aliases it maps to other families.
-const GPUI_LISTED_NAMES: &[&str] = &[
-    ".SystemUIFont",
-    ".ZedMono",
-    ".ZedSans",
-    "Zed Plex Mono",
-    "Zed Plex Sans",
-    "Helvetica",
-    "Segoe UI",
-    "Ubuntu",
-    "Adwaita Sans",
-    "Cantarell",
-    "Noto Sans",
-    "DejaVu Sans",
-    "Arial",
-];
-
-/// Whether the platform has a face of `family`. Resolving a family it has never reaches GPUI's
-/// fallback stack, which panics when none of those faces are installed either. Names GPUI
-/// lists on its own don't count, as they may not be installed.
-fn installed(family: &str, cx: &App) -> bool {
-    !GPUI_LISTED_NAMES.contains(&family)
-        && cx
-            .text_system()
-            .all_font_names()
-            .iter()
-            .any(|name| name == family)
+/// Whether the platform has a face of `family`, asked of fontdb, the database GPUI's Linux text
+/// system loads. Resolving a family it has never reaches GPUI's fallback stack, which panics
+/// when none of those faces are installed either, and `all_font_names` lists that stack's
+/// names whether or not they're installed.
+fn installed(family: &str) -> bool {
+    metrics::has_family(family)
 }
 
 /// The terminal font for `settings`: its `font_family` when the platform has it, else the
@@ -83,7 +63,7 @@ fn installed(family: &str, cx: &App) -> bool {
 /// named exactly, so it resolves from `load_bundled_fonts` with no fallback face installed.
 pub fn terminal_font(settings: &TerminalSettings, cx: &App) -> TerminalFont {
     let family: SharedString = match &settings.font_family {
-        Some(family) if installed(family, cx) => family.clone().into(),
+        Some(family) if installed(family) => family.clone().into(),
         Some(_) => BUNDLED_FAMILY.into(),
         None => terminal_font_family(cx).into(),
     };
