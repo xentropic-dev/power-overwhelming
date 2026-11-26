@@ -77,7 +77,7 @@ impl Shell {
         }
     }
 
-    /// Defines the agent wrappers and runs any pending resume command.
+    /// Defines the agent wrappers and schedules a pending resume for the first prompt.
     pub fn init_script(self, registry: &impl AgentProfileRegistry) -> String {
         let mut script = String::new();
         for profile in registry.profiles() {
@@ -92,42 +92,96 @@ impl Shell {
                 ),
             });
         }
-        script.push_str(match self {
+        match self {
             Self::Bash | Self::Zsh => {
-                r#"if [ -n "${POWER_RESUME-}" ]; then
+                script.push_str(
+                    r#"if [ -n "${POWER_RESUME-}" ]; then
+    __power_resume_command=$POWER_RESUME
+    unset POWER_RESUME
     function __power_resume_fallback {
         [ $((SECONDS - __power_resume_started)) -lt 5 ] || return 1
         printf '\033[2m── could not resume, started a new conversation ──\033[0m\n'
         "$@"
     }
     function __power_resume_once {
-        local power_resume_command="$POWER_RESUME" __power_resume_started=$SECONDS
+        local power_resume_command="$__power_resume_command" __power_resume_started=$SECONDS
+        unset __power_resume_command
         unset -f __power_resume_once
-        unset POWER_RESUME && eval "$power_resume_command"
+        eval "$power_resume_command"
         local power_resume_status=$?
         unset -f __power_resume_fallback
         return $power_resume_status
     }
-    __power_resume_once
+"#,
+                );
+                // Running during rc evaluation can leave the agent in the shell's group.
+                script.push_str(if self == Self::Bash {
+                    r#"    if [[ $- == *i* ]]; then
+        function __power_resume_prompt {
+            local index
+            for index in "${!PROMPT_COMMAND[@]}"; do
+                if [[ ${PROMPT_COMMAND[index]} == __power_resume_prompt ]]; then
+                    unset 'PROMPT_COMMAND[index]'
+                fi
+            done
+            unset -f __power_resume_prompt
+            __power_resume_once
+        }
+        PROMPT_COMMAND+=(__power_resume_prompt)
+    else
+        __power_resume_once
+    fi
 fi
 "#
+                } else {
+                    r#"    if [[ -o interactive ]]; then
+        function __power_resume_prompt {
+            precmd_functions=( "${(@)precmd_functions:#__power_resume_prompt}" )
+            unfunction __power_resume_prompt
+            __power_resume_once
+        }
+        precmd_functions+=(__power_resume_prompt)
+    else
+        __power_resume_once
+    fi
+fi
+"#
+                });
             }
             Self::Fish => {
-                r#"if test -n "$POWER_RESUME"
+                script.push_str(
+                    r#"if test -n "$POWER_RESUME"
+    set -g __power_resume_command "$POWER_RESUME"
+    set -e POWER_RESUME
     function __power_resume_fallback
         test (math (date +%s) - $__power_resume_started) -lt 5; or return 1
         printf '\033[2m── could not resume, started a new conversation ──\033[0m\n'
         eval (string escape -- $argv)
     end
-    set -l power_resume_command "$POWER_RESUME"
-    set -g __power_resume_started (date +%s)
-    set -e POWER_RESUME; and eval "$power_resume_command"
-    functions -e __power_resume_fallback
-    set -e __power_resume_started
+    function __power_resume_once
+        set -l power_resume_command "$__power_resume_command"
+        set -e __power_resume_command
+        functions -e __power_resume_once
+        set -g __power_resume_started (date +%s)
+        eval "$power_resume_command"
+        functions -e __power_resume_fallback
+        set -e __power_resume_started
+    end
+    if status is-interactive
+        function __power_resume_prompt --on-event fish_prompt
+            functions -e __power_resume_prompt
+            # Event handlers run in fish's group. Execute a foreground command instead.
+            commandline -r ' __power_resume_once'
+            commandline -f execute
+        end
+    else
+        __power_resume_once
+    end
 end
-"#
+"#,
+                );
             }
-        });
+        }
         script
     }
 
