@@ -574,14 +574,10 @@ mod tests {
                 })
             };
 
-            // An unset family, one GPUI can't find and one only its fallback stack names all
-            // resolve to the bundled font, whose features the runs then set.
-            for family in [
-                None,
-                Some("No Such Font"),
-                Some("monospace"),
-                Some("Helvetica"),
-            ] {
+            // An unset family and one no machine has resolve to the bundled font, whose features
+            // the runs then set. Installed families (e.g. Helvetica) legitimately resolve to
+            // themselves, so the test names none.
+            for family in [None, Some("No Such Font")] {
                 let settings = TerminalSettings {
                     font_family: family.map(str::to_owned),
                     ..TerminalSettings::default()
