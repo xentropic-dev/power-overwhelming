@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 application = { path = "../application" }
 async-channel = "2"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 domain = { path = "../domain" }
 fontdb = "0.16"

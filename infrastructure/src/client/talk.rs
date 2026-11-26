@@ -1,7 +1,9 @@
 use crate::wire::{self, Request, Response, talk::*};
 use anyhow::{Context, Result, bail};
 use application::talk::{LogFilter, TalkEvent as Event, TalkEventKind as EventKind};
-use domain::talk::{AgentRef, Delivery, Message, MessageId, Recipient, Sender, ThreadId};
+use domain::talk::{
+    AgentRef, AgentTalkSummary, Delivery, Message, MessageId, Recipient, Sender, ThreadId,
+};
 use std::{io::BufReader, os::unix::net::UnixStream, time::Duration};
 
 #[derive(Clone, Default)]
@@ -53,17 +55,30 @@ pub fn send(
     )
 }
 
-pub fn reply(caller: Caller, id: MessageId, body: String, urgent: bool) -> Result<Message> {
+pub fn reply(
+    caller: Caller,
+    id: MessageId,
+    body: String,
+    recipient_agent: Option<String>,
+) -> Result<Message> {
     messages(
         caller,
         TalkCommand::Reply {
             id: id.0,
             body,
-            urgent,
+            urgent: false,
+            recipient_agent,
         },
     )?
     .pop()
     .context("Daemon returned no reply")
+}
+
+pub fn summary(caller: Caller) -> Result<Vec<AgentTalkSummary>> {
+    match decode(wire::request(&request(caller, TalkCommand::Summary))?)? {
+        TalkResponse::Summary { agents } => Ok(agents.into_iter().map(Into::into).collect()),
+        _ => bail!("Unexpected talk response"),
+    }
 }
 
 pub fn inbox(caller: Caller, all: bool, peek: bool) -> Result<Vec<Message>> {
@@ -259,6 +274,30 @@ impl From<TalkEvent> for Event {
                 TalkEventKind::Read => EventKind::Read,
                 TalkEventKind::Delivery => EventKind::Delivery,
             },
+        }
+    }
+}
+
+impl From<AgentTalkSummary> for TalkAgentSummary {
+    fn from(value: AgentTalkSummary) -> Self {
+        Self {
+            agent: value.agent,
+            unread: value.unread,
+            to_user: value.to_user,
+            count: value.count,
+            latest: value.latest,
+        }
+    }
+}
+
+impl From<TalkAgentSummary> for AgentTalkSummary {
+    fn from(value: TalkAgentSummary) -> Self {
+        Self {
+            agent: value.agent,
+            unread: value.unread,
+            to_user: value.to_user,
+            count: value.count,
+            latest: value.latest,
         }
     }
 }

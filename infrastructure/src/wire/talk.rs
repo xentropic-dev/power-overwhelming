@@ -19,6 +19,7 @@ pub enum TalkCommand {
     },
     Reply {
         id: String,
+        recipient_agent: Option<String>,
         body: String,
         urgent: bool,
     },
@@ -46,6 +47,7 @@ pub enum TalkCommand {
         #[serde(default)]
         output_sets_busy: bool,
     },
+    Summary,
     Watch,
 }
 
@@ -54,6 +56,7 @@ pub enum TalkCommand {
 pub enum TalkResponse {
     Messages { messages: Vec<TalkMessage> },
     Reply { message: Option<TalkMessage> },
+    Summary { agents: Vec<TalkAgentSummary> },
     Event { event: TalkEvent },
     Ok,
 }
@@ -120,4 +123,13 @@ pub enum TalkEventKind {
     Read,
     #[serde(rename = "talk_delivery")]
     Delivery,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TalkAgentSummary {
+    pub agent: String,
+    pub unread: usize,
+    pub to_user: usize,
+    pub count: usize,
+    pub latest: String,
 }

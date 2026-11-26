@@ -5,7 +5,8 @@ use application::talk::{
     DeliveryChange, LogFilter, TalkEvent, TalkEventKind, TalkReader, TalkStore, TalkTransaction,
 };
 use domain::talk::{
-    AgentRef, Delivery, Directory, Message, MessageId, Recipient, RunRef, Sender, ThreadId,
+    AgentRef, AgentTalkSummary, Delivery, Directory, Message, MessageId, Recipient, RunRef, Sender,
+    ThreadId,
 };
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use std::time::Instant;
@@ -23,6 +24,7 @@ pub(super) fn migrate(db: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS talk_unread ON talk_messages(recipient_agent, box_id)
              WHERE read_at IS NULL;
+         CREATE INDEX IF NOT EXISTS talk_box ON talk_messages(box_id);
          CREATE INDEX IF NOT EXISTS talk_thread ON talk_messages(thread);
          CREATE INDEX IF NOT EXISTS talk_pair ON talk_messages(sender_agent, recipient_agent, created_at);
          CREATE TABLE IF NOT EXISTS talk_events (
@@ -186,6 +188,45 @@ impl TalkReader for TalkDb<'_> {
             ),
             params![recipient_id(recipient), box_id],
         )
+    }
+
+    fn summary(&self, box_id: &str) -> Result<Vec<AgentTalkSummary>> {
+        Ok(self
+            .0
+            .prepare(
+                "WITH participants AS (
+                 SELECT recipient_agent AS agent, rowid AS message, read_at IS NULL AS unread,
+                        0 AS to_user
+                 FROM talk_messages WHERE box_id = ?1 AND recipient_agent IS NOT NULL
+                 UNION ALL
+                 SELECT sender_agent, rowid, 0, recipient_agent IS NULL AND read_at IS NULL
+                 FROM talk_messages WHERE box_id = ?1 AND sender_agent IS NOT NULL
+                    AND sender_agent IS NOT recipient_agent
+             ), summary AS (
+                 SELECT agent, SUM(unread) AS unread, SUM(to_user) AS to_user,
+                        COUNT(*) AS count, MAX(message) AS latest
+                 FROM participants GROUP BY agent
+             )
+             SELECT agent, unread, to_user, count, body
+             FROM summary JOIN talk_messages ON talk_messages.rowid = summary.latest",
+            )?
+            .query_map([box_id], |row| {
+                let body: String = row.get(4)?;
+                Ok(AgentTalkSummary {
+                    agent: row.get(0)?,
+                    unread: row.get(1)?,
+                    to_user: row.get(2)?,
+                    count: row.get(3)?,
+                    latest: body
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(160)
+                        .collect(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     fn pending_agents(&self) -> Result<Vec<String>> {

@@ -1,6 +1,6 @@
 use super::DagWorktrees;
 use crate::keymap::{Command, Keymap, Scope};
-use domain::dag::AttemptArtifact;
+use domain::{dag::AttemptArtifact, talk::AgentTalkSummary};
 use gpui::{prelude::*, *};
 use infrastructure::{
     client::{Attempt, Coordinator, Run, Task, TaskState},
@@ -248,6 +248,7 @@ pub(super) struct DagView {
     pub message: Option<String>,
     pub refresh_error: Option<String>,
     pub worktrees: DagWorktrees,
+    pub talk: HashMap<String, AgentTalkSummary>,
     /// Waiting for a digit that picks one of several listed artifacts.
     pub picking_artifact: bool,
     graph: GraphLayout,
@@ -268,6 +269,7 @@ impl DagView {
             message: None,
             refresh_error: None,
             worktrees: DagWorktrees::default(),
+            talk: HashMap::new(),
             picking_artifact: false,
             selected,
             viewport: GraphViewport::new(),
@@ -382,6 +384,10 @@ impl DagView {
         {
             actions.push(format!("{open_key} open worker"));
         }
+        let talk_key = keymap.keys(Scope::Dag, Command::AgentTalk);
+        if self.attempt().is_some() && !talk_key.is_empty() {
+            actions.push(format!("{talk_key} open talk"));
+        }
         let artifact_key = keymap.first(Scope::Dag, Command::DagArtifact);
         let artifacts = self.artifacts().len();
         if self.picking_artifact {
@@ -465,6 +471,8 @@ impl DagView {
                                 &self.worktrees,
                                 &self.run.id,
                                 self.picking_artifact,
+                                self.attempt()
+                                    .and_then(|attempt| self.talk.get(&attempt.agent)),
                                 open_artifact,
                             ))
                             .into_any_element()
@@ -722,6 +730,7 @@ fn details(
     worktrees: &DagWorktrees,
     run_id: &str,
     picking: bool,
+    talk: Option<&AgentTalkSummary>,
     open_artifact: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
     let mut fields = Vec::new();
@@ -730,6 +739,13 @@ fn details(
         fields.push((
             "Assigned agent",
             format!("{} · {}", attempt.provider.name(), attempt.agent),
+        ));
+        fields.push((
+            "Talk messages",
+            talk.map_or_else(
+                || "0".into(),
+                |talk| format!("{} · {}", talk.count, talk.latest),
+            ),
         ));
         if let Some(model) = &attempt.model {
             fields.push(("Model", model.clone()));
@@ -849,7 +865,7 @@ mod tests {
         numbered_artifact,
     };
     use crate::keymap::Command;
-    use domain::dag::AttemptArtifact;
+    use domain::{dag::AttemptArtifact, talk::AgentTalkSummary};
     use gpui::{Bounds, point, px, size};
     use infrastructure::client::{Attempt, AttemptState, Provider, Task, TaskState};
 

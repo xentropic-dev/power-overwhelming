@@ -139,9 +139,15 @@ pub(crate) fn request(
                 urgent,
             })?)
         }
-        TalkCommand::Reply { id, body, urgent } => items(vec![talk.reply(Reply {
+        TalkCommand::Reply {
+            id,
+            body,
+            urgent,
+            recipient_agent,
+        } => items(vec![talk.reply(Reply {
             caller,
             message: MessageId(id),
+            recipient_agent,
             body,
             urgent,
         })?]),
@@ -196,6 +202,9 @@ pub(crate) fn request(
             )?;
             TalkResponse::Ok
         }
+        TalkCommand::Summary => TalkResponse::Summary {
+            agents: talk.summary(caller)?.into_iter().map(Into::into).collect(),
+        },
         TalkCommand::Watch => unreachable!("Talk watch uses the streaming handler"),
     })
 }

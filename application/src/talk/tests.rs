@@ -71,6 +71,9 @@ impl TalkReader for Db {
             .cloned()
             .collect())
     }
+    fn summary(&self, _: &str) -> Result<Vec<AgentTalkSummary>> {
+        unreachable!()
+    }
     fn pending_agents(&self) -> Result<Vec<String>> {
         Ok(vec!["b".into()])
     }
@@ -217,6 +220,7 @@ fn queued_peer_and_user_messages_follow_delivery_and_read_rules() -> Result<()> 
     let reply = talk.reply(Reply {
         caller: caller(Some("b-session")),
         message: peer.id.clone(),
+        recipient_agent: None,
         body: "reply".into(),
         urgent: false,
     })?;

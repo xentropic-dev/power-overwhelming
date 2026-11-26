@@ -85,6 +85,15 @@ impl Message {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentTalkSummary {
+    pub agent: String,
+    pub unread: usize,
+    pub to_user: usize,
+    pub count: usize,
+    pub latest: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Address {
     Agent(String),

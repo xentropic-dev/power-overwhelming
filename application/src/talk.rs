@@ -1,7 +1,7 @@
 use anyhow::Result;
 use domain::talk::{
-    Activity, Directory, HookState, Message, MessageId, NoticePolicy, Recipient, Sender, Target,
-    ThreadId,
+    Activity, AgentTalkSummary, Directory, HookState, Message, MessageId, NoticePolicy, Recipient,
+    Sender, Target, ThreadId,
 };
 use std::{sync::Arc, time::Instant};
 
@@ -18,6 +18,7 @@ pub trait TalkReader {
     fn message(&self, id: &MessageId) -> Result<Option<Message>>;
     fn inbox(&self, recipient: &Recipient, box_id: Option<&str>, all: bool)
     -> Result<Vec<Message>>;
+    fn summary(&self, box_id: &str) -> Result<Vec<AgentTalkSummary>>;
     fn pending_agents(&self) -> Result<Vec<String>>;
     fn thread(&self, id: &ThreadId) -> Result<Vec<Message>>;
     fn log(&self, filter: &LogFilter) -> Result<Vec<Message>>;
@@ -90,6 +91,7 @@ pub struct SendMessage {
 pub struct Reply {
     pub caller: Caller,
     pub message: MessageId,
+    pub recipient_agent: Option<String>,
     pub body: String,
     pub urgent: bool,
 }
@@ -305,7 +307,11 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 actor.agent.is_none() || from_me || parent.recipient.matches_sender(&sender),
                 "You are not a participant in message {:?}", command.message.0,
             );
-            let recipient = if from_me {
+            let recipient = if let Some(id) = &command.recipient_agent {
+                ensure!(actor.agent.is_none() && parent.involves_agent(id),
+                    "Only the user can direct a reply to a participant in this message");
+                Recipient::Agent { id: id.clone(), box_id: parent.box_id.clone() }
+            } else if from_me {
                 parent.recipient.clone()
             } else {
                 match &parent.sender {
@@ -502,6 +508,18 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 filter.box_id = scoped_box.map(str::to_owned);
             }
             db.log(&filter)
+        })
+    }
+
+    pub fn summary(&self, caller: Caller) -> Result<Vec<AgentTalkSummary>> {
+        self.store.read(|db| {
+            let directory = db.directory()?;
+            let actor = Actor::new(&caller, &directory);
+            ensure!(
+                actor.agent.is_none(),
+                "Talk summaries are available to the user"
+            );
+            db.summary(actor.box_id.context("Specify a box for the talk summary")?)
         })
     }
 

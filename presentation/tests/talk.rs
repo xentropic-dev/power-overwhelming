@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
@@ -61,7 +61,7 @@ impl Drop for Daemon {
 }
 
 struct Fixture {
-    daemon: Option<Daemon>,
+    _daemon: Option<Daemon>,
     root: tempfile::TempDir,
     coordinator: ManagedAgent,
     run: Run,
@@ -70,8 +70,8 @@ struct Fixture {
 }
 
 struct Sandbox {
-    root: tempfile::TempDir,
     daemon: Option<Daemon>,
+    root: tempfile::TempDir,
 }
 
 impl Sandbox {
@@ -154,9 +154,8 @@ impl Sandbox {
         Self { root, daemon }
     }
 
-    fn launch(&self, name: &str, box_id: &str, restorable: bool) -> ManagedAgent {
+    fn launch(&self, name: &str, box_id: &str) -> ManagedAgent {
         let path = self.root.path();
-        let provider = if restorable { "fixture" } else { "command" };
         let mut launch = power(path, None);
         launch
             .args([
@@ -165,14 +164,11 @@ impl Sandbox {
                 "--box",
                 box_id,
                 "--provider",
-                provider,
+                "fixture",
                 "--worktree",
             ])
             .arg(path.join(name))
             .arg("--");
-        if !restorable {
-            launch.arg(path.join("worker.sh"));
-        }
         let agent = json(launch.arg(name).output().unwrap())["agent"].take();
         poll("fixture worker startup", || {
             path.join(format!("ready-{name}")).exists().then_some(())
@@ -186,7 +182,7 @@ impl Fixture {
         let Sandbox { root, daemon } = Sandbox::new();
         let sandbox = Sandbox { root, daemon };
         let path = sandbox.root.path();
-        let coordinator = sandbox.launch("coordinator", BOX, false);
+        let coordinator = sandbox.launch("coordinator", BOX);
         let run = json(
             power(path, Some(&coordinator))
                 .args(["dag", "create", "--title", "Talk"])
@@ -227,7 +223,7 @@ impl Fixture {
         let b = dispatch("b");
         Self {
             root: sandbox.root,
-            daemon: sandbox.daemon,
+            _daemon: sandbox.daemon,
             coordinator,
             run,
             a,
@@ -538,7 +534,7 @@ fn restart_preserves_unread_messages_and_delivers_one_reminder() {
     let mut sandbox = Sandbox::new();
     // Command sessions are intentionally never replayed after restart. The same deterministic
     // fixture script runs as a configured profile for this restorable recipient.
-    let worker = sandbox.launch("b", BOX, true);
+    let worker = sandbox.launch("b", BOX);
     let path = sandbox.root.path();
     let sent = messages(talk(
         path,

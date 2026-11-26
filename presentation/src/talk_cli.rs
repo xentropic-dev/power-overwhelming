@@ -117,7 +117,7 @@ pub fn run(args: TalkArgs) -> Result<()> {
         }
         Action::Reply { id, words, input } => {
             let body = body(words, input.file)?;
-            let message = talk::reply(caller.clone(), MessageId(id), body, false)?;
+            let message = talk::reply(caller.clone(), MessageId(id), body, None)?;
             sent(caller, vec![message], input.wait, input.timeout, json)
         }
         Action::Inbox { peek, all } => print_messages(talk::inbox(caller, all, peek)?, json),

@@ -5,6 +5,7 @@ mod preview;
 mod settings;
 mod status_bar;
 mod talk_cli;
+mod talk_dialog;
 mod terminal;
 
 use anyhow::{Context, Result};
