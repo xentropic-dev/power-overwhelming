@@ -28,6 +28,7 @@ fn power(root: &Path) -> Command {
         .current_dir(root)
         .env("POWER_SOCKET", root.join("power.sock"))
         .env("POWER_STATE_DIR", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("runtime"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("SHELL", "/bin/sh")
         .env_remove("POWER_BIN")
@@ -190,8 +191,13 @@ impl Fixture {
     }
 
     fn with_configure(configure: impl FnOnce(&Path)) -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("pX.")
+            .rand_bytes(4)
+            .tempdir_in("/tmp")
+            .unwrap();
         let root = directory.path();
+        fs::create_dir(root.join("runtime")).unwrap();
         let checkout = root.join("box-repo");
         init_repo(&checkout);
         let checkout = checkout.canonicalize().unwrap();
@@ -388,20 +394,43 @@ impl Fixture {
         EventPage::parse(json_output(output(&mut command)), since)
     }
 
-    fn attention(&self) -> Vec<BoxAttention> {
-        // Attention is exposed on the daemon socket for the desktop.
+    fn request(&self, request: Value) -> BufReader<UnixStream> {
         let mut socket = UnixStream::connect(self.root().join("power.sock")).unwrap();
         socket.set_read_timeout(Some(TIMEOUT)).unwrap();
         socket.set_write_timeout(Some(TIMEOUT)).unwrap();
-        let request = json!({"request": "dag", "dag": {"op": "attention"}});
         writeln!(socket, "{request}").unwrap();
+        BufReader::new(socket)
+    }
+
+    fn subscribe(&self, session: &str) -> BufReader<UnixStream> {
+        self.request(json!({"request": "subscribe", "session": session}))
+    }
+
+    fn attention(&self) -> Vec<BoxAttention> {
+        // Attention is exposed on the daemon socket for the desktop.
+        let mut reply = self.request(json!({"request": "dag", "dag": {"op": "attention"}}));
         let mut line = String::new();
-        BufReader::new(socket).read_line(&mut line).unwrap();
+        reply.read_line(&mut line).unwrap();
         let mut response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response["event"], "dag", "{response}");
         assert_eq!(response["dag"]["kind"], "attention", "{response}");
         serde_json::from_value(response["dag"]["boxes"].take()).unwrap()
     }
+}
+
+#[track_caller]
+fn next_metadata(subscription: &mut BufReader<UnixStream>) -> Value {
+    for line in subscription.lines() {
+        let mut event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if event["event"] == "metadata" {
+            return event["metadata"].take();
+        }
+        assert!(
+            !matches!(event["event"].as_str(), Some("error" | "exit" | "ok")),
+            "Expected metadata before terminal exit, error, or keepalive. Received {event}"
+        );
+    }
+    panic!("Terminal subscription ended before sending metadata");
 }
 
 struct EventPage {
@@ -623,7 +652,7 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
 }
 
 #[test]
-fn worker_models_follow_reports_and_survive_restart() {
+fn worker_metadata_starts_with_task_title_and_explicit_model() {
     let mut fixture = Fixture::with_configure(|root| {
         let program = root.join("codex");
         fs::write(
@@ -639,7 +668,10 @@ for phase in update finish; do
     done
     test -f "$fixture_dir/$phase"
     case "$phase" in
-        update) printf '%s' '{"model":"actual-model"}' | "$POWER_BIN" session model --json ;;
+        update)
+            "$POWER_BIN" session task "Revised task"
+            printf '%s' '{"model":"actual-model"}' | "$POWER_BIN" session model --json
+            ;;
         finish) "$POWER_BIN" dag report success --summary "Done" ;;
     esac
 done
@@ -659,7 +691,15 @@ done
         .unwrap();
     });
     let run = fixture.create_run().id;
-    fixture.add_task(&run, "model");
+    fixture.json(&[
+        "dag",
+        "add-task",
+        &run,
+        "--id",
+        "model",
+        "--title",
+        "Check model labels",
+    ]);
     let (attempt, agent) = dispatched(fixture.command(&[
         "dag",
         "dispatch",
@@ -674,7 +714,16 @@ done
     ]));
     assert_eq!(attempt.model.as_deref(), Some("launch-model"));
     assert_eq!(agent.model, attempt.model);
+    let mut attached = fixture.subscribe(attempt.session.as_deref().unwrap());
+    assert_eq!(
+        next_metadata(&mut attached),
+        json!({"task": "Check model labels", "model": "launch-model"})
+    );
     fixture.release("update");
+    assert_eq!(
+        next_metadata(&mut attached),
+        json!({"task": "Revised task", "model": "launch-model"})
+    );
     let updated = poll("the model change", || {
         fixture
             .events(&run, 0, &["agent_model_changed"])
@@ -1005,16 +1054,27 @@ fn simultaneous_dispatches_create_exactly_one_attempt() {
 fn interrupted_worker_requires_retry_and_old_reports_cannot_change_new_attempt() {
     let fixture = Fixture::new();
     let run = fixture.create_run().id;
-    fixture.add_task(&run, "retry-me");
+    fixture.json(&[
+        "dag",
+        "add-task",
+        &run,
+        "--id",
+        "retry-me",
+        "--title",
+        "Retry the worker",
+    ]);
     let (first, agent) = dispatched(fixture.dispatch(
         &run,
         "retry-me",
         &fixture.worktrees[0],
         false,
-        &["exit", "exit-now"],
+        &["label", "update-task", "First attempt label", "exit-now"],
     ));
     assert_eq!(first.number, 1);
-    fixture.wait_for_worker("exit-now");
+    let mut attached = fixture.subscribe(first.session.as_deref().unwrap());
+    assert_eq!(next_metadata(&mut attached)["task"], "Retry the worker");
+    fixture.release("update-task");
+    assert_eq!(next_metadata(&mut attached)["task"], "First attempt label");
     fixture.release("exit-now");
     let interrupted = fixture.wait_for_state(&run, "retry-me", TaskState::Interrupted);
     let attempt = &interrupted.attempts[0];
@@ -1041,6 +1101,8 @@ fn interrupted_worker_requires_retry_and_old_reports_cannot_change_new_attempt()
         dispatched(fixture.dispatch(&run, "retry-me", &fixture.worktrees[0], true, &worker));
     assert_eq!(second.number, 2);
     assert_ne!(second.id, first.id);
+    let mut reattached = fixture.subscribe(second.session.as_deref().unwrap());
+    assert_eq!(next_metadata(&mut reattached)["task"], "Retry the worker");
     let current = fixture.wait_for_state(&run, "retry-me", TaskState::Working);
     assert_eq!(current.current_attempt.as_deref(), Some(second.id.as_str()));
     assert_eq!(current.attempts, [attempt.clone(), second.clone()]);

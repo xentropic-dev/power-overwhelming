@@ -21,6 +21,8 @@ pub struct SessionOptions {
     pub env: Vec<(OsString, Option<OsString>)>,
     /// Sent once at launch and never persisted, so a restore cannot replay it.
     pub initial_prompt: Option<OsString>,
+    /// Initial task label for a dispatched worker.
+    pub initial_task: Option<String>,
     /// Starting directory. Defaults to the worktree.
     pub cwd: Option<PathBuf>,
     /// Agent a restored shell runs once its integration has loaded.

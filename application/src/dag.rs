@@ -360,7 +360,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             };
             let mut agent =
                 self.new_agent(box_id, worktree, command.provider, parent, command.label);
-            self.launch_worker(&mut agent, command.args, command.prompt, launched)?;
+            self.launch_worker(&mut agent, command.args, command.prompt, None, launched)?;
             db.insert_agent(&agent)?;
             Ok(agent)
         })
@@ -443,7 +443,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 let prompt = (agent.provider != Provider::Command).then(|| {
                     worker_prompt(&run, task, &agent.worktree, branch.as_deref(), resuming)
                 });
-                self.launch_worker(&mut agent, command.args, prompt, launched)?;
+                self.launch_worker(
+                    &mut agent,
+                    command.args,
+                    prompt,
+                    Some(&task.title),
+                    launched,
+                )?;
                 Ok(branch)
             })();
             let start = match start {
@@ -526,6 +532,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         agent: &mut ManagedAgent,
         args: Vec<String>,
         prompt: Option<String>,
+        task_title: Option<&str>,
         launched: &mut Option<String>,
     ) -> Result<()> {
         let terminal = terminal_agent(&agent.provider);
@@ -557,6 +564,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 args: args.into_iter().map(OsString::from).collect(),
                 env,
                 initial_prompt,
+                initial_task: task_title.map(str::to_owned),
                 ..SessionOptions::default()
             },
         )?;
