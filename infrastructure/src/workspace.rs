@@ -10,11 +10,34 @@ use std::{
 
 pub struct LocalWorkspace;
 
-pub struct LocalWorktreeRoot;
+#[derive(Default)]
+pub struct LocalWorktreeRoot {
+    #[cfg(feature = "lua-config")]
+    defaults: crate::config::Sections,
+}
+
+impl LocalWorktreeRoot {
+    /// Supply the desktop defaults used to seed Lua globals in the user's config.
+    #[cfg(feature = "lua-config")]
+    pub fn new(defaults: crate::config::Sections) -> Self {
+        Self { defaults }
+    }
+}
 
 impl WorktreeRoot for LocalWorktreeRoot {
     fn worktree_root(&self) -> Result<PathBuf> {
-        todo!()
+        // Read config at each request so edits apply to subsequent creations.
+        #[cfg(feature = "lua-config")]
+        let configured = crate::config::load_worktree_root(self.defaults.clone())?;
+        #[cfg(not(feature = "lua-config"))]
+        let configured = None::<PathBuf>;
+        let root = match configured {
+            Some(root) => std::path::absolute(root).context("Resolve worktrees.root")?,
+            None => crate::persistence::data_directory()?.join("worktrees"),
+        };
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("Create worktree root at {}", root.display()))?;
+        Ok(root)
     }
 }
 
