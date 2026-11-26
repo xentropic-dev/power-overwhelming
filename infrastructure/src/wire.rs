@@ -442,6 +442,8 @@ pub enum TaskState {
     /// Some prerequisite has not completed successfully.
     Waiting,
     Ready,
+    /// Dispatched while the worker budget was full. Power starts it when capacity frees up.
+    Queued,
     Working,
     NeedsInput,
     Completed,
@@ -513,6 +515,9 @@ pub struct Task {
     pub deps: Vec<String>,
     /// Derived by the daemon from persisted attempts and prerequisite states.
     pub state: TaskState,
+    /// Unix seconds, while a dispatch of the task waits for the worker budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at: Option<u64>,
     pub current_attempt: Option<String>,
     /// Oldest first.
     pub attempts: Vec<Attempt>,
@@ -575,6 +580,10 @@ pub enum RunEventKind {
     StaleReport,
     RunArchived,
     RunUnarchived,
+    /// A dispatch waits for the worker budget. The summary says which limit held it.
+    TaskQueued,
+    /// A queued dispatch could not be started. The summary has the error.
+    QueuedDispatchFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -624,6 +633,26 @@ impl WorktreeRequest {
                 path,
                 allow_main_checkout,
             },
+        }
+    }
+}
+
+/// What a dispatch does when the worker budget is full.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetMode {
+    #[default]
+    Queue,
+    Refuse,
+    Override,
+}
+
+impl From<BudgetMode> for application::dag::BudgetMode {
+    fn from(value: BudgetMode) -> Self {
+        match value {
+            BudgetMode::Queue => Self::Queue,
+            BudgetMode::Refuse => Self::Refuse,
+            BudgetMode::Override => Self::Override,
         }
     }
 }
@@ -838,6 +867,14 @@ pub enum DagRequest {
         #[serde(default)]
         args: Vec<String>,
         caller: Option<String>,
+        /// What to do when the worker budget is full. Queues by default.
+        #[serde(default)]
+        budget: BudgetMode,
+    },
+    /// Starts a queued task now, over the worker budget, as it was dispatched.
+    StartQueued {
+        run: String,
+        task: String,
     },
     CreateViewWorktree {
         box_sel: String,
@@ -906,6 +943,13 @@ pub enum DagResponse {
         agent: Box<ManagedAgent>,
         /// Present for a newly created or resumed managed checkout.
         branch: Option<String>,
+    },
+    /// The worker budget is full. The task is queued and starts when capacity frees up.
+    Queued {
+        run: String,
+        task: String,
+        /// The limit that holds the dispatch.
+        reason: String,
     },
     ViewWorktreeCreated {
         path: PathBuf,
@@ -1002,6 +1046,7 @@ mod dag_dto {
     enum_dto!(TaskState {
         Waiting,
         Ready,
+        Queued,
         Working,
         NeedsInput,
         Completed,
@@ -1036,6 +1081,8 @@ mod dag_dto {
         StaleReport,
         RunArchived,
         RunUnarchived,
+        TaskQueued,
+        QueuedDispatchFailed,
     });
 
     struct_dto!(BoxInfo {
@@ -1100,7 +1147,7 @@ mod dag_dto {
         instructions,
         deps
     });
-    struct_dto!(Task { id, title, instructions, deps, state, current_attempt } lists { attempts });
+    struct_dto!(Task { id, title, instructions, deps, state, queued_at, current_attempt } lists { attempts });
     enum_dto!(RunStatus {
         Active,
         Completed,

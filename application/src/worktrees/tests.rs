@@ -37,6 +37,10 @@ impl Workspace for WorktreeWorkspace {
         Ok("view-head".into())
     }
 
+    fn resolve_commit(&self, _: &Path, commitish: &str) -> Result<String> {
+        Ok(commitish.into())
+    }
+
     fn branch_exists(&self, repository: &Path, _: &str) -> Result<BranchStatus> {
         ensure!(repository == Path::new("/repo"), "Wrong repository");
         Ok(self

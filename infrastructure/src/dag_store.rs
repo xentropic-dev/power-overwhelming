@@ -1,11 +1,13 @@
 use crate::{persistence::state_directory, wire};
 use anyhow::{Context, Result};
-use application::dag::{DagReader, DagStore, DagTransaction, EventScope, OpenAttempt, now};
+use application::dag::{
+    DagReader, DagStore, DagTransaction, EventScope, OpenAttempt, QueuedDispatch, now,
+};
 use domain::{
     dag::{
         AgentStatus, Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState,
     },
-    worktree::{ManagedWorktree, WorktreeCreator},
+    worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest},
 };
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::IntoDeserializer};
@@ -76,6 +78,15 @@ impl SqliteDagStore {
                      (creator_run IS NULL AND creator_task IS NULL AND creator_attempt IS NULL
                       AND creator_box IS NOT NULL AND creator_session IS NOT NULL)
                  )
+             );
+             CREATE TABLE IF NOT EXISTS queued_dispatches (
+                 id TEXT NOT NULL UNIQUE,
+                 run_id TEXT NOT NULL, task_id TEXT NOT NULL, provider TEXT NOT NULL,
+                 worktree TEXT NOT NULL, allow_main_checkout INTEGER NOT NULL,
+                 retry INTEGER NOT NULL, args TEXT NOT NULL, caller TEXT,
+                 queued_at INTEGER NOT NULL,
+                 PRIMARY KEY (run_id, task_id),
+                 FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, id)
              );",
         )?;
         let has_model: bool = db.query_row(
@@ -139,6 +150,7 @@ impl DagDb<'_> {
                     instructions: row.get(2)?,
                     deps: Vec::new(),
                     state: TaskState::Waiting,
+                    queued_at: None,
                     current_attempt: None,
                     attempts: Vec::new(),
                 })
@@ -153,6 +165,14 @@ impl DagDb<'_> {
         )? {
             deps.entry(task).or_default().push(dep);
         }
+        let mut queued: HashMap<String, u64> = rows(
+            self.0,
+            "SELECT task_id, queued_at FROM queued_dispatches WHERE run_id = ?1",
+            [&run.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+        .into_iter()
+        .collect();
         let mut attempts = HashMap::<String, Vec<Attempt>>::new();
         for (task, attempt) in rows(
             self.0,
@@ -171,6 +191,7 @@ impl DagDb<'_> {
             .map(|mut task| {
                 task.deps = deps.remove(&task.id).unwrap_or_default();
                 task.attempts = attempts.remove(&task.id).unwrap_or_default();
+                task.queued_at = queued.remove(&task.id);
                 task
             })
             .collect();
@@ -341,6 +362,34 @@ impl DagReader for DagDb<'_> {
         )?)
     }
 
+    fn queued_dispatches(&self) -> Result<Vec<QueuedDispatch>> {
+        rows(
+            self.0,
+            "SELECT run_id, task_id, provider, worktree, allow_main_checkout, retry, args, caller,
+                    queued_at, id
+             FROM queued_dispatches ORDER BY queued_at, rowid",
+            [],
+            |row| {
+                let worktree: wire::WorktreeRequest =
+                    serde_json::from_str(&row.get::<_, String>(3)?)
+                        .map_err(|error| invalid_column(3, error))?;
+                Ok(QueuedDispatch {
+                    id: row.get(9)?,
+                    run: row.get(0)?,
+                    task: row.get(1)?,
+                    provider: enum_column::<wire::Provider>(row, 2)?.into(),
+                    worktree: worktree.into_domain(row.get(4)?),
+                    retry: row.get(5)?,
+                    args: serde_json::from_str(&row.get::<_, String>(6)?)
+                        .map_err(|error| invalid_column(6, error))?,
+                    caller: row.get(7)?,
+                    queued_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
     fn latest_seq(&self) -> Result<u64> {
         Ok(self
             .0
@@ -387,6 +436,45 @@ impl DagTransaction for DagDb<'_> {
             [path.as_os_str().as_bytes()],
         )?;
         Ok(())
+    }
+
+    fn insert_queued(&self, queued: &QueuedDispatch) -> Result<()> {
+        let (worktree, allow_main_checkout) = match queued.worktree.clone() {
+            WorktreeRequest::New { branch, base } => {
+                (wire::WorktreeRequest::New { branch, base }, false)
+            }
+            WorktreeRequest::RetryManaged => (wire::WorktreeRequest::RetryManaged, false),
+            WorktreeRequest::Existing {
+                path,
+                allow_main_checkout,
+            } => (wire::WorktreeRequest::Existing(path), allow_main_checkout),
+        };
+        self.0.execute(
+            "INSERT INTO queued_dispatches
+                 (run_id, task_id, provider, worktree, allow_main_checkout, retry, args, caller,
+                  queued_at, id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                queued.run,
+                queued.task,
+                enum_name(wire::Provider::from(queued.provider.clone()))?,
+                serde_json::to_string(&worktree)?,
+                allow_main_checkout,
+                queued.retry,
+                serde_json::to_string(&queued.args)?,
+                queued.caller,
+                queued.queued_at,
+                queued.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn remove_queued(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .execute("DELETE FROM queued_dispatches WHERE id = ?1", [id])?
+            > 0)
     }
 
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
