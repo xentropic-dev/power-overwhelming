@@ -119,8 +119,7 @@ struct Workspace {
     config_scheme: Option<&'static Scheme>,
     settings_ready: bool,
     daemon_theme: async_channel::Sender<&'static Scheme>,
-    /// Whether keys go to the preview pane instead of the terminal.
-    preview_focus: bool,
+    preview_focus: FocusHandle,
     /// The terminal showing numbered link hints, if any.
     hinting: Option<Entity<TerminalView>>,
     _bar_config: Subscription,
@@ -247,7 +246,7 @@ impl Workspace {
             config_scheme: None,
             settings_ready: false,
             daemon_theme,
-            preview_focus: false,
+            preview_focus: cx.focus_handle(),
             hinting: None,
             main_checkouts: HashMap::new(),
             config_error: None,
@@ -525,7 +524,7 @@ impl Workspace {
         }
         if digit.is_some() {
             if let Some((session, link)) = chosen {
-                self.resolve(session, link, window, cx);
+                self.resolve(session, link, true, window, cx);
             }
         } else if command == Some(Command::HintSearch) {
             self.search_links(window, cx);
@@ -805,14 +804,13 @@ impl Workspace {
             AutoOpen::Never => false,
         };
         if open {
-            self.resolve_in(box_id, artifact.session, artifact.uri, window, cx);
+            self.resolve_in(box_id, artifact.session, artifact.uri, false, window, cx);
         }
     }
 
     fn focus_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_preview_index().is_some() {
-            self.preview_focus = true;
-            self.focus.focus(window);
+            self.preview_focus.focus(window);
             cx.notify();
         }
     }
@@ -853,7 +851,6 @@ impl Workspace {
         if self.previews[active].preview.act(action, window, cx)
             && action == PreviewAction::Interact
         {
-            self.preview_focus = false;
             cx.notify();
         }
     }
@@ -919,7 +916,7 @@ impl Workspace {
         let view = cx.new(|cx| TerminalView::new(session, scheme, window, cx));
         let links = cx.subscribe_in(&view, window, |app, source, link: &OpenLink, window, cx| {
             let id = source.read(cx).session.id.clone();
-            app.resolve(id, link.0.clone(), window, cx);
+            app.resolve(id, link.0.clone(), false, window, cx);
         });
         let agent = cx.subscribe(&view, |app, source, changed: &AgentChanged, cx| {
             let id = &source.read(cx).session.id;
@@ -950,7 +947,6 @@ impl Workspace {
     }
 
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview_focus = false;
         if self.hinting.is_some() {
             self.end_hints(cx);
         }
@@ -1660,7 +1656,7 @@ impl Workspace {
                 self.picker = None;
                 self.restore_focus(window, cx);
                 if let Some(session) = self.active_view() {
-                    self.resolve(session, link, window, cx);
+                    self.resolve(session, link, true, window, cx);
                 }
             }
             Choice::Setup(install) => self.finish_onboarding(install, window, cx),
@@ -2052,7 +2048,7 @@ impl Workspace {
             return;
         }
 
-        if self.preview_focus && self.prefix.is_none() {
+        if self.preview_focus.is_focused(window) && self.prefix.is_none() {
             cx.stop_propagation();
             if let Some(command) = self.keymap.command(Scope::Preview, stroke) {
                 self.preview_command(command, window, cx);
@@ -2138,6 +2134,7 @@ impl Workspace {
         &mut self,
         session: String,
         target: String,
+        focus_preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2145,22 +2142,24 @@ impl Workspace {
             LinkAction::OpenDag(run) => self.open_dag_link(run.to_owned(), window, cx),
             LinkAction::ResolveArtifact => {
                 if let Some(box_id) = self.layout.active_box.clone() {
-                    self.resolve_in(box_id, session, target, window, cx);
+                    self.resolve_in(box_id, session, target, focus_preview, window, cx);
                 }
             }
         }
     }
 
-    /// Opens `target` in `box_id`'s preview pane without moving keyboard focus.
+    /// Opens `target` in `box_id`'s preview pane. Keyboard opens can take focus.
     fn resolve_in(
         &mut self,
         box_id: String,
         session: String,
         target: String,
+        focus_preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let source = session.clone();
+        let opening_focus = focus_preview.then(|| window.focused(cx)).flatten();
         let query = ResolveArtifact { session, target };
         let resolved = cx
             .background_executor()
@@ -2176,12 +2175,16 @@ impl Workspace {
                         Some(format!("{error:#}")),
                     ),
                 };
-                if let Some(target) = &target
-                    && let Some(index) = this
-                        .previews
-                        .iter()
-                        .position(|tab| tab.box_id == box_id && tab.target.as_ref() == Some(target))
-                {
+                // A link may resolve after the user has moved on to another view or shortcut.
+                let take_focus = this.layout.active_box.as_ref() == Some(&box_id)
+                    && this.prefix.is_none()
+                    && this.hinting.is_none()
+                    && opening_focus.is_some_and(|focus| focus.is_focused(window));
+                let existing = this
+                    .previews
+                    .iter()
+                    .position(|tab| tab.box_id == box_id && tab.target == target);
+                let index = if let (Some(target), Some(index)) = (&target, existing) {
                     let tab = &mut this.previews[index];
                     tab.originating_terminal = source;
                     tab.title = title;
@@ -2191,23 +2194,27 @@ impl Workspace {
                         tab.preview.close(window, cx);
                         tab.preview = Preview::open(target, window, cx);
                     }
-                    this.activate_preview(index, cx);
-                    return;
-                }
-                let preview = match &target {
-                    Some(target) => Preview::open(target, window, cx),
-                    None => Preview::Error(error.unwrap_or_default()),
+                    index
+                } else {
+                    let preview = match &target {
+                        Some(target) => Preview::open(target, window, cx),
+                        None => Preview::Error(error.unwrap_or_default()),
+                    };
+                    let id = this.next_id();
+                    this.previews.push(PreviewTab {
+                        id,
+                        box_id,
+                        title,
+                        target,
+                        preview,
+                        originating_terminal: source,
+                    });
+                    this.previews.len() - 1
                 };
-                let id = this.next_id();
-                this.previews.push(PreviewTab {
-                    id,
-                    box_id,
-                    title,
-                    target,
-                    preview,
-                    originating_terminal: source,
-                });
-                this.activate_preview(this.previews.len() - 1, cx);
+                this.activate_preview(index, cx);
+                if take_focus {
+                    this.focus_preview(window, cx);
+                }
             });
         })
         .detach();
@@ -2237,6 +2244,7 @@ impl Workspace {
     }
 
     fn close_preview(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let closing_active = self.active_preview_index() == Some(index);
         let tab = self.previews.remove(index);
         tab.preview.close(window, cx);
         if self.active_previews.get(&tab.box_id) == Some(&tab.id) {
@@ -2256,13 +2264,16 @@ impl Workspace {
                 .any(|view| view.session == tab.originating_terminal)
         }) {
             self.activate_tab(tab.originating_terminal, window, cx);
+        } else if closing_active {
+            self.restore_focus(window, cx);
         }
         cx.notify();
     }
 
-    fn previews(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    fn previews(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let colors = colors(cx);
         let active = self.active_preview_index()?;
+        let focused = self.preview_focus.is_focused(window);
         let tabs =
             self.previews
                 .iter()
@@ -2289,6 +2300,7 @@ impl Workspace {
                 });
         Some(
             div()
+                .track_focus(&self.preview_focus)
                 .w(relative(0.48))
                 .flex_none()
                 .min_w(px(245.))
@@ -2297,7 +2309,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .border_l_1()
-                .border_color(if self.preview_focus {
+                .border_color(if focused {
                     rgb(colors.accent)
                 } else {
                     rgb(colors.raised)
@@ -2320,7 +2332,7 @@ impl Workspace {
                         .overflow_hidden()
                         .child(self.previews[active].preview.render(colors)),
                 )
-                .when(self.preview_focus, |pane| {
+                .when(focused, |pane| {
                     let key = |command| self.keymap.first(Scope::Preview, command);
                     pane.child(
                         div()
@@ -2432,7 +2444,7 @@ fn attention_fill(colors: &Colors, strength: u32) -> u32 {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = colors(cx);
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
@@ -2533,7 +2545,7 @@ impl Render for Workspace {
                     .child(message)
                     .into_any_element()
             });
-        let previews = self.previews(cx);
+        let previews = self.previews(window, cx);
         let entity = cx.weak_entity();
         let modal = self.picker.as_ref().map(|picker| {
             let picker_id = picker.id;

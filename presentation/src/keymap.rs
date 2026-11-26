@@ -228,7 +228,7 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
-    entry(S::Preview, "close", C::PreviewClose, &["x"], "Close preview"),
+    entry(S::Preview, "close", C::PreviewClose, &["escape", "x"], "Close preview"),
     entry(S::Preview, "play", C::PreviewPlay, &["space"], "Play or pause video"),
     entry(S::Preview, "back", C::PreviewBack, &[","], "Back 5 seconds"),
     entry(S::Preview, "forward", C::PreviewForward, &["."], "Forward 5 seconds"),
@@ -236,7 +236,7 @@ const TABLE: &[Entry] = &[
     entry(S::Preview, "scroll_up", C::PreviewScrollUp, &["k", "up"], "Scroll page up"),
     entry(S::Preview, "reload", C::PreviewReload, &["r"], "Reload page"),
     entry(S::Preview, "interact", C::PreviewInteract, &["i"], "Type into the page"),
-    entry(S::Preview, "exit", C::PreviewExit, &["escape"], "Back to the terminal"),
+    entry(S::Preview, "exit", C::PreviewExit, &["tab"], "Back to the terminal"),
     entry(S::Hints, "search", C::HintSearch, &["s"], "Search links and published artifacts"),
     entry(S::Hints, "cancel", C::HintCancel, &["escape"], "Hide the numbers"),
 ];
@@ -526,6 +526,13 @@ mod tests {
             Some(C::PickerDown)
         );
         assert_eq!(keymap.command(Scope::Prefix, &stroke("ctrl-shift-s")), None);
+        for (key, command) in [
+            ("escape", C::PreviewClose),
+            ("x", C::PreviewClose),
+            ("tab", C::PreviewExit),
+        ] {
+            assert_eq!(keymap.command(Scope::Preview, &stroke(key)), Some(command));
+        }
     }
 
     #[test]
