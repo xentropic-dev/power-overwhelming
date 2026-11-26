@@ -810,11 +810,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .context("Specify --worktree to retry an attempt without a managed worktree")?;
                 let path = workspace.validate_box_worktree(repository, &worktree.path)?;
                 ensure!(
-                    matches!(
-                        workspace.branch_exists(repository, &worktree.branch)?,
-                        BranchStatus::Exists { checked_out_at: Some(ref checkout) } if checkout == &path
-                    ),
-                    "Managed branch {:?} is no longer checked out at {}. Specify --worktree to retry",
+                    workspace.owns_worktree(&worktree),
+                    "Managed branch {:?} no longer belongs to Power at {}. Specify --worktree to retry",
                     worktree.branch,
                     path.display(),
                 );
@@ -1176,6 +1173,9 @@ fn report(
         reason: None,
     })
 }
+
+#[path = "worktrees.rs"]
+mod worktrees;
 
 #[cfg(test)]
 mod tests;

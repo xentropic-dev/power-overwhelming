@@ -72,6 +72,7 @@ pub enum KeepReason {
     Dirty,
     Unmerged,
     InUse,
+    NoLongerManaged,
 }
 
 /// Reports the first applicable keep reason in the order dirty, unmerged, in use.

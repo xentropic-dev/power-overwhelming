@@ -18,6 +18,9 @@ use std::{
     thread,
 };
 
+#[path = "../worktrees/tests.rs"]
+mod worktrees;
+
 #[derive(Clone, Default)]
 struct Records {
     agents: Vec<ManagedAgent>,
@@ -195,8 +198,12 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
-    fn remove_worktree(&self, _path: &Path) -> Result<()> {
-        bail!("Unexpected managed worktree removal")
+    fn remove_worktree(&self, path: &Path) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .worktrees
+            .retain(|record| record.path != path);
+        Ok(())
     }
 
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
@@ -404,6 +411,10 @@ impl Workspace for FakeWorkspace {
             path,
             base_commit: format!("resolved-{base}"),
         })
+    }
+
+    fn owns_worktree(&self, worktree: &ManagedWorktree) -> bool {
+        self.0.lock().unwrap().branches.get(&worktree.branch) == Some(&Some(worktree.path.clone()))
     }
 
     fn worktree_status(&self, _path: &Path) -> Result<WorktreeStatus> {

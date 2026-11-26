@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use application::{BranchStatus, CreatedWorktree, Workspace, WorktreeRoot, WorktreeStatus};
+use domain::worktree::ManagedWorktree;
 use std::{
     ffi::{OsStr, OsString},
     fs,
@@ -173,10 +174,36 @@ impl Workspace for LocalWorkspace {
             .arg(&path)
             .arg(&base_commit);
         git_output(command)?;
-        Ok(CreatedWorktree {
-            path: path.canonicalize()?,
-            base_commit,
-        })
+        let created = (|| {
+            let path = path.canonicalize()?;
+            fs::write(
+                worktree_marker(&path)?,
+                marker_contents(branch, &base_commit),
+            )
+            .context("Record Power worktree ownership in Git metadata")?;
+            Ok(CreatedWorktree { path, base_commit })
+        })();
+        if created.is_err()
+            && let Err(cleanup) = self.remove_worktree(&path, true)
+        {
+            return created
+                .with_context(|| format!("Could not undo worktree creation: {cleanup:#}"));
+        }
+        created
+    }
+
+    fn owns_worktree(&self, worktree: &ManagedWorktree) -> bool {
+        let Ok(path) = self.validate_box_worktree(&worktree.repository, &worktree.path) else {
+            return false;
+        };
+        let branch = format!("refs/heads/{}", worktree.branch);
+        path == worktree.path
+            && matches!(symbolic_ref(&path, "HEAD"), Ok(Some(head)) if head == branch.as_str())
+            && worktree_marker(&path)
+                .and_then(|marker| Ok(fs::read_to_string(marker)?))
+                .is_ok_and(|contents| {
+                    contents == marker_contents(&worktree.branch, &worktree.base_commit)
+                })
     }
 
     fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus> {
@@ -254,6 +281,17 @@ impl Workspace for LocalWorkspace {
     fn list_worktrees(&self, directory: &Path) -> Result<Vec<PathBuf>> {
         worktree_listing(git_in(directory))
     }
+}
+
+fn worktree_marker(path: &Path) -> Result<PathBuf> {
+    let mut command = git_in(path);
+    command.args(["rev-parse", "--absolute-git-dir"]);
+    let output = git_output(command)?;
+    Ok(Path::new(git_line(&output)).join("power-managed-worktree"))
+}
+
+fn marker_contents(branch: &str, base_commit: &str) -> String {
+    format!("{branch}\n{base_commit}\n")
 }
 
 fn resolve_commit(directory: &Path, revision: &str) -> Result<String> {
@@ -421,6 +459,39 @@ mod tests {
         ])?;
         let checkout = Checkout::discover(&root.join("bare linked"))?;
         assert_eq!(main_checkout(&checkout.repository)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_recreated_checkout_with_the_same_path_and_branch_is_not_managed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let main = init_repository(&root)?;
+        let repository = Checkout::discover(&main)?.repository;
+        let created =
+            LocalWorkspace.create_worktree(&repository, &root.join("worker"), "feature", "main")?;
+        let worktree = ManagedWorktree {
+            box_id: "test".into(),
+            repository,
+            path: created.path,
+            branch: "feature".into(),
+            base_commit: created.base_commit,
+            created_at: 0,
+            creator: domain::worktree::WorktreeCreator::View {
+                box_id: "test".into(),
+                session: "source".into(),
+            },
+        };
+        assert!(LocalWorkspace.owns_worktree(&worktree));
+
+        LocalWorkspace.remove_worktree(&worktree.path, false)?;
+        let mut command = git_in(&main);
+        command
+            .args(["worktree", "add", "--"])
+            .arg(&worktree.path)
+            .arg("feature");
+        git_output(command)?;
+        assert!(!LocalWorkspace.owns_worktree(&worktree));
         Ok(())
     }
 

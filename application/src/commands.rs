@@ -65,6 +65,8 @@ impl<T: TerminalRuntime> Application<T> {
         command: StartSession,
         options: SessionOptions,
     ) -> Result<Session> {
+        // Prune checks live sessions and removes worktrees while holding this lock.
+        let mut sessions = self.sessions.lock().unwrap();
         let session = Session {
             id: (self.new_id)(),
             worktree: self.workspace.open_worktree(&command.worktree)?,
@@ -82,19 +84,29 @@ impl<T: TerminalRuntime> Application<T> {
             cwd: None,
         })?;
         let id = session.id.clone();
-        self.launch(session, options).inspect_err(|_| {
-            let _ = self.records.remove(&id);
-        })
+        self.launch_into(&mut sessions, session, options)
+            .inspect_err(|_| {
+                let _ = self.records.remove(&id);
+            })
     }
 
     /// Starts a terminal under the session's existing ID without touching its record.
     pub(crate) fn launch(&self, session: Session, options: SessionOptions) -> Result<Session> {
+        self.launch_into(&mut self.sessions.lock().unwrap(), session, options)
+    }
+
+    fn launch_into(
+        &self,
+        sessions: &mut std::collections::BTreeMap<String, Live<T::Handle>>,
+        session: Session,
+        options: SessionOptions,
+    ) -> Result<Session> {
         let profile = match &session.agent {
             Agent::Shell => None,
             Agent::Coding(id) => Some(self.agents.resolve(id)?),
         };
         let terminal = self.runtime.start(&session, options, profile)?;
-        self.sessions.lock().unwrap().insert(
+        sessions.insert(
             session.id.clone(),
             Live {
                 session: session.clone(),
