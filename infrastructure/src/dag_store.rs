@@ -3,12 +3,14 @@ use anyhow::{Context, Result};
 use application::dag::{DagReader, DagStore, DagTransaction, EventScope, OpenAttempt, now};
 use domain::{
     dag::{Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState},
-    worktree::ManagedWorktree,
+    worktree::{ManagedWorktree, WorktreeCreator},
 };
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::IntoDeserializer};
 use std::{
     collections::HashMap,
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -57,7 +59,21 @@ impl SqliteDagStore {
                  seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id),
                  kind TEXT NOT NULL, task_id TEXT, attempt_id TEXT, summary TEXT, at INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS run_events ON events(run_id, seq);",
+             CREATE INDEX IF NOT EXISTS run_events ON events(run_id, seq);
+             CREATE TABLE IF NOT EXISTS worktrees (
+                 path BLOB NOT NULL PRIMARY KEY, box_id TEXT NOT NULL, repository BLOB NOT NULL,
+                 branch TEXT NOT NULL, base_commit TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 creator_run TEXT, creator_task TEXT, creator_attempt TEXT UNIQUE,
+                 creator_box TEXT, creator_session TEXT,
+                 CHECK (
+                     (creator_run IS NOT NULL AND creator_task IS NOT NULL
+                      AND creator_attempt IS NOT NULL AND creator_box IS NULL
+                      AND creator_session IS NULL)
+                     OR
+                     (creator_run IS NULL AND creator_task IS NULL AND creator_attempt IS NULL
+                      AND creator_box IS NOT NULL AND creator_session IS NOT NULL)
+                 )
+             );",
         )?;
         let has_model: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name = 'model')",
@@ -152,16 +168,35 @@ impl DagDb<'_> {
 }
 
 impl DagReader for DagDb<'_> {
-    fn list_worktrees(&self, _box_id: Option<&str>) -> Result<Vec<ManagedWorktree>> {
-        todo!()
+    fn list_worktrees(&self, box_id: Option<&str>) -> Result<Vec<ManagedWorktree>> {
+        Ok(rows(
+            self.0,
+            &format!("{WORKTREE_SELECT} WHERE (?1 IS NULL OR box_id = ?1) ORDER BY rowid"),
+            [box_id],
+            worktree_from_row,
+        )?)
     }
 
-    fn find_worktree_by_attempt(&self, _attempt: &str) -> Result<Option<ManagedWorktree>> {
-        todo!()
+    fn find_worktree_by_attempt(&self, attempt: &str) -> Result<Option<ManagedWorktree>> {
+        Ok(self
+            .0
+            .query_row(
+                &format!("{WORKTREE_SELECT} WHERE creator_attempt = ?1"),
+                [attempt],
+                worktree_from_row,
+            )
+            .optional()?)
     }
 
-    fn find_worktree_by_path(&self, _path: &Path) -> Result<Option<ManagedWorktree>> {
-        todo!()
+    fn find_worktree_by_path(&self, path: &Path) -> Result<Option<ManagedWorktree>> {
+        Ok(self
+            .0
+            .query_row(
+                &format!("{WORKTREE_SELECT} WHERE path = ?1"),
+                [path.as_os_str().as_bytes()],
+                worktree_from_row,
+            )
+            .optional()?)
     }
 
     fn list_agents(&self, box_id: Option<&str>) -> Result<Vec<ManagedAgent>> {
@@ -292,12 +327,42 @@ impl DagReader for DagDb<'_> {
 }
 
 impl DagTransaction for DagDb<'_> {
-    fn insert_worktree(&self, _worktree: &ManagedWorktree) -> Result<()> {
-        todo!()
+    fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()> {
+        let (run, task, attempt, creator_box, session) = match &worktree.creator {
+            WorktreeCreator::Attempt { run, task, attempt } => {
+                (Some(run), Some(task), Some(attempt), None, None)
+            }
+            WorktreeCreator::View { box_id, session } => {
+                (None, None, None, Some(box_id), Some(session))
+            }
+        };
+        self.0.execute(
+            "INSERT INTO worktrees (path, box_id, repository, branch, base_commit, created_at,
+                                    creator_run, creator_task, creator_attempt, creator_box, creator_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                worktree.path.as_os_str().as_bytes(),
+                worktree.box_id,
+                worktree.repository.as_os_str().as_bytes(),
+                worktree.branch,
+                worktree.base_commit,
+                worktree.created_at,
+                run,
+                task,
+                attempt,
+                creator_box,
+                session,
+            ],
+        )?;
+        Ok(())
     }
 
-    fn remove_worktree(&self, _path: &Path) -> Result<()> {
-        todo!()
+    fn remove_worktree(&self, path: &Path) -> Result<()> {
+        self.0.execute(
+            "DELETE FROM worktrees WHERE path = ?1",
+            [path.as_os_str().as_bytes()],
+        )?;
+        Ok(())
     }
 
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
@@ -417,6 +482,33 @@ impl DagTransaction for DagDb<'_> {
     }
 }
 
+const WORKTREE_SELECT: &str = "SELECT path, box_id, repository, branch, base_commit, created_at,
+                                     creator_run, creator_task, creator_attempt, creator_box, creator_session
+                              FROM worktrees";
+
+fn worktree_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedWorktree> {
+    let creator = match row.get::<_, Option<String>>(8)? {
+        Some(attempt) => WorktreeCreator::Attempt {
+            run: row.get(6)?,
+            task: row.get(7)?,
+            attempt,
+        },
+        None => WorktreeCreator::View {
+            box_id: row.get(9)?,
+            session: row.get(10)?,
+        },
+    };
+    Ok(ManagedWorktree {
+        path: PathBuf::from(OsString::from_vec(row.get(0)?)),
+        box_id: row.get(1)?,
+        repository: PathBuf::from(OsString::from_vec(row.get(2)?)),
+        branch: row.get(3)?,
+        base_commit: row.get(4)?,
+        created_at: row.get(5)?,
+        creator,
+    })
+}
+
 const AGENT_SELECT: &str =
     "SELECT a.id, a.box_id, a.worktree, a.provider, a.parent, a.session, p.run_id, p.task_id,
             p.id, a.state, a.label, a.created_at, a.model
@@ -504,10 +596,13 @@ fn invalid_column(
 mod tests {
     use super::*;
     use domain::dag::Provider;
+    use std::ffi::OsStr;
 
     #[test]
-    fn reads_prior_agent_and_attempt_records() -> Result<()> {
-        let db = Connection::open_in_memory()?;
+    fn migrates_prior_agent_and_attempt_records() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dag.sqlite3");
+        let db = Connection::open(&path)?;
         db.execute_batch(
             "CREATE TABLE agents (
                 id TEXT PRIMARY KEY, box_id TEXT NOT NULL, worktree TEXT NOT NULL,
@@ -522,6 +617,7 @@ mod tests {
         let store = SqliteDagStore::initialize(db)?;
         store.0.lock().unwrap().execute_batch(
             r#"
+            DROP TABLE IF EXISTS worktrees;
             INSERT INTO runs VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
             INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');
             INSERT INTO attempts VALUES
@@ -530,8 +626,11 @@ mod tests {
                 ('attempt-c', 'run', 'task', 3, 'c', 'succeeded', NULL, NULL, NULL, 5, 6);
             "#,
         )?;
+        drop(store);
 
+        let store = SqliteDagStore::initialize(Connection::open(&path)?)?;
         store.read(|db| {
+            assert!(db.list_worktrees(None)?.is_empty());
             let run = db.run("run")?;
             let attempts = &run.tasks[0].attempts;
             assert_eq!(attempts.len(), 3);
@@ -546,6 +645,79 @@ mod tests {
                 assert_eq!(agent.provider, expected);
                 assert_eq!(agent.model, None);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn stores_and_removes_worktree_ownership_records() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dag.sqlite3");
+        let store = SqliteDagStore::initialize(Connection::open(&path)?)?;
+        let worker = ManagedWorktree {
+            box_id: "worker-box".into(),
+            repository: "/repos/worker".into(),
+            path: "/worktrees/worker/feature".into(),
+            branch: "feature/worker".into(),
+            base_commit: "abc123".into(),
+            created_at: 10,
+            creator: WorktreeCreator::Attempt {
+                run: "run".into(),
+                task: "task".into(),
+                attempt: "attempt".into(),
+            },
+        };
+        let tab = ManagedWorktree {
+            box_id: "tab-box".into(),
+            repository: OsStr::from_bytes(b"/repos/tab-\xff").into(),
+            path: OsStr::from_bytes(b"/worktrees/tab-\xff/feature").into(),
+            branch: "feature/tab".into(),
+            base_commit: "def456".into(),
+            created_at: 20,
+            creator: WorktreeCreator::View {
+                box_id: "tab-box".into(),
+                session: "view-session".into(),
+            },
+        };
+
+        store.write(|db| {
+            db.insert_worktree(&worker)?;
+            db.insert_worktree(&tab)
+        })?;
+        let duplicate_path = ManagedWorktree {
+            path: worker.path.clone(),
+            ..tab.clone()
+        };
+        assert!(
+            store
+                .write(|db| db.insert_worktree(&duplicate_path))
+                .is_err()
+        );
+        drop(store);
+
+        let store = SqliteDagStore::initialize(Connection::open(&path)?)?;
+        store.read(|db| {
+            assert_eq!(
+                db.find_worktree_by_attempt("attempt")?,
+                Some(worker.clone())
+            );
+            assert_eq!(db.find_worktree_by_attempt("unknown")?, None);
+            assert_eq!(db.find_worktree_by_path(&tab.path)?, Some(tab.clone()));
+            assert_eq!(db.find_worktree_by_path(Path::new("/unknown"))?, None);
+            assert_eq!(
+                db.list_worktrees(Some("worker-box"))?.as_slice(),
+                std::slice::from_ref(&worker)
+            );
+            assert!(db.list_worktrees(Some("unknown"))?.is_empty());
+            assert_eq!(db.list_worktrees(None)?, [worker.clone(), tab.clone()]);
+            Ok(())
+        })?;
+
+        store.write(|db| db.remove_worktree(&worker.path))?;
+        store.read(|db| {
+            assert_eq!(db.find_worktree_by_path(&worker.path)?, None);
+            assert_eq!(db.find_worktree_by_attempt("attempt")?, None);
+            assert_eq!(db.list_worktrees(None)?, [tab]);
             Ok(())
         })
     }
