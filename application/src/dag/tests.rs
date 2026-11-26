@@ -34,6 +34,24 @@ struct MemoryStore(Mutex<Records>);
 
 struct MemoryDb(RefCell<Records>);
 
+impl MemoryDb {
+    /// Derives the display status from the agent's attempt, as the SQLite store does.
+    fn with_status(&self, mut agent: ManagedAgent) -> ManagedAgent {
+        let attempt = self
+            .0
+            .borrow()
+            .runs
+            .iter()
+            .flat_map(|run| &run.tasks)
+            .flat_map(|task| &task.attempts)
+            .filter(|attempt| attempt.agent == agent.id)
+            .max_by_key(|attempt| (attempt.number, attempt.started_at))
+            .map(|attempt| attempt.state);
+        agent.status = AgentStatus::derive(agent.state, attempt);
+        agent
+    }
+}
+
 impl DagStore for MemoryStore {
     fn read<T>(&self, query: impl FnOnce(&dyn DagReader) -> Result<T>) -> Result<T> {
         let records = self.0.lock().unwrap();
@@ -84,6 +102,7 @@ impl DagReader for MemoryDb {
             .iter()
             .find(|agent| agent.id == id)
             .cloned()
+            .map(|agent| self.with_status(agent))
             .context("Unknown agent")
     }
 
@@ -94,7 +113,8 @@ impl DagReader for MemoryDb {
             .agents
             .iter()
             .find(|agent| agent.session.as_deref() == Some(session))
-            .cloned())
+            .cloned()
+            .map(|agent| self.with_status(agent)))
     }
 
     fn list_agents(&self, box_id: Option<&str>) -> Result<Vec<ManagedAgent>> {
@@ -104,7 +124,7 @@ impl DagReader for MemoryDb {
             .agents
             .iter()
             .filter(|agent| box_id.is_none_or(|id| agent.box_id == id))
-            .cloned()
+            .map(|agent| self.with_status(agent.clone()))
             .collect())
     }
 
@@ -115,7 +135,7 @@ impl DagReader for MemoryDb {
             .agents
             .iter()
             .filter(|agent| agent.worktree == worktree)
-            .cloned()
+            .map(|agent| self.with_status(agent.clone()))
             .collect())
     }
 
@@ -1233,6 +1253,18 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         ReportStatus::Success,
         "Prerequisite result",
     )?;
+    let statuses: Vec<_> = dag
+        .list_agents(selection())?
+        .into_iter()
+        .map(|agent| (agent.id, agent.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            (coordinator.clone(), AgentStatus::Idle),
+            (first.agent.id.clone(), AgentStatus::Done)
+        ]
+    );
     let worker = dag.dispatch(Dispatch {
         task: "join".into(),
         provider: Provider::Agent("claude".into()),
@@ -1259,6 +1291,43 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         "Full worker contract: `power skills get power-dag --reference worker-contract`.",
     ] {
         assert!(prompt.contains(expected), "{prompt}");
+    }
+    Ok(())
+}
+
+#[test]
+fn agent_status_follows_the_attempt_while_the_session_lives() -> Result<()> {
+    let (dag, run) = setup()?;
+    let tasks = ["blocked", "done", "failed", "exited"];
+    dag.add_tasks(&run, &tasks.map(|id| spec(id, &[])))?;
+    let working = dag.dispatch(command(&run, false))?;
+    assert_eq!(working.agent.status, AgentStatus::Working);
+    let [blocked, done, failed, exited] = tasks.map(|task| {
+        dag.dispatch(Dispatch {
+            task: task.into(),
+            ..command(&run, false)
+        })
+        .unwrap()
+    });
+    for (task, attempt, status) in [
+        ("blocked", &blocked, ReportStatus::NeedsInput),
+        ("done", &done, ReportStatus::Success),
+        ("failed", &failed, ReportStatus::Failed),
+        ("exited", &exited, ReportStatus::Success),
+    ] {
+        dag.report(&run, task, &attempt.attempt.id, status, "summary")?;
+    }
+    dag.session_exited(exited.agent.session.as_deref().unwrap(), "closed")?;
+
+    let status = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.status);
+    assert_eq!(status(&working.agent.id)?, AgentStatus::Working);
+    assert_eq!(status(&blocked.agent.id)?, AgentStatus::NeedsInput);
+    assert_eq!(status(&done.agent.id)?, AgentStatus::Done);
+    assert_eq!(status(&failed.agent.id)?, AgentStatus::Failed);
+    assert_eq!(status(&exited.agent.id)?, AgentStatus::Exited);
+    for agent in [&working, &blocked, &done, &failed] {
+        let state = dag.store.read(|db| db.agent(&agent.agent.id))?.state;
+        assert_eq!(state, AgentState::Running);
     }
     Ok(())
 }

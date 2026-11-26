@@ -94,6 +94,48 @@ pub enum AgentState {
     Exited,
 }
 
+/// What an agent is doing, for display. Derived from the agent's state and its attempt when
+/// agents are read; never persisted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentStatus {
+    /// Its attempt is active.
+    Working,
+    NeedsInput,
+    /// Its attempt succeeded and its session is still alive.
+    Done,
+    /// Its attempt failed or was interrupted and its session is still alive.
+    Failed,
+    /// Running without an attempt, such as a coordinator.
+    Idle,
+    Exited,
+}
+
+impl AgentStatus {
+    pub fn derive(state: AgentState, attempt: Option<AttemptState>) -> Self {
+        match (state, attempt) {
+            (AgentState::Exited, _) => Self::Exited,
+            (AgentState::Running, None) => Self::Idle,
+            (AgentState::Running, Some(AttemptState::Active)) => Self::Working,
+            (AgentState::Running, Some(AttemptState::NeedsInput)) => Self::NeedsInput,
+            (AgentState::Running, Some(AttemptState::Succeeded)) => Self::Done,
+            (AgentState::Running, Some(AttemptState::Failed | AttemptState::Interrupted)) => {
+                Self::Failed
+            }
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::NeedsInput => "needs input",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Idle => "idle",
+            Self::Exited => "exited",
+        }
+    }
+}
+
 /// A coding agent or fixture process managed by Power. Tab attachment is tracked by the
 /// desktop, independently of this record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +153,8 @@ pub struct ManagedAgent {
     pub task: Option<String>,
     pub attempt: Option<String>,
     pub state: AgentState,
+    /// Derived from `state` and the attempt's state when read; never persisted.
+    pub status: AgentStatus,
     /// Short label, the task title for DAG workers.
     pub label: String,
     /// Unix seconds.

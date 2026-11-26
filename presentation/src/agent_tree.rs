@@ -64,8 +64,9 @@ impl AgentTree {
                 .file_name()
                 .unwrap_or(agent.worktree.as_os_str());
             let text = format!(
-                "{} {} {} {} {}",
+                "{} {} {} {} {} {}",
                 agent.label,
+                agent.status.label(),
                 agent.task.as_deref().unwrap_or(""),
                 agent.provider.name(),
                 agent.model.as_deref().unwrap_or(""),
@@ -188,6 +189,7 @@ mod tests {
             task: None,
             attempt: None,
             state: infrastructure::client::AgentState::Running,
+            status: infrastructure::client::AgentStatus::Idle,
             label: id.into(),
             created_at: 0,
         }
@@ -202,15 +204,17 @@ mod tests {
             "/repo/api-fix",
         );
         worker.model = Some("sonnet-4".into());
+        let mut unrelated = agent(
+            "unrelated",
+            None,
+            Provider::Agent("codex".into()),
+            "/repo/unrelated",
+        );
+        unrelated.status = infrastructure::client::AgentStatus::Failed;
         let mut tree = AgentTree::new(vec![
             worker,
             agent("delegator", None, Provider::Agent("codex".into()), "/repo"),
-            agent(
-                "unrelated",
-                None,
-                Provider::Agent("codex".into()),
-                "/repo/unrelated",
-            ),
+            unrelated,
             agent(
                 "delegate",
                 Some("delegator"),
@@ -223,6 +227,9 @@ mod tests {
         assert_eq!(tree.branch(0, false), Some(0));
         assert_eq!(tree.rows().count(), 2);
         assert_eq!(tree.search("clade apfx", &mut matcher), 2);
+        tree.search("failed", &mut matcher);
+        let failed: Vec<_> = tree.rows().map(|(agent, ..)| agent.id.as_str()).collect();
+        assert_eq!(failed, ["unrelated"]);
         assert_eq!(tree.search("sonnet-4", &mut matcher), 2);
         assert_eq!(
             tree.rows()

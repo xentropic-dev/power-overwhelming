@@ -387,6 +387,20 @@ pub enum AgentState {
     Exited,
 }
 
+/// What an agent is doing, derived by the daemon from its state and its attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Working,
+    NeedsInput,
+    Done,
+    Failed,
+    /// Also assumed when an older daemon omits the status.
+    #[default]
+    Idle,
+    Exited,
+}
+
 /// A Claude Code, Codex, or fixture process managed by Power. Tab attachment is tracked by the
 /// desktop, independently of this record.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -405,6 +419,8 @@ pub struct ManagedAgent {
     pub task: Option<String>,
     pub attempt: Option<String>,
     pub state: AgentState,
+    #[serde(default)]
+    pub status: AgentStatus,
     /// Short label, the task title for DAG workers.
     pub label: String,
     /// Unix seconds.
@@ -950,6 +966,14 @@ mod dag_dto {
     }
 
     enum_dto!(AgentState { Running, Exited });
+    enum_dto!(AgentStatus {
+        Working,
+        NeedsInput,
+        Done,
+        Failed,
+        Idle,
+        Exited
+    });
     enum_dto!(Coordinator { Agent { agent }, External { label } });
     enum_dto!(TaskState {
         Waiting,
@@ -1007,6 +1031,7 @@ mod dag_dto {
         task,
         attempt,
         state,
+        status,
         label,
         created_at,
     });
