@@ -626,7 +626,10 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
             skills_dir: None,
-            resume: None,
+            resume: Some(domain::agent::Resume {
+                resume_last: vec!["--continue".into()],
+                ..Default::default()
+            }),
         })
         .collect();
     Arc::new(Application::new(
@@ -1230,6 +1233,117 @@ fn reconcile_stops_restored_agents_whose_worktree_is_gone_unless_an_attempt_is_o
     assert_eq!(
         snapshot.tasks[0].attempts.last().unwrap().state,
         AttemptState::Active
+    );
+    Ok(())
+}
+
+#[test]
+fn restore_tells_only_workers_with_active_attempts_to_continue() -> Result<()> {
+    let application = application();
+    let caller = application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Coding("claude".into()),
+    })?;
+    let plain = application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Coding("claude".into()),
+    })?;
+    let dag = TestDag::new(
+        application,
+        MemoryStore::default(),
+        FakeRegistry(vec![caller.id.clone(), plain.id.clone()]),
+        FakeIcons::default(),
+    );
+    let run = dag.create_run(
+        BoxSelection {
+            selector: None,
+            caller: Some(caller.id.clone()),
+        },
+        "Restart".into(),
+        None,
+    )?;
+    dag.add_tasks(&run.id, &[spec("work", &[]), spec("blocked", &[])])?;
+    let claude = |task: &str| Dispatch {
+        task: task.into(),
+        provider: Provider::Agent("claude".into()),
+        args: Vec::new(),
+        caller: Some(caller.id.clone()),
+        ..command(&run.id, false)
+    };
+    let working = dag.dispatch(claude("work"))?;
+    let blocked = dag.dispatch(claude("blocked"))?;
+    dag.report(
+        &run.id,
+        "blocked",
+        &blocked.attempt.id,
+        ReportStatus::NeedsInput,
+        "question",
+    )?;
+    // Saved records must point at a real directory to be restored.
+    let worktree = tempfile::tempdir()?;
+    for mut record in dag.application.records.list()? {
+        record.worktree = worktree.path().into();
+        dag.application.records.save(&record)?;
+    }
+    let launched = dag.application.runtime.launches.lock().unwrap().len();
+    let before = dag.latest_seq()?;
+
+    let restored = dag.restore()?;
+
+    let working_session = working.agent.session.clone().unwrap();
+    let blocked_session = blocked.agent.session.clone().unwrap();
+    assert_eq!(restored.len(), 4);
+    let launches = dag.application.runtime.launches.lock().unwrap();
+    let prompts: BTreeMap<_, _> = launches[launched..]
+        .iter()
+        .map(|(session, options)| {
+            assert_eq!(options.args, ["--continue"]);
+            (session.id.clone(), options.initial_prompt.clone())
+        })
+        .collect();
+    assert_eq!(prompts.len(), 4);
+    let prompt = prompts[&working_session]
+        .as_deref()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    for expected in [
+        "Power restarted",
+        &format!("run {}", run.id),
+        "task work",
+        "worker-contract",
+    ] {
+        assert!(
+            prompt.contains(expected),
+            "{expected:?} missing from {prompt:?}"
+        );
+    }
+    for session in [&blocked_session, &caller.id, &plain.id] {
+        assert_eq!(
+            prompts[session], None,
+            "{session} must resume without a prompt"
+        );
+    }
+    drop(launches);
+    let page = dag.events(EventScope::Run(&run.id, &[]), before, Duration::ZERO)?;
+    let events: Vec<_> = page
+        .events
+        .iter()
+        .map(|event| (event.kind, event.task.as_deref(), event.attempt.as_deref()))
+        .collect();
+    assert_eq!(
+        events,
+        [(
+            RunEventKind::AttemptResumed,
+            Some("work"),
+            Some(working.attempt.id.as_str())
+        )]
+    );
+    let snapshot = dag.run(&run.id)?;
+    assert_eq!(snapshot.tasks[0].state, TaskState::Working);
+    assert_eq!(
+        snapshot.tasks[1].attempts.last().unwrap().state,
+        AttemptState::NeedsInput
     );
     Ok(())
 }

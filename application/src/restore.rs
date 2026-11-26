@@ -6,6 +6,14 @@ use domain::{
 };
 use std::ffi::OsString;
 
+/// A session that `restore_sessions_with` relaunched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoredSession {
+    pub id: String,
+    /// Whether the resumed agent received a continuation prompt.
+    pub prompted: bool,
+}
+
 /// What to do with one saved session on daemon start.
 enum Plan {
     Launch(SessionOptions),
@@ -18,9 +26,23 @@ impl<T: TerminalRuntime> Application<T> {
     /// One failing record does not stop the others. A failed record is kept so a later
     /// restart can retry it, or the user can close its tab to forget it.
     pub fn restore_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .restore_sessions_with(|_| None)?
+            .into_iter()
+            .map(|restored| restored.id)
+            .collect())
+    }
+
+    /// Restores like `restore_sessions`. A coding agent that resumes its conversation
+    /// also receives the prompt `continuation` returns for its session ID, passed the
+    /// way a launch passes the initial prompt. A fresh fallback start never receives it.
+    pub fn restore_sessions_with(
+        &self,
+        continuation: impl Fn(&str) -> Option<String>,
+    ) -> Result<Vec<RestoredSession>> {
         let mut restored = Vec::new();
         for record in self.records.list()? {
-            let options = match self.restore_plan(&record) {
+            let options = match self.restore_plan(&record, &continuation) {
                 Ok(Plan::Launch(options)) => options,
                 Ok(Plan::Drop(reason)) => {
                     eprintln!("Not restoring session {}: {reason}.", record.id);
@@ -39,15 +61,23 @@ impl<T: TerminalRuntime> Application<T> {
                 worktree: record.worktree.clone(),
                 agent: record.agent.clone(),
             };
+            let prompted = options.initial_prompt.is_some();
             match self.launch(session, options) {
-                Ok(_) => restored.push(record.id),
+                Ok(_) => restored.push(RestoredSession {
+                    id: record.id,
+                    prompted,
+                }),
                 Err(error) => eprintln!("Could not restore session {}. {error:#}", record.id),
             }
         }
         Ok(restored)
     }
 
-    fn restore_plan(&self, record: &SessionRecord) -> Result<Plan> {
+    fn restore_plan(
+        &self,
+        record: &SessionRecord,
+        continuation: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Plan> {
         if !record.worktree.is_dir() {
             return Ok(Plan::Drop("its worktree no longer exists"));
         }
@@ -64,6 +94,7 @@ impl<T: TerminalRuntime> Application<T> {
                     fresh.extend(record.args.iter().cloned());
                     options.args = resume;
                     options.fallback_args = Some(fresh);
+                    options.initial_prompt = continuation(&record.id).map(Into::into);
                 }
                 options.args.extend(record.args.iter().cloned());
             }
@@ -459,6 +490,58 @@ mod tests {
         );
         assert!(application.terminal("shell-tab").is_ok());
         assert_eq!(store.list()?[3].args, Vec::<OsString>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_passes_a_continuation_prompt_only_to_resumed_coding_agents() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        let mut worker = record("worker", root, coding("claude"), &["--model", "opus"]);
+        worker.conversation = Some("conv".into());
+        let idle = record("idle", root, coding("claude"), &[]);
+        // Without resume arguments the agent starts fresh, so a nudge means nothing.
+        let fresh = record("fresh", root, coding("plain"), &[]);
+        let mut shell = record("shell", root, Agent::Shell, &[]);
+        shell.foreground = coding("claude");
+        for record in [&worker, &idle, &fresh, &shell] {
+            store.save(record)?;
+        }
+        let (application, starts) = app(store.clone());
+
+        let restored = application
+            .restore_sessions_with(|id| (id != "idle").then(|| format!("continue {id}")))?;
+
+        let prompted: Vec<_> = restored
+            .iter()
+            .map(|session| (session.id.as_str(), session.prompted))
+            .collect();
+        assert_eq!(
+            prompted,
+            [
+                ("worker", true),
+                ("idle", false),
+                ("fresh", false),
+                ("shell", false)
+            ]
+        );
+        let starts = starts.0.lock().unwrap();
+        let (_, options) = &starts[0];
+        assert_eq!(options.args, os(&["--resume", "conv", "--model", "opus"]));
+        assert_eq!(
+            options.initial_prompt.as_deref(),
+            Some("continue worker".as_ref())
+        );
+        assert!(
+            starts[1..]
+                .iter()
+                .all(|(_, options)| options.initial_prompt.is_none())
+        );
+        assert!(
+            !format!("{:?}", store.list()?).contains("continue"),
+            "the continuation prompt must never be persisted"
+        );
         Ok(())
     }
 

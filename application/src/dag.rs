@@ -750,16 +750,57 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         })
     }
 
+    /// Restores saved sessions on daemon start, then reconciles attempts with them.
+    /// A resumed conversation waits for input, so a worker whose attempt is still active
+    /// is told to continue, and its run records `AttemptResumed`. Workers waiting on the
+    /// user, coordinators and plain sessions resume without a prompt.
+    pub fn restore(&self) -> Result<Vec<String>> {
+        let active: BTreeMap<String, OpenAttempt> = self.store.read(|db| {
+            Ok(db
+                .open_attempts(None)?
+                .into_iter()
+                .filter(|open| open.attempt.state == AttemptState::Active)
+                .filter_map(|open| Some((open.attempt.session.clone()?, open)))
+                .collect())
+        })?;
+        let restored = self
+            .application
+            .restore_sessions_with(|session| active.get(session).map(continuation_prompt))?;
+        let resumed: Vec<_> = restored
+            .iter()
+            .filter(|session| session.prompted)
+            .filter_map(|session| active.get(&session.id))
+            .collect();
+        let restored: Vec<_> = restored.into_iter().map(|session| session.id).collect();
+        self.reconcile_restored(&restored, &resumed)?;
+        Ok(restored)
+    }
+
     /// Interrupts attempts and stops agents whose session did not survive a restart.
     /// Those in `restored` keep running under their original session IDs, unless their
     /// worktree is gone and they have no open attempt.
     pub fn reconcile(&self, restored: &[String]) -> Result<()> {
+        self.reconcile_restored(restored, &[])
+    }
+
+    /// Reconciles like `reconcile`, and records `AttemptResumed` for each attempt in
+    /// `resumed`, whose worker was told to continue.
+    fn reconcile_restored(&self, restored: &[String], resumed: &[&OpenAttempt]) -> Result<()> {
         let restored = |session: Option<&str>| {
             session.is_some_and(|session| restored.iter().any(|id| id == session))
         };
         let workspace = self.application.workspace.as_ref();
         self.write(|db| {
             interrupt(db, None, RESTART_DETAIL, &restored)?;
+            for open in resumed {
+                db.event(
+                    &open.run,
+                    RunEventKind::AttemptResumed,
+                    Some(&open.task),
+                    Some(&open.attempt.id),
+                    Some(RESUME_DETAIL),
+                )?;
+            }
             let attempting: BTreeSet<_> = db
                 .open_attempts(None)?
                 .into_iter()
@@ -1145,6 +1186,17 @@ fn select_box<'a>(entries: &'a [RegisteredBox], selector: &str) -> Result<&'a Re
 }
 
 const RESTART_DETAIL: &str = "daemon restarted; session unavailable";
+const RESUME_DETAIL: &str = "daemon restarted; session resumed and told to continue";
+
+/// What a worker whose session was resumed after a daemon restart is told.
+fn continuation_prompt(open: &OpenAttempt) -> String {
+    format!(
+        "Power restarted and resumed this session. Continue your task (run {}, task {}) \
+         from where you left off, and report through the worker contract when done: \
+         `power skills get power-dag --reference worker-contract`.",
+        open.run, open.task
+    )
+}
 
 /// Interrupts open attempts of one session, or of every session, except those `keep` accepts.
 fn interrupt(
