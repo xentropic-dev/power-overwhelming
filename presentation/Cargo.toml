@@ -38,6 +38,7 @@ cc = "1"
 pkg-config = "0.3"
 
 [dev-dependencies]
+rusqlite = { version = "0.33", features = ["bundled"] }
 base64 = "0.22"
 
 # GPUI's Linux shaper, to shape terminal runs in tests without a window.

@@ -146,7 +146,7 @@ pub(crate) fn request(
         TalkCommand::Inbox { all, peek } => items(talk.inbox(caller, all, peek)?),
         TalkCommand::Show { id, read } => items(talk.show(caller, MessageId(id), read)?),
         TalkCommand::Wait {
-            thread,
+            threads,
             after,
             seconds,
         } => {
@@ -155,7 +155,12 @@ pub(crate) fn request(
                 .context("Talk timeout is too large")?;
             TalkResponse::Reply {
                 message: talk
-                    .wait_for_reply(caller, ThreadId(thread), after.map(MessageId), deadline)?
+                    .wait_for_reply(
+                        caller,
+                        threads.into_iter().map(ThreadId).collect(),
+                        after.map(MessageId),
+                        deadline,
+                    )?
                     .map(Into::into),
             }
         }

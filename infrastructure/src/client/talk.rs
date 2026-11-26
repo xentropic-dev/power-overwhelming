@@ -98,14 +98,14 @@ pub fn turn(caller: Caller, ready: bool) -> Result<()> {
 
 pub fn wait(
     caller: Caller,
-    thread: ThreadId,
+    threads: Vec<ThreadId>,
     after: Option<MessageId>,
     seconds: u64,
 ) -> Result<Option<Message>> {
     let mut socket = connect(
         caller,
         TalkCommand::Wait {
-            thread: thread.0,
+            threads: threads.into_iter().map(|id| id.0).collect(),
             after: after.map(|id| id.0),
             seconds,
         },

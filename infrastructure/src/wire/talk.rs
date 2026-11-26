@@ -31,7 +31,7 @@ pub enum TalkCommand {
         read: bool,
     },
     Wait {
-        thread: String,
+        threads: Vec<String>,
         after: Option<String>,
         seconds: u64,
     },

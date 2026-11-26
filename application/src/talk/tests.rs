@@ -223,7 +223,12 @@ fn queued_peer_and_user_messages_follow_delivery_and_read_rules() -> Result<()> 
     assert_eq!(reply.thread, peer.thread);
     assert_eq!(reply.reply_to, Some(peer.id));
     assert_eq!(
-        talk.wait_for_reply(caller(Some("a-session")), peer.thread, None, Instant::now())?,
+        talk.wait_for_reply(
+            caller(Some("a-session")),
+            vec![peer.thread],
+            None,
+            Instant::now()
+        )?,
         Some(reply)
     );
     Ok(())

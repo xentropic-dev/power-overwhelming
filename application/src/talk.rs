@@ -430,29 +430,38 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     pub fn wait_for_reply(
         &self,
         caller: Caller,
-        thread: ThreadId,
+        threads: Vec<ThreadId>,
         after: Option<MessageId>,
         deadline: Instant,
     ) -> Result<Option<Message>> {
+        ensure!(!threads.is_empty(), "Specify a talk thread");
         loop {
             let (reply, cursor) = self.store.read(|db| {
                 let directory = db.directory()?;
                 let actor = Actor::new(&caller, &directory);
-                let messages = db.thread(&thread)?;
                 let recipient = actor.recipient();
                 let sent = |message: &Message| recipient.matches_sender(&message.sender);
-                let from = messages
-                    .iter()
-                    .position(|message| {
-                        sent(message) && after.as_ref().is_none_or(|id| message.id == *id)
-                    })
-                    .with_context(|| {
-                        format!("You have no sent message in thread {:?}", thread.0)
-                    })?;
-                let reply = messages.into_iter().skip(from + 1).find(|message| {
-                    message.reply_to.is_some() && message.recipient == recipient && !sent(message)
-                });
-                Ok((reply, db.cursor()?))
+                let mut replies = Vec::new();
+                for thread in &threads {
+                    let messages = db.thread(thread)?;
+                    let from = messages
+                        .iter()
+                        .position(|message| {
+                            sent(message) && after.as_ref().is_none_or(|id| message.id == *id)
+                        })
+                        .with_context(|| {
+                            format!("You have no sent message in thread {:?}", thread.0)
+                        })?;
+                    replies.extend(messages.into_iter().skip(from + 1).find(|message| {
+                        message.reply_to.is_some()
+                            && message.recipient == recipient
+                            && !sent(message)
+                    }));
+                }
+                Ok((
+                    replies.into_iter().min_by_key(|message| message.created_at),
+                    db.cursor()?,
+                ))
             })?;
             if reply.is_some() || Instant::now() >= deadline {
                 return Ok(reply);
