@@ -352,7 +352,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                     box_id: box_id.clone(),
                 });
             }
-            Ok(Response::Dag { dag })
+            Ok(Response::Dag { dag: Box::new(dag) })
         }
         Request::WatchArtifacts | Request::WatchBoxIcons => {
             unreachable!("Watches use the streaming handler")

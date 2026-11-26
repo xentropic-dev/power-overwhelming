@@ -196,7 +196,7 @@ pub enum Response {
         title: String,
     },
     Dag {
-        dag: DagResponse,
+        dag: Box<DagResponse>,
     },
 }
 
@@ -659,7 +659,7 @@ pub enum DagResponse {
     },
     Dispatched {
         attempt: Attempt,
-        agent: ManagedAgent,
+        agent: Box<ManagedAgent>,
     },
     Reported {
         applied: bool,

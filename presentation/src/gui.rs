@@ -2348,27 +2348,6 @@ impl Workspace {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{LinkAction, link_action};
-
-    #[test]
-    fn dag_links_open_runs_directly() {
-        assert_eq!(
-            link_action("pwr://dag/Run-123"),
-            LinkAction::OpenDag("Run-123")
-        );
-        for target in [
-            "pwr://artifact/abc",
-            "pwr://dag/",
-            "pwr://dag/a/b",
-            "./report.html",
-        ] {
-            assert_eq!(link_action(target), LinkAction::ResolveArtifact);
-        }
-    }
-}
-
 fn path_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or(path.as_os_str())
@@ -2671,5 +2650,26 @@ impl Render for Workspace {
             )
             .children(modal)
             .children(graph)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinkAction, link_action};
+
+    #[test]
+    fn dag_links_open_runs_directly() {
+        assert_eq!(
+            link_action("pwr://dag/Run-123"),
+            LinkAction::OpenDag("Run-123")
+        );
+        for target in [
+            "pwr://artifact/abc",
+            "pwr://dag/",
+            "pwr://dag/a/b",
+            "./report.html",
+        ] {
+            assert_eq!(link_action(target), LinkAction::ResolveArtifact);
+        }
     }
 }

@@ -30,12 +30,13 @@ use std::{
 };
 
 pub(crate) type ActiveScheme = Arc<RwLock<&'static Scheme>>;
+type ExitHandler = Arc<dyn Fn(&str, &str) + Send + Sync>;
 type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send + Sync>;
 
 pub struct PtyRuntime {
     pub socket: PathBuf,
     pub scheme: ActiveScheme,
-    pub on_exit: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    pub on_exit: ExitHandler,
     pub on_model_changed: ModelChanged,
     pub profiles: Arc<dyn AgentProfileRegistry>,
 }
@@ -43,7 +44,7 @@ pub struct PtyRuntime {
 struct Lifecycle {
     running: AtomicBool,
     session: String,
-    on_exit: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    on_exit: ExitHandler,
     foreground: Mutex<Foreground>,
     on_model_changed: ModelChanged,
 }
@@ -290,9 +291,11 @@ fn launch(
             geometry,
             pid,
             launched_agent,
-            &actor_lifecycle,
-            active_scheme,
-            profiles.as_ref(),
+            ActorEnv {
+                lifecycle: &actor_lifecycle,
+                active_scheme,
+                profiles: profiles.as_ref(),
+            },
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
             let _ = stop_tx.send(());
@@ -321,6 +324,12 @@ fn pty_size(geometry: Geometry) -> PtySize {
     }
 }
 
+struct ActorEnv<'a> {
+    lifecycle: &'a Lifecycle,
+    active_scheme: ActiveScheme,
+    profiles: &'a dyn AgentProfileRegistry,
+}
+
 fn terminal_actor(
     rx: Receiver<Command>,
     writer: SyncSender<Vec<u8>>,
@@ -328,10 +337,13 @@ fn terminal_actor(
     mut geometry: Geometry,
     shell_pid: Option<u32>,
     launched_agent: Agent,
-    lifecycle: &Lifecycle,
-    active_scheme: ActiveScheme,
-    profiles: &dyn AgentProfileRegistry,
+    env: ActorEnv<'_>,
 ) -> Result<Option<String>> {
+    let ActorEnv {
+        lifecycle,
+        active_scheme,
+        profiles,
+    } = env;
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
         rows: geometry.rows,

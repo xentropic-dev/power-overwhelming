@@ -353,7 +353,7 @@ pub fn dag(request: DagRequest, timeout: Duration) -> Result<DagResponse> {
     wire::send(&mut socket, &Request::Dag { dag: request })?;
     socket.flush()?;
     match wire::receive::<Response>(&mut BufReader::new(socket))?.context("Daemon disconnected")? {
-        Response::Dag { dag } => Ok(dag),
+        Response::Dag { dag } => Ok(*dag),
         Response::Error { message } => bail!("{message}"),
         _ => bail!("Unexpected daemon response"),
     }
@@ -434,13 +434,14 @@ pub fn watch_runs(box_sel: Option<String>, deliver: impl Fn(RunEvent) -> bool) -
     let mut reader = BufReader::new(socket);
     while let Some(response) = wire::receive::<Response>(&mut reader)? {
         match response {
-            Response::Dag {
-                dag: DagResponse::Event { event },
-            } => {
-                if !deliver(event.into()) {
-                    break;
+            Response::Dag { dag } => match *dag {
+                DagResponse::Event { event } => {
+                    if !deliver(event.into()) {
+                        break;
+                    }
                 }
-            }
+                other => bail!("unexpected DAG response: {other:?}"),
+            },
             Response::Ok => continue,
             Response::Error { message } => bail!("{message}"),
             _ => bail!("Unexpected daemon response"),

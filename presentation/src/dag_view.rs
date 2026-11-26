@@ -213,7 +213,7 @@ impl GraphViewport {
         if delta == Point::default() || (!drag.panning && delta.magnitude() < DRAG_THRESHOLD) {
             return false;
         }
-        self.offset = self.offset + delta;
+        self.offset += delta;
         drag.position = position;
         drag.panning = true;
         true

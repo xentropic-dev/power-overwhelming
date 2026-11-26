@@ -324,8 +324,7 @@ fn main() -> Result<()> {
                 })
                 .transpose()?;
             client::ensure_daemon()?;
-            let box_id =
-                client::set_box_icon(box_sel, std::env::var("POWER_SESSION").ok(), path)?;
+            let box_id = client::set_box_icon(box_sel, std::env::var("POWER_SESSION").ok(), path)?;
             print_json(json!({"box_id": box_id}))
         }
         Some(Action::Agent { command }) => match command {
