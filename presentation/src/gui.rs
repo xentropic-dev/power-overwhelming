@@ -16,6 +16,7 @@ use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
+    dag::{Coordinator, RunStatus},
     link::dag_run_id,
     session::{Agent, Session},
 };
@@ -67,6 +68,39 @@ enum DagSnapshot {
     Runs(Vec<Run>),
     Run(Run, Box<DagWorktrees>),
     Agents(Vec<ManagedAgent>),
+}
+
+fn running_progress(run: &Run) -> Option<String> {
+    if run.tasks.is_empty() || run.status() != RunStatus::Active {
+        return None;
+    }
+    Some(format!(
+        "DAG {}/{} done",
+        run.completed_tasks(),
+        run.tasks.len()
+    ))
+}
+
+fn session_dag_progress(box_id: String, session: &str) -> Result<Option<String>> {
+    let agents = client::list_agents(Some(box_id.clone()), None)?;
+    let Some(agent) = agents
+        .into_iter()
+        .find(|agent| agent.session.as_deref() == Some(session))
+    else {
+        return Ok(None);
+    };
+    if let Some(run) = agent.run {
+        return Ok(running_progress(&client::get_run(run)?));
+    }
+    let runs = client::list_runs(Some(box_id), None)?;
+    Ok(runs
+        .iter()
+        .filter(
+            |run| matches!(&run.coordinator, Coordinator::Agent { agent: id } if id == &agent.id),
+        )
+        .filter_map(|run| Some((run.created_at, running_progress(run)?)))
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, progress)| progress))
 }
 
 #[derive(Default, PartialEq)]
@@ -155,6 +189,7 @@ struct Workspace {
     picker: Option<Picker>,
     dag: Option<DagView>,
     dag_refresh: async_channel::Sender<()>,
+    dag_progress: Option<(String, String)>,
     attention: HashMap<String, HashSet<String>>,
     previews: Vec<PreviewTab>,
     active_previews: HashMap<String, u64>,
@@ -290,6 +325,7 @@ impl Workspace {
             picker: None,
             dag: None,
             dag_refresh,
+            dag_progress: None,
             attention: HashMap::new(),
             previews: Vec::new(),
             active_previews: HashMap::new(),
@@ -748,9 +784,19 @@ impl Workspace {
             .detach();
         cx.spawn_in(window, async move |app, cx| {
             while rx.recv().await.is_ok() {
-                let Ok(query) = app.update(cx, |this, _| this.dag_query()) else {
+                let Ok((query, view)) = app.update(cx, |this, _| {
+                    let view = this
+                        .active_box()
+                        .and_then(|entry| Some((entry.id.clone(), entry.active_view.clone()?)));
+                    (this.dag_query(), view)
+                }) else {
                     break;
                 };
+                let progress = view.map(|(box_id, session)| {
+                    cx.background_executor().spawn(async move {
+                        session_dag_progress(box_id, &session).map(|progress| (session, progress))
+                    })
+                });
                 let attention = cx
                     .background_executor()
                     .spawn(async { client::attention() });
@@ -781,6 +827,22 @@ impl Workspace {
                     {
                         break;
                     }
+                }
+                if let Some(progress) = progress
+                    && let Ok((session, progress)) = progress.await
+                    && app
+                        .update(cx, |this, cx| {
+                            if this.active_view().as_deref() == Some(&session) {
+                                let progress = progress.map(|value| (session, value));
+                                if this.dag_progress != progress {
+                                    this.dag_progress = progress;
+                                    this.sync_status_bar(cx);
+                                }
+                            }
+                        })
+                        .is_err()
+                {
+                    break;
                 }
                 let Ok(attention) = attention.await else {
                     continue;
@@ -1089,6 +1151,7 @@ impl Workspace {
             self.focus.focus(window);
         }
         self.sync_status_bar(cx);
+        let _ = self.dag_refresh.try_send(());
         cx.notify();
     }
 
@@ -1137,6 +1200,10 @@ impl Workspace {
                 agent_type: terminal.session.agent.name().into(),
                 agent_task: terminal.metadata.task.clone(),
                 agent_model: terminal.metadata.model.clone(),
+                dag_progress: self
+                    .dag_progress
+                    .as_ref()
+                    .and_then(|(id, progress)| (id == session).then(|| progress.clone())),
             })
         });
         let scheme = cx.global::<DesktopScheme>().0;
@@ -2975,7 +3042,42 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkAction, link_action};
+    use super::{Coordinator, LinkAction, Run, Task, link_action, running_progress};
+    use domain::dag::TaskState;
+
+    #[test]
+    fn shows_progress_while_the_dag_has_actionable_work() {
+        let mut run = Run {
+            id: "run".into(),
+            box_id: "box".into(),
+            title: "Review a change".into(),
+            coordinator: Coordinator::Agent {
+                agent: "coordinator".into(),
+            },
+            created_at: 0,
+            tasks: Vec::new(),
+        };
+        assert_eq!(running_progress(&run), None);
+        for (id, state) in [("done", TaskState::Completed), ("review", TaskState::Ready)] {
+            run.tasks.push(Task {
+                id: id.into(),
+                title: id.into(),
+                instructions: String::new(),
+                deps: Vec::new(),
+                state,
+                current_attempt: None,
+                attempts: Vec::new(),
+            });
+        }
+        for state in [TaskState::Ready, TaskState::Working, TaskState::NeedsInput] {
+            run.tasks[1].state = state;
+            assert_eq!(running_progress(&run).as_deref(), Some("DAG 1/2 done"));
+        }
+        for state in [TaskState::Waiting, TaskState::Failed, TaskState::Completed] {
+            run.tasks[1].state = state;
+            assert_eq!(running_progress(&run), None);
+        }
+    }
 
     #[test]
     fn dag_links_open_runs_directly() {

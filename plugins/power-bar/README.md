@@ -26,6 +26,8 @@ The [minimal plugin](examples/minimal.rs) provides one live segment. Use `wit_bi
 
 Use `{theme.name}` in a Power-bar template to show the active scheme. Plugins that need its exact RGB values can target `terminal-bottom-with-palette` and call `palette.get-palette()` during `render`. It reads the same palette the desktop uses. Power calls `render` after a scheme change, and plugins can keep returning color names for the host to resolve.
 
+Use `{dag.progress}` to show the completed and total task counts for the active tab's running DAG. The host supplies this value as the reserved `@dag.progress` field for bottom-row plugins.
+
 A segment can request `path` overflow to preserve the tail, `text` to trim the end, or `keep` for higher priority. Foreground and background accept terminal color names, `foreground`, `background`, `accent`, `muted`, `surface`, `raised`, `contrast`, and hex RGB.
 
 Send `` for Powerline chevrons or `` for rounded joins. Power mirrors the join on the right and fills it with the adjacent segment colors. It draws these joins directly, so they also work with fonts that lack Powerline glyphs. Other separator strings render as Unicode text.
