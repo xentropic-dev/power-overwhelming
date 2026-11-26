@@ -245,7 +245,7 @@ pub fn resolve(
             exact(parent, "parent")
         }
         Target::One(Address::Coordinator) => {
-            let run = find_run(sender_run, "coordinator")?;
+            let run = find_run(sender_run.or(ctx.run), "coordinator")?;
             match &run.coordinator {
                 Coordinator::Agent { agent } => exact(agent, "coordinator"),
                 Coordinator::External { label } => {
@@ -408,7 +408,7 @@ pub enum HookState {
     Ready,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Activity {
     pub last_output: u64,
     pub last_input: u64,
@@ -416,6 +416,9 @@ pub struct Activity {
     pub active_since: u64,
     pub hook: HookState,
     pub restoring: bool,
+    pub paused: bool,
+    /// Changes with each input, output or hook report, even within one millisecond.
+    pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -500,7 +503,7 @@ impl NoticePolicy {
             None => Notify,
             Some(_) if message.delivery.reminded_at.is_some() => Hold(AlreadyReminded),
             Some(at) if now.saturating_sub(at) < REMINDER_AFTER_MS => Hold(ReminderDelay),
-            Some(at) if activity.active_since <= at => Hold(SameIdlePeriod),
+            Some(at) if activity.active_since < at => Hold(SameIdlePeriod),
             Some(_) => Remind,
         }
     }

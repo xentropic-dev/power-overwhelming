@@ -1,9 +1,12 @@
-use super::SqliteDagStore;
+use super::{DagDb, SqliteDagStore, run_from_row};
 use anyhow::Result;
+use application::dag::DagReader;
 use application::talk::{
     DeliveryChange, LogFilter, TalkEvent, TalkEventKind, TalkReader, TalkStore, TalkTransaction,
 };
-use domain::talk::{AgentRef, Delivery, Message, MessageId, Recipient, Sender, ThreadId};
+use domain::talk::{
+    AgentRef, Delivery, Directory, Message, MessageId, Recipient, RunRef, Sender, ThreadId,
+};
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use std::time::Instant;
 
@@ -138,6 +141,26 @@ impl TalkDb<'_> {
 }
 
 impl TalkReader for TalkDb<'_> {
+    fn directory(&self) -> Result<Directory> {
+        let runs = self
+            .0
+            .prepare("SELECT id, box_id, title, coordinator, created_at, archived_at FROM runs")?
+            .query_map([], run_from_row)?
+            .map(|run| {
+                let run = run?;
+                Ok(RunRef {
+                    id: run.id,
+                    box_id: run.box_id,
+                    coordinator: run.coordinator,
+                })
+            })
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Directory {
+            agents: DagDb(self.0).list_agents(None)?,
+            runs,
+        })
+    }
+
     fn message(&self, id: &MessageId) -> Result<Option<Message>> {
         Ok(self
             .0
