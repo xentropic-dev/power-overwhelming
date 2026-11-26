@@ -2,7 +2,7 @@ use super::{
     TerminalView, cell_metrics,
     frame::CellPosition,
     input::register_mouse_exit,
-    runs::{RowOp, RunCell, Shaping, row_ops},
+    runs::{RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
 };
 use gpui::{prelude::*, *};
 use infrastructure::theme::blend;
@@ -68,6 +68,10 @@ impl Render for TerminalView {
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             let grid = metrics.snap(bounds.origin);
                             let text_system = window.text_system().clone();
+                            let symbols = text_system.resolve_font(&font(SYMBOLS_FAMILY));
+                            let primary = text_system.resolve_font(&terminal_font);
+                            let has_glyph =
+                                |c: char| text_system.advance(primary, font_size, c).is_ok();
                             let rows: Vec<_> = frame
                                 .rows
                                 .iter()
@@ -98,6 +102,9 @@ impl Render for TerminalView {
                                         font: &terminal_font,
                                         font_size,
                                         cell_width: cell_size.width,
+                                        cell_height: cell_size.height,
+                                        symbols,
+                                        has_glyph: &has_glyph,
                                         ligatures,
                                         cursor: frame
                                             .cursor
@@ -163,9 +170,11 @@ impl Render for TerminalView {
                             let baseline = point(metrics.glyph_x, metrics.baseline);
                             for (row, (ops, _)) in rows.iter().enumerate() {
                                 for op in ops {
-                                    if let RowOp::Text { column, .. } = op {
+                                    if let RowOp::Text { column, .. } | RowOp::Icon { column, .. } =
+                                        op
+                                    {
                                         let origin = metrics.cell_origin(grid, row, *column);
-                                        op.paint(origin + baseline, window);
+                                        op.paint(origin, origin + baseline, window);
                                     }
                                 }
                             }

@@ -30,14 +30,17 @@ use std::{path::PathBuf, sync::Arc, thread};
 /// which are proportional and join `ffi` whatever `terminal.ligatures` says.
 pub(crate) const BUNDLED_FONT: &[u8] =
     include_bytes!("../../assets/fonts/JetBrainsMono-Variable.ttf");
+/// Symbols Nerd Font, shipped so Nerd Font icons the terminal font lacks still draw.
+pub(crate) const SYMBOLS_FONT: &[u8] =
+    include_bytes!("../../assets/fonts/SymbolsNerdFont-Regular.ttf");
 const BUNDLED_FAMILY: &str = "JetBrains Mono";
 
 /// Adds the bundled font to GPUI's text system; call once before any terminal is drawn.
 pub fn load_bundled_fonts(cx: &App) {
-    if let Err(error) = cx
-        .text_system()
-        .add_fonts(vec![std::borrow::Cow::Borrowed(BUNDLED_FONT)])
-    {
+    if let Err(error) = cx.text_system().add_fonts(vec![
+        std::borrow::Cow::Borrowed(BUNDLED_FONT),
+        std::borrow::Cow::Borrowed(SYMBOLS_FONT),
+    ]) {
         eprintln!("Could not load the bundled terminal font. {error:#}");
     }
 }

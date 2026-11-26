@@ -16,3 +16,11 @@ Font bundled at presentation/assets/fonts/JetBrainsMono-Variable.ttf for termina
 
 Source: https://github.com/JetBrains/JetBrainsMono
 License: SIL Open Font License, Version 1.1 (licenses/JetBrainsMono-OFL.txt)
+
+Symbols Nerd Font
+-----------------
+
+Font bundled at presentation/assets/fonts/SymbolsNerdFont-Regular.ttf, drawn for Nerd Font icons that the terminal font lacks. Copied from herdr-app's assets/fonts.
+
+Source: https://github.com/ryanoasis/nerd-fonts
+License: MIT License (licenses/SymbolsNerdFont-MIT.txt) for the Nerd Fonts patcher and symbols; the glyphs keep their original licenses, listed in the project's LICENSE file
