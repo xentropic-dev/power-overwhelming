@@ -1,4 +1,5 @@
 use crate::{
+    agents::AgentProfiles,
     boxes::BoxesFile,
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
@@ -40,7 +41,7 @@ struct Server {
     dag: Arc<DaemonDag>,
 }
 
-pub fn serve() -> Result<()> {
+pub fn serve(profiles: AgentProfiles) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
         .parent()
@@ -74,12 +75,14 @@ pub fn serve() -> Result<()> {
     let exit_handler = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
     let terminal_exit_handler = exit_handler.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
+    let profiles = Arc::new(profiles);
     let application = Arc::new(Application::new(
         artifacts,
         LocalWorkspace,
         PtyRuntime {
             socket: socket.clone(),
             scheme: scheme.clone(),
+            profiles: profiles.clone(),
             on_exit: Arc::new(move |session, detail| {
                 if let Some(dag) = terminal_exit_handler.get().and_then(Weak::upgrade)
                     && let Err(error) = dag.session_exited(session, detail)
@@ -88,6 +91,7 @@ pub fn serve() -> Result<()> {
                 }
             }),
         },
+        profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
     let dag = Arc::new(DaemonDag::new(application.clone(), store, BoxesFile));

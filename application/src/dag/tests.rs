@@ -1,7 +1,8 @@
 use super::*;
-use crate::{ArtifactStore, RecentArtifact, Workspace};
+use crate::{ArtifactStore, RecentArtifact, Workspace, agents::AgentProfileRegistry};
 use anyhow::bail;
 use domain::{
+    agent::{AgentProfile, Injection},
     artifact::{ArtifactRecord, ResolvedArtifact},
     session::Session,
 };
@@ -302,7 +303,12 @@ struct FakeTerminal(Mutex<Vec<(Session, SessionOptions)>>);
 impl TerminalRuntime for FakeTerminal {
     type Handle = Arc<AtomicBool>;
 
-    fn start(&self, session: &Session, options: SessionOptions) -> Result<Self::Handle> {
+    fn start(
+        &self,
+        session: &Session,
+        options: SessionOptions,
+        _: Option<&AgentProfile>,
+    ) -> Result<Self::Handle> {
         self.0.lock().unwrap().push((session.clone(), options));
         Ok(Arc::new(AtomicBool::new(true)))
     }
@@ -342,12 +348,32 @@ impl BoxRegistry for FakeRegistry {
 
 type TestDag = DagApplication<FakeTerminal, MemoryStore, FakeRegistry>;
 
+struct FakeProfiles(Vec<AgentProfile>);
+
+impl AgentProfileRegistry for FakeProfiles {
+    fn profiles(&self) -> &[AgentProfile] {
+        &self.0
+    }
+}
+
 fn application() -> Arc<Application<FakeTerminal>> {
     static ID: AtomicU64 = AtomicU64::new(0);
+    let profiles = ["claude", "codex"]
+        .into_iter()
+        .map(|id| AgentProfile {
+            id: id.into(),
+            command: id.into(),
+            injection: Injection::None,
+            skip_subcommands: Vec::new(),
+            skip_if_args_contain: Vec::new(),
+            skills_dir: None,
+        })
+        .collect();
     Arc::new(Application::new(
         FakeArtifacts,
         FakeWorkspace,
         FakeTerminal::default(),
+        Arc::new(FakeProfiles(profiles)),
         || format!("id-{}", ID.fetch_add(1, Ordering::Relaxed)),
     ))
 }
@@ -520,7 +546,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     let application = application();
     let caller = application.start_session(StartSession {
         worktree: "/worktree".into(),
-        agent: Agent::Codex,
+        agent: Agent::Coding("codex".into()),
     })?;
     let dag = TestDag::new(
         application,
@@ -549,15 +575,16 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     )?;
     let worker = dag.dispatch(Dispatch {
         task: "join".into(),
-        provider: Provider::Claude,
+        provider: Provider::Agent("claude".into()),
         caller: Some(caller.id),
         args: vec!["--flag".into()],
         ..command(&run.id, false)
     })?;
     assert_eq!(worker.agent.parent.as_deref(), Some(coordinator.as_str()));
     let launches = dag.application.runtime.0.lock().unwrap();
-    let (_, options) = launches.last().unwrap();
-    assert_eq!(options.argv, ["claude", "--flag"]);
+    let (session, options) = launches.last().unwrap();
+    assert_eq!(session.agent, Agent::Coding("claude".into()));
+    assert_eq!(options.args, ["--flag"]);
     let prompt = options.initial_prompt.as_deref().unwrap().to_str().unwrap();
     for expected in [
         "My run",
@@ -614,7 +641,7 @@ fn starting_an_agent_ignores_a_caller_session_this_daemon_does_not_host() -> Res
             selector: Some("2".into()),
             caller: Some("session-from-another-daemon".into()),
         },
-        provider: Provider::Codex,
+        provider: Provider::Agent("codex".into()),
         worktree: "/worktree".into(),
         parent: None,
         label: "coordinator".into(),

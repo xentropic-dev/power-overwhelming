@@ -1,4 +1,3 @@
-use super::agent_tree::provider_name;
 use crate::keymap::{Command, Keymap, Scope};
 use gpui::{prelude::*, *};
 use infrastructure::{
@@ -660,7 +659,7 @@ fn details(colors: &Colors, task: &Task) -> impl IntoElement {
         fields.extend([
             (
                 "Assigned agent",
-                format!("{} · {}", provider_name(attempt.provider), attempt.agent),
+                format!("{} · {}", attempt.provider.name(), attempt.agent),
             ),
             ("Worktree", attempt.worktree.display().to_string()),
             (

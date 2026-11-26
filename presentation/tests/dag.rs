@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::Barrier,
@@ -28,6 +28,7 @@ fn power(root: &Path) -> Command {
         .current_dir(root)
         .env("POWER_SOCKET", root.join("power.sock"))
         .env("POWER_STATE_DIR", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("SHELL", "/bin/sh")
         .env_remove("POWER_BIN")
         .env_remove("POWER_PLUGIN_DIR")
@@ -185,6 +186,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_configure(|_| {})
+    }
+
+    fn with_configure(configure: impl FnOnce(&Path)) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let checkout = root.join("box-repo");
@@ -231,6 +236,7 @@ impl Fixture {
             include_str!("fixtures/dag-worker.sh"),
         )
         .unwrap();
+        configure(root);
         let daemon = Daemon::start(root);
         Self {
             daemon,
@@ -467,6 +473,149 @@ fn create_show_and_list_include_links_for_each_run() {
         assert!(runs.iter().any(|run| run["id"] == id.as_str()));
         assert_eq!(links[id], format!("pwr://dag/{id}"));
     }
+}
+
+#[test]
+fn legacy_agent_aliases_use_the_configured_profiles() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let config = root.join("config/power-overwhelming");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("config.lua"),
+        r#"
+        agents.claude = { command = "/bin/echo", injection = { kind = "none" } }
+        agents.codex = { command = "/bin/echo", injection = { kind = "none" } }
+        "#,
+    )
+    .unwrap();
+    for prefix in [&[][..], &["agent"][..]] {
+        for id in ["claude", "codex"] {
+            let aliased = output(power(root).args(prefix).args([id, "--", "two words"]));
+            assert_success(&aliased);
+            assert_eq!(aliased.stdout, b"two words\n");
+        }
+    }
+}
+
+#[test]
+fn configured_profile_works_in_a_shell_and_as_a_dag_worker() {
+    let mut fixture = Fixture::with_configure(|root| {
+        let program = root.join("fixture program");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+test "$1" = "--instructions"
+case "$2" in
+    *'power skills get <name>'*) ;;
+    *) exit 2 ;;
+esac
+shift 2
+if [ "${POWER_RUN:-}" = "" ]; then
+    printf '%s\n' "$@"
+    exit
+fi
+case "$7" in
+    *'Task: profile'*'power dag report success'*) ;;
+    *) exit 3 ;;
+esac
+exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            format!(
+                r##"
+                keys.prefix.tab = "ctrl-a"
+                power_bar.agent_colors.Codex = "#62a0ea"
+                agents["fixture-agent"] = {{
+                    command = {:?},
+                    injection = {{ kind = "flag", flag = "--instructions" }},
+                }}
+                "##,
+                program.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+    });
+
+    let wrapped = output(
+        Command::new("/bin/bash")
+            .env("POWER_BIN", env!("CARGO_BIN_EXE_power"))
+            .env("XDG_CONFIG_HOME", fixture.root().join("config"))
+            .env_remove("POWER_RUN")
+            .args([
+                "--norc",
+                "-c",
+                r#"eval "$("$POWER_BIN" shell-init bash)"; fixture-agent "$@""#,
+                "test-wrapper",
+                "--custom-flag",
+                "two words",
+                "--",
+            ]),
+    );
+    assert_success(&wrapped);
+    assert_eq!(wrapped.stdout, b"--custom-flag\ntwo words\n--\n");
+
+    let worktree = fixture.worktrees[0].to_str().unwrap();
+    let started = fixture.command(&["session", "start", "fixture-agent", worktree]);
+    assert_success(&started);
+    let session = String::from_utf8(started.stdout).unwrap();
+    let sessions = fixture.command(&["session", "list"]);
+    assert_success(&sessions);
+    assert!(
+        String::from_utf8(sessions.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == format!("{}\tfixture-agent\t{worktree}", session.trim()))
+    );
+
+    let run = fixture.create_run();
+    fixture.add_task(&run.id, "profile");
+    let launch = |provider: &str| {
+        output(
+            power(fixture.root())
+                .args([
+                    "dag",
+                    "dispatch",
+                    &run.id,
+                    "profile",
+                    "--provider",
+                    provider,
+                    "--worktree",
+                    worktree,
+                ])
+                .arg("--")
+                .arg(fixture.root().join("power.sock"))
+                .arg(fixture.root().join("state"))
+                .args([worktree, "success", "profile-go", "Profile result"]),
+        )
+    };
+    let rejected = launch("missing");
+    assert_rejected(&rejected);
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        error.contains("Known profiles: claude, codex, grok, fixture-agent"),
+        "{error}"
+    );
+    assert!(task(&fixture.show(&run.id), "profile").attempts.is_empty());
+
+    let (attempt, agent) = dispatched(launch("fixture-agent"));
+    assert_eq!(agent.provider, Provider::Agent("fixture-agent".into()));
+    assert_eq!(attempt.provider, agent.provider);
+    fixture.release("profile-go");
+    let task = fixture.wait_for_state(&run.id, "profile", TaskState::Completed);
+    assert_eq!(task.attempts[0].summary.as_deref(), Some("Profile result"));
+
+    fs::remove_file(fixture.root().join("config/power-overwhelming/config.lua")).unwrap();
+    fixture.restart();
+    let persisted = fixture.show(&run.id);
+    assert_eq!(persisted.tasks[0].attempts[0].provider, agent.provider);
 }
 
 #[test]

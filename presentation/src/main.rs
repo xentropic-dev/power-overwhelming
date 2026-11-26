@@ -9,19 +9,21 @@ mod terminal_view;
 use anyhow::{Context, Result};
 use application::{
     PublishArtifact, StartSession,
+    agents::AgentProfileRegistry,
     skills::{GetSkill, ListSkills, SkillOutput, SkillSelection},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use domain::session::Agent;
+use domain::{agent::display_name, session::Agent};
 use infrastructure::{
+    agents::AgentProfiles,
     client::{
         self,
         protocol::{
             DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec, TaskState,
         },
     },
-    daemon,
-    shell::Shell,
+    config, daemon,
+    shell::{self, Shell},
     skills::EmbeddedSkillCatalog,
 };
 use serde_json::{Value, json};
@@ -55,7 +57,7 @@ enum Action {
         #[command(subcommand)]
         command: ArtifactAction,
     },
-    /// Install the shell hook that wraps claude and codex inside Power terminals.
+    /// Install the shell hook that wraps coding agents inside Power terminals.
     Setup {
         /// Print what would change without writing.
         #[arg(long)]
@@ -65,6 +67,22 @@ enum Action {
     ShellInit {
         #[arg(value_parser = ["bash", "zsh", "fish"])]
         shell: String,
+    },
+    #[command(hide = true)]
+    ExecAgent {
+        id: String,
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
+    #[command(hide = true)]
+    Codex {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    #[command(hide = true)]
+    Claude {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
     },
     Box {
         #[command(subcommand)]
@@ -87,12 +105,6 @@ enum Action {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum WrappedAgent {
-    Codex,
-    Claude,
-}
-
 #[derive(Subcommand)]
 enum SessionAction {
     List,
@@ -101,8 +113,8 @@ enum SessionAction {
         directory: PathBuf,
     },
     Start {
-        #[arg(value_enum)]
-        agent: AgentChoice,
+        /// Profile ID or `shell`.
+        agent: String,
         #[arg(default_value = ".")]
         directory: PathBuf,
     },
@@ -117,23 +129,6 @@ enum SessionAction {
     End {
         id: String,
     },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum AgentChoice {
-    Shell,
-    Codex,
-    Claude,
-}
-
-impl From<AgentChoice> for Agent {
-    fn from(choice: AgentChoice) -> Self {
-        match choice {
-            AgentChoice::Shell => Self::Shell,
-            AgentChoice::Codex => Self::Codex,
-            AgentChoice::Claude => Self::Claude,
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -189,7 +184,7 @@ fn main() -> Result<()> {
         error.exit()
     });
     match cli.command {
-        Some(Action::Daemon) => daemon::serve(),
+        Some(Action::Daemon) => daemon::serve(configured_agents()),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
         }) => {
@@ -229,7 +224,11 @@ fn main() -> Result<()> {
                 SessionAction::Start { agent, directory } => {
                     let session = client::start_session(StartSession {
                         worktree: directory.canonicalize()?,
-                        agent: agent.into(),
+                        agent: if agent == "shell" {
+                            Agent::Shell
+                        } else {
+                            Agent::Coding(agent.into())
+                        },
                     })?;
                     println!("{}", session.id);
                 }
@@ -263,7 +262,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Action::ShellInit { shell }) => {
-            print!("{}", Shell::parse(&shell).unwrap().init_script());
+            print!(
+                "{}",
+                Shell::parse(&shell)
+                    .unwrap()
+                    .init_script(&configured_agents())
+            );
             Ok(())
         }
         Some(Action::Box {
@@ -272,9 +276,12 @@ fn main() -> Result<()> {
             client::ensure_daemon()?;
             print_json(json!({"boxes": protocol_boxes()?}))
         }
+        Some(Action::ExecAgent { id, args }) => exec_agent(&id, args),
+        Some(Action::Codex { args }) => exec_agent("codex", args),
+        Some(Action::Claude { args }) => exec_agent("claude", args),
         Some(Action::Agent { command }) => match command {
-            AgentAction::Codex { args } => infrastructure::shell::exec_agent(Agent::Codex, args),
-            AgentAction::Claude { args } => infrastructure::shell::exec_agent(Agent::Claude, args),
+            AgentAction::Codex { args } => exec_agent("codex", args),
+            AgentAction::Claude { args } => exec_agent("claude", args),
             AgentAction::List { box_sel } => {
                 client::ensure_daemon()?;
                 print_json(json!({"agents": protocol_agents(box_sel)?}))
@@ -289,18 +296,19 @@ fn main() -> Result<()> {
                 args,
             } => {
                 client::ensure_daemon()?;
-                let (provider, name) = match provider {
-                    WrappedAgent::Codex => (Provider::Codex, "Codex"),
-                    WrappedAgent::Claude => (Provider::Claude, "Claude"),
-                };
+                anyhow::ensure!(
+                    provider != "command",
+                    "Specify a coding agent profile for --provider"
+                );
+                let label = label.unwrap_or_else(|| display_name(&provider).into());
                 dag_reply(
                     DagRequest::StartAgent {
                         box_sel,
                         caller: caller_session(),
-                        provider,
+                        provider: Provider::Agent(provider),
                         worktree: worktree.canonicalize().context("Open worktree")?,
                         parent,
-                        label: label.unwrap_or_else(|| name.into()),
+                        label,
                         prompt,
                         args,
                     },
@@ -319,6 +327,18 @@ fn main() -> Result<()> {
     }
 }
 
+fn configured_agents() -> AgentProfiles {
+    config::load_agent_profiles(settings::Settings::defaults()).unwrap_or_else(|error| {
+        eprintln!("Could not load agent profiles. {error:#}");
+        AgentProfiles::default()
+    })
+}
+
+fn exec_agent(id: &str, args: Vec<OsString>) -> Result<()> {
+    let profiles = configured_agents();
+    shell::exec_agent(profiles.resolve(&id.into())?, args)
+}
+
 #[derive(Subcommand)]
 enum BoxAction {
     List,
@@ -333,8 +353,9 @@ enum AgentAction {
     Start {
         #[arg(long = "box")]
         box_sel: Option<String>,
-        #[arg(long, value_enum)]
-        provider: WrappedAgent,
+        /// Coding agent profile ID.
+        #[arg(long)]
+        provider: String,
         #[arg(long)]
         worktree: PathBuf,
         #[arg(long)]
@@ -346,7 +367,6 @@ enum AgentAction {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Start an agent with Power's instructions. The shell wrappers call this.
     #[command(hide = true)]
     Codex {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -436,8 +456,9 @@ enum DagAction {
 struct DispatchArgs {
     run: String,
     task: String,
-    #[arg(long, value_enum)]
-    provider: ProviderChoice,
+    /// Coding agent profile ID, or `command` to run an executable directly.
+    #[arg(long)]
+    provider: String,
     #[arg(long)]
     worktree: PathBuf,
     #[arg(last = true)]
@@ -451,13 +472,6 @@ struct EventArgs {
     since: u64,
     #[arg(long = "kind", value_parser = parse_event_kind)]
     kinds: Vec<RunEventKind>,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum ProviderChoice {
-    Codex,
-    Claude,
-    Command,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -585,11 +599,7 @@ fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
     Ok(DagRequest::Dispatch {
         run: launch.run,
         task: launch.task,
-        provider: match launch.provider {
-            ProviderChoice::Codex => Provider::Codex,
-            ProviderChoice::Claude => Provider::Claude,
-            ProviderChoice::Command => Provider::Command,
-        },
+        provider: launch.provider.into(),
         worktree: launch.worktree.canonicalize().context("Open worktree")?,
         retry,
         args: launch.args,

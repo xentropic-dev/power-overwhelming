@@ -3,8 +3,8 @@
 
 use crate::skills::EmbeddedSkillCatalog;
 use anyhow::{Context, Result, bail};
-use application::skills::ListSkills;
-use domain::session::Agent;
+use application::{agents::AgentProfileRegistry, skills::ListSkills};
+use domain::agent::{AgentProfile, Injection};
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -14,34 +14,6 @@ use std::{
 };
 
 const MARKER: &str = "# Power Overwhelming shell integration";
-const WRAPPED: [Agent; 2] = [Agent::Claude, Agent::Codex];
-
-/// Claude subcommands that manage the installation instead of starting a conversation.
-const CLAUDE_SUBCOMMANDS: &[&str] = &[
-    "agents",
-    "attach",
-    "auth",
-    "auto-mode",
-    "config",
-    "doctor",
-    "gateway",
-    "import",
-    "install",
-    "kill",
-    "logs",
-    "mcp",
-    "migrate-installer",
-    "plugin",
-    "plugins",
-    "purge",
-    "respawn",
-    "rm",
-    "setup-token",
-    "stop",
-    "ultrareview",
-    "update",
-    "upgrade",
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Shell {
@@ -98,23 +70,20 @@ impl Shell {
         }
     }
 
-    /// Shell code that wraps `claude` and `codex` so they receive Power's instructions.
-    pub fn init_script(self) -> String {
-        WRAPPED
-            .iter()
-            .map(|agent| {
-                let name = agent.command();
-                match self {
-                    Self::Bash | Self::Zsh => {
-                        // `function name` keeps a user's alias from expanding in the definition.
-                        format!("function {name} {{ \"$POWER_BIN\" agent {name} \"$@\"; }}\n")
-                    }
-                    Self::Fish => format!(
-                        "function {name} --wraps {name}\n    \"$POWER_BIN\" agent {name} $argv\nend\n"
-                    ),
+    /// Shell functions that start configured agents with Power's instructions.
+    pub fn init_script(self, registry: &impl AgentProfileRegistry) -> String {
+        registry.profiles().iter().map(|profile| {
+            let name = profile.id.as_str();
+            match self {
+                Self::Bash | Self::Zsh => {
+                    // `function name` keeps a user's alias from expanding in the definition.
+                    format!("function {name} {{ \"$POWER_BIN\" exec-agent {name} -- \"$@\"; }}\n")
                 }
-            })
-            .collect()
+                Self::Fish => format!(
+                    "function {name} --wraps {name}\n    \"$POWER_BIN\" exec-agent {name} -- $argv\nend\n"
+                ),
+            }
+        }).collect()
     }
 
     pub fn installed(self) -> bool {
@@ -158,7 +127,23 @@ fn has_marker(path: &Path) -> bool {
 }
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
-pub(crate) fn instruction_args(agent: Agent, user: &[OsString]) -> Result<Vec<OsString>> {
+pub(crate) fn instruction_args(profile: &AgentProfile, user: &[OsString]) -> Result<Vec<OsString>> {
+    if profile.injection == Injection::None
+        || user
+            .first()
+            .and_then(|arg| arg.to_str())
+            .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
+        || user.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            profile
+                .skip_if_args_contain
+                .iter()
+                .any(|skip| arg.contains(skip))
+        })
+    {
+        return Ok(Vec::new());
+    }
+
     let mut instructions = String::from(concat!(
         "You are running inside Power Overwhelming. ",
         "Power skills, load with `power skills get <name>` when relevant:\n",
@@ -171,46 +156,22 @@ pub(crate) fn instruction_args(agent: Agent, user: &[OsString]) -> Result<Vec<Os
         "`power session task 'Short task label'` from this terminal. ",
         "Use a short, concrete label and update it when the objective changes.",
     ));
-    let has = |needle: &str| {
-        user.iter()
-            .any(|arg| arg.to_string_lossy().contains(needle))
-    };
-    Ok(match agent {
-        Agent::Shell => Vec::new(),
-        Agent::Claude => {
-            let subcommand = user
-                .first()
-                .and_then(|arg| arg.to_str())
-                .is_some_and(|arg| CLAUDE_SUBCOMMANDS.contains(&arg));
-            if subcommand || has("--append-system-prompt") {
-                Vec::new()
-            } else {
-                vec!["--append-system-prompt".into(), instructions.into()]
-            }
-        }
-        Agent::Codex => {
-            if has("developer_instructions") {
-                Vec::new()
-            } else {
-                vec![
-                    "-c".into(),
-                    format!(
-                        "developer_instructions={}",
-                        serde_json::to_string(&instructions)?
-                    )
-                    .into(),
-                ]
-            }
-        }
+    Ok(match &profile.injection {
+        Injection::Flag { flag } => vec![flag.into(), instructions.into()],
+        Injection::ConfigValue { flag, key } => vec![
+            flag.into(),
+            format!("{key}={}", serde_json::to_string(&instructions)?).into(),
+        ],
+        Injection::None => Vec::new(),
     })
 }
 
 /// Replaces this process with the real agent binary, adding Power's instructions.
-pub fn exec_agent(agent: Agent, args: Vec<OsString>) -> Result<()> {
-    let program = find_program(agent.command())
-        .with_context(|| format!("{}: command not found", agent.command()))?;
+pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
+    let program = find_program(&profile.command)
+        .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
-    command.args(instruction_args(agent, &args)?).args(&args);
+    command.args(instruction_args(profile, &args)?).args(&args);
     let error = command.exec();
     bail!("Start {}. {error}", program.display())
 }
@@ -220,11 +181,15 @@ fn find_program(name: &str) -> Option<PathBuf> {
     let current = std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok());
+    let is_program =
+        |path: &Path| is_executable(path) && path.canonicalize().ok().as_ref() != current.as_ref();
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        return is_program(&path).then_some(path);
+    }
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|directory| directory.join(name))
-        .find(|candidate| {
-            is_executable(candidate) && candidate.canonicalize().ok().as_ref() != current.as_ref()
-        })
+        .find(|candidate| is_program(candidate))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -234,24 +199,29 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Whether an agent's binary is on PATH, for onboarding to report.
-pub fn agent_available(agent: Agent) -> bool {
-    find_program(agent.command()).is_some()
+pub fn agent_available(profile: &AgentProfile) -> bool {
+    find_program(&profile.command).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::AgentProfiles;
 
     #[test]
     fn skips_instructions_for_management_commands() {
+        let profiles = AgentProfiles::default();
         assert!(
-            instruction_args(Agent::Claude, &["mcp".into(), "list".into()])
-                .unwrap()
-                .is_empty()
+            instruction_args(
+                profiles.resolve(&"claude".into()).unwrap(),
+                &["mcp".into(), "list".into()]
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(
             instruction_args(
-                Agent::Codex,
+                profiles.resolve(&"codex".into()).unwrap(),
                 &["-c".into(), "developer_instructions=\"x\"".into()]
             )
             .unwrap()
@@ -260,8 +230,27 @@ mod tests {
     }
 
     #[test]
+    fn respects_no_injection_and_existing_flag_values() -> Result<()> {
+        let profiles = AgentProfiles::default();
+        let grok = profiles.resolve(&"grok".into())?;
+        assert_eq!(instruction_args(grok, &[])?[0], "--rules");
+        assert!(instruction_args(grok, &["--rules=custom".into()])?.is_empty());
+        assert!(instruction_args(grok, &["mcp".into(), "list".into()])?.is_empty());
+
+        let mut profile = grok.clone();
+        profile.injection = Injection::None;
+        assert!(instruction_args(&profile, &["prompt".into()])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn launch_instructions_list_every_catalog_skill() {
-        let claude = instruction_args(Agent::Claude, &["fix the bug".into()]).unwrap();
+        let profiles = AgentProfiles::default();
+        let claude = instruction_args(
+            profiles.resolve(&"claude".into()).unwrap(),
+            &["fix the bug".into()],
+        )
+        .unwrap();
         assert_eq!(claude[0], "--append-system-prompt");
         let instructions = claude[1].to_str().unwrap();
         let mut lines = instructions.lines();
@@ -286,7 +275,11 @@ mod tests {
         );
         assert_eq!(lines.next(), None);
 
-        let codex = instruction_args(Agent::Codex, &["fix the bug".into()]).unwrap();
+        let codex = instruction_args(
+            profiles.resolve(&"codex".into()).unwrap(),
+            &["fix the bug".into()],
+        )
+        .unwrap();
         assert_eq!(codex[0], "-c");
         let encoded = codex[1]
             .to_str()
