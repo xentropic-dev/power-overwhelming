@@ -1,3 +1,4 @@
+use crate::agent::{AgentId, display_name};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
@@ -60,12 +61,20 @@ pub struct BoxInfo {
     pub open: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Provider {
-    Codex,
-    Claude,
+    Agent(AgentId),
     /// Runs the given argv directly. Used for deterministic worker fixtures.
     Command,
+}
+
+impl Provider {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Command => "Command",
+            Self::Agent(id) => display_name(id.as_str()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,7 +83,7 @@ pub enum AgentState {
     Exited,
 }
 
-/// A Claude Code, Codex, or fixture process managed by Power. Tab attachment is tracked by the
+/// A coding agent or fixture process managed by Power. Tab attachment is tracked by the
 /// desktop, independently of this record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedAgent {

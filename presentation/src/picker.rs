@@ -1,7 +1,4 @@
-use crate::{
-    gui::agent_tree::{AgentTree, provider_name},
-    keymap::Shortcut,
-};
+use crate::{gui::agent_tree::AgentTree, keymap::Shortcut};
 use domain::session::Session;
 use gpui::{prelude::*, *};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
@@ -377,7 +374,7 @@ impl Picker {
                     detail: format!(
                         "{}{} · {}",
                         " ".repeat(depth),
-                        provider_name(agent.provider),
+                        agent.provider.name(),
                         agent.worktree.display(),
                     ),
                     choice: Choice::Agent(agent.id.clone()),

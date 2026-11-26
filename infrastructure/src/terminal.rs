@@ -3,9 +3,12 @@ use crate::{
     wire::{MetadataField, Response, SessionMetadata},
 };
 use anyhow::Result;
-use application::{SessionOptions, TerminalRuntime};
+use application::{SessionOptions, TerminalRuntime, agents::AgentProfileRegistry};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::session::{Agent, Geometry, Session};
+use domain::{
+    agent::AgentProfile,
+    session::{Agent, Geometry, Session},
+};
 use ghostty_vt::{
     Terminal,
     fmt::{Formatter, FormatterOptions},
@@ -15,7 +18,7 @@ use ghostty_vt::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -31,6 +34,7 @@ pub struct PtyRuntime {
     pub socket: PathBuf,
     pub scheme: ActiveScheme,
     pub on_exit: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    pub profiles: Arc<dyn AgentProfileRegistry>,
 }
 
 struct Lifecycle {
@@ -72,14 +76,13 @@ impl Handle {
 impl TerminalRuntime for PtyRuntime {
     type Handle = Handle;
 
-    fn start(&self, session: &Session, options: SessionOptions) -> Result<Self::Handle> {
-        launch(
-            session,
-            &self.socket,
-            options,
-            self.on_exit.clone(),
-            self.scheme.clone(),
-        )
+    fn start(
+        &self,
+        session: &Session,
+        options: SessionOptions,
+        profile: Option<&AgentProfile>,
+    ) -> Result<Self::Handle> {
+        launch(self, session, options, profile)
     }
 
     fn is_running(&self, handle: &Self::Handle) -> bool {
@@ -91,7 +94,7 @@ impl TerminalRuntime for PtyRuntime {
     }
 
     fn agent(&self, handle: &Self::Handle) -> Option<Agent> {
-        Some(*handle.agent.lock().unwrap())
+        Some(handle.agent.lock().unwrap().clone())
     }
 }
 
@@ -116,30 +119,24 @@ pub enum Command {
 }
 
 fn launch(
+    runtime: &PtyRuntime,
     session: &Session,
-    socket: &Path,
     options: SessionOptions,
-    on_exit: Arc<dyn Fn(&str, &str) + Send + Sync>,
-    active_scheme: ActiveScheme,
+    profile: Option<&AgentProfile>,
 ) -> Result<Handle> {
     let geometry = Geometry::default();
     let pair = native_pty_system().openpty(pty_size(geometry))?;
-    let mut process = if let Some((program, args)) = options.argv.split_first() {
+    let mut process = if let Some(profile) = profile {
+        let mut command = CommandBuilder::new(&profile.command);
+        command.args(crate::shell::instruction_args(profile, &options.args)?);
+        command.args(&options.args);
+        command
+    } else if let Some((program, args)) = options.args.split_first() {
         let mut command = CommandBuilder::new(program);
-        command.args(crate::shell::instruction_args(session.agent, args)?);
         command.args(args);
         command
     } else {
-        match session.agent {
-            Agent::Shell => {
-                CommandBuilder::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
-            }
-            agent => {
-                let mut command = CommandBuilder::new(agent.command());
-                command.args(crate::shell::instruction_args(agent, &[])?);
-                command
-            }
-        }
+        CommandBuilder::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
     };
     if let Some(prompt) = options.initial_prompt {
         process.arg(prompt);
@@ -154,7 +151,7 @@ fn launch(
     process.env("TERM", "xterm-256color");
     process.env("COLORTERM", "truecolor");
     process.env("POWER_SESSION", &session.id);
-    process.env("POWER_SOCKET", socket);
+    process.env("POWER_SOCKET", &runtime.socket);
     process.env_remove("TMUX");
     if let Ok(executable) = std::env::current_exe()
         && let Some(dir) = executable.parent()
@@ -175,7 +172,7 @@ fn launch(
     let lifecycle = Arc::new(Lifecycle {
         running: AtomicBool::new(true),
         session: session.id.clone(),
-        on_exit,
+        on_exit: runtime.on_exit.clone(),
     });
     drop(pair.slave);
 
@@ -232,7 +229,7 @@ fn launch(
         };
         let _ = waiter_tx.send(Command::ProcessExited(detail));
     });
-    let agent = Arc::new(Mutex::new(session.agent));
+    let agent = Arc::new(Mutex::new(session.agent.clone()));
     if session.agent == Agent::Shell {
         let poll_tx = tx.clone();
         let lifecycle = lifecycle.clone();
@@ -243,8 +240,10 @@ fn launch(
         });
     }
     let actor_agent = agent.clone();
-    let launched_agent = session.agent;
+    let launched_agent = session.agent.clone();
     let actor_lifecycle = lifecycle.clone();
+    let active_scheme = runtime.scheme.clone();
+    let profiles = runtime.profiles.clone();
     thread::spawn(move || {
         let result = terminal_actor(
             rx,
@@ -256,6 +255,7 @@ fn launch(
             actor_agent,
             &actor_lifecycle,
             active_scheme,
+            profiles.as_ref(),
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
             let _ = stop_tx.send(());
@@ -295,6 +295,7 @@ fn terminal_actor(
     agent: Arc<Mutex<Agent>>,
     lifecycle: &Lifecycle,
     active_scheme: ActiveScheme,
+    profiles: &dyn AgentProfileRegistry,
 ) -> Result<Option<String>> {
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
@@ -316,7 +317,7 @@ fn terminal_actor(
     let mut run = if launched_agent == Agent::Shell {
         None
     } else {
-        shell_pid.map(|pid| (pid, launched_agent))
+        shell_pid.map(|pid| (pid, launched_agent.clone()))
     };
     let mut metadata = SessionMetadata::default();
 
@@ -373,17 +374,20 @@ fn terminal_actor(
                     .process_group_leader()
                     .and_then(|pid| u32::try_from(pid).ok()),
                 shell_pid,
+                profiles,
             );
             if current != run {
                 run = current;
-                let current = run.map_or(Agent::Shell, |(_, agent)| agent);
+                let current = run
+                    .as_ref()
+                    .map_or(Agent::Shell, |(_, agent)| agent.clone());
                 let mut stored = agent.lock().unwrap();
                 if *stored != current {
-                    *stored = current;
+                    *stored = current.clone();
                     clients.retain(|client| {
                         client
                             .try_send(Response::Agent {
-                                agent: current.into(),
+                                agent: current.clone().into(),
                             })
                             .is_ok()
                     });
@@ -403,7 +407,7 @@ fn terminal_actor(
                     .is_ok()
                     && client
                         .try_send(Response::Agent {
-                            agent: (*agent.lock().unwrap()).into(),
+                            agent: agent.lock().unwrap().clone().into(),
                         })
                         .is_ok()
                     && (metadata == SessionMetadata::default()
@@ -462,7 +466,10 @@ fn terminal_actor(
                 value,
                 reply,
             } => {
-                let accepted = !exited && run.is_some_and(|(owner, _)| descends_from(pid, owner));
+                let accepted = !exited
+                    && run
+                        .as_ref()
+                        .is_some_and(|(owner, _)| descends_from(pid, *owner));
                 if accepted {
                     let field = match field {
                         MetadataField::Task => &mut metadata.task,
@@ -559,13 +566,17 @@ fn process_directory(pid: u32) -> Option<PathBuf> {
 }
 
 /// Walks from the foreground process group leader up to the shell, looking for an agent.
-fn foreground_agent(leader: Option<u32>, shell: Option<u32>) -> Option<(u32, Agent)> {
+fn foreground_agent(
+    leader: Option<u32>,
+    shell: Option<u32>,
+    profiles: &dyn AgentProfileRegistry,
+) -> Option<(u32, Agent)> {
     let mut pid = leader;
     for _ in 0..32 {
         let Some(current) = pid.filter(|current| Some(*current) != shell && *current > 1) else {
             break;
         };
-        if let Some(agent) = process_agent(current) {
+        if let Some(agent) = process_agent(current, profiles) {
             return Some((current, agent));
         }
         pid = parent_pid(current);
@@ -586,40 +597,43 @@ fn descends_from(mut pid: u32, owner: u32) -> bool {
     false
 }
 
-fn process_agent(pid: u32) -> Option<Agent> {
+fn process_agent(pid: u32, profiles: &dyn AgentProfileRegistry) -> Option<Agent> {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let mut args = cmdline
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| String::from_utf8_lossy(arg).into_owned());
-    let program = program_name(&args.next()?);
+    let cmdline = String::from_utf8_lossy(&cmdline);
+    let mut args = cmdline.split('\0').filter(|arg| !arg.is_empty());
+    let program = args.next()?;
     // Interpreters such as `node /usr/bin/codex` carry the agent in the next argument.
     let program = if matches!(
-        program.as_str(),
+        program_name(program),
         "node" | "bun" | "deno" | "sh" | "bash" | "dash" | "zsh" | "python" | "python3"
     ) {
-        program_name(&args.find(|arg| !arg.starts_with('-'))?)
+        args.find(|arg| !arg.starts_with('-'))?
     } else {
         program
     };
-    agent_named(&program)
+    agent_for_program(program, profiles)
 }
 
-fn program_name(arg: &str) -> String {
+fn program_name(arg: &str) -> &str {
     let name = arg.rsplit('/').next().unwrap_or(arg);
-    let name = [".js", ".mjs", ".cjs"]
+    [".js", ".mjs", ".cjs"]
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
-        .unwrap_or(name);
-    name.to_owned()
+        .unwrap_or(name)
 }
 
-fn agent_named(name: &str) -> Option<Agent> {
-    match name {
-        "claude" => Some(Agent::Claude),
-        "codex" => Some(Agent::Codex),
-        _ => None,
-    }
+fn agent_for_program(program: &str, profiles: &dyn AgentProfileRegistry) -> Option<Agent> {
+    let name = program_name(program);
+    let profiles = profiles.profiles();
+    profiles
+        .iter()
+        .find(|profile| profile.command == program)
+        .or_else(|| {
+            profiles
+                .iter()
+                .find(|profile| program_name(&profile.command) == name)
+        })
+        .map(|profile| Agent::Coding(profile.id.clone()))
 }
 
 fn parent_pid(pid: u32) -> Option<u32> {
@@ -639,15 +653,33 @@ mod tests {
 
     #[test]
     fn recognizes_agent_programs() {
+        let profiles = crate::agents::AgentProfiles::default();
         assert_eq!(
-            agent_named(&program_name("/usr/bin/claude")),
-            Some(Agent::Claude)
+            agent_for_program("/usr/bin/claude", &profiles),
+            Some(Agent::Coding("claude".into()))
         );
         assert_eq!(
-            agent_named(&program_name("/opt/codex/bin/codex.js")),
-            Some(Agent::Codex)
+            agent_for_program("/opt/codex/bin/codex.js", &profiles),
+            Some(Agent::Coding("codex".into()))
         );
-        assert_eq!(agent_named(&program_name("vim")), None);
+        assert_eq!(agent_for_program("vim", &profiles), None);
+    }
+
+    #[test]
+    fn recognizes_a_configured_agent_by_its_executable() {
+        let mut profiles = crate::agents::AgentProfiles::default();
+        profiles.0.push(AgentProfile {
+            id: "custom".into(),
+            command: "/opt/agent/bin/assistant.mjs".into(),
+            injection: Default::default(),
+            skip_subcommands: Vec::new(),
+            skip_if_args_contain: Vec::new(),
+            skills_dir: None,
+        });
+        assert_eq!(
+            agent_for_program("/opt/agent/bin/assistant.mjs", &profiles),
+            Some(Agent::Coding("custom".into()))
+        );
     }
 
     #[test]

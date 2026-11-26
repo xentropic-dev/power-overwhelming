@@ -11,13 +11,37 @@ mise run release
 ./target/release/power gui
 ```
 
-Run `power` or `power gui` from any directory. Enter a Git checkout path in the picker to create a box with a shell tab. As you type, the picker searches every directory up to six levels below the path before the last separator with fzf’s algorithm and query syntax: space-separated terms must all match, and `'exact`, `^prefix`, `suffix$`, and `!exclude` work as in fzf. Lowercase queries ignore case. Matches in the final folder name rank first. The search skips hidden directories and anything `.gitignore` excludes, and does not enter `node_modules` or `target`. Tab completes the selected result, and Enter opens it. Type `codex` or `claude` in the shell to start an agent. Tabs show their number and what is running, such as `1 shell` or `2 claude`, and update when an agent starts or exits.
+Run `power` or `power gui` from any directory. Enter a Git checkout path in the picker to create a box with a shell tab. As you type, the picker searches every directory up to six levels below the path before the last separator with fzf’s algorithm and query syntax: space-separated terms must all match, and `'exact`, `^prefix`, `suffix$`, and `!exclude` work as in fzf. Lowercase queries ignore case. Matches in the final folder name rank first. The search skips hidden directories and anything `.gitignore` excludes, and does not enter `node_modules` or `target`. Tab completes the selected result, and Enter opens it. Type `codex`, `claude`, or `grok` in the shell to start an installed agent. Tabs show their number and what is running, such as `1 shell` or `2 claude`, and update when an agent starts or exits.
 
 ## Shell integration
 
-On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines `claude` and `codex` shell functions. Agents started through these functions or from the app receive a list of bundled Power skills and can load a guide with `power skills get <name>`. Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Power restores the last open box and its active tab when you relaunch with the daemon still running.
+On first launch, Power offers to add one line to your shell's rc file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`). Inside Power terminals, that line defines a shell function for each agent profile. Profiles with launch instructions give agents a list of bundled Power skills and tell them how to load a guide with `power skills get <name>`. Outside Power terminals, the line does nothing. To install it later, press `ctrl-b i` in the app or run `power setup` (`power setup --dry-run` shows the change first). To remove it, delete the line and the comment above it. Power restores the last open box and its active tab when you relaunch with the daemon still running.
 
 Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
+
+## Agent profiles
+
+Power provides `claude`, `codex`, and `grok` profiles. Pass a profile ID to `power session start`, `power agent start --provider`, or `power dag dispatch --provider`. With shell integration, use the ID as a command inside a Power terminal.
+
+Add profiles or override built-in fields in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua`.
+
+```lua
+agents["my-agent"] = {
+  command = "/opt/bin/my-agent",
+  injection = { kind = "flag", flag = "--append-system-prompt" },
+  skip_subcommands = { "login", "version" },
+  skip_if_args_contain = { "--append-system-prompt" },
+  skills_dir = "~/.my-agent/skills",
+}
+
+agents.codex = { command = "/opt/bin/codex" }
+```
+
+For a new profile, `command` defaults to the ID and `injection` defaults to `{ kind = "none" }`. Use the executable's name on PATH or an absolute path. Profile IDs use lowercase letters, digits, hyphens and underscores and start with a letter or digit. Power reserves `shell`, `command`, and `power`.
+
+Use `{ kind = "config_value", flag = "-c", key = "developer_instructions" }` to pass launch instructions as a JSON-encoded string in a `key=value` argument. The skip lists match the first argument exactly for subcommands and look for substrings across all arguments for existing flags or settings. `skills_dir` records the optional directory where the agent reads native skills.
+
+Open a new shell to pick up new wrapper names. Restart the daemon when you want profile changes to apply to daemon-launched agents.
 
 ## Color schemes
 
@@ -41,7 +65,7 @@ Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` 
 
 ## Power-bar
 
-The status bar shows the main checkout and active worktree folder names with distinct icons, followed by the foreground agent and its task when reported. Press Ctrl+S then `y` to copy either full path. Power’s launch instructions ask Claude and Codex to set `{agent.task}` with `power session task "Fix WebM playback"` and update it as their work changes. An integration running under the agent can report a model with `power session model "Model name"`.
+The status bar shows the main checkout and active worktree folder names with distinct icons, followed by the foreground agent and its task when reported. Press Ctrl+S then `y` to copy either full path. Power’s launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"` and update it as their work changes. An integration running under the agent can report a model with `power session model "Model name"`.
 
 Set `power_bar` in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua` and press Ctrl+B then `r` to reload. The default uses colored Powerline joins and changes the rightmost accent with the active agent. Set `separator` to `""` for rounded joins or to Unicode text such as `" │ "` for a plain separator. Each segment can set an `icon`, foreground, and background. [Bundled defaults](plugins/power-bar/defaults.json)
 

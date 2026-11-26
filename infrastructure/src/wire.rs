@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use domain::{artifact, session};
+use domain::{artifact, dag, session};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{BufRead, BufReader, Write},
@@ -7,12 +7,12 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
     Shell,
-    Codex,
-    Claude,
+    #[serde(untagged)]
+    Coding(String),
 }
 
 /// A published artifact in history or in a publish event.
@@ -237,8 +237,7 @@ impl From<Agent> for session::Agent {
     fn from(value: Agent) -> Self {
         match value {
             Agent::Shell => Self::Shell,
-            Agent::Codex => Self::Codex,
-            Agent::Claude => Self::Claude,
+            Agent::Coding(id) => Self::Coding(id.into()),
         }
     }
 }
@@ -247,8 +246,7 @@ impl From<session::Agent> for Agent {
     fn from(value: session::Agent) -> Self {
         match value {
             session::Agent::Shell => Self::Shell,
-            session::Agent::Codex => Self::Codex,
-            session::Agent::Claude => Self::Claude,
+            session::Agent::Coding(id) => Self::Coding(id.into()),
         }
     }
 }
@@ -334,13 +332,41 @@ pub struct BoxInfo {
     pub open: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
-    Codex,
-    Claude,
     /// Runs the given argv directly. Used for deterministic worker fixtures.
     Command,
+    #[serde(untagged)]
+    Agent(String),
+}
+
+impl From<String> for Provider {
+    fn from(id: String) -> Self {
+        if id == "command" {
+            Self::Command
+        } else {
+            Self::Agent(id)
+        }
+    }
+}
+
+impl From<dag::Provider> for Provider {
+    fn from(value: dag::Provider) -> Self {
+        match value {
+            dag::Provider::Command => Self::Command,
+            dag::Provider::Agent(id) => Self::Agent(id.into()),
+        }
+    }
+}
+
+impl From<Provider> for dag::Provider {
+    fn from(value: Provider) -> Self {
+        match value {
+            Provider::Command => Self::Command,
+            Provider::Agent(id) => Self::Agent(id.into()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -665,11 +691,6 @@ mod dag_dto {
         };
     }
 
-    enum_dto!(Provider {
-        Codex,
-        Claude,
-        Command
-    });
     enum_dto!(AgentState { Running, Exited });
     enum_dto!(Coordinator { Agent { agent }, External { label } });
     enum_dto!(TaskState {
@@ -766,4 +787,27 @@ mod dag_dto {
         sessions,
         agents
     });
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_existing_sessions_and_new_profile_ids_as_strings() -> Result<()> {
+        for (name, expected) in [
+            ("shell", session::Agent::Shell),
+            ("codex", session::Agent::Coding("codex".into())),
+            ("claude", session::Agent::Coding("claude".into())),
+            ("custom", session::Agent::Coding("custom".into())),
+        ] {
+            let record = json!({"id": "session", "worktree": "/repo", "agent": name});
+            let session: session::Session =
+                serde_json::from_value::<Session>(record.clone())?.into();
+            assert_eq!(session.agent, expected);
+            assert_eq!(serde_json::to_value(Session::from(session))?, record);
+        }
+        Ok(())
+    }
 }

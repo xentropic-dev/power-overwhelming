@@ -7,8 +7,11 @@
 
 use crate::keymap::{self, Keymap};
 use anyhow::{Context as _, Result, bail};
-use infrastructure::config::Sections;
 use infrastructure::theme::{self, Scheme};
+use infrastructure::{
+    agents::AgentProfiles,
+    config::{AGENTS_SECTION, Sections, agent_profiles},
+};
 use serde_json::{Value, json};
 
 const PREVIEWS: &str = "previews";
@@ -75,6 +78,7 @@ pub struct Settings {
     pub keymap: Keymap,
     pub previews: Previews,
     pub scheme: Option<&'static Scheme>,
+    pub agents: AgentProfiles,
 }
 
 impl Settings {
@@ -84,6 +88,7 @@ impl Settings {
             (keymap::SECTION.to_owned(), keymap::defaults()),
             (PREVIEWS.to_owned(), previews_defaults()),
             (APPEARANCE.to_owned(), json!({})),
+            (AGENTS_SECTION.to_owned(), json!({})),
         ]
         .into()
     }
@@ -99,6 +104,7 @@ impl Settings {
                 }
             },
             scheme: read_scheme(config.get(APPEARANCE))?,
+            agents: agent_profiles(config)?,
         })
     }
 }

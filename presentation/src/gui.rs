@@ -13,7 +13,7 @@ use crate::{
     terminal_view::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
 };
 use anyhow::{Context as _, Result, ensure};
-use application::{ResolveArtifact, StartSession};
+use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
     link::dag_run_id,
@@ -21,6 +21,7 @@ use domain::{
 };
 use gpui::{prelude::*, *};
 use infrastructure::{
+    agents::AgentProfiles,
     boxes::{Layout, Registry, SavedBox, SavedView},
     client::{self, Run},
     plugins::ActiveView,
@@ -110,6 +111,7 @@ struct Workspace {
     config_error: Option<String>,
     keymap: Keymap,
     preview_settings: Previews,
+    agent_profiles: AgentProfiles,
     config_scheme: Option<&'static Scheme>,
     settings_ready: bool,
     daemon_theme: async_channel::Sender<&'static Scheme>,
@@ -195,6 +197,7 @@ impl Workspace {
                     ConfigChanged::Settings(settings) => {
                         app.keymap = settings.keymap.clone();
                         app.preview_settings = settings.previews.clone();
+                        app.agent_profiles = settings.agents.clone();
                         app.config_scheme = settings.scheme;
                         app.apply_preferred_scheme(cx);
                     }
@@ -228,6 +231,7 @@ impl Workspace {
             status_bar,
             keymap: Keymap::default(),
             preview_settings: Previews::default(),
+            agent_profiles: AgentProfiles::default(),
             config_scheme: None,
             settings_ready: false,
             daemon_theme,
@@ -362,7 +366,7 @@ impl Workspace {
         let shell = Shell::detect();
         let rc = shell.and_then(Shell::rc_file);
         let mut lines = vec![
-            "Power can wrap claude and codex in its terminals, so agents you start from a \
+            "Power can wrap coding agents in its terminals, so agents you start from a \
              shell get the list of bundled Power skills."
                 .to_owned(),
         ];
@@ -409,9 +413,9 @@ impl Workspace {
                 }]
             }
         };
-        for agent in [Agent::Claude, Agent::Codex] {
-            if !shell::agent_available(agent) {
-                lines.push(format!("{} is not on PATH.", agent.command()));
+        for profile in self.agent_profiles.profiles() {
+            if !shell::agent_available(profile) {
+                lines.push(format!("Could not find executable {}.", profile.command));
             }
         }
         let key = |scope, command| self.keymap.first(scope, command);
@@ -870,7 +874,7 @@ impl Workspace {
         let agent = cx.subscribe(&view, |app, source, changed: &AgentChanged, cx| {
             let id = &source.read(cx).session.id;
             if let Some(session) = app.sessions.get_mut(id) {
-                session.agent = changed.0;
+                session.agent = changed.0.clone();
                 cx.notify();
             }
         });
@@ -2076,8 +2080,8 @@ impl Workspace {
         let agent = self
             .sessions
             .get(&view.session)
-            .map_or(Agent::Shell, |session| session.agent);
-        format!("{} {}", index + 1, agent.command())
+            .map_or("shell", |session| session.agent.as_str());
+        format!("{} {}", index + 1, agent)
     }
 
     fn resolve(

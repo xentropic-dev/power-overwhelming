@@ -13,7 +13,8 @@ pub struct StartSession {
 
 #[derive(Default)]
 pub struct SessionOptions {
-    pub argv: Vec<OsString>,
+    /// Extra coding-agent arguments, or the full argv for a shell command.
+    pub args: Vec<OsString>,
     pub env: Vec<(OsString, Option<OsString>)>,
     pub initial_prompt: Option<OsString>,
 }
@@ -41,12 +42,16 @@ impl<T: TerminalRuntime> Application<T> {
         command: StartSession,
         options: SessionOptions,
     ) -> Result<Session> {
+        let profile = match &command.agent {
+            Agent::Shell => None,
+            Agent::Coding(id) => Some(self.agents.resolve(id)?),
+        };
         let session = Session {
             id: (self.new_id)(),
             worktree: self.workspace.open_worktree(&command.worktree)?,
             agent: command.agent,
         };
-        let terminal = self.runtime.start(&session, options)?;
+        let terminal = self.runtime.start(&session, options, profile)?;
         self.sessions.lock().unwrap().insert(
             session.id.clone(),
             Live {

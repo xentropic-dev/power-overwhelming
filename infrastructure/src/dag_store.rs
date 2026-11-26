@@ -10,7 +10,10 @@ pub(crate) struct SqliteDagStore(Mutex<Connection>);
 
 impl SqliteDagStore {
     pub(crate) fn open() -> Result<Self> {
-        let db = Connection::open(state_directory()?.join("dag.sqlite3"))?;
+        Self::initialize(Connection::open(state_directory()?.join("dag.sqlite3"))?)
+    }
+
+    fn initialize(db: Connection) -> Result<Self> {
         db.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS runs (
@@ -266,7 +269,7 @@ impl DagTransaction for DagDb<'_> {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 agent.id, agent.box_id, agent.worktree.to_str().context("Worktree path must be UTF-8")?,
-                enum_name(wire::Provider::from(agent.provider))?, agent.parent, agent.session, enum_name(wire::AgentState::from(agent.state))?,
+                enum_name(wire::Provider::from(agent.provider.clone()))?, agent.parent, agent.session, enum_name(wire::AgentState::from(agent.state))?,
                 agent.label, agent.created_at,
             ],
         )?;
@@ -447,4 +450,44 @@ fn invalid_column(
     error: impl std::error::Error + Send + Sync + 'static,
 ) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::dag::Provider;
+
+    #[test]
+    fn reads_prior_agent_and_attempt_records() -> Result<()> {
+        let store = SqliteDagStore::initialize(Connection::open_in_memory()?)?;
+        store.0.lock().unwrap().execute_batch(
+            r#"
+            INSERT INTO runs VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
+            INSERT INTO agents VALUES
+                ('a', 'box', '/repo', 'codex', NULL, 'session-a', 'exited', 'Codex', 1),
+                ('b', 'box', '/repo', 'claude', NULL, 'session-b', 'exited', 'Claude', 1),
+                ('c', 'box', '/repo', 'command', NULL, 'session-c', 'exited', 'Command', 1);
+            INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');
+            INSERT INTO attempts VALUES
+                ('attempt-a', 'run', 'task', 1, 'a', 'failed', NULL, NULL, NULL, 1, 2),
+                ('attempt-b', 'run', 'task', 2, 'b', 'failed', NULL, NULL, NULL, 3, 4),
+                ('attempt-c', 'run', 'task', 3, 'c', 'succeeded', NULL, NULL, NULL, 5, 6);
+            "#,
+        )?;
+
+        store.read(|db| {
+            let run = db.run("run")?;
+            let attempts = &run.tasks[0].attempts;
+            assert_eq!(attempts.len(), 3);
+            for (attempt, expected) in attempts.iter().zip([
+                Provider::Agent("codex".into()),
+                Provider::Agent("claude".into()),
+                Provider::Command,
+            ]) {
+                assert_eq!(attempt.provider, expected);
+                assert_eq!(db.agent(&attempt.agent)?.provider, expected);
+            }
+            Ok(())
+        })
+    }
 }

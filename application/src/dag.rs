@@ -353,8 +353,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                 agent.task = Some(target.task.clone());
                 agent.attempt = Some(target.id.clone());
             }
-            let terminal = terminal_agent(agent.provider);
-            let mut argv = Vec::<OsString>::new();
+            let terminal = terminal_agent(&agent.provider);
             let initial_prompt = if agent.provider == Provider::Command {
                 ensure!(
                     args.first().is_some_and(|program| !program.is_empty()),
@@ -362,10 +361,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                 );
                 None
             } else {
-                argv.push(terminal.command().into());
                 prompt.map(Into::into)
             };
-            argv.extend(args.into_iter().map(OsString::from));
             let env = [
                 ("POWER_BOX", Some(agent.box_id.as_str())),
                 ("POWER_AGENT", Some(agent.id.as_str())),
@@ -382,7 +379,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                     agent: terminal,
                 },
                 SessionOptions {
-                    argv,
+                    args: args.into_iter().map(OsString::from).collect(),
                     env,
                     initial_prompt,
                 },
@@ -404,7 +401,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                     agent: agent.id.clone(),
                     session: agent.session.clone(),
                     worktree: agent.worktree.clone(),
-                    provider: agent.provider,
+                    provider: agent.provider.clone(),
                     state: AttemptState::Active,
                     summary: None,
                     blocker: None,
@@ -570,9 +567,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             "Caller session is in another box"
         );
         let session = self.application.session(session)?;
-        let provider = match session.agent {
-            Agent::Codex => Provider::Codex,
-            Agent::Claude => Provider::Claude,
+        let provider = match session.agent.clone() {
+            Agent::Coding(id) => Provider::Agent(id),
             Agent::Shell => Provider::Command,
         };
         let mut agent = self.new_agent(
@@ -683,10 +679,9 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-fn terminal_agent(provider: Provider) -> Agent {
+fn terminal_agent(provider: &Provider) -> Agent {
     match provider {
-        Provider::Codex => Agent::Codex,
-        Provider::Claude => Agent::Claude,
+        Provider::Agent(id) => Agent::Coding(id.clone()),
         Provider::Command => Agent::Shell,
     }
 }

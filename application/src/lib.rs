@@ -1,3 +1,4 @@
+pub mod agents;
 mod commands;
 pub mod dag;
 mod queries;
@@ -8,13 +9,14 @@ pub use queries::ResolveArtifact;
 
 use anyhow::{Context, Result};
 use domain::{
+    agent::AgentProfile,
     artifact::{ArtifactRecord, ResolvedArtifact, Target, TargetLocation},
     session::{Agent, Session},
 };
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 pub trait ArtifactStore: Send + Sync {
@@ -42,7 +44,12 @@ pub trait Workspace: Send + Sync {
 pub trait TerminalRuntime: Send + Sync {
     type Handle: Clone + Send;
 
-    fn start(&self, session: &Session, options: SessionOptions) -> Result<Self::Handle>;
+    fn start(
+        &self,
+        session: &Session,
+        options: SessionOptions,
+        profile: Option<&AgentProfile>,
+    ) -> Result<Self::Handle>;
     fn is_running(&self, handle: &Self::Handle) -> bool;
     fn end(&self, handle: Self::Handle) -> Result<()>;
     /// The agent currently in the foreground, which can differ from the launched one
@@ -60,6 +67,7 @@ pub struct Application<T: TerminalRuntime> {
     artifacts: Box<dyn ArtifactStore>,
     workspace: Box<dyn Workspace>,
     runtime: T,
+    agents: Arc<dyn agents::AgentProfileRegistry>,
     new_id: fn() -> String,
 }
 
@@ -68,6 +76,7 @@ impl<T: TerminalRuntime> Application<T> {
         artifacts: impl ArtifactStore + 'static,
         workspace: impl Workspace + 'static,
         runtime: T,
+        agents: Arc<dyn agents::AgentProfileRegistry>,
         new_id: fn() -> String,
     ) -> Self {
         Self {
@@ -75,6 +84,7 @@ impl<T: TerminalRuntime> Application<T> {
             artifacts: Box::new(artifacts),
             workspace: Box::new(workspace),
             runtime,
+            agents,
             new_id,
         }
     }

@@ -1,4 +1,4 @@
-use infrastructure::client::{ManagedAgent, Provider};
+use infrastructure::client::ManagedAgent;
 use nucleo_matcher::{
     Matcher, Utf32Str,
     pattern::{CaseMatching, Normalization, Pattern},
@@ -67,7 +67,7 @@ impl AgentTree {
                 "{} {} {} {}",
                 agent.label,
                 agent.task.as_deref().unwrap_or(""),
-                provider_name(agent.provider),
+                agent.provider.name(),
                 worktree.to_string_lossy()
             );
             if let Some(score) = pattern.score(Utf32Str::new(&text, &mut buffer), matcher) {
@@ -149,17 +149,10 @@ impl AgentTree {
     }
 }
 
-pub(crate) fn provider_name(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Codex => "Codex",
-        Provider::Claude => "Claude",
-        Provider::Command => "Command",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infrastructure::client::Provider;
     use nucleo_matcher::Config;
 
     fn agent(id: &str, parent: Option<&str>, provider: Provider, worktree: &str) -> ManagedAgent {
@@ -185,12 +178,22 @@ mod tests {
             agent(
                 "worker",
                 Some("delegate"),
-                Provider::Claude,
+                Provider::Agent("claude".into()),
                 "/repo/api-fix",
             ),
-            agent("delegator", None, Provider::Codex, "/repo"),
-            agent("unrelated", None, Provider::Codex, "/repo/unrelated"),
-            agent("delegate", Some("delegator"), Provider::Codex, "/repo"),
+            agent("delegator", None, Provider::Agent("codex".into()), "/repo"),
+            agent(
+                "unrelated",
+                None,
+                Provider::Agent("codex".into()),
+                "/repo/unrelated",
+            ),
+            agent(
+                "delegate",
+                Some("delegator"),
+                Provider::Agent("codex".into()),
+                "/repo",
+            ),
         ]);
         let mut matcher = Matcher::new(Config::DEFAULT);
         tree.search("", &mut matcher);

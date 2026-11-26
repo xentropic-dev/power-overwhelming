@@ -1,26 +1,24 @@
+use crate::agent::{AgentId, display_name};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Agent {
     Shell,
-    Codex,
-    Claude,
+    Coding(AgentId),
 }
 
 impl Agent {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Shell => "Shell",
-            Self::Codex => "Codex",
-            Self::Claude => "Claude",
+            Self::Coding(id) => display_name(id.as_str()),
         }
     }
 
-    pub fn command(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Shell => "shell",
-            Self::Codex => "codex",
-            Self::Claude => "claude",
+            Self::Coding(id) => id.as_str(),
         }
     }
 }

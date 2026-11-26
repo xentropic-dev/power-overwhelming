@@ -124,7 +124,7 @@ impl TerminalView {
             while let Ok(first) = rx.recv().await {
                 if view
                     .update_in(cx, |view, _, cx| {
-                        let agent = view.session.agent;
+                        let agent = view.session.agent.clone();
                         let metadata = view.metadata.clone();
                         view.apply(first);
                         for _ in 0..127 {
@@ -132,7 +132,7 @@ impl TerminalView {
                             view.apply(event);
                         }
                         if view.session.agent != agent {
-                            cx.emit(AgentChanged(view.session.agent));
+                            cx.emit(AgentChanged(view.session.agent.clone()));
                         }
                         if view.session.agent != agent || view.metadata != metadata {
                             cx.emit(BarContextChanged);
