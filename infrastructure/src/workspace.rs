@@ -34,12 +34,20 @@ impl WorktreeRoot for LocalWorktreeRoot {
         let configured = None::<PathBuf>;
         let root = match configured {
             Some(root) => std::path::absolute(root).context("Resolve worktrees.root")?,
-            None => crate::persistence::data_directory()?.join("worktrees"),
+            None => power_home()?,
         };
         std::fs::create_dir_all(&root)
             .with_context(|| format!("Create worktree root at {}", root.display()))?;
         Ok(root)
     }
+}
+
+/// `~/.power`, the default home for Power-created worktrees.
+fn power_home() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .context("Set HOME or worktrees.root to choose where worktrees go")?;
+    Ok(PathBuf::from(home).join(".power"))
 }
 
 pub struct Checkout {

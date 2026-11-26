@@ -1843,6 +1843,11 @@ impl Workspace {
                         window,
                         cx,
                     );
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.suggest_branch(domain::worktree::generated_worktree_name(
+                            random_seed(),
+                        ));
+                    }
                 }
             }
             Choice::CreateWorktree(branch) => {
@@ -2956,6 +2961,14 @@ impl Render for Workspace {
             .children(modal)
             .children(graph)
     }
+}
+
+/// A per-call random value from the standard library's randomly keyed hasher.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 #[cfg(test)]

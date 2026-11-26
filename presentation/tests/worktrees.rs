@@ -148,7 +148,7 @@ impl Fixture {
     }
 
     fn default_root(&self) -> PathBuf {
-        self.temp.path().join("data/power-overwhelming/worktrees")
+        self.temp.path().join("home/.power")
     }
 
     fn request(&self, request: Value) -> Value {
@@ -175,7 +175,7 @@ fn power(root: &Path) -> Command {
         .env("POWER_SOCKET", root.join("power.sock"))
         .env("POWER_STATE_DIR", root.join("state"))
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_DATA_HOME", root.join("data"))
+        .env("HOME", root.join("home"))
         .env("SHELL", "/bin/sh")
         .env_remove("POWER_SESSION")
         .env_remove("POWER_BOX")
@@ -477,7 +477,7 @@ fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     assert!(first.is_dir());
 
     fs::remove_file(&config).unwrap();
-    fs::remove_dir_all(fixture.temp.path().join("data")).unwrap();
+    fs::remove_dir_all(fixture.temp.path().join("home/.power")).unwrap();
     let result = fixture.spawn(&run_id, "after-reset", "restored", REPORT_SUCCESS);
     assert_eq!(
         checkout(&result, "restored"),

@@ -7,17 +7,13 @@ use serde_json::json;
 use std::{env, fs, path::PathBuf, process::Command};
 
 #[test]
-fn worktree_root_uses_xdg_and_rereads_lua() -> Result<()> {
+fn worktree_root_defaults_to_power_home_and_rereads_lua() -> Result<()> {
     const TEST_DIRECTORY: &str = "POWER_TEST_WORKTREE_ROOT_DIRECTORY";
     if let Some(directory) = env::var_os(TEST_DIRECTORY) {
         let directory = PathBuf::from(directory);
         let home = directory.join("home");
         let config = directory.join("config/power-overwhelming/config.lua");
-        let data = match env::var_os("XDG_DATA_HOME") {
-            Some(path) if PathBuf::from(&path).is_absolute() => PathBuf::from(path),
-            _ => home.join(".local/share"),
-        };
-        let default = data.join("power-overwhelming/worktrees");
+        let default = home.join(".power");
         let resolver = LocalWorktreeRoot::new(
             [("keys".into(), json!({ "prefix": { "tab": "ctrl-a" } }))].into(),
         );
@@ -70,18 +66,21 @@ fn worktree_root_uses_xdg_and_rereads_lua() -> Result<()> {
     }
 
     // Run the assertions in child processes so each test has an isolated environment.
-    for data_home in [Some("data"), None, Some(""), Some("relative")] {
+    // The XDG data directory must not affect the default.
+    for data_home in [Some("data"), None] {
         let directory = tempfile::tempdir()?;
         let mut test = Command::new(env::current_exe()?);
-        test.args(["--exact", "worktree_root_uses_xdg_and_rereads_lua"])
-            .current_dir(directory.path())
-            .env(TEST_DIRECTORY, directory.path())
-            .env("HOME", directory.path().join("home"))
-            .env("XDG_CONFIG_HOME", directory.path().join("config"))
-            .env("POWER_STATE_DIR", directory.path().join("state"));
+        test.args([
+            "--exact",
+            "worktree_root_defaults_to_power_home_and_rereads_lua",
+        ])
+        .current_dir(directory.path())
+        .env(TEST_DIRECTORY, directory.path())
+        .env("HOME", directory.path().join("home"))
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .env("POWER_STATE_DIR", directory.path().join("state"));
         match data_home {
-            Some("data") => test.env("XDG_DATA_HOME", directory.path().join("data")),
-            Some(value) => test.env("XDG_DATA_HOME", value),
+            Some(value) => test.env("XDG_DATA_HOME", directory.path().join(value)),
             None => test.env_remove("XDG_DATA_HOME"),
         };
         let output = test.output()?;
