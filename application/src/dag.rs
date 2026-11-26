@@ -419,6 +419,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     args: args.into_iter().map(OsString::from).collect(),
                     env,
                     initial_prompt,
+                    ..SessionOptions::default()
                 },
             )?;
             launched = Some(session.id.clone());
@@ -514,18 +515,23 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     pub fn session_exited(&self, session: &str, detail: &str) -> Result<()> {
         self.write(|db| {
             if let Some(agent) = db.session_agent(session)? {
-                interrupt(db, Some(session), detail)?;
+                interrupt(db, Some(session), detail, &|_| false)?;
                 db.set_agent_exited(&agent.id)?;
             }
             Ok(())
         })
     }
 
-    pub fn reconcile(&self) -> Result<()> {
+    /// Interrupts attempts and stops agents whose session did not survive a restart.
+    /// Those in `restored` keep running under their original session IDs.
+    pub fn reconcile(&self, restored: &[String]) -> Result<()> {
+        let restored = |session: Option<&str>| {
+            session.is_some_and(|session| restored.iter().any(|id| id == session))
+        };
         self.write(|db| {
-            interrupt(db, None, "daemon restarted; session unavailable")?;
+            interrupt(db, None, RESTART_DETAIL, &restored)?;
             for agent in db.list_agents(None)? {
-                if agent.state == AgentState::Running {
+                if agent.state == AgentState::Running && !restored(agent.session.as_deref()) {
                     db.set_agent_exited(&agent.id)?;
                 }
             }
@@ -734,7 +740,15 @@ fn select_box<'a>(entries: &'a [RegisteredBox], selector: &str) -> Result<&'a Re
     Ok(entry)
 }
 
-fn interrupt(db: &dyn DagTransaction, session: Option<&str>, detail: &str) -> Result<()> {
+const RESTART_DETAIL: &str = "daemon restarted; session unavailable";
+
+/// Interrupts open attempts of one session, or of every session, except those `keep` accepts.
+fn interrupt(
+    db: &dyn DagTransaction,
+    session: Option<&str>,
+    detail: &str,
+    keep: &dyn Fn(Option<&str>) -> bool,
+) -> Result<()> {
     for OpenAttempt {
         run,
         task,
@@ -742,7 +756,7 @@ fn interrupt(db: &dyn DagTransaction, session: Option<&str>, detail: &str) -> Re
         ..
     } in db.open_attempts(session)?
     {
-        if attempt.interrupt(detail, now()) {
+        if !keep(attempt.session.as_deref()) && attempt.interrupt(detail, now()) {
             db.update_attempt(&attempt)?;
             db.event(
                 &run,

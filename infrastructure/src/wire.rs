@@ -98,6 +98,12 @@ pub enum Request {
         field: MetadataField,
         value: String,
     },
+    /// Sent by an agent wrapper in a shell session before it starts the agent.
+    SetConversation {
+        session: String,
+        agent: String,
+        conversation: String,
+    },
     Launch {
         worktree: PathBuf,
         agent: Agent,
@@ -839,6 +845,33 @@ mod dag_dto {
 mod profile_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn set_conversation_round_trips() -> Result<()> {
+        let request = Request::SetConversation {
+            session: "session".into(),
+            agent: "claude".into(),
+            conversation: "conversation".into(),
+        };
+        let mut line = Vec::new();
+        send(&mut line, &request)?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&line)?,
+            json!({
+                "request": "set_conversation",
+                "session": "session",
+                "agent": "claude",
+                "conversation": "conversation",
+            })
+        );
+        let decoded = receive::<Request>(&mut line.as_slice())?;
+        assert!(matches!(
+            decoded,
+            Some(Request::SetConversation { session, agent, conversation })
+                if session == "session" && agent == "claude" && conversation == "conversation"
+        ));
+        Ok(())
+    }
 
     #[test]
     fn reads_existing_sessions_and_new_profile_ids_as_strings() -> Result<()> {

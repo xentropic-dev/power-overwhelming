@@ -1,0 +1,444 @@
+use crate::{Application, ResumeCommand, SessionOptions, SessionRecord, TerminalRuntime};
+use anyhow::Result;
+use domain::session::{Agent, Session};
+
+/// What to do with one saved session on daemon start.
+enum Plan {
+    Launch(SessionOptions),
+    /// Forget the record. The reason is logged.
+    Drop(&'static str),
+}
+
+impl<T: TerminalRuntime> Application<T> {
+    /// Recreates every saved session under its original ID and returns the restored IDs.
+    /// One failing record does not stop the others. A failed record is kept so a later
+    /// restart can retry it, or the user can close its tab to forget it.
+    pub fn restore_sessions(&self) -> Result<Vec<String>> {
+        let mut restored = Vec::new();
+        for record in self.records.list()? {
+            let options = match self.restore_plan(&record) {
+                Ok(Plan::Launch(options)) => options,
+                Ok(Plan::Drop(reason)) => {
+                    eprintln!("Not restoring session {}: {reason}.", record.id);
+                    if let Err(error) = self.records.remove(&record.id) {
+                        eprintln!("Could not forget session {}. {error:#}", record.id);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("Could not restore session {}. {error:#}", record.id);
+                    continue;
+                }
+            };
+            let session = Session {
+                id: record.id.clone(),
+                worktree: record.worktree.clone(),
+                agent: record.agent.clone(),
+            };
+            match self.launch(session, options) {
+                Ok(_) => restored.push(record.id),
+                Err(error) => eprintln!("Could not restore session {}. {error:#}", record.id),
+            }
+        }
+        Ok(restored)
+    }
+
+    fn restore_plan(&self, record: &SessionRecord) -> Result<Plan> {
+        if !record.worktree.is_dir() {
+            return Ok(Plan::Drop("its worktree no longer exists"));
+        }
+        let mut options = SessionOptions {
+            env: record.env.clone(),
+            ..SessionOptions::default()
+        };
+        match &record.agent {
+            Agent::Coding(id) => {
+                let profile = self.agents.resolve(id)?;
+                options.args = match &profile.resume {
+                    Some(resume) => resume.resume_args(record.conversation.as_deref()),
+                    None => Vec::new(),
+                };
+                options.args.extend(record.args.iter().cloned());
+            }
+            // Command fixtures are never re-run, since their argv can be anything.
+            Agent::Shell if !record.args.is_empty() => {
+                return Ok(Plan::Drop("it ran a command"));
+            }
+            Agent::Shell => {
+                options.cwd = record.cwd.clone().filter(|cwd| cwd.is_dir());
+                if let Agent::Coding(id) = &record.foreground {
+                    match self.agents.resolve(id) {
+                        Ok(profile) => {
+                            options.resume = Some(ResumeCommand {
+                                program: profile.id.as_str().to_owned(),
+                                args: profile.resume.as_ref().map_or_else(Vec::new, |resume| {
+                                    resume.resume_args(record.conversation.as_deref())
+                                }),
+                            })
+                        }
+                        Err(error) => eprintln!(
+                            "Not resuming {} in session {}. {error:#}",
+                            id.as_str(),
+                            record.id
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(Plan::Launch(options))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Application, ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact,
+        ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession, TerminalRuntime,
+        Workspace, WorktreeStatus, agents::AgentProfileRegistry,
+    };
+    use anyhow::{Result, bail};
+    use domain::{
+        agent::{AgentProfile, Injection, Resume},
+        artifact::{ArtifactRecord, ResolvedArtifact},
+        session::{Agent, Session},
+    };
+    use std::{
+        ffi::OsString,
+        path::{Path, PathBuf},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    struct NoArtifacts;
+
+    impl ArtifactStore for NoArtifacts {
+        fn insert(&self, _: ArtifactRecord) -> Result<()> {
+            bail!("unused")
+        }
+        fn find(&self, _: &str) -> Result<ResolvedArtifact> {
+            bail!("unused")
+        }
+        fn recent(&self, _: &[String], _: usize) -> Result<Vec<RecentArtifact>> {
+            bail!("unused")
+        }
+    }
+
+    struct PassThrough;
+
+    impl Workspace for PassThrough {
+        fn open_worktree(&self, directory: &Path) -> Result<PathBuf> {
+            Ok(directory.into())
+        }
+        fn list_worktrees(&self, _: &Path) -> Result<Vec<PathBuf>> {
+            bail!("unused")
+        }
+        fn validate_box_worktree(&self, _: &Path, _: &Path) -> Result<PathBuf> {
+            bail!("unused")
+        }
+        fn head(&self, _: &Path) -> Result<String> {
+            bail!("unused")
+        }
+        fn branch_exists(&self, _: &Path, _: &str) -> Result<BranchStatus> {
+            bail!("unused")
+        }
+        fn create_worktree(&self, _: &Path, _: &Path, _: &str, _: &str) -> Result<CreatedWorktree> {
+            bail!("unused")
+        }
+        fn worktree_status(&self, _: &Path) -> Result<WorktreeStatus> {
+            bail!("unused")
+        }
+        fn remove_worktree(&self, _: &Path, _: bool) -> Result<()> {
+            bail!("unused")
+        }
+        fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
+            bail!("unused")
+        }
+    }
+
+    #[derive(Default)]
+    struct Starts(Mutex<Vec<(Session, SessionOptions)>>);
+
+    impl TerminalRuntime for Arc<Starts> {
+        type Handle = ();
+
+        fn start(
+            &self,
+            session: &Session,
+            options: SessionOptions,
+            _: Option<&AgentProfile>,
+        ) -> Result<()> {
+            if options.args.first().is_some_and(|arg| arg == "fail") {
+                bail!("launch failed");
+            }
+            self.0.lock().unwrap().push((session.clone(), options));
+            Ok(())
+        }
+        fn is_running(&self, _: &()) -> bool {
+            true
+        }
+        fn end(&self, _: ()) -> Result<()> {
+            Ok(())
+        }
+        fn agent(&self, _: &()) -> Option<Agent> {
+            None
+        }
+    }
+
+    struct Profiles(Vec<AgentProfile>);
+
+    impl AgentProfileRegistry for Profiles {
+        fn profiles(&self) -> &[AgentProfile] {
+            &self.0
+        }
+    }
+
+    fn profile(id: &str, resume: Option<Resume>) -> AgentProfile {
+        AgentProfile {
+            id: id.into(),
+            command: id.into(),
+            injection: Injection::None,
+            skip_subcommands: Vec::new(),
+            skip_if_args_contain: Vec::new(),
+            skills_dir: None,
+            resume,
+        }
+    }
+
+    fn app(store: Arc<MemorySessions>) -> (Application<Arc<Starts>>, Arc<Starts>) {
+        static ID: AtomicU64 = AtomicU64::new(0);
+        let starts = Arc::new(Starts::default());
+        let claude = Resume {
+            assign: vec!["--session-id".into(), "{id}".into()],
+            resume: vec!["--resume".into(), "{id}".into()],
+            resume_last: vec!["--continue".into()],
+            conflicts: vec!["--resume".into()],
+        };
+        let codex = Resume {
+            resume_last: vec!["resume".into(), "--last".into()],
+            ..Resume::default()
+        };
+        let profiles = vec![
+            profile("claude", Some(claude)),
+            profile("codex", Some(codex)),
+            profile("plain", None),
+        ];
+        let application = Application::new(
+            NoArtifacts,
+            store,
+            PassThrough,
+            starts.clone(),
+            Arc::new(Profiles(profiles)),
+            || format!("new-{}", ID.fetch_add(1, Ordering::Relaxed)),
+        );
+        (application, starts)
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn record(id: &str, worktree: &Path, agent: Agent, args: &[&str]) -> SessionRecord {
+        SessionRecord {
+            id: id.into(),
+            worktree: worktree.into(),
+            agent: agent.clone(),
+            args: os(args),
+            env: vec![("POWER_TASK".into(), Some("task".into()))],
+            foreground: agent,
+            conversation: None,
+            cwd: None,
+        }
+    }
+
+    fn coding(id: &str) -> Agent {
+        Agent::Coding(id.into())
+    }
+
+    #[test]
+    fn start_saves_launch_options_without_the_prompt_and_end_forgets_them() -> Result<()> {
+        let store = Arc::new(MemorySessions::default());
+        let (application, _) = app(store.clone());
+        let session = application.start_session_with(
+            StartSession {
+                worktree: "/repo".into(),
+                agent: coding("claude"),
+            },
+            SessionOptions {
+                args: os(&["--model", "opus"]),
+                env: vec![("POWER_TASK".into(), None)],
+                initial_prompt: Some("do the thing".into()),
+                ..SessionOptions::default()
+            },
+        )?;
+        let saved = store.list()?;
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, session.id);
+        assert_eq!(saved[0].args, os(&["--model", "opus"]));
+        assert_eq!(saved[0].env, vec![("POWER_TASK".into(), None)]);
+        assert!(
+            !format!("{saved:?}").contains("do the thing"),
+            "the initial prompt must never be persisted"
+        );
+
+        application.end_session(&session.id)?;
+        assert!(store.list()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_start_forgets_its_record() {
+        let store = Arc::new(MemorySessions::default());
+        let (application, _) = app(store.clone());
+        let started = application.start_session_with(
+            StartSession {
+                worktree: "/repo".into(),
+                agent: coding("claude"),
+            },
+            SessionOptions {
+                args: os(&["fail"]),
+                ..SessionOptions::default()
+            },
+        );
+        assert!(started.is_err());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_relaunches_sessions_under_their_ids_with_resume_args() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let subdir = worktree.path().join("sub");
+        std::fs::create_dir(&subdir)?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        let mut claude = record("claude-tab", root, coding("claude"), &["--model", "opus"]);
+        claude.conversation = Some("conv-1".into());
+        let codex = record("codex-tab", root, coding("codex"), &[]);
+        let plain = record("plain-tab", root, coding("plain"), &["--flag"]);
+        let mut shell = record("shell-tab", root, Agent::Shell, &[]);
+        shell.foreground = coding("claude");
+        shell.conversation = Some("conv-2".into());
+        shell.cwd = Some(subdir.clone());
+        let mut moved = record("moved-tab", root, Agent::Shell, &[]);
+        moved.cwd = Some(root.join("gone"));
+        let gone = record("gone-tab", &root.join("missing"), coding("claude"), &[]);
+        let command = record("command-tab", root, Agent::Shell, &["sh", "-c", "rm -rf /"]);
+        let broken = record("broken-tab", root, coding("plain"), &["fail"]);
+        for record in [
+            &claude, &codex, &plain, &shell, &moved, &gone, &command, &broken,
+        ] {
+            store.save(record)?;
+        }
+        let (application, starts) = app(store.clone());
+
+        let restored = application.restore_sessions()?;
+
+        assert_eq!(
+            restored,
+            [
+                "claude-tab",
+                "codex-tab",
+                "plain-tab",
+                "shell-tab",
+                "moved-tab"
+            ]
+        );
+        let starts = starts.0.lock().unwrap();
+        let launched: Vec<_> = starts
+            .iter()
+            .map(|(session, options)| (session.id.as_str(), options))
+            .collect();
+        let env = vec![("POWER_TASK".into(), Some("task".into()))];
+        assert_eq!(
+            launched,
+            [
+                (
+                    "claude-tab",
+                    &SessionOptions {
+                        args: os(&["--resume", "conv-1", "--model", "opus"]),
+                        env: env.clone(),
+                        ..SessionOptions::default()
+                    }
+                ),
+                (
+                    "codex-tab",
+                    &SessionOptions {
+                        args: os(&["resume", "--last"]),
+                        env: env.clone(),
+                        ..SessionOptions::default()
+                    }
+                ),
+                (
+                    "plain-tab",
+                    &SessionOptions {
+                        args: os(&["--flag"]),
+                        env: env.clone(),
+                        ..SessionOptions::default()
+                    }
+                ),
+                (
+                    "shell-tab",
+                    &SessionOptions {
+                        env: env.clone(),
+                        cwd: Some(subdir),
+                        resume: Some(ResumeCommand {
+                            program: "claude".into(),
+                            args: os(&["--resume", "conv-2"]),
+                        }),
+                        ..SessionOptions::default()
+                    }
+                ),
+                (
+                    "moved-tab",
+                    &SessionOptions {
+                        env,
+                        ..SessionOptions::default()
+                    }
+                ),
+            ]
+        );
+        assert!(
+            starts
+                .iter()
+                .all(|(session, options)| session.worktree == root
+                    && options.initial_prompt.is_none())
+        );
+        let kept: Vec<_> = store.list()?.into_iter().map(|record| record.id).collect();
+        assert_eq!(
+            kept,
+            [
+                "claude-tab",
+                "codex-tab",
+                "plain-tab",
+                "shell-tab",
+                "moved-tab",
+                "broken-tab"
+            ]
+        );
+        assert!(application.terminal("shell-tab").is_ok());
+        assert_eq!(store.list()?[3].args, Vec::<OsString>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn record_foreground_updates_the_saved_record() -> Result<()> {
+        let store = Arc::new(MemorySessions::default());
+        let (application, _) = app(store.clone());
+        let session = application.start_session(StartSession {
+            worktree: "/repo".into(),
+            agent: Agent::Shell,
+        })?;
+        application.record_foreground(
+            &session.id,
+            &coding("claude"),
+            Some("conv"),
+            Some(Path::new("/repo/sub")),
+        )?;
+        let saved = &store.list()?[0];
+        assert_eq!(saved.foreground, coding("claude"));
+        assert_eq!(saved.conversation.as_deref(), Some("conv"));
+        assert_eq!(saved.cwd.as_deref(), Some(Path::new("/repo/sub")));
+        Ok(())
+    }
+}

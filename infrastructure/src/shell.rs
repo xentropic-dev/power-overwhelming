@@ -155,7 +155,6 @@ fn has_marker(path: &Path) -> bool {
 }
 
 /// Quotes a program and its arguments for evaluation by Bash, Zsh, or Fish.
-#[allow(dead_code, reason = "The session restore path will call this helper")]
 pub(crate) fn resume_command(program: &str, args: &[OsString]) -> OsString {
     let mut command = Vec::new();
     for word in std::iter::once(OsStr::new(program)).chain(args.iter().map(OsString::as_os_str)) {
@@ -232,13 +231,26 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     let program = find_program(&profile.command)
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
-    command
-        .args(instruction_args(
-            profile,
-            &args,
-            &LocalInstalledSkills(&std::env::current_dir()?),
-        )?)
-        .args(&args);
+    command.args(instruction_args(
+        profile,
+        &args,
+        &LocalInstalledSkills(&std::env::current_dir()?),
+    )?);
+    if let Some(resume) = &profile.resume {
+        let (assign, conversation) = resume.launch(&args, || uuid::Uuid::new_v4().to_string());
+        command.args(assign);
+        if let (Some(conversation), Some(session)) =
+            (conversation, std::env::var_os("POWER_SESSION"))
+        {
+            // The agent starts either way. Without the report it restarts fresh.
+            let _ = crate::client::set_conversation(
+                session.to_string_lossy().into_owned(),
+                profile.id.as_str().to_owned(),
+                conversation,
+            );
+        }
+    }
+    command.args(&args);
     let error = command.exec();
     bail!("Start {}. {error}", program.display())
 }

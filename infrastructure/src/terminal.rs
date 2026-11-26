@@ -36,12 +36,26 @@ use std::{
 pub(crate) type ActiveScheme = Arc<RwLock<&'static Scheme>>;
 type ExitHandler = Arc<dyn Fn(&str, &str) + Send + Sync>;
 type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send + Sync>;
+/// Saves a session's foreground agent, its conversation and the shell's directory.
+type ForegroundChanged =
+    Arc<dyn Fn(&str, &Agent, Option<&str>, Option<&Path>) -> Result<()> + Send + Sync>;
+
+/// How often a shell session's working directory is checked for a restore.
+const CWD_INTERVAL: Duration = Duration::from_secs(3);
+/// How long a shell stays in the foreground before its agent's conversation is
+/// forgotten. A reboot kills the agent before the daemon, and this keeps the
+/// conversation until the shutdown flush.
+const CLEAR_DELAY: Duration = Duration::from_secs(3);
 
 pub struct PtyRuntime {
     pub socket: PathBuf,
     pub scheme: ActiveScheme,
     pub on_exit: ExitHandler,
     pub on_model_changed: ModelChanged,
+    pub on_foreground_changed: ForegroundChanged,
+    /// Set on daemon shutdown. Exits are then not reported and foreground state
+    /// is only saved by an explicit flush, so a reboot cannot erase what a restore needs.
+    pub shutting_down: Arc<AtomicBool>,
     pub profiles: Arc<dyn AgentProfileRegistry>,
 }
 
@@ -51,6 +65,8 @@ struct Lifecycle {
     on_exit: ExitHandler,
     foreground: Mutex<Foreground>,
     on_model_changed: ModelChanged,
+    on_foreground_changed: ForegroundChanged,
+    shutting_down: Arc<AtomicBool>,
 }
 
 struct Foreground {
@@ -60,8 +76,28 @@ struct Foreground {
 
 impl Lifecycle {
     fn notify_exit(&self, detail: &str) {
-        if self.running.swap(false, Ordering::AcqRel) {
+        if self.running.swap(false, Ordering::AcqRel) && !self.shutting_down.load(Ordering::Acquire)
+        {
             (self.on_exit)(&self.session, detail);
+        }
+    }
+
+    /// Saves foreground state. Only a shutdown flush saves once shutdown has begun.
+    fn record_foreground(
+        &self,
+        agent: &Agent,
+        conversation: Option<&str>,
+        cwd: Option<&Path>,
+        flush: bool,
+    ) {
+        if !flush && self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(error) = (self.on_foreground_changed)(&self.session, agent, conversation, cwd) {
+            eprintln!(
+                "Could not save foreground state for {}. {error:#}",
+                self.session
+            );
         }
     }
 
@@ -144,16 +180,19 @@ pub enum Command {
         value: Option<String>,
         reply: SyncSender<Result<bool>>,
     },
+    /// An agent wrapper in this shell session reports the conversation it starts.
+    SetConversation {
+        pid: u32,
+        agent: Agent,
+        conversation: String,
+        reply: SyncSender<bool>,
+    },
     Output(Vec<u8>),
     /// Recheck which agent owns the foreground of a shell session.
     Poll,
     OutputClosed,
     ProcessExited(String),
-    /// Save pending scrollback on the actor and acknowledge after the write attempt.
-    #[allow(
-        dead_code,
-        reason = "The daemon shutdown handler will send this command"
-    )]
+    /// Save pending scrollback and foreground state, then acknowledge after the attempt.
     FlushScrollback(SyncSender<()>),
     End,
 }
@@ -167,6 +206,11 @@ fn launch(
     let geometry = Geometry::default();
     let pair = native_pty_system().openpty(pty_size(geometry))?;
     let model = requested_model(&session.agent, &options.args);
+    let cwd = options
+        .cwd
+        .clone()
+        .unwrap_or_else(|| session.worktree.clone());
+    let mut conversation = None;
     let mut process = if let Some(profile) = profile {
         let mut command = CommandBuilder::new(&profile.command);
         let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
@@ -175,6 +219,11 @@ fn launch(
             &options.args,
             &installed,
         )?);
+        if let Some(resume) = &profile.resume {
+            let (assign, id) = resume.launch(&options.args, || uuid::Uuid::new_v4().to_string());
+            command.args(assign);
+            conversation = id;
+        }
         command.args(&options.args);
         command
     } else if let Some((program, args)) = options.args.split_first() {
@@ -193,7 +242,13 @@ fn launch(
             None => process.env_remove(name),
         }
     }
-    process.cwd(&session.worktree);
+    if let Some(resume) = &options.resume {
+        process.env(
+            "POWER_RESUME",
+            crate::shell::resume_command(&resume.program, &resume.args),
+        );
+    }
+    process.cwd(&cwd);
     process.env("TERM", "xterm-256color");
     process.env("COLORTERM", "truecolor");
     process.env("POWER_SESSION", &session.id);
@@ -224,8 +279,13 @@ fn launch(
             model,
         }),
         on_model_changed: runtime.on_model_changed.clone(),
+        on_foreground_changed: runtime.on_foreground_changed.clone(),
+        shutting_down: runtime.shutting_down.clone(),
     });
     drop(pair.slave);
+    if conversation.is_some() {
+        lifecycle.record_foreground(&session.agent, conversation.as_deref(), None, false);
+    }
 
     let (tx, rx) = mpsc::sync_channel(128);
     let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
@@ -305,6 +365,7 @@ fn launch(
                 lifecycle: &actor_lifecycle,
                 active_scheme,
                 profiles: profiles.as_ref(),
+                cwd,
             },
         );
         if actor_lifecycle.running.load(Ordering::Acquire) {
@@ -338,6 +399,8 @@ struct ActorEnv<'a> {
     lifecycle: &'a Lifecycle,
     active_scheme: ActiveScheme,
     profiles: &'a dyn AgentProfileRegistry,
+    /// Directory the session started in.
+    cwd: PathBuf,
 }
 
 fn terminal_actor(
@@ -353,6 +416,7 @@ fn terminal_actor(
         lifecycle,
         active_scheme,
         profiles,
+        cwd,
     } = env;
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
@@ -401,6 +465,8 @@ fn terminal_actor(
         model: lifecycle.foreground.lock().unwrap().model.clone(),
         ..SessionMetadata::default()
     };
+
+    let mut restore = RestoreState::new(launched_agent.clone(), cwd);
 
     let mut output_closed = false;
     let mut process_exit: Option<(String, Instant)> = None;
@@ -458,7 +524,10 @@ fn terminal_actor(
             && launched_agent == Agent::Shell
             && matches!(
                 command,
-                Command::Attach(_) | Command::Poll | Command::SetMetadata { .. }
+                Command::Attach(_)
+                    | Command::Poll
+                    | Command::SetMetadata { .. }
+                    | Command::SetConversation { .. }
             )
         {
             let current = foreground_agent(
@@ -500,6 +569,7 @@ fn terminal_actor(
                     metadata = next;
                     notify_metadata(&metadata, &mut clients);
                 }
+                restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
             }
         }
         match command {
@@ -617,7 +687,28 @@ fn terminal_actor(
                     });
                 }
             }
-            Command::Poll | Command::RefreshTheme => {}
+            Command::Poll => {
+                if !exited {
+                    restore.poll(run.is_none(), shell_pid, lifecycle);
+                }
+            }
+            Command::SetConversation {
+                pid,
+                agent,
+                conversation,
+                reply,
+            } => {
+                // Only a shell session's own descendants may name its conversation.
+                let accepted = !exited
+                    && launched_agent == Agent::Shell
+                    && shell_pid.is_some_and(|shell| pid != shell && descends_from(pid, shell));
+                if accepted {
+                    let foreground = run.as_ref().map(|(_, agent)| agent);
+                    restore.set_conversation(agent, conversation, foreground, lifecycle);
+                }
+                let _ = reply.send(accepted);
+            }
+            Command::RefreshTheme => {}
             Command::OutputClosed => output_closed = true,
             Command::ProcessExited(detail) => {
                 process_exit = Some((detail, Instant::now() + Duration::from_millis(150)));
@@ -625,6 +716,9 @@ fn terminal_actor(
             Command::FlushScrollback(reply) => {
                 if let Some(scrollback) = &mut scrollback {
                     scrollback.flush(&terminal);
+                }
+                if !exited {
+                    restore.flush(shell_pid, lifecycle);
                 }
                 let _ = reply.send(());
             }
@@ -653,6 +747,106 @@ fn terminal_actor(
         }
     }
     Ok(None)
+}
+
+/// What a shell session last saved for a restore.
+struct RestoreState {
+    shell: bool,
+    /// Foreground agent and conversation as saved.
+    saved: (Agent, Option<String>),
+    /// Conversation reported by the agent wrapper, possibly before the agent runs.
+    conversation: Option<(Agent, String)>,
+    cwd: Option<PathBuf>,
+    cwd_checked: Instant,
+    /// When a shell in the foreground makes the saved agent stale.
+    clear_at: Option<Instant>,
+    /// Whether this actor has saved anything. Until then, the record of a restored
+    /// session keeps the agent it is about to resume.
+    touched: bool,
+}
+
+impl RestoreState {
+    fn new(launched: Agent, cwd: PathBuf) -> Self {
+        Self {
+            shell: launched == Agent::Shell,
+            saved: (launched, None),
+            conversation: None,
+            cwd: Some(cwd),
+            cwd_checked: Instant::now(),
+            clear_at: None,
+            touched: false,
+        }
+    }
+
+    fn save(&mut self, lifecycle: &Lifecycle, flush: bool) {
+        self.touched = true;
+        lifecycle.record_foreground(
+            &self.saved.0,
+            self.saved.1.as_deref(),
+            self.cwd.as_deref(),
+            flush,
+        );
+    }
+
+    fn foreground_changed(&mut self, foreground: Option<&Agent>, lifecycle: &Lifecycle) {
+        if let Some(agent) = foreground {
+            self.clear_at = None;
+            let conversation = self
+                .conversation
+                .as_ref()
+                .filter(|(owner, _)| owner == agent)
+                .map(|(_, id)| id.clone());
+            self.saved = (agent.clone(), conversation);
+            self.save(lifecycle, false);
+        } else {
+            // A conversation reported from now on belongs to the next agent.
+            self.conversation = None;
+            self.clear_at = Some(Instant::now() + CLEAR_DELAY);
+        }
+    }
+
+    fn set_conversation(
+        &mut self,
+        agent: Agent,
+        conversation: String,
+        foreground: Option<&Agent>,
+        lifecycle: &Lifecycle,
+    ) {
+        if foreground == Some(&agent) {
+            self.saved = (agent.clone(), Some(conversation.clone()));
+            self.save(lifecycle, false);
+        }
+        self.conversation = Some((agent, conversation));
+    }
+
+    fn poll(&mut self, shell_foreground: bool, shell_pid: Option<u32>, lifecycle: &Lifecycle) {
+        let now = Instant::now();
+        if self.clear_at.is_some_and(|at| now >= at) {
+            self.clear_at = None;
+            if shell_foreground {
+                self.saved = (Agent::Shell, None);
+                self.save(lifecycle, false);
+            }
+        }
+        if now >= self.cwd_checked + CWD_INTERVAL {
+            self.cwd_checked = now;
+            let cwd = shell_pid.and_then(process_directory);
+            if cwd.is_some() && cwd != self.cwd {
+                self.cwd = cwd;
+                self.save(lifecycle, false);
+            }
+        }
+    }
+
+    fn flush(&mut self, shell_pid: Option<u32>, lifecycle: &Lifecycle) {
+        if !self.shell || !self.touched {
+            return;
+        }
+        if let Some(cwd) = shell_pid.and_then(process_directory) {
+            self.cwd = Some(cwd);
+        }
+        self.save(lifecycle, true);
+    }
 }
 
 const SCROLLBACK_LIMIT: usize = 2 * 1024 * 1024;

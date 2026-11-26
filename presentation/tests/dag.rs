@@ -484,7 +484,11 @@ fn legacy_agent_aliases_use_the_configured_profiles() {
     fs::write(
         config.join("config.lua"),
         r#"
-        agents.claude = { command = "/bin/echo", injection = { kind = "none" } }
+        agents.claude = {
+            command = "/bin/echo",
+            injection = { kind = "none" },
+            resume = { assign = {} },
+        }
         agents.codex = { command = "/bin/echo", injection = { kind = "none" } }
         "#,
     )

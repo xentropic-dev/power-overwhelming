@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    ArtifactStore, BranchStatus, CreatedWorktree, RecentArtifact, Workspace, WorktreeStatus,
-    agents::AgentProfileRegistry,
+    ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact, Workspace,
+    WorktreeStatus, agents::AgentProfileRegistry,
 };
 use anyhow::bail;
 use domain::{
@@ -451,6 +451,7 @@ fn application() -> Arc<Application<FakeTerminal>> {
         .collect();
     Arc::new(Application::new(
         FakeArtifacts,
+        Arc::new(MemorySessions::default()),
         FakeWorkspace,
         FakeTerminal::default(),
         Arc::new(FakeProfiles(profiles)),
@@ -592,7 +593,7 @@ fn reconcile_interrupts_active_and_blocked_attempts_and_keeps_reported_results()
     )?;
     let before = dag.latest_seq()?;
     assert_eq!(dag.attention()?.len(), 1);
-    dag.reconcile()?;
+    dag.reconcile(&[])?;
     assert!(dag.attention()?.is_empty());
     let snapshot = dag.run(&run)?;
     assert_eq!(snapshot.tasks[2].state, TaskState::Completed);
@@ -617,8 +618,32 @@ fn reconcile_interrupts_active_and_blocked_attempts_and_keeps_reported_results()
         Duration::ZERO,
     )?;
     assert_eq!(page.events.len(), 2);
-    dag.reconcile()?;
+    dag.reconcile(&[])?;
     assert_eq!(dag.latest_seq()?, page.cursor);
+    Ok(())
+}
+
+#[test]
+fn reconcile_keeps_attempts_and_agents_whose_session_was_restored() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("lost", &[])])?;
+    let restored = dag.dispatch(command(&run, false))?;
+    let lost = dag.dispatch(Dispatch {
+        task: "lost".into(),
+        ..command(&run, false)
+    })?;
+    let session = restored.agent.session.clone().unwrap();
+
+    dag.reconcile(std::slice::from_ref(&session))?;
+
+    let snapshot = dag.run(&run)?;
+    let kept = snapshot.tasks[0].attempts.last().unwrap();
+    assert_eq!(kept.state, AttemptState::Active);
+    assert_eq!(kept.session.as_deref(), Some(session.as_str()));
+    assert_eq!(snapshot.tasks[1].state, TaskState::Interrupted);
+    let agent = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.state);
+    assert_eq!(agent(&restored.agent.id)?, AgentState::Running);
+    assert_eq!(agent(&lost.agent.id)?, AgentState::Exited);
     Ok(())
 }
 
