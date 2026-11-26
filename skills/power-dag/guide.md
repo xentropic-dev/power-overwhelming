@@ -35,7 +35,15 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 
 ## Dispatch and monitor
 
-1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Choose `codex` or `claude` based on the installed provider, and use `git -C "$REPOSITORY" worktree list` to find an existing worktree of the box's repository. Use separate worktrees for concurrent edits. For test fixtures, `--provider command` runs the command supplied after `--`.
-2. Run `power dag dispatch "$RUN" "$TASK" --provider codex --worktree "$WORKTREE"`. Power starts the worker in a background terminal and gives it the task instructions, completed prerequisite summaries, and reporting contract. Dispatch other ready tasks as appropriate.
+1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Choose `codex` or `claude` based on the installed provider. For test fixtures, `--provider command` runs the command supplied after `--`.
+2. Dispatch each ready task with the appropriate worktree.
+
+   - For concurrent edits, run `power dag dispatch "$RUN" "$TASK" --provider codex --worktree new --branch "$BRANCH"`. Choose a distinct, unused branch name for each task. Inside Power, the new branch starts at the coordinator's current HEAD. Pass `--base` with a branch or other commit-ish to override it. For a dependent task that builds on a prerequisite's commits, pass the prerequisite's branch, for example `--base docs/setup`. Outside Power, `--base` is required when creating a worktree.
+   - For read-only tasks, pass the coordinator's worktree path with `power dag dispatch "$RUN" "$TASK" --provider codex --worktree "$WORKTREE"`. Use `git -C "$REPOSITORY" worktree list` to find existing worktrees of the box's repository.
+
+   Power starts the worker in a background terminal and gives it the task instructions, completed prerequisite summaries, and reporting contract. If Power creates a worktree, the dispatch output includes its path and branch.
+
 3. Run `power dag wait "$RUN" --since "$CURSOR" --timeout 60`. Start `CURSOR` at `0` for a new run. Process the returned `events`, then save the returned `cursor` and pass it as `--since` on the next wait. A timeout returns an empty event list with the same cursor. After results, check `power dag ready "$RUN"` again and dispatch newly ready tasks.
 4. On `needs_input`, surface the worker's question to the user. They can open the worker from the graph (Ctrl+B then `d`) or the agent tree (Ctrl+B then `a`) and answer in that worker's terminal. The worker reports `working` once answered, clearing the request.
+
+When retrying, Power reuses the task's Power-created worktree and branch by default. See the recovery reference for retry commands. To preview which Power-created worktrees can be removed, run `power worktree prune --dry-run`.
