@@ -635,7 +635,7 @@ for phase in update finish; do
     done
     test -f "$fixture_dir/$phase"
     case "$phase" in
-        update) "$POWER_BIN" session model actual-model ;;
+        update) printf '%s' '{"model":"actual-model"}' | "$POWER_BIN" session model --json ;;
         finish) "$POWER_BIN" dag report success --summary "Done" ;;
     esac
 done
