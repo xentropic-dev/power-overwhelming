@@ -7,10 +7,10 @@ use self::{agent_tree::AgentTree, dag_view::DagView};
 use crate::{
     keymap::{Command, Keymap, Scope},
     picker::{Choice, Kind, Picker, Row},
-    preview::{Preview, PreviewAction},
-    settings::{AutoOpen, Previews, Settings},
+    preview::{Preview, PreviewAction, decode_image},
+    settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
-    terminal_view::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
+    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
@@ -22,8 +22,9 @@ use domain::{
 use gpui::{prelude::*, *};
 use infrastructure::{
     agents::AgentProfiles,
+    box_icons::icon_path,
     boxes::{Layout, Registry, SavedBox, SavedView},
-    client::{self, Run},
+    client::{self, ManagedAgent, Run},
     plugins::ActiveView,
     shell::{self, Shell},
     theme::{self, Colors, Scheme},
@@ -32,6 +33,7 @@ use infrastructure::{
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -54,11 +56,13 @@ enum Prefix {
 enum DagQuery {
     Runs(String),
     Run(String),
+    Agents(String),
 }
 
 enum DagSnapshot {
     Runs(Vec<Run>),
     Run(Run),
+    Agents(Vec<ManagedAgent>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -91,6 +95,8 @@ struct PreviewTab {
 struct Workspace {
     registry: Option<Registry>,
     layout: Layout,
+    /// Custom icons set with `power box icon`, by box ID. Other boxes show an identicon.
+    box_icons: HashMap<String, Arc<RenderImage>>,
     sessions: HashMap<String, Session>,
     terminals: HashMap<String, TerminalTab>,
     tab_scroll: ScrollHandle,
@@ -111,12 +117,14 @@ struct Workspace {
     config_error: Option<String>,
     keymap: Keymap,
     preview_settings: Previews,
+    terminal_settings: TerminalSettings,
+    /// Logical pixels the zoom keys add to `terminal.font_size`, for every terminal.
+    terminal_zoom: f32,
     agent_profiles: AgentProfiles,
     config_scheme: Option<&'static Scheme>,
     settings_ready: bool,
     daemon_theme: async_channel::Sender<&'static Scheme>,
-    /// Whether keys go to the preview pane instead of the terminal.
-    preview_focus: bool,
+    preview_focus: FocusHandle,
     /// The terminal showing numbered link hints, if any.
     hinting: Option<Entity<TerminalView>>,
     _bar_config: Subscription,
@@ -169,14 +177,20 @@ impl Workspace {
         });
         let load = cx.background_executor().spawn(async {
             let (registry, layout) = Registry::open()?;
+            let icons = layout
+                .boxes
+                .iter()
+                .filter_map(|entry| Some((entry.id.clone(), load_box_icon(&entry.id)?)))
+                .collect::<HashMap<_, _>>();
             client::ensure_daemon()?;
-            Ok::<_, anyhow::Error>((registry, layout, client::list_sessions()?))
+            Ok::<_, anyhow::Error>((registry, layout, icons, client::list_sessions()?))
         });
         cx.spawn_in(window, async move |app, cx| {
             let result = load.await;
             let _ = app.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok((registry, layout, sessions)) => {
+                    Ok((registry, layout, icons, sessions)) => {
+                        this.box_icons = icons;
                         this.load(registry, layout, sessions, window, cx);
                     }
                     Err(error) => this.error = Some(format!("{error:#}")),
@@ -186,6 +200,7 @@ impl Workspace {
         })
         .detach();
         Self::watch_artifacts(window, cx);
+        Self::watch_box_icons(window, cx);
         let dag_refresh = Self::watch_dag(window, cx);
         let status_bar =
             cx.new(|cx| StatusBar::new(window, cx, Settings::defaults(), Settings::from_sections));
@@ -197,6 +212,8 @@ impl Workspace {
                     ConfigChanged::Settings(settings) => {
                         app.keymap = settings.keymap.clone();
                         app.preview_settings = settings.previews.clone();
+                        app.terminal_settings = settings.terminal.clone();
+                        app.apply_terminal_settings(cx);
                         app.agent_profiles = settings.agents.clone();
                         app.config_scheme = settings.scheme;
                         app.apply_preferred_scheme(cx);
@@ -213,6 +230,7 @@ impl Workspace {
         Self {
             registry: None,
             layout: Layout::default(),
+            box_icons: HashMap::new(),
             sessions: HashMap::new(),
             terminals: HashMap::new(),
             tab_scroll: ScrollHandle::new(),
@@ -231,11 +249,13 @@ impl Workspace {
             status_bar,
             keymap: Keymap::default(),
             preview_settings: Previews::default(),
+            terminal_settings: TerminalSettings::default(),
+            terminal_zoom: 0.,
             agent_profiles: AgentProfiles::default(),
             config_scheme: None,
             settings_ready: false,
             daemon_theme,
-            preview_focus: false,
+            preview_focus: cx.focus_handle(),
             hinting: None,
             main_checkouts: HashMap::new(),
             config_error: None,
@@ -337,6 +357,35 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The terminal settings with the zoom added to the font size.
+    fn zoomed_terminal_settings(&self) -> TerminalSettings {
+        let mut settings = self.terminal_settings.clone();
+        settings.font_size =
+            (settings.font_size + self.terminal_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        settings
+    }
+
+    fn apply_terminal_settings(&mut self, cx: &mut Context<Self>) {
+        let settings = self.zoomed_terminal_settings();
+        for terminal in self.terminals.values() {
+            terminal
+                .view
+                .update(cx, |view, cx| view.set_settings(settings.clone(), cx));
+        }
+    }
+
+    /// Grows or shrinks every terminal's text by `step` logical pixels, or resets it.
+    fn zoom_terminals(&mut self, step: Option<f32>, cx: &mut Context<Self>) {
+        let size = self.terminal_settings.font_size;
+        self.terminal_zoom = match step {
+            Some(step) => {
+                (size + self.terminal_zoom + step).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE) - size
+            }
+            None => 0.,
+        };
+        self.apply_terminal_settings(cx);
+    }
+
     fn pick_color_scheme(&mut self, first_run: bool, window: &mut Window, cx: &mut Context<Self>) {
         let active = cx.global::<DesktopScheme>().0;
         let rows = std::iter::once(active)
@@ -372,7 +421,10 @@ impl Workspace {
         ];
         let rows = match (shell, &rc) {
             (Some(shell), Some(rc)) if shell.installed() => {
-                lines.push(format!("Shell integration is installed in {}.", rc.display()));
+                lines.push(format!(
+                    "Shell integration is installed in {}.",
+                    rc.display()
+                ));
                 vec![Row {
                     label: "Close".into(),
                     detail: String::new(),
@@ -442,10 +494,15 @@ impl Workspace {
             );
             return;
         }
-        let first_run = self
-            .picker
-            .as_ref()
-            .is_none_or(|picker| matches!(picker.kind, Kind::Setup { first_run: true, .. }));
+        let first_run = self.picker.as_ref().is_none_or(|picker| {
+            matches!(
+                picker.kind,
+                Kind::Setup {
+                    first_run: true,
+                    ..
+                }
+            )
+        });
         self.picker = None;
         if !first_run {
             self.restore_focus(window, cx);
@@ -505,7 +562,7 @@ impl Workspace {
         }
         if digit.is_some() {
             if let Some((session, link)) = chosen {
-                self.resolve(session, link, window, cx);
+                self.resolve(session, link, true, window, cx);
             }
         } else if command == Some(Command::HintSearch) {
             self.search_links(window, cx);
@@ -585,6 +642,36 @@ impl Workspace {
         .detach();
     }
 
+    /// Reloads a box's icon whenever an agent sets or resets it.
+    fn watch_box_icons(window: &mut Window, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded(16);
+        std::thread::spawn(move || {
+            client::watch_box_icons(|box_id| tx.send_blocking(box_id).is_ok());
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            while let Ok(box_id) = rx.recv().await {
+                let icon = cx.background_executor().spawn({
+                    let box_id = box_id.clone();
+                    async move { load_box_icon(&box_id) }
+                });
+                let icon = icon.await;
+                if app
+                    .update(cx, |this, cx| {
+                        match icon {
+                            Some(icon) => this.box_icons.insert(box_id, icon),
+                            None => this.box_icons.remove(&box_id),
+                        };
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Run events invalidate snapshots. One pending refresh is enough, even during a burst.
     fn watch_dag(window: &mut Window, cx: &mut Context<Self>) -> async_channel::Sender<()> {
         let (tx, rx) = async_channel::bounded(1);
@@ -626,6 +713,9 @@ impl Workspace {
                                     client::list_runs(Some(box_id), None).map(DagSnapshot::Runs)
                                 }
                                 DagQuery::Run(run) => client::get_run(run).map(DagSnapshot::Run),
+                                DagQuery::Agents(box_id) => {
+                                    client::list_agents(Some(box_id), None).map(DagSnapshot::Agents)
+                                }
                             }
                         })
                         .await;
@@ -667,10 +757,12 @@ impl Workspace {
             return Some((dag.id, DagQuery::Run(dag.run.id.clone())));
         }
         let picker = self.picker.as_ref()?;
-        if let Kind::Runs { box_id, .. } = &picker.kind {
-            return Some((picker.id, DagQuery::Runs(box_id.clone())));
-        }
-        None
+        let query = match &picker.kind {
+            Kind::Runs { box_id, .. } => DagQuery::Runs(box_id.clone()),
+            Kind::Agents { box_id, .. } => DagQuery::Agents(box_id.clone()),
+            _ => return None,
+        };
+        Some((picker.id, query))
     }
 
     fn update_dag(
@@ -711,17 +803,28 @@ impl Workspace {
                     }
                     picker.message = runs.is_empty().then(|| "This box has no DAG runs.".into());
                     picker.set_runs(runs);
-                    if std::mem::take(&mut picker.accept_pending)
-                        && let Some(choice) = picker.selection()
-                    {
-                        self.choose(choice, window, cx);
-                    }
+                }
+                Ok(DagSnapshot::Agents(agents)) => {
+                    picker.message = agents
+                        .is_empty()
+                        .then(|| "This box has no managed agents.".into());
+                    picker.set_agents(agents);
                 }
                 Err(error) => {
                     picker.accept_pending = false;
-                    picker.message = Some(format!("Could not list runs. {error:#}"));
+                    let name = if matches!(picker.kind, Kind::Agents { .. }) {
+                        "agents"
+                    } else {
+                        "runs"
+                    };
+                    picker.message = Some(format!("Could not list {name}. {error:#}"));
                 }
                 _ => return,
+            }
+            if std::mem::take(&mut picker.accept_pending)
+                && let Some(choice) = picker.selection()
+            {
+                self.choose(choice, window, cx);
             }
         } else {
             return;
@@ -755,14 +858,13 @@ impl Workspace {
             AutoOpen::Never => false,
         };
         if open {
-            self.resolve_in(box_id, artifact.session, artifact.uri, window, cx);
+            self.resolve_in(box_id, artifact.session, artifact.uri, false, window, cx);
         }
     }
 
     fn focus_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_preview_index().is_some() {
-            self.preview_focus = true;
-            self.focus.focus(window);
+            self.preview_focus.focus(window);
             cx.notify();
         }
     }
@@ -803,7 +905,6 @@ impl Workspace {
         if self.previews[active].preview.act(action, window, cx)
             && action == PreviewAction::Interact
         {
-            self.preview_focus = false;
             cx.notify();
         }
     }
@@ -866,10 +967,11 @@ impl Workspace {
             return;
         };
         let scheme = cx.global::<DesktopScheme>().0;
-        let view = cx.new(|cx| TerminalView::new(session, scheme, window, cx));
+        let settings = self.zoomed_terminal_settings();
+        let view = cx.new(|cx| TerminalView::new(session, scheme, settings, window, cx));
         let links = cx.subscribe_in(&view, window, |app, source, link: &OpenLink, window, cx| {
             let id = source.read(cx).session.id.clone();
-            app.resolve(id, link.0.clone(), window, cx);
+            app.resolve(id, link.0.clone(), false, window, cx);
         });
         let agent = cx.subscribe(&view, |app, source, changed: &AgentChanged, cx| {
             let id = &source.read(cx).session.id;
@@ -900,7 +1002,6 @@ impl Workspace {
     }
 
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview_focus = false;
         if self.hinting.is_some() {
             self.end_hints(cx);
         }
@@ -1366,9 +1467,9 @@ impl Workspace {
         let Some(box_id) = self.layout.active_box.clone() else {
             return;
         };
-        let id = self.open_picker(
+        self.open_picker(
             Kind::Agents {
-                box_id: box_id.clone(),
+                box_id,
                 tree: AgentTree::default(),
             },
             Vec::new(),
@@ -1379,36 +1480,7 @@ impl Workspace {
             picker.loading = true;
             picker.message = Some("Looking up agents…".into());
         }
-        let agents = cx
-            .background_executor()
-            .spawn(async move { client::list_agents(Some(box_id), None) });
-        cx.spawn_in(window, async move |app, cx| {
-            let result = agents.await;
-            let _ = app.update_in(cx, |this, window, cx| {
-                let Some(picker) = this.picker.as_mut().filter(|picker| picker.id == id) else {
-                    return;
-                };
-                picker.loading = false;
-                match result {
-                    Ok(agents) => {
-                        picker.message = agents
-                            .is_empty()
-                            .then(|| "This box has no managed agents.".into());
-                        picker.set_agent_tree(AgentTree::new(agents));
-                    }
-                    Err(error) => {
-                        picker.message = Some(format!("Could not list agents. {error:#}"))
-                    }
-                }
-                if std::mem::take(&mut picker.accept_pending)
-                    && let Some(choice) = picker.selection()
-                {
-                    this.choose(choice, window, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        let _ = self.dag_refresh.try_send(());
     }
 
     fn open_worker(
@@ -1610,7 +1682,7 @@ impl Workspace {
                 self.picker = None;
                 self.restore_focus(window, cx);
                 if let Some(session) = self.active_view() {
-                    self.resolve(session, link, window, cx);
+                    self.resolve(session, link, true, window, cx);
                 }
             }
             Choice::Setup(install) => self.finish_onboarding(install, window, cx),
@@ -1810,8 +1882,36 @@ impl Workspace {
             .active_box()
             .and_then(|entry| entry.active_view.clone())
         {
-            self.open_picker(Kind::End(id), Vec::new(), window, cx);
+            let message = self.end_session_message();
+            self.open_picker(
+                Kind::End {
+                    session: id,
+                    message,
+                },
+                Vec::new(),
+                window,
+                cx,
+            );
         }
+    }
+
+    /// Confirmation text for ending a session, naming the keys the user has bound.
+    fn end_session_message(&self) -> String {
+        let key = |scope, command| self.keymap.first(scope, command);
+        let mut message = format!(
+            "{} ends the session and removes its tab. {} cancels.",
+            key(Scope::Picker, Command::PickerSelect),
+            key(Scope::Picker, Command::PickerCancel),
+        );
+        let bound = |scope, command| !self.keymap.keys(scope, command).is_empty();
+        if bound(Scope::Prefix, Command::TabPrefix) && bound(Scope::Tab, Command::TabDetach) {
+            message.push_str(&format!(
+                " To close the tab and keep the session running, use {} then {}.",
+                key(Scope::Prefix, Command::TabPrefix),
+                key(Scope::Tab, Command::TabDetach),
+            ));
+        }
+        message
     }
 
     fn detach_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1883,6 +1983,24 @@ impl Workspace {
         let key = stroke.key.as_str();
         if let Some(dag) = &mut self.dag {
             cx.stop_propagation();
+            if dag.picking_artifact {
+                if event.is_held {
+                    return;
+                }
+                dag.picking_artifact = false;
+                let mods = stroke.modifiers;
+                let digit = (!mods.control && !mods.alt && !mods.platform)
+                    .then(|| shortcut_digit(key))
+                    .flatten();
+                if let Some(digit) = digit {
+                    match dag.artifact_link(usize::from(digit)) {
+                        Some(link) => self.open_dag_artifact(link, window, cx),
+                        None => dag.message = Some(format!("No artifact {digit}.")),
+                    }
+                }
+                cx.notify();
+                return;
+            }
             match self.keymap.command(Scope::Dag, stroke) {
                 Some(Command::DagClose) => {
                     self.dag = None;
@@ -1900,6 +2018,21 @@ impl Workspace {
                     } else {
                         self.show_error("This task has no assigned worker.", cx);
                     }
+                }
+                Some(Command::DagArtifact) if !event.is_held && !dag.opening => {
+                    let artifacts = dag.artifacts();
+                    match artifacts.as_slice() {
+                        [] => dag.message = Some("This task has no artifacts yet.".into()),
+                        [artifact] => {
+                            let link = artifact.link();
+                            self.open_dag_artifact(link, window, cx);
+                        }
+                        _ => {
+                            dag.picking_artifact = true;
+                            dag.message = None;
+                        }
+                    }
+                    cx.notify();
                 }
                 Some(
                     command @ (Command::DagUp
@@ -1941,8 +2074,8 @@ impl Workspace {
                     }
                     if picker.loading {
                         picker.accept_pending = true;
-                    } else if let Kind::End(id) = &picker.kind {
-                        let id = id.clone();
+                    } else if let Kind::End { session, .. } = &picker.kind {
+                        let id = session.clone();
                         self.dismiss_picker(window, cx);
                         self.end_session(id, window, cx);
                     } else if let Some(choice) = picker.selection() {
@@ -2002,7 +2135,7 @@ impl Workspace {
             return;
         }
 
-        if self.preview_focus && self.prefix.is_none() {
+        if self.preview_focus.is_focused(window) && self.prefix.is_none() {
             cx.stop_propagation();
             if let Some(command) = self.keymap.command(Scope::Preview, stroke) {
                 self.preview_command(command, window, cx);
@@ -2058,6 +2191,9 @@ impl Workspace {
             Some(Command::TabLast) => self.navigate_tabs("l", window, cx),
             Some(Command::TabOpenLink) => self.start_hints(cx),
             Some(Command::TabPreview) => self.focus_preview(window, cx),
+            Some(Command::TerminalZoomIn) => self.zoom_terminals(Some(1.), cx),
+            Some(Command::TerminalZoomOut) => self.zoom_terminals(Some(-1.), cx),
+            Some(Command::TerminalZoomReset) => self.zoom_terminals(None, cx),
             Some(_) => {}
             None => match (prefix, digit) {
                 (Prefix::Box, Some(digit)) => {
@@ -2076,6 +2212,23 @@ impl Workspace {
         }
     }
 
+    /// Closes the task graph and opens an artifact link in the box's preview pane, focused,
+    /// as choosing a link from the link search does.
+    fn open_dag_artifact(&mut self, link: String, window: &mut Window, cx: &mut Context<Self>) {
+        let worker = self
+            .dag
+            .as_ref()
+            .and_then(|dag| dag.attempt())
+            .and_then(|attempt| attempt.session.clone());
+        self.dag = None;
+        self.restore_focus(window, cx);
+        // Resolution runs as a live session; the worker's may have ended.
+        match self.active_view().or(worker) {
+            Some(session) => self.resolve(session, link, true, window, cx),
+            None => self.show_error("Open a terminal in this box to preview artifacts.", cx),
+        }
+    }
+
     fn tab_label(&self, index: usize, view: &SavedView) -> String {
         let agent = self
             .sessions
@@ -2088,6 +2241,7 @@ impl Workspace {
         &mut self,
         session: String,
         target: String,
+        focus_preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2095,22 +2249,24 @@ impl Workspace {
             LinkAction::OpenDag(run) => self.open_dag_link(run.to_owned(), window, cx),
             LinkAction::ResolveArtifact => {
                 if let Some(box_id) = self.layout.active_box.clone() {
-                    self.resolve_in(box_id, session, target, window, cx);
+                    self.resolve_in(box_id, session, target, focus_preview, window, cx);
                 }
             }
         }
     }
 
-    /// Opens `target` in `box_id`'s preview pane without moving keyboard focus.
+    /// Opens `target` in `box_id`'s preview pane. Keyboard opens can take focus.
     fn resolve_in(
         &mut self,
         box_id: String,
         session: String,
         target: String,
+        focus_preview: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let source = session.clone();
+        let opening_focus = focus_preview.then(|| window.focused(cx)).flatten();
         let query = ResolveArtifact { session, target };
         let resolved = cx
             .background_executor()
@@ -2126,12 +2282,16 @@ impl Workspace {
                         Some(format!("{error:#}")),
                     ),
                 };
-                if let Some(target) = &target
-                    && let Some(index) = this
-                        .previews
-                        .iter()
-                        .position(|tab| tab.box_id == box_id && tab.target.as_ref() == Some(target))
-                {
+                // A link may resolve after the user has moved on to another view or shortcut.
+                let take_focus = this.layout.active_box.as_ref() == Some(&box_id)
+                    && this.prefix.is_none()
+                    && this.hinting.is_none()
+                    && opening_focus.is_some_and(|focus| focus.is_focused(window));
+                let existing = this
+                    .previews
+                    .iter()
+                    .position(|tab| tab.box_id == box_id && tab.target == target);
+                let index = if let (Some(target), Some(index)) = (&target, existing) {
                     let tab = &mut this.previews[index];
                     tab.originating_terminal = source;
                     tab.title = title;
@@ -2141,23 +2301,27 @@ impl Workspace {
                         tab.preview.close(window, cx);
                         tab.preview = Preview::open(target, window, cx);
                     }
-                    this.activate_preview(index, cx);
-                    return;
-                }
-                let preview = match &target {
-                    Some(target) => Preview::open(target, window, cx),
-                    None => Preview::Error(error.unwrap_or_default()),
+                    index
+                } else {
+                    let preview = match &target {
+                        Some(target) => Preview::open(target, window, cx),
+                        None => Preview::Error(error.unwrap_or_default()),
+                    };
+                    let id = this.next_id();
+                    this.previews.push(PreviewTab {
+                        id,
+                        box_id,
+                        title,
+                        target,
+                        preview,
+                        originating_terminal: source,
+                    });
+                    this.previews.len() - 1
                 };
-                let id = this.next_id();
-                this.previews.push(PreviewTab {
-                    id,
-                    box_id,
-                    title,
-                    target,
-                    preview,
-                    originating_terminal: source,
-                });
-                this.activate_preview(this.previews.len() - 1, cx);
+                this.activate_preview(index, cx);
+                if take_focus {
+                    this.focus_preview(window, cx);
+                }
             });
         })
         .detach();
@@ -2187,6 +2351,7 @@ impl Workspace {
     }
 
     fn close_preview(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let closing_active = self.active_preview_index() == Some(index);
         let tab = self.previews.remove(index);
         tab.preview.close(window, cx);
         if self.active_previews.get(&tab.box_id) == Some(&tab.id) {
@@ -2206,13 +2371,16 @@ impl Workspace {
                 .any(|view| view.session == tab.originating_terminal)
         }) {
             self.activate_tab(tab.originating_terminal, window, cx);
+        } else if closing_active {
+            self.restore_focus(window, cx);
         }
         cx.notify();
     }
 
-    fn previews(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    fn previews(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let colors = colors(cx);
         let active = self.active_preview_index()?;
+        let focused = self.preview_focus.is_focused(window);
         let tabs =
             self.previews
                 .iter()
@@ -2239,6 +2407,7 @@ impl Workspace {
                 });
         Some(
             div()
+                .track_focus(&self.preview_focus)
                 .w(relative(0.48))
                 .flex_none()
                 .min_w(px(245.))
@@ -2247,7 +2416,7 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .border_l_1()
-                .border_color(if self.preview_focus {
+                .border_color(if focused {
                     rgb(colors.accent)
                 } else {
                     rgb(colors.raised)
@@ -2270,7 +2439,7 @@ impl Workspace {
                         .overflow_hidden()
                         .child(self.previews[active].preview.render(colors)),
                 )
-                .when(self.preview_focus, |pane| {
+                .when(focused, |pane| {
                     let key = |command| self.keymap.first(Scope::Preview, command);
                     pane.child(
                         div()
@@ -2297,27 +2466,6 @@ impl Workspace {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{LinkAction, link_action};
-
-    #[test]
-    fn dag_links_open_runs_directly() {
-        assert_eq!(
-            link_action("pwr://dag/Run-123"),
-            LinkAction::OpenDag("Run-123")
-        );
-        for target in [
-            "pwr://artifact/abc",
-            "pwr://dag/",
-            "pwr://dag/a/b",
-            "./report.html",
-        ] {
-            assert_eq!(link_action(target), LinkAction::ResolveArtifact);
-        }
-    }
-}
-
 fn path_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or(path.as_os_str())
@@ -2328,6 +2476,12 @@ fn path_name(path: &Path) -> String {
 fn shortcut_digit(key: &str) -> Option<u8> {
     let [digit] = key.as_bytes() else { return None };
     digit.is_ascii_digit().then(|| digit - b'0')
+}
+
+/// The icon stored for a box, or `None` when it has none or the file is unreadable.
+fn load_box_icon(box_id: &str) -> Option<Arc<RenderImage>> {
+    let path = icon_path(box_id).ok()?;
+    path.exists().then(|| decode_image(&path).ok()).flatten()
 }
 
 fn avatar(id: &str, colors: &Colors) -> impl IntoElement {
@@ -2376,7 +2530,7 @@ fn attention_fill(colors: &Colors, strength: u32) -> u32 {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = colors(cx);
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
@@ -2414,7 +2568,13 @@ impl Render for Workspace {
                         .text_color(rgb(colors.contrast(background)))
                 })
                 .child(digit.to_string())
-                .child(avatar(&entry.id, colors))
+                .child(match self.box_icons.get(&entry.id) {
+                    Some(icon) => img(icon.clone())
+                        .flex_none()
+                        .size(px(17.))
+                        .into_any_element(),
+                    None => avatar(&entry.id, colors).into_any_element(),
+                })
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.activate_box(id.clone(), window, cx);
                 }))
@@ -2471,7 +2631,7 @@ impl Render for Workspace {
                     .child(message)
                     .into_any_element()
             });
-        let previews = self.previews(cx);
+        let previews = self.previews(window, cx);
         let entity = cx.weak_entity();
         let modal = self.picker.as_ref().map(|picker| {
             let picker_id = picker.id;
@@ -2491,15 +2651,27 @@ impl Render for Workspace {
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
-            dag.render(colors, &self.keymap, move |action, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == id)
-                        && dag.graph_action(action)
-                    {
-                        cx.notify();
-                    }
-                });
-            })
+            let open = entity.clone();
+            dag.render(
+                colors,
+                &self.keymap,
+                move |action, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == id)
+                            && dag.graph_action(action)
+                        {
+                            cx.notify();
+                        }
+                    });
+                },
+                move |link, window, cx| {
+                    let _ = open.update(cx, |this, cx| {
+                        if this.dag.as_ref().is_some_and(|dag| dag.id == id) {
+                            this.open_dag_artifact(link, window, cx);
+                        }
+                    });
+                },
+            )
         });
         div()
             .id("workspace")
@@ -2608,5 +2780,26 @@ impl Render for Workspace {
             )
             .children(modal)
             .children(graph)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinkAction, link_action};
+
+    #[test]
+    fn dag_links_open_runs_directly() {
+        assert_eq!(
+            link_action("pwr://dag/Run-123"),
+            LinkAction::OpenDag("Run-123")
+        );
+        for target in [
+            "pwr://artifact/abc",
+            "pwr://dag/",
+            "pwr://dag/a/b",
+            "./report.html",
+        ] {
+            assert_eq!(link_action(target), LinkAction::ResolveArtifact);
+        }
     }
 }

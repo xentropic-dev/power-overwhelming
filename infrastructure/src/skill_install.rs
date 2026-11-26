@@ -3,10 +3,11 @@ use crate::{
     workspace::Checkout,
 };
 use anyhow::{Context, Result, ensure};
-use application::skill_install::{
-    ObservedStub, SkillFilesystem, SkillLocation, SkillMutation, SkillTargets,
+use application::{
+    skill_install::{ObservedStub, SkillFilesystem, SkillLocation, SkillMutation, SkillTargets},
+    skills::InstalledSkills,
 };
-use domain::session::Agent;
+use domain::agent::AgentProfile;
 use fs2::FileExt;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use std::{
@@ -19,7 +20,6 @@ use std::{
 };
 
 const SHARED_SKILLS: &str = ".agents/skills";
-const CLAUDE_SKILLS: &str = ".claude/skills";
 const SKILL_FILE: &str = "SKILL.md";
 const MAX_STUB_BYTES: u64 = 64 * 1024;
 
@@ -31,7 +31,27 @@ fn home() -> Result<PathBuf> {
     Ok(std::path::absolute(home)?)
 }
 
-pub fn install_targets(local: bool, claude: bool) -> Result<SkillTargets> {
+/// Expand a leading `~` in a configured skill folder.
+pub fn expand_home(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_owned(),
+    }
+}
+
+/// A profile's user skill folder, and the same folder relative to a project when it lives
+/// under the home directory.
+fn skill_roots(profile: &AgentProfile, home: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
+    let user = expand_home(profile.skills_dir.as_deref()?, home);
+    let relative = user
+        .strip_prefix(home)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_owned);
+    Some((user, relative))
+}
+
+pub fn install_targets(local: bool, profiles: &[&AgentProfile]) -> Result<SkillTargets> {
     let home = home()?;
     let project = if local {
         Some(
@@ -42,10 +62,14 @@ pub fn install_targets(local: bool, claude: bool) -> Result<SkillTargets> {
     } else {
         None
     };
-    targets_at(&home, project.as_deref(), claude)
+    targets_at(&home, project.as_deref(), profiles)
 }
 
-fn targets_at(home: &Path, project: Option<&Path>, claude: bool) -> Result<SkillTargets> {
+fn targets_at(
+    home: &Path,
+    project: Option<&Path>,
+    profiles: &[&AgentProfile],
+) -> Result<SkillTargets> {
     let scope = project.unwrap_or(home);
     let shared = scope.join(SHARED_SKILLS);
     if let Some(project) = project {
@@ -55,31 +79,51 @@ fn targets_at(home: &Path, project: Option<&Path>, claude: bool) -> Result<Skill
             shared.display()
         );
     }
+    let resolved_shared = resolve_root(&shared).ok();
 
-    let claude_root = scope.join(CLAUDE_SKILLS);
-    let detected = if project.is_some() {
-        claude_root.is_dir()
-    } else {
-        scope.join(".claude").is_dir()
-    };
-    let claude = if claude && detected {
-        let resolved = resolve_root(&claude_root);
+    let mut links: Vec<PathBuf> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for profile in profiles {
+        let Some((user, relative)) = skill_roots(profile, home) else {
+            continue;
+        };
+        // Agents that read the shared folder natively need no link.
+        if relative.as_deref() == Some(Path::new(SHARED_SKILLS)) {
+            continue;
+        }
+        let (root, detected) = match project {
+            Some(project) => {
+                let Some(relative) = relative else { continue };
+                let root = project.join(relative);
+                let detected = root.is_dir();
+                (root, detected)
+            }
+            None => {
+                let detected = user.parent().is_some_and(Path::is_dir);
+                (user, detected)
+            }
+        };
+        if !detected {
+            continue;
+        }
+        let resolved = resolve_root(&root);
         let in_scope = project.is_none_or(|project| {
             resolved
                 .as_ref()
                 .is_ok_and(|root| root.starts_with(project))
         });
-        let distinct = match (resolve_root(&shared), resolved) {
-            (Ok(shared), Ok(root)) => shared != root,
+        let distinct = match (&resolved_shared, &resolved) {
+            (Some(shared), Ok(root)) => shared != root,
             _ => true, // Let observation report errors for these locations.
         };
-        (in_scope && distinct).then_some(claude_root)
-    } else {
-        None
-    };
+        let key = resolved.unwrap_or_else(|_| root.clone());
+        if in_scope && distinct && seen.insert(key) {
+            links.push(root);
+        }
+    }
     Ok(SkillTargets {
         shared,
-        claude,
+        links,
         backups: home.join(".agents/.power-skill-backups"),
     })
 }
@@ -306,54 +350,47 @@ fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(Into::into)
 }
 
-/// Discover user and project skills from the filesystem for the current directory.
-pub fn installed_skills(agent: &Agent) -> Result<BTreeSet<String>> {
-    installed_skills_in(agent, &std::env::current_dir()?)
+/// Discovers the skills a profile's agent loads from its user and project folders, as seen
+/// from the agent's launch directory.
+pub struct LocalInstalledSkills<'a>(pub &'a Path);
+
+impl InstalledSkills for LocalInstalledSkills<'_> {
+    fn installed(&self, profile: &AgentProfile) -> Result<BTreeSet<String>> {
+        installed_skills_in(profile, self.0)
+    }
 }
 
 /// Discover user and project skills as seen from an agent's launch directory.
-pub fn installed_skills_in(agent: &Agent, cwd: &Path) -> Result<BTreeSet<String>> {
-    if *agent == Agent::Shell {
-        return Ok(BTreeSet::new());
-    }
-    let home = home()?;
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .filter(|path| !path.is_empty())
-        .map_or_else(|| home.join(".codex"), PathBuf::from);
-    installed_skills_at(agent, &home, &codex_home, cwd)
+pub fn installed_skills_in(profile: &AgentProfile, cwd: &Path) -> Result<BTreeSet<String>> {
+    installed_skills_at(profile, &home()?, cwd)
 }
 
 fn installed_skills_at(
-    agent: &Agent,
+    profile: &AgentProfile,
     home: &Path,
-    codex_home: &Path,
     cwd: &Path,
 ) -> Result<BTreeSet<String>> {
-    // Agents other than Claude and Codex report nothing until profiles carry their skill folders.
-    let relative = match agent.as_str() {
-        "claude" => CLAUDE_SKILLS,
-        "codex" => SHARED_SKILLS,
-        _ => return Ok(BTreeSet::new()),
+    let Some((user, relative)) = skill_roots(profile, home) else {
+        return Ok(BTreeSet::new());
     };
-    let codex = agent.as_str() == "codex";
-    let cwd = cwd.canonicalize()?;
-    let root = Checkout::discover(&cwd).map_or_else(|_| cwd.clone(), |checkout| checkout.worktree);
     let mut names = BTreeSet::new();
-    scan_skills(&home.join(relative), codex, &mut names)?;
-    if codex {
-        // Current Codex still discovers existing skills in its legacy user directory.
-        scan_skills(&codex_home.join("skills"), codex, &mut names)?;
-    }
-    for directory in cwd
-        .ancestors()
-        .take_while(|directory| directory.starts_with(&root))
-    {
-        scan_skills(&directory.join(relative), codex, &mut names)?;
+    scan_skills(&user, &mut names)?;
+    if let Some(relative) = relative {
+        let cwd = cwd.canonicalize()?;
+        let root =
+            Checkout::discover(&cwd).map_or_else(|_| cwd.clone(), |checkout| checkout.worktree);
+        for directory in cwd
+            .ancestors()
+            .take_while(|directory| directory.starts_with(&root))
+        {
+            scan_skills(&directory.join(&relative), &mut names)?;
+        }
     }
     Ok(names)
 }
 
-fn scan_skills(directory: &Path, codex: bool, names: &mut BTreeSet<String>) -> Result<()> {
+/// Collect skill names in a folder, preferring the frontmatter name over the folder name.
+fn scan_skills(directory: &Path, names: &mut BTreeSet<String>) -> Result<()> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -365,26 +402,17 @@ fn scan_skills(directory: &Path, codex: bool, names: &mut BTreeSet<String>) -> R
         if !path.is_file() {
             continue;
         }
-        let name = if codex {
-            let mut markdown = String::new();
-            if File::open(path)?
-                .take(MAX_STUB_BYTES)
-                .read_to_string(&mut markdown)
-                .is_err()
-            {
-                continue;
-            }
-            let Ok(summary) = parse_frontmatter(&markdown) else {
-                continue;
-            };
-            summary.name.trim_matches(['\'', '"']).to_owned()
-        } else {
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            name
-        };
-        names.insert(name);
+        let mut markdown = String::new();
+        let frontmatter = File::open(path)?
+            .take(MAX_STUB_BYTES)
+            .read_to_string(&mut markdown)
+            .ok()
+            .and_then(|_| parse_frontmatter(&markdown).ok())
+            .map(|summary| summary.name.trim_matches(['\'', '"']).to_owned())
+            .filter(|name| !name.is_empty());
+        if let Some(name) = frontmatter.or_else(|| entry.file_name().into_string().ok()) {
+            names.insert(name);
+        }
     }
     Ok(())
 }
@@ -392,8 +420,62 @@ fn scan_skills(directory: &Path, codex: bool, names: &mut BTreeSet<String>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::EmbeddedSkillCatalog;
-    use application::skill_install::{InstallSkills, SkillAction, SkillStub};
+    use crate::{agents::AgentProfiles, skills::EmbeddedSkillCatalog};
+    use application::{
+        agents::AgentProfileRegistry,
+        skill_install::{InstallSkills, SkillAction, SkillStub},
+    };
+
+    const CLAUDE_SKILLS: &str = ".claude/skills";
+
+    fn builtin(id: &str) -> AgentProfile {
+        AgentProfiles::default()
+            .resolve(&id.into())
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn links_only_detected_agents_that_do_not_read_the_shared_folder() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let profiles = AgentProfiles::default();
+        let mut custom = builtin("claude");
+        custom.id = "custom".into();
+        custom.skills_dir = Some("~/.custom/skills".into());
+        let mut all: Vec<_> = profiles.profiles().iter().collect();
+        all.push(&custom);
+
+        assert!(targets_at(home.path(), None, &all)?.links.is_empty());
+        fs::create_dir(home.path().join(".claude"))?;
+        fs::create_dir(home.path().join(".custom"))?;
+        let targets = targets_at(home.path(), None, &all)?;
+        assert_eq!(
+            targets.links,
+            [
+                home.path().join(CLAUDE_SKILLS),
+                home.path().join(".custom/skills")
+            ]
+        );
+        assert!(
+            targets_at(home.path(), None, &[&custom, &custom])?
+                .links
+                .len()
+                == 1
+        );
+
+        let project = tempfile::tempdir()?;
+        assert!(
+            targets_at(home.path(), Some(project.path()), &all)?
+                .links
+                .is_empty()
+        );
+        fs::create_dir_all(project.path().join(CLAUDE_SKILLS))?;
+        assert_eq!(
+            targets_at(home.path(), Some(project.path()), &all)?.links,
+            [project.path().join(CLAUDE_SKILLS)]
+        );
+        Ok(())
+    }
 
     const OLD_STUB: &str = "---\nname: power-dag\ndescription: Previous stub.\n---\n";
     const OLD_HASH: &str = "179d6c05537c0c5ccbc2ca0c9b62412a4e3a3ea9971f95e64cfd76485794b541";
@@ -402,7 +484,8 @@ mod tests {
     fn update_refreshes_a_shipped_stub_without_adding_missing_locations() -> Result<()> {
         let home = tempfile::tempdir()?;
         fs::create_dir_all(home.path().join(".claude"))?;
-        let targets = targets_at(home.path(), None, true)?;
+        let claude = builtin("claude");
+        let targets = targets_at(home.path(), None, &[&claude])?;
         let skill = targets.shared.join("power-dag");
         fs::create_dir_all(&skill)?;
         fs::write(skill.join(SKILL_FILE), OLD_STUB)?;
@@ -458,45 +541,45 @@ mod tests {
     }
 
     #[test]
-    fn visibility_follows_agent_specific_user_and_project_roots() -> Result<()> {
+    fn visibility_follows_profile_user_and_project_roots() -> Result<()> {
         let root = tempfile::tempdir()?;
         let home = root.path().join("home");
         let cwd = root.path().join("project");
-        let codex_home = root.path().join("codex");
         let shared = home.join(SHARED_SKILLS).join("power-dag");
         let claude = home.join(CLAUDE_SKILLS);
         let project_claude = cwd.join(CLAUDE_SKILLS).join("claude-project");
-        let project_shared = cwd.join(SHARED_SKILLS).join("codex-project");
-        let codex_legacy = codex_home.join("skills/legacy-codex");
-        for dir in [&shared, &project_claude, &project_shared, &codex_legacy] {
+        let project_shared = cwd.join(SHARED_SKILLS).join("codex-folder");
+        for dir in [&shared, &project_claude, &project_shared] {
             fs::create_dir_all(dir)?;
         }
         fs::write(shared.join(SKILL_FILE), OLD_STUB)?;
         fs::write(project_claude.join(SKILL_FILE), "Claude skill")?;
-        for (name, dir) in [
-            ("codex-project", project_shared),
-            ("legacy-codex", codex_legacy),
-        ] {
-            fs::write(
-                dir.join(SKILL_FILE),
-                format!("---\nname: {name}\ndescription: Test\n---\n"),
-            )?;
-        }
+        fs::write(
+            project_shared.join(SKILL_FILE),
+            "---\nname: codex-project\ndescription: Test\n---\n",
+        )?;
         fs::create_dir_all(&claude)?;
         symlink(&shared, claude.join("power-dag"))?;
         symlink(home.join("missing"), claude.join("missing"))?;
         assert_eq!(
-            installed_skills_at(&Agent::Coding("claude".into()), &home, &codex_home, &cwd)?,
+            installed_skills_at(&builtin("claude"), &home, &cwd)?,
             BTreeSet::from(["claude-project".into(), "power-dag".into()])
         );
+        let expected = BTreeSet::from(["codex-project".into(), "power-dag".into()]);
         assert_eq!(
-            installed_skills_at(&Agent::Coding("codex".into()), &home, &codex_home, &cwd)?,
-            BTreeSet::from([
-                "codex-project".into(),
-                "legacy-codex".into(),
-                "power-dag".into()
-            ])
+            installed_skills_at(&builtin("codex"), &home, &cwd)?,
+            expected
         );
+        assert_eq!(
+            installed_skills_at(&builtin("grok"), &home, &cwd)?,
+            expected
+        );
+
+        let mut custom = builtin("claude");
+        custom.skills_dir = None;
+        assert!(installed_skills_at(&custom, &home, &cwd)?.is_empty());
+        custom.skills_dir = Some(root.path().join("elsewhere"));
+        assert!(installed_skills_at(&custom, &home, &cwd)?.is_empty());
         Ok(())
     }
 }

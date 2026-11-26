@@ -2,7 +2,7 @@
 
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
-use domain::agent::{AgentProfile, Injection};
+use domain::agent::{AgentProfile, Injection, Resume};
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -101,6 +101,16 @@ struct ProfileConfig {
     skip_subcommands: Option<Vec<String>>,
     skip_if_args_contain: Option<Vec<String>>,
     skills_dir: Option<PathBuf>,
+    resume: Option<ResumeConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeConfig {
+    assign: Option<Vec<String>>,
+    resume: Option<Vec<String>>,
+    resume_last: Option<Vec<String>>,
+    conflicts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -124,15 +134,9 @@ fn read_agent_profile(
             && !matches!(id, "shell" | "command" | "power"),
         "Use a lowercase shell function name starting with a letter or digit, excluding shell, command and power"
     );
-    // Lua's empty table becomes an empty JSON object, including when used as an empty list.
-    for key in ["skip_subcommands", "skip_if_args_contain"] {
-        if value
-            .get(key)
-            .and_then(JsonValue::as_object)
-            .is_some_and(|table| table.is_empty())
-        {
-            value[key] = json!([]);
-        }
+    normalize_empty_lists(&mut value, &["skip_subcommands", "skip_if_args_contain"]);
+    if let Some(resume) = value.get_mut("resume") {
+        normalize_empty_lists(resume, &["assign", "resume", "resume_last", "conflicts"]);
     }
     let config: ProfileConfig = serde_json::from_value(value)?;
     let mut profile = profiles
@@ -147,6 +151,7 @@ fn read_agent_profile(
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             skills_dir: None,
+            resume: None,
         });
     if let Some(command) = config.command {
         anyhow::ensure!(
@@ -171,7 +176,27 @@ fn read_agent_profile(
     if let Some(directory) = config.skills_dir {
         profile.skills_dir = Some(directory);
     }
+    if let Some(config) = config.resume {
+        let defaults = profile.resume.take().unwrap_or_default();
+        profile.resume = Some(Resume {
+            assign: config.assign.unwrap_or(defaults.assign),
+            resume: config.resume.unwrap_or(defaults.resume),
+            resume_last: config.resume_last.unwrap_or(defaults.resume_last),
+            conflicts: config.conflicts.unwrap_or(defaults.conflicts),
+        });
+    }
     Ok(profile)
+}
+
+fn normalize_empty_lists(value: &mut JsonValue, keys: &[&str]) {
+    // Lua's empty table becomes an empty JSON object, including when used as an empty list.
+    for &key in keys {
+        if let Some(list) = value.get_mut(key)
+            && list.as_object().is_some_and(|table| table.is_empty())
+        {
+            *list = json!([]);
+        }
+    }
 }
 
 /// Power's configuration directory, following the XDG base directory convention.
@@ -315,10 +340,64 @@ mod tests {
         assert_eq!(custom.skip_subcommands, ["login"]);
         assert_eq!(custom.skip_if_args_contain, ["instructions="]);
         assert_eq!(custom.skills_dir, Some("~/.custom/skills".into()));
+        assert_eq!(custom.resume, None);
         let error = profiles.resolve(&"unknown".into()).unwrap_err().to_string();
         assert_eq!(
             error,
             "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, custom"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_resume_fields_override_builtin_lists_individually() -> Result<()> {
+        let sections = evaluate(
+            r#"
+            agents.claude = { resume = { assign = {}, resume_last = { "--latest" } } }
+            agents.codex = { resume = { resume_last = {}, conflicts = {} } }
+            "#,
+            Path::new("config.lua"),
+            [(AGENTS_SECTION.into(), json!({}))].into(),
+        )?;
+        let profiles = agent_profiles(&sections)?;
+        let defaults = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into())?;
+        let mut expected = defaults.resolve(&claude.id)?.resume.clone().unwrap();
+        expected.assign.clear();
+        expected.resume_last = vec!["--latest".into()];
+        assert_eq!(claude.resume, Some(expected));
+        assert_eq!(
+            profiles.resolve(&"codex".into())?.resume,
+            Some(Resume::default())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_parses_resume_fields_for_a_custom_agent() -> Result<()> {
+        let sections = evaluate(
+            r#"
+            agents.custom = {
+                resume = {
+                    assign = { "--id", "{id}" },
+                    resume = { "reopen", "{id}" },
+                    resume_last = { "reopen", "--last" },
+                    conflicts = { "--id", "reopen" },
+                },
+            }
+            "#,
+            Path::new("config.lua"),
+            [(AGENTS_SECTION.into(), json!({}))].into(),
+        )?;
+        let profiles = agent_profiles(&sections)?;
+        assert_eq!(
+            profiles.resolve(&"custom".into())?.resume,
+            Some(Resume {
+                assign: vec!["--id".into(), "{id}".into()],
+                resume: vec!["reopen".into(), "{id}".into()],
+                resume_last: vec!["reopen".into(), "--last".into()],
+                conflicts: vec!["--id".into(), "reopen".into()],
+            })
         );
         Ok(())
     }

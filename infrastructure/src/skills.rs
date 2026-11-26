@@ -20,7 +20,10 @@ const SKILLS: &[EmbeddedSkill] = &[
     },
     EmbeddedSkill {
         stub: include_str!("../../skills/power-dag/SKILL.md"),
-        shipped_stub_hashes: &["776c7037a75329bb90681af1e0929c95e86bc8ad4b7eab41ee258456e5216513"],
+        shipped_stub_hashes: &[
+            "776c7037a75329bb90681af1e0929c95e86bc8ad4b7eab41ee258456e5216513",
+            "c8b06aa5a00cd64fed9e63216155627b1887c5039a5e688a7cdf0490b5a76bc5",
+        ],
         guide: include_str!("../../skills/power-dag/guide.md"),
         references: &[
             (

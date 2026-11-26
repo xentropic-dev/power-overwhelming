@@ -1,6 +1,6 @@
 ## Example
 
-From outside Power, set `BOX` to your selector and `REPOSITORY` to the `repository` path from `power box list`. Pick `WT1` and `WT2` from `git -C "$REPOSITORY" worktree list`. Use an installed provider for each dispatch.
+From outside Power, set `BOX` to your selector and `REPOSITORY` to the `repository` path from `power box list`. Pick `WT1` and `WT2` from `git -C "$REPOSITORY" worktree list`. Set `PROFILE` to the agent profile ID of an installed agent, such as `codex`, `claude`, or `grok`.
 
 ```sh
 power dag create --box "$BOX" --coordinator "docs-review" --title "Review project documentation"
@@ -19,8 +19,8 @@ cat > "$TASKS_FILE" <<'JSON'
 JSON
 power dag apply "$RUN" --file "$TASKS_FILE"
 power dag ready "$RUN"  # setup and usage
-power dag dispatch "$RUN" setup --provider codex --worktree "$WT1"
-power dag dispatch "$RUN" usage --provider codex --worktree "$WT2"
+power dag dispatch "$RUN" setup --provider "$PROFILE" --worktree "$WT1"
+power dag dispatch "$RUN" usage --provider "$PROFILE" --worktree "$WT2"
 CURSOR=0
 power dag wait "$RUN" --since "$CURSOR" --timeout 60
 ```
@@ -28,7 +28,7 @@ power dag wait "$RUN" --since "$CURSOR" --timeout 60
 After each wait, update `CURSOR` from the response. Repeat until both reviews succeed and `power dag ready "$RUN"` lists `synthesize`.
 
 ```sh
-power dag dispatch "$RUN" synthesize --provider codex --worktree "$WT1"
+power dag dispatch "$RUN" synthesize --provider "$PROFILE" --worktree "$WT1"
 power dag wait "$RUN" --since "$CURSOR" --timeout 60
 power dag show "$RUN"
 ```

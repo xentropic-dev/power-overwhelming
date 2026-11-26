@@ -558,6 +558,19 @@ mod tests {
         assert_eq!(row.right[0].text, "Fix WebM playback");
         assert_eq!(row.right[1].text, "Codex");
         assert_eq!(row.right[1].bg.as_deref(), Some("bright-blue"));
+        let mut with_model = view();
+        with_model.agent_model = Some("gpt-6".into());
+        let model_row = runtime
+            .render(
+                &mut plugin,
+                &with_model,
+                &BTreeMap::new(),
+                None,
+                theme::default_scheme(),
+            )?
+            .context("Missing model row")?;
+        assert_eq!(model_row.right[1].text, "gpt-6");
+        assert_eq!(model_row.right[2].text, "Codex");
         let mut shell = view();
         shell.agent_type = "Shell".into();
         shell.agent_task = None;

@@ -98,6 +98,12 @@ pub enum Request {
         field: MetadataField,
         value: String,
     },
+    /// Sent by an agent wrapper in a shell session before it starts the agent.
+    SetConversation {
+        session: String,
+        agent: String,
+        conversation: String,
+    },
     Launch {
         worktree: PathBuf,
         agent: Agent,
@@ -130,6 +136,8 @@ pub enum Request {
     },
     /// Stream an `artifact_published` event for every publish.
     WatchArtifacts,
+    /// Stream a `box_icon_changed` event whenever a box's icon is set or reset.
+    WatchBoxIcons,
     End {
         session: String,
     },
@@ -186,12 +194,15 @@ pub enum Response {
     ArtifactPublished {
         artifact: Artifact,
     },
+    BoxIconChanged {
+        box_id: String,
+    },
     Resolved {
         target: Target,
         title: String,
     },
     Dag {
-        dag: DagResponse,
+        dag: Box<DagResponse>,
     },
 }
 
@@ -384,6 +395,8 @@ pub struct ManagedAgent {
     pub box_id: String,
     pub worktree: PathBuf,
     pub provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The delegating Power agent, if any.
     pub parent: Option<String>,
     /// The daemon terminal session, while it has one.
@@ -439,6 +452,8 @@ pub struct Attempt {
     pub session: Option<String>,
     pub worktree: PathBuf,
     pub provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub state: AttemptState,
     /// Result summary from the worker's final report.
     pub summary: Option<String>,
@@ -448,6 +463,18 @@ pub struct Attempt {
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Artifacts published from the attempt's session, in publish order, newest last.
+    #[serde(default)]
+    pub artifacts: Vec<AttemptArtifact>,
+}
+
+/// An artifact published from an attempt's session.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct AttemptArtifact {
+    pub id: String,
+    pub title: String,
+    /// `pwr://artifact/<id>`; derived from `id` when decoding.
+    pub link: String,
 }
 
 /// A task as the coordinator defines it.
@@ -503,6 +530,7 @@ pub enum RunEventKind {
     TaskAdded,
     TaskReady,
     AttemptStarted,
+    AgentModelChanged,
     AttemptSucceeded,
     AttemptFailed,
     NeedsInput,
@@ -616,6 +644,13 @@ pub enum DagRequest {
         kinds: Vec<RunEventKind>,
     },
     Attention,
+    /// Sets the box's icon from an image at an absolute path, or restores the identicon
+    /// when `path` is absent.
+    SetBoxIcon {
+        box_sel: Option<String>,
+        caller: Option<String>,
+        path: Option<PathBuf>,
+    },
     /// Streams `DagResponse::Event` for every run event in the selected box, or all boxes.
     Watch {
         box_sel: Option<String>,
@@ -625,16 +660,42 @@ pub enum DagRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DagResponse {
-    Boxes { boxes: Vec<BoxInfo> },
-    Agents { agents: Vec<ManagedAgent> },
-    Agent { agent: ManagedAgent },
-    Run { run: Run },
-    Runs { runs: Vec<Run> },
-    Dispatched { attempt: Attempt, agent: ManagedAgent },
-    Reported { applied: bool, reason: Option<String> },
-    Events { events: Vec<RunEvent>, cursor: u64 },
-    Attention { boxes: Vec<BoxAttention> },
-    Event { event: RunEvent },
+    Boxes {
+        boxes: Vec<BoxInfo>,
+    },
+    Agents {
+        agents: Vec<ManagedAgent>,
+    },
+    Agent {
+        agent: ManagedAgent,
+    },
+    Run {
+        run: Run,
+    },
+    Runs {
+        runs: Vec<Run>,
+    },
+    Dispatched {
+        attempt: Attempt,
+        agent: Box<ManagedAgent>,
+    },
+    Reported {
+        applied: bool,
+        reason: Option<String>,
+    },
+    Events {
+        events: Vec<RunEvent>,
+        cursor: u64,
+    },
+    Attention {
+        boxes: Vec<BoxAttention>,
+    },
+    Event {
+        event: RunEvent,
+    },
+    BoxIcon {
+        box_id: String,
+    },
 }
 
 // Domain entities do not depend on serde. These conversions keep the transport
@@ -720,6 +781,7 @@ mod dag_dto {
         TaskAdded,
         TaskReady,
         AttemptStarted,
+        AgentModelChanged,
         AttemptSucceeded,
         AttemptFailed,
         NeedsInput,
@@ -741,6 +803,7 @@ mod dag_dto {
         box_id,
         worktree,
         provider,
+        model,
         parent,
         session,
         run,
@@ -757,13 +820,31 @@ mod dag_dto {
         session,
         worktree,
         provider,
+        model,
         state,
         summary,
         blocker,
         detail,
         started_at,
         ended_at,
-    });
+    } lists { artifacts });
+    impl From<dag::AttemptArtifact> for AttemptArtifact {
+        fn from(value: dag::AttemptArtifact) -> Self {
+            Self {
+                link: value.link(),
+                id: value.id,
+                title: value.title,
+            }
+        }
+    }
+    impl From<AttemptArtifact> for dag::AttemptArtifact {
+        fn from(value: AttemptArtifact) -> Self {
+            Self {
+                id: value.id,
+                title: value.title,
+            }
+        }
+    }
     struct_dto!(TaskSpec {
         id,
         title,
@@ -793,6 +874,33 @@ mod dag_dto {
 mod profile_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn set_conversation_round_trips() -> Result<()> {
+        let request = Request::SetConversation {
+            session: "session".into(),
+            agent: "claude".into(),
+            conversation: "conversation".into(),
+        };
+        let mut line = Vec::new();
+        send(&mut line, &request)?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&line)?,
+            json!({
+                "request": "set_conversation",
+                "session": "session",
+                "agent": "claude",
+                "conversation": "conversation",
+            })
+        );
+        let decoded = receive::<Request>(&mut line.as_slice())?;
+        assert!(matches!(
+            decoded,
+            Some(Request::SetConversation { session, agent, conversation })
+                if session == "session" && agent == "claude" && conversation == "conversation"
+        ));
+        Ok(())
+    }
 
     #[test]
     fn reads_existing_sessions_and_new_profile_ids_as_strings() -> Result<()> {

@@ -91,6 +91,7 @@ pub struct ManagedAgent {
     pub box_id: String,
     pub worktree: PathBuf,
     pub provider: Provider,
+    pub model: Option<String>,
     /// The delegating Power agent, if any.
     pub parent: Option<String>,
     /// The daemon terminal session, while it has one.
@@ -122,6 +123,7 @@ pub struct Attempt {
     pub session: Option<String>,
     pub worktree: PathBuf,
     pub provider: Provider,
+    pub model: Option<String>,
     pub state: AttemptState,
     /// Result summary from the worker's final report.
     pub summary: Option<String>,
@@ -131,6 +133,23 @@ pub struct Attempt {
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Artifacts published from the attempt's session, in publish order, newest last.
+    /// Derived from the artifact store when a run is read; never persisted with the run.
+    pub artifacts: Vec<AttemptArtifact>,
+}
+
+/// An artifact published from an attempt's session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptArtifact {
+    pub id: String,
+    pub title: String,
+}
+
+impl AttemptArtifact {
+    /// The `pwr://artifact/<id>` link that opens this artifact.
+    pub fn link(&self) -> String {
+        format!("{}{}", crate::artifact::URI_PREFIX, self.id)
+    }
 }
 
 impl Attempt {
@@ -176,6 +195,7 @@ pub enum RunEventKind {
     TaskAdded,
     TaskReady,
     AttemptStarted,
+    AgentModelChanged,
     AttemptSucceeded,
     AttemptFailed,
     NeedsInput,
@@ -195,7 +215,7 @@ pub struct RunEvent {
     pub kind: RunEventKind,
     pub task: Option<String>,
     pub attempt: Option<String>,
-    /// Result summary, blocker text, or interruption context.
+    /// Result summary, blocker text, interruption context, or updated model name.
     pub summary: Option<String>,
     pub at: u64,
 }

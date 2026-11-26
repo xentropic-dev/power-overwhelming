@@ -8,7 +8,8 @@ depends = ["release"]
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-# Restarting the daemon ends every session it hosts, including the tab this may run in.
+# SIGTERM lets the daemon save its sessions. Running processes still end, including the tab
+# this may run in, and the new daemon recreates each session and resumes its agent.
 pattern='(^|/)power daemon$'
 if pkill -f "$pattern"; then
   for _ in $(seq 50); do
@@ -19,4 +20,67 @@ if pkill -f "$pattern"; then
 fi
 # The GUI starts a fresh daemon from this binary when none is listening.
 exec ./target/release/power
+"""
+
+[tasks.install]
+description = "Install Power into ~/.local/bin and restart an outdated daemon"
+depends = ["release"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+dest_dir="${POWER_INSTALL_DIR:-$HOME/.local/bin}"
+dest="$dest_dir/power"
+mkdir -p "$dest_dir"
+# Copy then rename so a running daemon or GUI keeps its old inode instead of failing with ETXTBSY.
+tmp="$(mktemp "$dest_dir/.power.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+install -m 0755 target/release/power "$tmp"
+mv -f "$tmp" "$dest"
+trap - EXIT
+echo "Installed $dest"
+
+# Desktop entry so app launchers (Walker, GNOME, KDE, rofi) list Power.
+apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$apps_dir"
+cat > "$apps_dir/power.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Power Overwhelming
+GenericName=Agent Workspace
+Comment=Launch the Power GUI
+Exec=$dest
+TryExec=$dest
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+StartupNotify=true
+EOF
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$apps_dir" || true
+fi
+echo "Installed $apps_dir/power.desktop"
+
+# The daemon and client share one binary. Restart only a daemon running different bytes.
+# Restarting ends every session it hosts, including the tab this may run in.
+pattern='(^|/)power daemon$'
+stale=()
+for pid in $(pgrep -f "$pattern" || true); do
+  cmp -s "/proc/$pid/exe" "$dest" || stale+=("$pid")
+done
+if [[ -z "${stale[*]-}" ]]; then
+  pgrep -f "$pattern" >/dev/null && echo "Daemon already up to date"
+  exit 0
+fi
+echo "Restarting daemon (pid ${stale[*]})"
+kill "${stale[@]}" 2>/dev/null || true
+for _ in $(seq 50); do
+  alive=0
+  for pid in "${stale[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+  ((alive)) || break
+  sleep 0.1
+done
+kill -9 "${stale[@]}" 2>/dev/null || true
+# Any session command starts a detached daemon from the installed binary.
+"$dest" session list >/dev/null
+echo "Daemon restarted from $dest"
 """
