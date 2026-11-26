@@ -4,3 +4,4 @@ pub mod dag;
 pub mod link;
 pub mod session;
 pub mod skill;
+pub mod worktree;

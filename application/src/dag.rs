@@ -1,5 +1,5 @@
 use crate::{Application, SessionOptions, StartSession, TerminalRuntime};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
         AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, ManagedAgent,
@@ -7,6 +7,7 @@ use domain::{
         TaskState, can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
+    worktree::{ManagedWorktree, WorktreeRequest},
 };
 use std::{
     collections::BTreeMap,
@@ -34,6 +35,11 @@ pub trait DagReader {
     fn open_attempts(&self, session: Option<&str>) -> Result<Vec<OpenAttempt>>;
     fn events(&self, scope: EventScope<'_>, since: u64) -> Result<Vec<RunEvent>>;
     fn latest_seq(&self) -> Result<u64>;
+    /// Lists ownership records for one box, or for all boxes when unfiltered.
+    fn list_worktrees(&self, box_id: Option<&str>) -> Result<Vec<ManagedWorktree>>;
+    /// Looks up the ownership record created for this attempt ID.
+    fn find_worktree_by_attempt(&self, attempt: &str) -> Result<Option<ManagedWorktree>>;
+    fn find_worktree_by_path(&self, path: &Path) -> Result<Option<ManagedWorktree>>;
 }
 
 pub trait DagTransaction: DagReader {
@@ -44,6 +50,8 @@ pub trait DagTransaction: DagReader {
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()>;
     fn update_attempt(&self, attempt: &Attempt) -> Result<()>;
+    fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()>;
+    fn remove_worktree(&self, path: &Path) -> Result<()>;
     fn event(
         &self,
         run: &str,
@@ -89,7 +97,7 @@ pub struct BoxSelection {
 pub struct StartAgent {
     pub selection: BoxSelection,
     pub provider: Provider,
-    pub worktree: PathBuf,
+    pub worktree: WorktreeRequest,
     pub parent: Option<String>,
     pub label: String,
     pub prompt: Option<String>,
@@ -100,7 +108,7 @@ pub struct Dispatch {
     pub run: String,
     pub task: String,
     pub provider: Provider,
-    pub worktree: PathBuf,
+    pub worktree: WorktreeRequest,
     pub retry: bool,
     pub args: Vec<String>,
     pub caller: Option<String>,
@@ -583,7 +591,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
         Ok(agent)
     }
 
-    fn validate_worktree(&self, box_id: &str, worktree: &Path) -> Result<PathBuf> {
+    fn validate_worktree(&self, box_id: &str, request: &WorktreeRequest) -> Result<PathBuf> {
+        let WorktreeRequest::Existing(worktree) = request else {
+            bail!("Worktree provisioning is unavailable");
+        };
         let entry = self
             .registry
             .boxes()?

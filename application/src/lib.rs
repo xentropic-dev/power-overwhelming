@@ -39,7 +39,47 @@ pub trait Workspace: Send + Sync {
     fn open_worktree(&self, directory: &Path) -> Result<PathBuf>;
     fn list_worktrees(&self, directory: &Path) -> Result<Vec<PathBuf>>;
     fn validate_box_worktree(&self, repository: &Path, worktree: &Path) -> Result<PathBuf>;
+    /// The full commit ID at the worktree's HEAD.
+    fn head(&self, worktree: &Path) -> Result<String>;
+    /// Looks up a local branch and reports where it is checked out, if anywhere.
+    fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus>;
+    /// Creates a new branch and checks it out at `path`, starting at the given commit-ish.
+    fn create_worktree(
+        &self,
+        repository: &Path,
+        path: &Path,
+        branch: &str,
+        base: &str,
+    ) -> Result<CreatedWorktree>;
+    fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus>;
+    fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()>;
     fn open_artifact_file(&self, path: &Path) -> Result<PathBuf>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchStatus {
+    Missing,
+    Exists { checked_out_at: Option<PathBuf> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedWorktree {
+    /// Canonical path to the new checkout.
+    pub path: PathBuf,
+    /// Full commit ID resolved from the requested base.
+    pub base_commit: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorktreeStatus {
+    /// Includes untracked files.
+    pub dirty: bool,
+    pub merged_into_default: bool,
+}
+
+pub trait WorktreeRoot: Send + Sync {
+    /// Resolves the current configured root or the default data directory location.
+    fn worktree_root(&self) -> Result<PathBuf>;
 }
 
 pub trait TerminalRuntime: Send + Sync {

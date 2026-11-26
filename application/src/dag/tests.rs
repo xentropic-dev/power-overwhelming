@@ -1,5 +1,8 @@
 use super::*;
-use crate::{ArtifactStore, RecentArtifact, Workspace, agents::AgentProfileRegistry};
+use crate::{
+    ArtifactStore, BranchStatus, CreatedWorktree, RecentArtifact, Workspace, WorktreeStatus,
+    agents::AgentProfileRegistry,
+};
 use anyhow::bail;
 use domain::{
     agent::{AgentProfile, Injection},
@@ -43,6 +46,18 @@ impl DagStore for MemoryStore {
 }
 
 impl DagReader for MemoryDb {
+    fn list_worktrees(&self, _box_id: Option<&str>) -> Result<Vec<ManagedWorktree>> {
+        bail!("Unexpected managed worktree lookup")
+    }
+
+    fn find_worktree_by_attempt(&self, _attempt: &str) -> Result<Option<ManagedWorktree>> {
+        bail!("Unexpected managed worktree lookup")
+    }
+
+    fn find_worktree_by_path(&self, _path: &Path) -> Result<Option<ManagedWorktree>> {
+        bail!("Unexpected managed worktree lookup")
+    }
+
     fn agent(&self, id: &str) -> Result<ManagedAgent> {
         self.0
             .borrow()
@@ -145,6 +160,14 @@ impl DagReader for MemoryDb {
 }
 
 impl DagTransaction for MemoryDb {
+    fn insert_worktree(&self, _worktree: &ManagedWorktree) -> Result<()> {
+        bail!("Unexpected managed worktree insert")
+    }
+
+    fn remove_worktree(&self, _path: &Path) -> Result<()> {
+        bail!("Unexpected managed worktree removal")
+    }
+
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
         self.0.borrow_mut().agents.push(agent.clone());
         Ok(())
@@ -274,6 +297,32 @@ impl Workspace for FakeWorkspace {
             "Wrong worktree"
         );
         Ok(worktree.to_owned())
+    }
+
+    fn head(&self, _worktree: &Path) -> Result<String> {
+        bail!("Unexpected HEAD lookup")
+    }
+
+    fn branch_exists(&self, _repository: &Path, _branch: &str) -> Result<BranchStatus> {
+        bail!("Unexpected branch lookup")
+    }
+
+    fn create_worktree(
+        &self,
+        _repository: &Path,
+        _path: &Path,
+        _branch: &str,
+        _base: &str,
+    ) -> Result<CreatedWorktree> {
+        bail!("Unexpected worktree creation")
+    }
+
+    fn worktree_status(&self, _path: &Path) -> Result<WorktreeStatus> {
+        bail!("Unexpected worktree status lookup")
+    }
+
+    fn remove_worktree(&self, _path: &Path, _delete_branch: bool) -> Result<()> {
+        bail!("Unexpected worktree removal")
     }
 
     fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
@@ -410,7 +459,7 @@ fn command(run: &str, retry: bool) -> Dispatch {
         run: run.into(),
         task: "work".into(),
         provider: Provider::Command,
-        worktree: "/worktree".into(),
+        worktree: WorktreeRequest::Existing("/worktree".into()),
         retry,
         args: vec!["worker".into()],
         caller: None,
@@ -642,7 +691,7 @@ fn starting_an_agent_ignores_a_caller_session_this_daemon_does_not_host() -> Res
             caller: Some("session-from-another-daemon".into()),
         },
         provider: Provider::Agent("codex".into()),
-        worktree: "/worktree".into(),
+        worktree: WorktreeRequest::Existing("/worktree".into()),
         parent: None,
         label: "coordinator".into(),
         prompt: None,
