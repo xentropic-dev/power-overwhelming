@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use application::dag::{
-    BoxRegistry, BoxSelection, DagApplication, Dispatch, EventScope, StartAgent,
+    BoxRegistry, BoxSelection, DagApplication, Dispatch, EventScope, PlanTask, StartAgent,
 };
 use domain::worktree::WorktreeRequest;
 use std::{os::unix::net::UnixStream, time::Duration};
@@ -71,6 +71,23 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::AddDependency { run, task, dep } => Reply::Run {
             run: application.add_dependency(&run, &task, &dep)?.into(),
         },
+        DagRequest::PlanTask {
+            run,
+            task,
+            provider,
+            model,
+            clear,
+        } => Reply::Run {
+            run: application
+                .plan_task(PlanTask {
+                    run,
+                    task,
+                    clear,
+                    provider: provider.map(Into::into),
+                    model,
+                })?
+                .into(),
+        },
         DagRequest::StartAgent {
             box_sel,
             caller,
@@ -108,7 +125,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             let result = application.dispatch(Dispatch {
                 run,
                 task,
-                provider: provider.into(),
+                provider: provider.map(Into::into),
                 worktree: worktree.into(),
                 retry,
                 args,

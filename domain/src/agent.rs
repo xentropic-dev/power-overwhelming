@@ -1,4 +1,7 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
 /// A profile's stable name on the command line, on the wire, and in storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +140,78 @@ pub enum ModelCallback {
     None,
 }
 
+/// The model flags of the agents whose command lines Power understands.
+fn model_flags(agent: &str) -> Option<&'static [&'static str]> {
+    match agent {
+        "codex" | "grok" => Some(&["--model", "-m"]),
+        "claude" => Some(&["--model"]),
+        _ => None,
+    }
+}
+
+/// The model that launch arguments select for the agent, if Power knows its model flag.
+pub fn requested_model(
+    agent: &str,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Option<String> {
+    let flags = model_flags(agent)?;
+    let mut model = None;
+    let mut expecting_value = false;
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            break;
+        }
+        if std::mem::take(&mut expecting_value) {
+            model = arg
+                .to_str()
+                .filter(|value| !value.starts_with('-'))
+                .and_then(model_name);
+        }
+        if flags.iter().any(|flag| arg == *flag) {
+            expecting_value = true;
+        } else if let Some((flag, value)) = arg.to_str().and_then(|arg| arg.split_once('='))
+            && flags.contains(&flag)
+        {
+            model = model_name(value);
+        }
+    }
+    if expecting_value { None } else { model }
+}
+
+/// True when the launch arguments pass a model flag the agent accepts, with or without a
+/// usable value. Unknown agents report false.
+pub fn passes_model_flag(agent: &str, args: &[impl AsRef<OsStr>]) -> bool {
+    let Some(flags) = model_flags(agent) else {
+        return false;
+    };
+    args.iter()
+        .map(AsRef::as_ref)
+        .take_while(|arg| *arg != "--")
+        .filter_map(OsStr::to_str)
+        .any(|arg| {
+            flags
+                .iter()
+                .any(|flag| arg == *flag || arg.split_once('=').is_some_and(|(f, _)| f == *flag))
+        })
+}
+
+/// Launch arguments that select `model`, for agents whose model flag Power knows.
+pub fn model_args(agent: &str, model: &str) -> Option<Vec<String>> {
+    model_flags(agent)?;
+    Some(vec!["--model".into(), model.into()])
+}
+
+/// A trimmed model name, if it is usable as session metadata.
+pub fn model_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (valid_metadata(value) && !value.is_empty()).then(|| value.to_owned())
+}
+
+pub fn valid_metadata(value: &str) -> bool {
+    value.chars().count() <= 120 && !value.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +309,22 @@ mod tests {
             spec.resume_args(Some("existing-id")),
             ["--continue"].map(OsString::from)
         );
+    }
+
+    #[test]
+    fn model_flags_are_detected_and_built_for_known_agents() {
+        assert_eq!(requested_model("codex", ["-m", "gpt"]), Some("gpt".into()));
+        assert_eq!(requested_model("claude", ["-m", "opus"]), None);
+        assert_eq!(requested_model("custom", ["--model", "x"]), None);
+        assert!(passes_model_flag("claude", &["--model"]));
+        assert!(passes_model_flag("codex", &["-m=gpt"]));
+        assert!(!passes_model_flag("codex", &["--", "--model"]));
+        assert!(!passes_model_flag("claude", &["--models"]));
+        assert!(!passes_model_flag("custom", &["--model", "x"]));
+        assert_eq!(
+            model_args("grok", "grok-5"),
+            Some(vec!["--model".into(), "grok-5".into()])
+        );
+        assert_eq!(model_args("custom", "x"), None);
     }
 }

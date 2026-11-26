@@ -51,6 +51,13 @@ pub trait DagTransaction: DagReader {
     fn insert_run(&self, run: &Run) -> Result<()>;
     fn insert_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<()>;
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
+    fn set_task_plan(
+        &self,
+        run: &str,
+        task: &str,
+        provider: Option<&Provider>,
+        model: Option<&str>,
+    ) -> Result<()>;
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()>;
     fn update_attempt(&self, attempt: &Attempt) -> Result<()>;
     fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()>;
@@ -118,11 +125,24 @@ pub struct StartAgent {
 pub struct Dispatch {
     pub run: String,
     pub task: String,
-    pub provider: Provider,
+    /// `None` uses the task's planned provider and model.
+    pub provider: Option<Provider>,
     pub worktree: WorktreeRequest,
     pub retry: bool,
     pub args: Vec<String>,
     pub caller: Option<String>,
+}
+
+/// A change to a task's planned provider and model.
+pub struct PlanTask {
+    pub run: String,
+    pub task: String,
+    /// Drops the current plan before applying `provider` and `model`.
+    pub clear: bool,
+    /// A new provider. Without `model`, it also drops the planned model.
+    pub provider: Option<Provider>,
+    /// A new model. An empty string drops the planned model.
+    pub model: Option<String>,
 }
 
 pub struct DispatchResult {
@@ -310,6 +330,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     pub fn add_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<Run> {
+        let tasks = tasks
+            .iter()
+            .map(|task| {
+                let (provider, model) = self
+                    .validate_plan(task.provider.clone(), task.model.clone())
+                    .with_context(|| format!("Task {:?}", task.id))?;
+                Ok(TaskSpec {
+                    provider,
+                    model,
+                    ..task.clone()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tasks = tasks.as_slice();
         self.write(|db| {
             let before = load_run(db, run)?;
             validate_batch(&task_specs(&before), tasks)?;
@@ -337,6 +371,62 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             db.insert_dep(run, task, dep)?;
             load_run(db, run)
         })
+    }
+
+    /// Sets, changes or clears a task's planned provider and model.
+    pub fn plan_task(&self, command: PlanTask) -> Result<Run> {
+        self.write(|db| {
+            let run = load_run(db, &command.run)?;
+            let task = find_task(&run, &command.task)?;
+            let (mut provider, mut model) = if command.clear {
+                (None, None)
+            } else {
+                (task.provider.clone(), task.model.clone())
+            };
+            if let Some(next) = command.provider {
+                provider = Some(next);
+                model = None;
+            }
+            if let Some(next) = command.model {
+                model = (!next.trim().is_empty()).then_some(next);
+            }
+            let (provider, model) = self.validate_plan(provider, model)?;
+            if (&provider, &model) == (&task.provider, &task.model) {
+                return Ok(run);
+            }
+            db.set_task_plan(&run.id, &task.id, provider.as_ref(), model.as_deref())?;
+            db.event(
+                &run.id,
+                RunEventKind::TaskPlanned,
+                Some(&task.id),
+                None,
+                Some(&plan_summary(provider.as_ref(), model.as_deref())),
+            )?;
+            load_run(db, &run.id)
+        })
+    }
+
+    /// Normalizes a planned model and rejects plans that dispatch could not honour.
+    fn validate_plan(
+        &self,
+        provider: Option<Provider>,
+        model: Option<String>,
+    ) -> Result<(Option<Provider>, Option<String>)> {
+        if let Some(Provider::Agent(id)) = &provider {
+            self.application.agents.resolve(id)?;
+        }
+        let model = match model {
+            None => None,
+            Some(value) => Some(
+                domain::agent::model_name(&value)
+                    .with_context(|| format!("Invalid model name {value:?}"))?,
+            ),
+        };
+        ensure!(
+            model.is_none() || provider != Some(Provider::Command),
+            "The command provider takes no planned model"
+        );
+        Ok((provider, model))
     }
 
     pub fn start_agent(&self, command: StartAgent) -> Result<ManagedAgent> {
@@ -390,6 +480,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .checked_add(1)
                     .context("Too many attempts for this task")
             })?;
+            let (provider, args) = planned_launch(task, command.provider.clone(), &command.args)?;
             let entry = self.registered_box(&run.box_id)?;
             let caller = self.hosted_caller(command.caller.as_deref());
             let DispatchWorktree { path, kind } =
@@ -413,7 +504,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             let mut agent = self.new_agent(
                 run.box_id.clone(),
                 path,
-                command.provider,
+                provider,
                 parent,
                 task.title.clone(),
             );
@@ -443,13 +534,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 let prompt = (agent.provider != Provider::Command).then(|| {
                     worker_prompt(&run, task, &agent.worktree, branch.as_deref(), resuming)
                 });
-                self.launch_worker(
-                    &mut agent,
-                    command.args,
-                    prompt,
-                    Some(&task.title),
-                    launched,
-                )?;
+                self.launch_worker(&mut agent, args, prompt, Some(&task.title), launched)?;
                 Ok(branch)
             })();
             let start = match start {
@@ -1079,8 +1164,60 @@ fn task_specs(run: &Run) -> Vec<TaskSpec> {
             title: task.title.clone(),
             instructions: task.instructions.clone(),
             deps: task.deps.clone(),
+            provider: task.provider.clone(),
+            model: task.model.clone(),
         })
         .collect()
+}
+
+fn plan_summary(provider: Option<&Provider>, model: Option<&str>) -> String {
+    match (provider, model) {
+        (None, None) => "no plan".into(),
+        (Some(provider), None) => provider_id(provider).into(),
+        (None, Some(model)) => model.into(),
+        (Some(provider), Some(model)) => format!("{} / {model}", provider_id(provider)),
+    }
+}
+
+fn provider_id(provider: &Provider) -> &str {
+    match provider {
+        Provider::Agent(id) => id.as_str(),
+        Provider::Command => "command",
+    }
+}
+
+/// The provider and launch arguments for an attempt. An explicit provider replaces the
+/// planned one. The planned model applies to the planned provider unless the arguments
+/// already choose a model.
+fn planned_launch(
+    task: &Task,
+    explicit: Option<Provider>,
+    args: &[String],
+) -> Result<(Provider, Vec<String>)> {
+    let provider = match explicit {
+        Some(provider) => provider,
+        None => task.provider.clone().with_context(|| {
+            format!(
+                "Specify --provider, or plan one with `power dag plan <run> {} --provider <id>`",
+                task.id
+            )
+        })?,
+    };
+    let mut launch = args.to_vec();
+    if let (Some(model), Provider::Agent(id)) = (&task.model, &provider)
+        && task.provider.as_ref() == Some(&provider)
+        && !domain::agent::passes_model_flag(id.as_str(), args)
+    {
+        match domain::agent::model_args(id.as_str(), model) {
+            Some(model_args) => launch.splice(0..0, model_args).for_each(drop),
+            None => ensure!(
+                !args.is_empty(),
+                "Power does not know the model flag of {:?}. Pass the planned model {model:?} after --",
+                id.as_str()
+            ),
+        }
+    }
+    Ok((provider, launch))
 }
 
 fn load_run(db: &dyn DagReader, id: &str) -> Result<Run> {

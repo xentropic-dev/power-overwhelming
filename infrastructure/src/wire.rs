@@ -487,6 +487,12 @@ pub struct TaskSpec {
     pub instructions: String,
     #[serde(default)]
     pub deps: Vec<String>,
+    /// Planned provider, used when a dispatch does not pass `--provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+    /// Planned model for the planned provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -495,6 +501,12 @@ pub struct Task {
     pub title: String,
     pub instructions: String,
     pub deps: Vec<String>,
+    /// Planned provider, chosen before dispatch. Attempts record what actually ran.
+    #[serde(default)]
+    pub provider: Option<Provider>,
+    /// Planned model, chosen before dispatch.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Derived by the daemon from persisted attempts and prerequisite states.
     pub state: TaskState,
     pub current_attempt: Option<String>,
@@ -529,6 +541,8 @@ pub enum RunEventKind {
     RunCreated,
     TaskAdded,
     TaskReady,
+    /// The planned provider or model changed. The summary is the new plan.
+    TaskPlanned,
     AttemptStarted,
     AgentModelChanged,
     AttemptSucceeded,
@@ -761,10 +775,22 @@ pub enum DagRequest {
         task: String,
         dep: String,
     },
+    /// Changes a task's planned provider and model. `clear` drops the plan first. A new
+    /// `provider` without `model` drops the planned model. An empty `model` clears it.
+    PlanTask {
+        run: String,
+        task: String,
+        provider: Option<Provider>,
+        model: Option<String>,
+        #[serde(default)]
+        clear: bool,
+    },
     Dispatch {
         run: String,
         task: String,
-        provider: Provider,
+        /// Absent means the task's planned provider and model.
+        #[serde(default)]
+        provider: Option<Provider>,
         worktree: WorktreeRequest,
         /// Required to start a new attempt after a failed or interrupted one.
         #[serde(default)]
@@ -904,11 +930,16 @@ mod dag_dto {
     }
 
     macro_rules! struct_dto {
-        ($name:ident { $($field:ident),+ $(,)? } $(lists { $($list:ident),+ $(,)? })?) => {
+        (
+            $name:ident { $($field:ident),+ $(,)? }
+            $(options { $($option:ident),+ $(,)? })?
+            $(lists { $($list:ident),+ $(,)? })?
+        ) => {
             impl From<dag::$name> for $name {
                 fn from(value: dag::$name) -> Self {
                     Self {
                         $($field: value.$field.into(),)+
+                        $($($option: value.$option.map(Into::into),)+)?
                         $($($list: value.$list.into_iter().map(Into::into).collect(),)+)?
                     }
                 }
@@ -917,6 +948,7 @@ mod dag_dto {
                 fn from(value: $name) -> Self {
                     Self {
                         $($field: value.$field.into(),)+
+                        $($($option: value.$option.map(Into::into),)+)?
                         $($($list: value.$list.into_iter().map(Into::into).collect(),)+)?
                     }
                 }
@@ -952,6 +984,7 @@ mod dag_dto {
         RunCreated,
         TaskAdded,
         TaskReady,
+        TaskPlanned,
         AttemptStarted,
         AgentModelChanged,
         AttemptSucceeded,
@@ -1021,9 +1054,14 @@ mod dag_dto {
         id,
         title,
         instructions,
-        deps
-    });
-    struct_dto!(Task { id, title, instructions, deps, state, current_attempt } lists { attempts });
+        deps,
+        model
+    } options { provider });
+    struct_dto!(
+        Task { id, title, instructions, deps, model, state, current_attempt }
+        options { provider }
+        lists { attempts }
+    );
     struct_dto!(Run { id, box_id, title, coordinator, created_at } lists { tasks });
     struct_dto!(RunEvent {
         seq,
