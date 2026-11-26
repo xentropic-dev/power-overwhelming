@@ -1,6 +1,8 @@
 mod frame;
 mod grid;
+mod ime;
 mod input;
+mod keys;
 mod links;
 mod metrics;
 mod paint;
@@ -23,7 +25,7 @@ use infrastructure::{
     client::{self, SessionMetadata, TerminalControl, TerminalEvent},
     theme::Scheme,
 };
-use std::{path::PathBuf, sync::Arc, thread};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, thread};
 
 /// JetBrains Mono, shipped so the terminal's default font resolves on every machine. A family
 /// GPUI can't find resolves to its UI fallback (Noto Sans and the like) with default features,
@@ -110,8 +112,15 @@ pub struct TerminalView {
     status: Option<String>,
     encoder: key::Encoder,
     mouse: mouse::Encoder,
+    /// Keys whose press went to the program, so their releases go too.
+    pressed_keys: HashSet<String>,
+    /// Whether the program was last told it has focus, as focus reporting sees it.
+    focused: bool,
+    /// What an input method is composing, shown at the cursor until it commits.
+    marked: Option<String>,
     commands: async_channel::Sender<TerminalControl>,
     _follow: Task<()>,
+    _focus_changes: [Subscription; 3],
 }
 
 impl TerminalView {
@@ -168,13 +177,19 @@ impl TerminalView {
                 }
             }
         });
+        let focus = cx.focus_handle();
+        let focus_changes = [
+            cx.on_focus(&focus, window, |view, window, _| view.sync_focus(window)),
+            cx.on_blur(&focus, window, |view, window, _| view.sync_focus(window)),
+            cx.observe_window_activation(window, |view, window, _| view.sync_focus(window)),
+        ];
         let mut terminal = Terminal::new(Options::default()).expect("allocate Ghostty terminal");
         scheme
             .apply_to(&mut terminal)
             .expect("apply bundled terminal palette");
         Self {
             session,
-            focus: cx.focus_handle(),
+            focus,
             metadata: SessionMetadata::default(),
             scheme,
             font: terminal_font(&settings, cx),
@@ -194,8 +209,12 @@ impl TerminalView {
             status: None,
             encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
+            pressed_keys: HashSet::new(),
+            focused: false,
+            marked: None,
             commands,
             _follow: follow,
+            _focus_changes: focus_changes,
         }
     }
 

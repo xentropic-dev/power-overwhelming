@@ -63,6 +63,8 @@ pub enum Command {
     TerminalZoomIn,
     TerminalZoomOut,
     TerminalZoomReset,
+    TerminalCopy,
+    TerminalPaste,
     PreviewPrevious,
     PreviewNext,
     PreviewClose,
@@ -99,6 +101,8 @@ pub enum Scope {
     Preview,
     /// While links on screen show number hints. Digits 1–9 always open a hint.
     Hints,
+    /// While a terminal has focus and no prefix is pending. Other keys go to the program.
+    Terminal,
 }
 
 impl Scope {
@@ -113,6 +117,7 @@ impl Scope {
             Self::Dag => "dag",
             Self::Preview => "preview",
             Self::Hints => "hints",
+            Self::Terminal => "terminal",
         }
     }
 }
@@ -247,6 +252,8 @@ const TABLE: &[Entry] = &[
     entry(S::Preview, "exit", C::PreviewExit, &["tab"], "Back to the terminal"),
     entry(S::Hints, "search", C::HintSearch, &["s"], "Search links and published artifacts"),
     entry(S::Hints, "cancel", C::HintCancel, &["escape"], "Hide the numbers"),
+    entry(S::Terminal, "copy", C::TerminalCopy, &["ctrl-shift-c"], "Copy the selection"),
+    entry(S::Terminal, "paste", C::TerminalPaste, &["ctrl-shift-v"], "Paste, bracketed if the program asks"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -497,6 +504,7 @@ impl Keymap {
                 Scope::AgentTree => format!("In the agent tree: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
+                Scope::Terminal => format!("In the terminal: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
                     format!("{hints} {keys}")
                 }
@@ -541,6 +549,38 @@ mod tests {
         ] {
             assert_eq!(keymap.command(Scope::Preview, &stroke(key)), Some(command));
         }
+    }
+
+    #[test]
+    fn terminal_copy_and_paste_are_commands() {
+        let keymap = Keymap::default();
+        assert_eq!(
+            keymap.command(Scope::Terminal, &stroke("ctrl-shift-c")),
+            Some(C::TerminalCopy)
+        );
+        assert_eq!(
+            keymap.command(Scope::Terminal, &stroke("ctrl-shift-v")),
+            Some(C::TerminalPaste)
+        );
+        // Plain Ctrl+C and Ctrl+V stay with the program.
+        assert_eq!(keymap.command(Scope::Terminal, &stroke("ctrl-c")), None);
+        assert_eq!(keymap.command(Scope::Terminal, &stroke("ctrl-v")), None);
+        let help = keymap.help();
+        assert!(
+            help.iter()
+                .any(|shortcut| shortcut.description == "Copy the selection"
+                    && shortcut.binding == "In the terminal: Ctrl+Shift+C")
+        );
+        let custom =
+            Keymap::from_config(&json!({ "terminal": { "paste": "shift-insert" } })).unwrap();
+        assert_eq!(
+            custom.command(Scope::Terminal, &stroke("shift-insert")),
+            Some(C::TerminalPaste)
+        );
+        assert_eq!(
+            custom.command(Scope::Terminal, &stroke("ctrl-shift-v")),
+            None
+        );
     }
 
     #[test]

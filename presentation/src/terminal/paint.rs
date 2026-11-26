@@ -1,6 +1,7 @@
 use super::{
     TerminalView, cell_metrics,
     frame::CellPosition,
+    ime::Preedit,
     input::register_mouse_exit,
     runs::{RowOp, RunCell, Shaping, row_ops},
 };
@@ -19,7 +20,21 @@ impl Render for TerminalView {
         let frame = self.frame.clone();
         let scheme = self.scheme;
         let colors = &scheme.colors;
-        let (_, background, cursor_color) = scheme.terminal_ink(&self.terminal);
+        let (foreground, background, cursor_color) = scheme.terminal_ink(&self.terminal);
+        let preedit = self
+            .marked
+            .clone()
+            .zip(self.frame.ime_cursor)
+            .map(|(text, at)| Preedit {
+                text,
+                at,
+                font: self.font.font.clone(),
+                font_size: px(self.font.size),
+                foreground: rgb(foreground).into(),
+                background: rgb(background).into(),
+            });
+        let focus = self.focus.clone();
+        let input_owner = terminal.clone();
         let selection_background = Hsla::from(rgba(scheme.selection_background));
         let terminal_font = self.font.font.clone();
         let hovered_link = self.hovered_link().cloned();
@@ -52,6 +67,7 @@ impl Render for TerminalView {
             .when(hovering, |terminal| terminal.cursor_pointer())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            .on_key_up(cx.listener(Self::key_up))
             .on_hover(cx.listener(Self::hover))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
@@ -63,8 +79,14 @@ impl Render for TerminalView {
                     move |bounds, _, cx| {
                         terminal.update(cx, |terminal, _| terminal.set_bounds(bounds, metrics));
                     },
-                    move |bounds, (), window, _| {
+                    move |bounds, (), window, cx| {
                         register_mouse_exit(pointer_owner.clone(), window);
+                        // While focused, input methods type into this terminal.
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, input_owner.clone()),
+                            cx,
+                        );
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             let grid = metrics.snap(bounds.origin);
                             let text_system = window.text_system().clone();
@@ -168,6 +190,9 @@ impl Render for TerminalView {
                                         op.paint(origin + baseline, window);
                                     }
                                 }
+                            }
+                            if let Some(preedit) = preedit {
+                                preedit.paint(grid, metrics, window, cx);
                             }
                         });
                     },

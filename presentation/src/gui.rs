@@ -2278,6 +2278,20 @@ impl Workspace {
             return;
         }
 
+        if self.prefix.is_none()
+            && let Some(command) = self.keymap.command(Scope::Terminal, stroke)
+            && let Some(tab) = self.active_view().and_then(|id| self.terminals.get(&id))
+            && tab.view.read(cx).focus.is_focused(window)
+        {
+            cx.stop_propagation();
+            tab.view.update(cx, |view, cx| match command {
+                Command::TerminalCopy if !event.is_held => view.copy(cx),
+                Command::TerminalPaste => view.paste(cx),
+                _ => {}
+            });
+            return;
+        }
+
         let Some(prefix) = self.prefix.take() else {
             return;
         };

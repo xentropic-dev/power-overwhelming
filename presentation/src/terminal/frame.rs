@@ -35,6 +35,9 @@ pub(super) struct Row {
 pub(super) struct Frame {
     pub(super) rows: Vec<Row>,
     pub(super) cursor: Option<CellPosition>,
+    /// Where the cursor is, shown or hidden: input methods compose and place their candidate
+    /// window there.
+    pub(super) ime_cursor: Option<CellPosition>,
 }
 
 pub(super) fn frame(
@@ -43,13 +46,11 @@ pub(super) fn frame(
     foreground: u32,
 ) -> Result<Frame> {
     let state = renderer.update(terminal)?;
-    let cursor = state
-        .cursor_viewport()?
-        .filter(|_| state.cursor_visible().unwrap_or(false))
-        .map(|cursor| CellPosition {
-            row: cursor.y.into(),
-            column: cursor.x.into(),
-        });
+    let ime_cursor = state.cursor_viewport()?.map(|cursor| CellPosition {
+        row: cursor.y.into(),
+        column: cursor.x.into(),
+    });
+    let cursor = ime_cursor.filter(|_| state.cursor_visible().unwrap_or(false));
     let mut row_iter = RowIterator::new()?;
     let mut cell_iter = CellIterator::new()?;
     let mut source = row_iter.update(&state)?;
@@ -116,7 +117,11 @@ pub(super) fn frame(
         }
         rows.push(Row { cells });
     }
-    Ok(Frame { rows, cursor })
+    Ok(Frame {
+        rows,
+        cursor,
+        ime_cursor,
+    })
 }
 
 fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
