@@ -1,5 +1,9 @@
 use anyhow::{Result, bail};
-use domain::skill::{Skill, SkillSummary};
+use domain::{
+    agent::AgentProfile,
+    skill::{Skill, SkillSummary},
+};
+use std::collections::BTreeSet;
 
 pub trait SkillCatalog: Send + Sync {
     fn list(&self) -> Result<Vec<SkillSummary>>;
@@ -13,6 +17,28 @@ impl ListSkills {
         let mut summaries = catalog.list()?;
         summaries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(summaries)
+    }
+}
+
+/// Skill names an agent already discovers from its own skill folders.
+pub trait InstalledSkills {
+    fn installed(&self, profile: &AgentProfile) -> Result<BTreeSet<String>>;
+}
+
+/// Catalog skills to advertise when launching an agent: those it cannot already discover.
+pub struct LaunchSkills;
+
+impl LaunchSkills {
+    pub fn execute(
+        catalog: &dyn SkillCatalog,
+        installed: &dyn InstalledSkills,
+        profile: &AgentProfile,
+    ) -> Result<Vec<SkillSummary>> {
+        // Unreadable skill folders only cost a longer prompt, so advertise everything.
+        let installed = installed.installed(profile).unwrap_or_default();
+        let mut skills = ListSkills::execute(catalog)?;
+        skills.retain(|skill| !installed.contains(&skill.name));
+        Ok(skills)
     }
 }
 

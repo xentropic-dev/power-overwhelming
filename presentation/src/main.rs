@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use application::{
     PublishArtifact, StartSession,
     agents::AgentProfileRegistry,
-    skill_install::{InstallSkills, SkillAction},
+    skill_install::{InstallSkills, SkillAction, select_profiles},
     skills::{GetSkill, ListSkills, SkillOutput, SkillSelection},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -171,21 +171,15 @@ enum SkillsAction {
     Update(SkillInstallArgs),
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
-enum SkillAgent {
-    Claude,
-    Codex,
-    Universal,
-}
-
 #[derive(Args)]
 struct SkillInstallArgs {
     /// Select a bundled skill by name. Repeat to select multiple skills. Defaults to all.
     #[arg(long = "skill", value_name = "NAME")]
     names: Vec<String>,
-    /// Select agent targets. Universal selects the shared folder alone. Defaults to detected agents.
-    #[arg(long = "agent", value_enum, value_delimiter = ',')]
-    agents: Vec<SkillAgent>,
+    /// Select agent profile ids to link for. `universal` selects the shared folder alone.
+    /// Defaults to every detected agent.
+    #[arg(long = "agent", value_name = "ID", value_delimiter = ',')]
+    agents: Vec<String>,
     /// Target the current Git worktree.
     #[arg(long)]
     local: bool,
@@ -573,8 +567,9 @@ fn run_skills(command: SkillsAction) -> Result<()> {
 }
 
 fn run_skill_install(args: SkillInstallArgs, update: bool) -> Result<()> {
-    let claude = args.agents.is_empty() || args.agents.contains(&SkillAgent::Claude);
-    let targets = install_targets(args.local, claude)?;
+    let profiles = configured_agents();
+    let selected = select_profiles(profiles.profiles(), &args.agents)?;
+    let targets = install_targets(args.local, &selected)?;
     let outcomes = InstallSkills {
         names: &args.names,
         update,

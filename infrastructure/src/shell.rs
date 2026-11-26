@@ -1,9 +1,12 @@
 //! Shell integration: agent wrappers that interactive shells in Power terminals pick up,
 //! and the one-line rc hook that onboarding installs.
 
-use crate::skills::EmbeddedSkillCatalog;
+use crate::{skill_install::LocalInstalledSkills, skills::EmbeddedSkillCatalog};
 use anyhow::{Context, Result, bail};
-use application::{agents::AgentProfileRegistry, skills::ListSkills};
+use application::{
+    agents::AgentProfileRegistry,
+    skills::{InstalledSkills, LaunchSkills},
+};
 use domain::agent::{AgentProfile, Injection};
 use std::{
     ffi::OsString,
@@ -127,7 +130,12 @@ fn has_marker(path: &Path) -> bool {
 }
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
-pub(crate) fn instruction_args(profile: &AgentProfile, user: &[OsString]) -> Result<Vec<OsString>> {
+/// Skills the agent already discovers natively are left out of the list.
+pub(crate) fn instruction_args(
+    profile: &AgentProfile,
+    user: &[OsString],
+    installed: &dyn InstalledSkills,
+) -> Result<Vec<OsString>> {
     if profile.injection == Injection::None
         || user
             .first()
@@ -144,11 +152,13 @@ pub(crate) fn instruction_args(profile: &AgentProfile, user: &[OsString]) -> Res
         return Ok(Vec::new());
     }
 
-    let mut instructions = String::from(concat!(
-        "You are running inside Power Overwhelming. ",
-        "Power skills, load with `power skills get <name>` when relevant:\n",
-    ));
-    for skill in ListSkills::execute(&EmbeddedSkillCatalog)? {
+    let mut instructions = String::from("You are running inside Power Overwhelming.");
+    let skills = LaunchSkills::execute(&EmbeddedSkillCatalog, installed, profile)?;
+    if !skills.is_empty() {
+        instructions.push_str(" Power skills, load with `power skills get <name>` when relevant:");
+    }
+    instructions.push('\n');
+    for skill in skills {
         instructions.push_str(&format!("- {}: {}\n", skill.name, skill.description));
     }
     instructions.push_str(concat!(
@@ -171,7 +181,13 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     let program = find_program(&profile.command)
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
-    command.args(instruction_args(profile, &args)?).args(&args);
+    command
+        .args(instruction_args(
+            profile,
+            &args,
+            &LocalInstalledSkills(&std::env::current_dir()?),
+        )?)
+        .args(&args);
     let error = command.exec();
     bail!("Start {}. {error}", program.display())
 }
@@ -207,6 +223,51 @@ pub fn agent_available(profile: &AgentProfile) -> bool {
 mod tests {
     use super::*;
     use crate::agents::AgentProfiles;
+    use application::skills::ListSkills;
+    use std::collections::BTreeSet;
+
+    struct Installed(BTreeSet<String>);
+
+    impl InstalledSkills for Installed {
+        fn installed(&self, _: &AgentProfile) -> Result<BTreeSet<String>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    const NONE: Installed = Installed(BTreeSet::new());
+
+    const TASK_LINE: &str = concat!(
+        "When you understand the user's objective, run ",
+        "`power session task 'Short task label'` from this terminal. ",
+        "Use a short, concrete label and update it when the objective changes.",
+    );
+
+    fn launch_text(installed: &Installed) -> String {
+        let profiles = AgentProfiles::default();
+        let args = instruction_args(
+            profiles.resolve(&"claude".into()).unwrap(),
+            &["fix the bug".into()],
+            installed,
+        )
+        .unwrap();
+        args[1].to_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn launch_instructions_omit_natively_installed_skills() {
+        let text = launch_text(&Installed(BTreeSet::from(["power-dag".into()])));
+        assert!(text.contains("- power-artifacts: "));
+        assert!(!text.contains("- power-dag: "));
+
+        let all = ListSkills::execute(&EmbeddedSkillCatalog).unwrap();
+        let text = launch_text(&Installed(
+            all.into_iter().map(|skill| skill.name).collect(),
+        ));
+        assert_eq!(
+            text,
+            format!("You are running inside Power Overwhelming.\n\n{TASK_LINE}")
+        );
+    }
 
     #[test]
     fn skips_instructions_for_management_commands() {
@@ -214,7 +275,8 @@ mod tests {
         assert!(
             instruction_args(
                 profiles.resolve(&"claude".into()).unwrap(),
-                &["mcp".into(), "list".into()]
+                &["mcp".into(), "list".into()],
+                &NONE
             )
             .unwrap()
             .is_empty()
@@ -222,7 +284,8 @@ mod tests {
         assert!(
             instruction_args(
                 profiles.resolve(&"codex".into()).unwrap(),
-                &["-c".into(), "developer_instructions=\"x\"".into()]
+                &["-c".into(), "developer_instructions=\"x\"".into()],
+                &NONE
             )
             .unwrap()
             .is_empty()
@@ -233,13 +296,13 @@ mod tests {
     fn respects_no_injection_and_existing_flag_values() -> Result<()> {
         let profiles = AgentProfiles::default();
         let grok = profiles.resolve(&"grok".into())?;
-        assert_eq!(instruction_args(grok, &[])?[0], "--rules");
-        assert!(instruction_args(grok, &["--rules=custom".into()])?.is_empty());
-        assert!(instruction_args(grok, &["mcp".into(), "list".into()])?.is_empty());
+        assert_eq!(instruction_args(grok, &[], &NONE)?[0], "--rules");
+        assert!(instruction_args(grok, &["--rules=custom".into()], &NONE)?.is_empty());
+        assert!(instruction_args(grok, &["mcp".into(), "list".into()], &NONE)?.is_empty());
 
         let mut profile = grok.clone();
         profile.injection = Injection::None;
-        assert!(instruction_args(&profile, &["prompt".into()])?.is_empty());
+        assert!(instruction_args(&profile, &["prompt".into()], &NONE)?.is_empty());
         Ok(())
     }
 
@@ -249,6 +312,7 @@ mod tests {
         let claude = instruction_args(
             profiles.resolve(&"claude".into()).unwrap(),
             &["fix the bug".into()],
+            &NONE,
         )
         .unwrap();
         assert_eq!(claude[0], "--append-system-prompt");
@@ -265,19 +329,13 @@ mod tests {
             assert_eq!(lines.next(), Some(entry.as_str()));
         }
         assert_eq!(lines.next(), Some(""));
-        assert_eq!(
-            lines.next(),
-            Some(concat!(
-                "When you understand the user's objective, run ",
-                "`power session task 'Short task label'` from this terminal. ",
-                "Use a short, concrete label and update it when the objective changes.",
-            ))
-        );
+        assert_eq!(lines.next(), Some(TASK_LINE));
         assert_eq!(lines.next(), None);
 
         let codex = instruction_args(
             profiles.resolve(&"codex".into()).unwrap(),
             &["fix the bug".into()],
+            &NONE,
         )
         .unwrap();
         assert_eq!(codex[0], "-c");
