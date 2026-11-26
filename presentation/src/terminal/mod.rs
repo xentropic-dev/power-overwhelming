@@ -23,31 +23,51 @@ use infrastructure::{
 };
 use std::{path::PathBuf, sync::Arc, thread};
 
-pub(crate) fn terminal_font_family(cx: &App) -> &'static str {
-    let fonts = cx.text_system().all_font_names();
-    ["JetBrainsMono Nerd Font Mono", "JetBrains Mono"]
-        .into_iter()
-        .find(|family| fonts.iter().any(|name| name == family))
-        .unwrap_or("monospace")
+/// JetBrains Mono, shipped so the terminal's default font resolves on every machine. A family
+/// GPUI can't find resolves to its UI fallback (Noto Sans and the like) with default features,
+/// which are proportional and join `ffi` whatever `terminal.ligatures` says.
+pub(crate) const BUNDLED_FONT: &[u8] =
+    include_bytes!("../../assets/fonts/JetBrainsMono-Variable.ttf");
+const BUNDLED_FAMILY: &str = "JetBrains Mono";
+
+/// Adds the bundled font to GPUI's text system; call once before any terminal is drawn.
+pub fn load_bundled_fonts(cx: &App) {
+    if let Err(error) = cx
+        .text_system()
+        .add_fonts(vec![std::borrow::Cow::Borrowed(BUNDLED_FONT)])
+    {
+        eprintln!("Could not load the bundled terminal font. {error:#}");
+    }
 }
 
-/// The terminal font for `settings`: its `font_family` when installed, else the default.
+pub(crate) fn terminal_font_family(cx: &App) -> &'static str {
+    let fonts = cx.text_system().all_font_names();
+    ["JetBrainsMono Nerd Font Mono"]
+        .into_iter()
+        .find(|family| fonts.iter().any(|name| name == family))
+        .unwrap_or(BUNDLED_FAMILY)
+}
+
+/// Whether GPUI resolves `font` to a face of its own family, not to its fallback stack.
+fn resolves(font: &Font, cx: &App) -> bool {
+    let text = cx.text_system();
+    text.get_font_for_id(text.resolve_font(font))
+        .is_some_and(|resolved| resolved.family == font.family)
+}
+
+/// The terminal font for `settings`: its `font_family` when GPUI resolves it, else the
+/// default, so the features set here reach the face that shapes every run.
 pub fn terminal_font(settings: &TerminalSettings, cx: &App) -> TerminalFont {
     let family: SharedString = match &settings.font_family {
-        Some(family)
-            if cx
-                .text_system()
-                .all_font_names()
-                .iter()
-                .any(|name| name == family) =>
-        {
-            family.clone().into()
-        }
-        _ => terminal_font_family(cx).into(),
+        Some(family) => family.clone().into(),
+        None => terminal_font_family(cx).into(),
     };
     let mut font = font(family);
     font.weight = FontWeight(f32::from(settings.font_weight));
     font.features = runs::ligature_features(false);
+    if !resolves(&font, cx) {
+        font.family = BUNDLED_FAMILY.into();
+    }
     TerminalFont {
         font,
         size: settings.font_size,

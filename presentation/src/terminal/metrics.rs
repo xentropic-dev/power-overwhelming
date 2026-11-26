@@ -175,10 +175,13 @@ struct FaceMetrics {
     advance: f32,
 }
 
-/// The system's fonts, for reading tables GPUI doesn't expose.
+/// The system's fonts and the bundled one, for reading tables GPUI doesn't expose.
 static FONT_FILES: LazyLock<fontdb::Database> = LazyLock::new(|| {
     let mut fonts = fontdb::Database::new();
     fonts.load_system_fonts();
+    fonts.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(
+        super::BUNDLED_FONT,
+    )));
     fonts
 });
 

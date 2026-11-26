@@ -10,7 +10,7 @@ use crate::{
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
-    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
+    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView, load_bundled_fonts},
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
@@ -132,6 +132,7 @@ struct Workspace {
 
 pub fn run() {
     Application::new().run(|cx| {
+        load_bundled_fonts(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

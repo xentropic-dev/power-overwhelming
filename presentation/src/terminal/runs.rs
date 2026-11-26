@@ -134,59 +134,97 @@ pub(super) fn row_ops(
         if first.blank() {
             continue;
         }
-        // The byte offset of each cell's text in the run, by cell.
-        let mut offsets = vec![0];
-        let mut text = first.cell.text.clone();
         let mut end = x;
         if first.cell.wide == CellWide::Narrow && cursor != Some(start) {
             while x < row.len() && cursor != Some(x) && first.joins(&row[x], shaping.ligatures) {
-                if row[x].blank() {
-                    // Spaces join only when text follows them in the run.
-                    x += 1;
-                    continue;
-                }
-                for cell in &row[end..=x] {
-                    offsets.push(text.len());
-                    text.push_str(&cell.cell.text);
-                }
                 x += 1;
-                end = x;
+                // Spaces join only when text follows them in the run.
+                if !row[x - 1].blank() {
+                    end = x;
+                }
             }
             x = end;
         }
+        let cells = &row[start..end];
+        let plain: String = cells.iter().map(|cell| cell.cell.text.as_str()).collect();
         let mut font = shaping.font.clone();
-        font.features = ligature_features(shaping.ligatures && needs_ligatures(&text, &font));
+        let ligatures = shaping.ligatures && needs_ligatures(&plain, &font);
+        font.features = ligature_features(ligatures);
+        let text = RunText::new(cells, ligatures);
         let run = TextRun {
-            len: text.len(),
+            len: text.text.len(),
             font,
             color: first.fg,
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let layout = shape(&text, shaping.font_size, &[run]);
+        let layout = shape(&text.text, shaping.font_size, &[run]);
         ops.push(RowOp::Text {
             column: start,
             color: first.fg,
-            glyphs: place_glyphs(&layout, &offsets, shaping.cell_width),
+            glyphs: place_glyphs(&layout, &text, shaping.cell_width),
         });
     }
     ops
 }
 
-/// Moves each glyph cluster onto its cell. `offsets` holds the byte offset where each cell's
-/// text starts; a glyph belongs to the last cell starting at or before its index. Glyphs after
-/// the first of a cell keep their shaped distance from it.
+/// A WORD JOINER. cosmic-text 0.14, which GPUI 0.2.2 shapes with on Linux, shapes each
+/// UAX #14 segment of a line on its own, and `!`, `-` and `|` end a segment, so `!=`, `->` and
+/// `|>` reach the font in two pieces and never join. A joiner between them forbids the break,
+/// and the shaper skips it, as a default-ignorable character, when matching the font's
+/// ligature and contextual-alternate lookups.
+const JOINER: char = '\u{2060}';
+
+/// A run's text as it is shaped: its cells' text, with a joiner between two punctuation
+/// marks when ligatures are on.
+pub(super) struct RunText {
+    pub(super) text: String,
+    /// The byte offset where each cell's text starts.
+    pub(super) offsets: Vec<usize>,
+    /// The byte offsets of the joiners, whose glyphs aren't drawn.
+    pub(super) joiners: Vec<usize>,
+}
+
+impl RunText {
+    fn new(cells: &[RunCell], ligatures: bool) -> Self {
+        let mut run = Self {
+            text: String::new(),
+            offsets: Vec::with_capacity(cells.len()),
+            joiners: Vec::new(),
+        };
+        for cell in cells {
+            let text = &cell.cell.text;
+            if ligatures
+                && run.text.ends_with(|c: char| c.is_ascii_punctuation())
+                && text.starts_with(|c: char| c.is_ascii_punctuation())
+            {
+                run.joiners.push(run.text.len());
+                run.text.push(JOINER);
+            }
+            run.offsets.push(run.text.len());
+            run.text.push_str(text);
+        }
+        run
+    }
+}
+
+/// Moves each glyph cluster onto its cell. A glyph belongs to the last cell starting at or
+/// before its index. Glyphs after the first of a cell keep their shaped distance from it.
 pub(super) fn place_glyphs(
     layout: &LineLayout,
-    offsets: &[usize],
+    text: &RunText,
     cell_width: Pixels,
 ) -> Vec<PlacedGlyph> {
     let mut placed = Vec::new();
     let mut cluster: Option<(usize, Pixels)> = None;
     for run in &layout.runs {
         for glyph in &run.glyphs {
-            let cell = offsets
+            if text.joiners.binary_search(&glyph.index).is_ok() {
+                continue;
+            }
+            let cell = text
+                .offsets
                 .partition_point(|offset| *offset <= glyph.index)
                 .saturating_sub(1);
             let shift = match cluster {
@@ -315,7 +353,12 @@ mod tests {
             }],
             ..LineLayout::default()
         };
-        let placed = place_glyphs(&layout, &[0, 3], px(8.));
+        let text = RunText {
+            text: "x\u{301}b".into(),
+            offsets: vec![0, 3],
+            joiners: Vec::new(),
+        };
+        let placed = place_glyphs(&layout, &text, px(8.));
         let xs: Vec<_> = placed
             .iter()
             .map(|glyph| f32::from(glyph.offset.x))
@@ -405,109 +448,204 @@ mod tests {
         assert!(needs_ligatures("cargo test", &font("Fira Code")));
     }
 
-    /// Port of herdr-app's `ligatures_change_glyphs_without_moving_terminal_cells`, shaped by
-    /// cosmic-text as GPUI's Linux text system shapes (`CosmicTextSystemState::layout_line`),
-    /// on the bundled JetBrains Mono. Cells are the rounded advance, so glyphs must move.
+    #[test]
+    fn ligatures_join_punctuation_across_segment_breaks() {
+        let frame = screen(b"a!=b x");
+        let row = cells(&frame, 0);
+        let joined = RunText::new(&row[..4], true);
+        assert_eq!(joined.text, "a!\u{2060}=b");
+        assert_eq!(joined.offsets, [0, 1, 5, 6]);
+        assert_eq!(joined.joiners, [2]);
+        assert_eq!(RunText::new(&row[..4], false).text, "a!=b");
+        // A joiner's glyph isn't drawn; the cells after it keep their places.
+        let layout = LineLayout {
+            font_size: px(13.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![glyph(0, 0.), glyph(1, 7.), glyph(2, 14.), glyph(5, 14.)],
+            }],
+            ..LineLayout::default()
+        };
+        let xs: Vec<_> = place_glyphs(&layout, &joined, px(8.))
+            .iter()
+            .map(|glyph| f32::from(glyph.offset.x))
+            .collect();
+        assert_eq!(xs, [0., 8., 16.]);
+    }
+
+    /// Port of herdr-app's `ligatures_change_glyphs_without_moving_terminal_cells`, in a
+    /// headless GPUI app with the system's fonts and the bundled one, as Power runs. The font
+    /// is chosen by `terminal_font` and resolved by GPUI's text system, and the cell is
+    /// measured from it as the grid is. Stock GPUI shapes only through a window, so runs are
+    /// shaped by cosmic-text as `CosmicTextSystemState::layout_line` does, with the family
+    /// and features GPUI resolved.
     #[cfg(target_os = "linux")]
     #[test]
     fn ligatures_change_glyphs_without_moving_terminal_cells() {
+        use gpui::Application;
+
+        // A headless app's `quit` doesn't end its run loop, so the app runs on its own thread
+        // and hands back the outcome.
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            Application::headless().run(move |cx| {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    shape_on_the_terminal_font(cx)
+                }));
+                let _ = done.send(result);
+                cx.quit();
+            });
+        });
+        if let Err(panic) = outcome.recv().expect("the app ran") {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shape_on_the_terminal_font(cx: &mut gpui::App) {
+        use crate::{
+            settings::TerminalSettings,
+            terminal::{TerminalFont, cell_metrics, load_bundled_fonts, terminal_font},
+        };
         use cosmic_text::{
             Attrs, AttrsList, Family, FeatureTag, FontFeatures as Features, FontSystem,
-            ShapeBuffer, ShapeLine, Shaping as Shaper, Wrap, fontdb,
+            ShapeBuffer, ShapeLine, Shaping as Shaper, Weight, Wrap,
         };
-
-        let mut db = fontdb::Database::new();
-        db.load_font_data(include_bytes!("../../assets/fonts/JetBrainsMono-Variable.ttf").to_vec());
-        let mut system = FontSystem::new_with_locale_and_db("en-US".into(), db);
-        let mut scratch = ShapeBuffer::default();
-        let mut shape = |text: &str, font_size: Pixels, runs: &[TextRun]| {
-            let mut features = Features::new();
-            for (tag, value) in runs[0].font.features.0.iter() {
-                let tag: [u8; 4] = tag.as_bytes().try_into().unwrap();
-                features.set(FeatureTag::new(&tag), *value);
-            }
-            let attrs = Attrs::new()
-                .family(Family::Name("JetBrains Mono"))
-                .font_features(features);
-            let line = ShapeLine::new(
-                &mut system,
-                text,
-                &AttrsList::new(&attrs),
-                Shaper::Advanced,
-                4,
-            );
-            let mut lines = Vec::new();
-            line.layout_to_buffer(
-                &mut scratch,
-                font_size.into(),
-                None,
-                Wrap::None,
-                None,
-                &mut lines,
-                None,
-            );
-            let glyphs = lines[0]
-                .glyphs
-                .iter()
-                .map(|glyph| ShapedGlyph {
-                    id: glyph_id(u32::from(glyph.glyph_id)),
-                    position: point(px(glyph.x), px(glyph.y)),
-                    index: glyph.start,
-                    is_emoji: false,
-                })
-                .collect();
-            Arc::new(LineLayout {
-                font_size,
-                len: text.len(),
-                runs: vec![ShapedRun {
-                    font_id: FontId(0),
-                    glyphs,
-                }],
-                ..LineLayout::default()
-            })
-        };
-        let mut font = font("JetBrains Mono");
-        font.features = ligature_features(false);
-        for font_size in [10., 14., 24., 36.] {
-            // JetBrains Mono's advance is 0.6 em; the grid rounds it.
-            let cell_width = px((font_size * 0.6_f32).round());
-            // herdr also checks `!=`, `->` and `|>`, which cosmic-text 0.14's rustybuzz, as
-            // GPUI 0.2.2 shapes on Linux, leaves unjoined.
-            for text in ["a=>b", "a===b", "a<=b", "a>=b", "a<-b", "a::b", "a==b"] {
-                let frame = screen(text.as_bytes());
-                let row = cells(&frame, 0);
-                let mut variants = Vec::new();
-                for ligatures in [false, true] {
-                    let shaping = Shaping {
-                        font: &font,
-                        font_size: px(font_size),
-                        cell_width,
-                        ligatures,
-                        cursor: None,
-                    };
-                    let ops = row_ops(&row, &shaping, &mut shape);
-                    let [
-                        RowOp::Text {
-                            column: 0, glyphs, ..
-                        },
-                    ] = ops.as_slice()
-                    else {
-                        panic!("{text}: expected one run, got {ops:?}");
-                    };
-                    assert_eq!(glyphs.len(), text.len(), "{text}: one glyph per cell");
-                    for (cell, glyph) in glyphs.iter().enumerate() {
-                        let drift = f32::from(glyph.offset.x - cell_width * cell as f32);
-                        assert!(
-                            drift.abs() < 0.1,
-                            "{text} at {font_size} px: cell {cell} drifts"
-                        );
-                    }
-                    variants.push(glyphs.iter().map(|glyph| glyph.id).collect::<Vec<_>>());
-                }
-                assert_ne!(
-                    variants[0], variants[1],
-                    "{text}: ligatures must change the glyphs"
+        {
+            load_bundled_fonts(cx);
+            let mut system = FontSystem::new();
+            system
+                .db_mut()
+                .load_font_data(super::super::BUNDLED_FONT.to_vec());
+            let mut scratch = ShapeBuffer::default();
+            let text_system = cx.text_system().clone();
+            let mut shape = |text: &str, font_size: Pixels, runs: &[TextRun]| {
+                // The face GPUI resolves, never its fallback stack.
+                let id = text_system.resolve_font(&runs[0].font);
+                let resolved = text_system.get_font_for_id(id).unwrap();
+                assert_eq!(
+                    resolved.family, runs[0].font.family,
+                    "{text}: fallback font"
                 );
+                let mut features = Features::new();
+                for (tag, value) in resolved.features.0.iter() {
+                    let tag: [u8; 4] = tag.as_bytes().try_into().unwrap();
+                    features.set(FeatureTag::new(&tag), *value);
+                }
+                let attrs = Attrs::new()
+                    .family(Family::Name(&resolved.family))
+                    .weight(Weight(resolved.weight.0 as u16))
+                    .font_features(features);
+                let line = ShapeLine::new(
+                    &mut system,
+                    text,
+                    &AttrsList::new(&attrs),
+                    Shaper::Advanced,
+                    4,
+                );
+                let mut lines = Vec::new();
+                line.layout_to_buffer(
+                    &mut scratch,
+                    font_size.into(),
+                    None,
+                    Wrap::None,
+                    None,
+                    &mut lines,
+                    None,
+                );
+                let glyphs = lines[0]
+                    .glyphs
+                    .iter()
+                    .map(|glyph| ShapedGlyph {
+                        id: glyph_id(u32::from(glyph.glyph_id)),
+                        position: point(px(glyph.x), px(glyph.y)),
+                        index: glyph.start,
+                        is_emoji: false,
+                    })
+                    .collect();
+                Arc::new(LineLayout {
+                    font_size,
+                    len: text.len(),
+                    runs: vec![ShapedRun {
+                        font_id: id,
+                        glyphs,
+                    }],
+                    ..LineLayout::default()
+                })
+            };
+
+            // An unset family, one GPUI can't find and one only its fallback stack names all
+            // resolve to the bundled font, whose features the runs then set.
+            for family in [
+                None,
+                Some("No Such Font"),
+                Some("monospace"),
+                Some("Helvetica"),
+            ] {
+                let settings = TerminalSettings {
+                    font_family: family.map(str::to_owned),
+                    ..TerminalSettings::default()
+                };
+                let font = terminal_font(&settings, cx).font;
+                assert!(font.family.contains("JetBrains"), "{family:?}: {font:?}");
+            }
+            let settings = TerminalSettings {
+                font_family: Some("No Such Font".into()),
+                ..TerminalSettings::default()
+            };
+            for font_size in [10., 14., 24., 36.] {
+                let font = TerminalFont {
+                    size: font_size,
+                    ..terminal_font(&settings, cx)
+                };
+                let cell_width = cell_metrics(&text_system, &font, 1.).size.width;
+                for (text, joins) in [
+                    ("a=>b", true),
+                    ("a!=b", true),
+                    ("a===b", true),
+                    ("a->b", true),
+                    ("a<=b", true),
+                    ("a>=b", true),
+                    ("a|>b", true),
+                    // JetBrains Mono's `liga` would join nothing here; a fallback's would.
+                    ("office", false),
+                ] {
+                    let frame = screen(text.as_bytes());
+                    let row = cells(&frame, 0);
+                    let mut variants = Vec::new();
+                    for ligatures in [false, true] {
+                        let shaping = Shaping {
+                            font: &font.font,
+                            font_size: px(font_size),
+                            cell_width,
+                            ligatures,
+                            cursor: None,
+                        };
+                        let ops = row_ops(&row, &shaping, &mut shape);
+                        let [
+                            RowOp::Text {
+                                column: 0, glyphs, ..
+                            },
+                        ] = ops.as_slice()
+                        else {
+                            panic!("{text}: expected one run, got {ops:?}");
+                        };
+                        assert_eq!(glyphs.len(), text.len(), "{text}: one glyph per cell");
+                        for (cell, glyph) in glyphs.iter().enumerate() {
+                            let drift = f32::from(glyph.offset.x - cell_width * cell as f32);
+                            assert!(
+                                drift.abs() < 0.1,
+                                "{text} at {font_size} px: cell {cell} drifts"
+                            );
+                        }
+                        variants.push(glyphs.iter().map(|glyph| glyph.id).collect::<Vec<_>>());
+                    }
+                    assert_eq!(
+                        variants[0] != variants[1],
+                        joins,
+                        "{text} at {font_size} px: ligatures change the glyphs"
+                    );
+                }
             }
         }
     }
