@@ -65,6 +65,10 @@ pub trait Workspace: Send + Sync {
         branch: &str,
         base: &str,
     ) -> Result<CreatedWorktree>;
+    /// Confirms that this is still the checkout created by Power.
+    fn owns_worktree(&self, _worktree: &domain::worktree::ManagedWorktree) -> bool {
+        false
+    }
     fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus>;
     fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()>;
     fn open_artifact_file(&self, path: &Path) -> Result<PathBuf>;

@@ -413,6 +413,10 @@ impl Workspace for FakeWorkspace {
         })
     }
 
+    fn owns_worktree(&self, worktree: &ManagedWorktree) -> bool {
+        self.0.lock().unwrap().branches.get(&worktree.branch) == Some(&Some(worktree.path.clone()))
+    }
+
     fn worktree_status(&self, _path: &Path) -> Result<WorktreeStatus> {
         bail!("Unexpected worktree status lookup")
     }

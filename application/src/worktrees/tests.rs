@@ -65,6 +65,10 @@ impl Workspace for WorktreeWorkspace {
         })
     }
 
+    fn owns_worktree(&self, worktree: &ManagedWorktree) -> bool {
+        self.0.lock().unwrap().statuses.contains_key(&worktree.path)
+    }
+
     fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus> {
         self.0
             .lock()

@@ -6,7 +6,7 @@ use crate::TerminalRuntime;
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::BoxInfo,
-    worktree::{ManagedWorktree, PruneStatus, PruneVerdict, prune_verdict},
+    worktree::{KeepReason, ManagedWorktree, PruneStatus, PruneVerdict, prune_verdict},
 };
 use std::{
     collections::BTreeSet,
@@ -119,7 +119,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .into_iter()
                     .map(|worktree| {
                         let verdict =
-                            self.worktree_verdict(&worktree.path, in_use.contains(&worktree.path))?;
+                            self.worktree_verdict(&worktree, in_use.contains(&worktree.path))?;
                         Ok((worktree, verdict))
                     })
                     .collect()
@@ -132,7 +132,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             // the earlier deletions recorded in the store.
             let verdict = self.store.write(|db| {
                 if db.find_worktree_by_path(&worktree.path)?.as_ref() != Some(&worktree) {
-                    return Ok(None);
+                    return Ok(Ok(None));
                 }
                 let open_attempt = db
                     .open_attempts(None)?
@@ -144,16 +144,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                         live.session.worktree == worktree.path
                             && self.application.runtime.is_running(&live.terminal)
                     });
-                let verdict = self.worktree_verdict(&worktree.path, in_use)?;
+                let verdict = self.worktree_verdict(&worktree, in_use)?;
                 if verdict == PruneVerdict::Remove {
-                    self.application
-                        .workspace
+                    let workspace = &self.application.workspace;
+                    let removal = workspace
                         .remove_worktree(&worktree.path, delete_branch)
-                        .with_context(|| format!("Remove worktree {}", worktree.path.display()))?;
-                    db.remove_worktree(&worktree.path)?;
+                        .with_context(|| format!("Remove worktree {}", worktree.path.display()));
+                    // Git can remove the checkout and then fail to delete the branch.
+                    if removal.is_ok() || !workspace.owns_worktree(&worktree) {
+                        db.remove_worktree(&worktree.path)?;
+                    }
+                    return Ok(removal.map(|()| Some(verdict)));
                 }
-                Ok(Some(verdict))
-            })?;
+                Ok(Ok(Some(verdict)))
+            })??;
             if let Some(verdict) = verdict {
                 results.push((worktree, verdict));
             }
@@ -161,12 +165,14 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(results)
     }
 
-    fn worktree_verdict(&self, path: &Path, in_use: bool) -> Result<PruneVerdict> {
-        let status = self
-            .application
-            .workspace
-            .worktree_status(path)
-            .with_context(|| format!("Check worktree {}", path.display()))?;
+    fn worktree_verdict(&self, worktree: &ManagedWorktree, in_use: bool) -> Result<PruneVerdict> {
+        let workspace = &self.application.workspace;
+        if !workspace.owns_worktree(worktree) {
+            return Ok(PruneVerdict::Keep(KeepReason::NoLongerManaged));
+        }
+        let status = workspace
+            .worktree_status(&worktree.path)
+            .with_context(|| format!("Check worktree {}", worktree.path.display()))?;
         Ok(prune_verdict(PruneStatus {
             dirty: status.dirty,
             merged_into_default: status.merged_into_default,
