@@ -55,3 +55,5 @@ To set aside a run you have abandoned, run `power dag archive "$RUN"`. Archived 
 When retrying, Power reuses the task's Power-created worktree and branch by default. See the recovery reference for retry commands. To preview which Power-created worktrees can be removed, run `power worktree prune --dry-run`. Outside Power, also select a box with `--box "$BOX"` or use `--all`.
 
 Use `power dag show "$RUN"` to read each attempt's `artifacts` (`id`, `title`, `link`) in publish order, newest last. In the DAG view (Ctrl+B then `d`), the selected node's Artifacts list shows the current attempt's artifacts. Open a listed artifact or its `pwr://artifact/<id>` link in the preview pane.
+
+Send review feedback to a worker with `power talk send task:<id> "Your feedback"`. Add `--run "$RUN"` when coordinating more than one run.
