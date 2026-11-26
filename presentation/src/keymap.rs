@@ -56,6 +56,7 @@ pub enum Command {
     DagZoomIn,
     DagZoomOut,
     DagOpen,
+    DagArtifact,
     DagClose,
     TabOpenLink,
     TabPreview,
@@ -231,6 +232,7 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "zoom_in", C::DagZoomIn, &["+"], "Zoom in"),
     entry(S::Dag, "zoom_out", C::DagZoomOut, &["-"], "Zoom out"),
     entry(S::Dag, "open", C::DagOpen, &["enter", "o"], "Open assigned worker terminal"),
+    entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
@@ -568,6 +570,7 @@ mod tests {
             (Scope::Dag, "-", C::DagZoomOut),
             (Scope::Dag, "enter", C::DagOpen),
             (Scope::Dag, "o", C::DagOpen),
+            (Scope::Dag, "p", C::DagArtifact),
             (Scope::Dag, "escape", C::DagClose),
         ] {
             assert_eq!(keymap.command(scope, &stroke(key)), Some(command));
@@ -584,6 +587,10 @@ mod tests {
                 "Open assigned worker terminal",
                 "In the task graph: Enter/o",
             ),
+            (
+                "Preview the selected task's artifact, then 1–9 to pick",
+                "In the task graph: p",
+            ),
         ] {
             assert!(
                 help.iter()
@@ -597,7 +604,7 @@ mod tests {
         let keymap = Keymap::from_config(&json!({
             "tab": { "next": ["n", "j"] },
             "box": { "runs": "g" },
-            "dag": { "open": "space" },
+            "dag": { "open": "space", "artifact": "a" },
             "agent_tree": { "expand": "ctrl-f" },
             "prefix": { "tab": "ctrl-a" },
         }))
@@ -618,6 +625,11 @@ mod tests {
             Some(C::DagOpen)
         );
         assert_eq!(keymap.command(Scope::Dag, &stroke("o")), None);
+        assert_eq!(
+            keymap.command(Scope::Dag, &stroke("a")),
+            Some(C::DagArtifact)
+        );
+        assert_eq!(keymap.command(Scope::Dag, &stroke("p")), None);
         assert_eq!(
             keymap.command(Scope::AgentTree, &stroke("ctrl-f")),
             Some(C::AgentExpand)
@@ -642,6 +654,7 @@ mod tests {
                 json!({ "agent_tree": { "expand": "down" } }),
                 "bound to both",
             ),
+            (json!({ "dag": { "artifact": "o" } }), "bound to both"),
             (json!({ "tab": { "next": "hyper-j" } }), "Unknown modifier"),
             (json!({ "tab": { "next": 3 } }), "must be a key name"),
         ] {

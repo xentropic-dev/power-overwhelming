@@ -1983,6 +1983,24 @@ impl Workspace {
         let key = stroke.key.as_str();
         if let Some(dag) = &mut self.dag {
             cx.stop_propagation();
+            if dag.picking_artifact {
+                if event.is_held {
+                    return;
+                }
+                dag.picking_artifact = false;
+                let mods = stroke.modifiers;
+                let digit = (!mods.control && !mods.alt && !mods.platform)
+                    .then(|| shortcut_digit(key))
+                    .flatten();
+                if let Some(digit) = digit {
+                    match dag.artifact_link(usize::from(digit)) {
+                        Some(link) => self.open_dag_artifact(link, window, cx),
+                        None => dag.message = Some(format!("No artifact {digit}.")),
+                    }
+                }
+                cx.notify();
+                return;
+            }
             match self.keymap.command(Scope::Dag, stroke) {
                 Some(Command::DagClose) => {
                     self.dag = None;
@@ -2000,6 +2018,21 @@ impl Workspace {
                     } else {
                         self.show_error("This task has no assigned worker.", cx);
                     }
+                }
+                Some(Command::DagArtifact) if !event.is_held && !dag.opening => {
+                    let artifacts = dag.artifacts();
+                    match artifacts.as_slice() {
+                        [] => dag.message = Some("This task has no artifacts yet.".into()),
+                        [artifact] => {
+                            let link = artifact.link();
+                            self.open_dag_artifact(link, window, cx);
+                        }
+                        _ => {
+                            dag.picking_artifact = true;
+                            dag.message = None;
+                        }
+                    }
+                    cx.notify();
                 }
                 Some(
                     command @ (Command::DagUp
@@ -2176,6 +2209,23 @@ impl Workspace {
                 (Prefix::View, Some(_)) => self.navigate_tabs(key, window, cx),
                 _ => {}
             },
+        }
+    }
+
+    /// Closes the task graph and opens an artifact link in the box's preview pane, focused,
+    /// as choosing a link from the link search does.
+    fn open_dag_artifact(&mut self, link: String, window: &mut Window, cx: &mut Context<Self>) {
+        let worker = self
+            .dag
+            .as_ref()
+            .and_then(|dag| dag.attempt())
+            .and_then(|attempt| attempt.session.clone());
+        self.dag = None;
+        self.restore_focus(window, cx);
+        // Resolution runs as a live session; the worker's may have ended.
+        match self.active_view().or(worker) {
+            Some(session) => self.resolve(session, link, true, window, cx),
+            None => self.show_error("Open a terminal in this box to preview artifacts.", cx),
         }
     }
 
@@ -2601,15 +2651,27 @@ impl Render for Workspace {
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
-            dag.render(colors, &self.keymap, move |action, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == id)
-                        && dag.graph_action(action)
-                    {
-                        cx.notify();
-                    }
-                });
-            })
+            let open = entity.clone();
+            dag.render(
+                colors,
+                &self.keymap,
+                move |action, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == id)
+                            && dag.graph_action(action)
+                        {
+                            cx.notify();
+                        }
+                    });
+                },
+                move |link, window, cx| {
+                    let _ = open.update(cx, |this, cx| {
+                        if this.dag.as_ref().is_some_and(|dag| dag.id == id) {
+                            this.open_dag_artifact(link, window, cx);
+                        }
+                    });
+                },
+            )
         });
         div()
             .id("workspace")

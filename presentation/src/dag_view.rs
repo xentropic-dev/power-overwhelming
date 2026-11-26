@@ -1,4 +1,5 @@
 use crate::keymap::{Command, Keymap, Scope};
+use domain::dag::AttemptArtifact;
 use gpui::{prelude::*, *};
 use infrastructure::{
     client::{Attempt, Coordinator, Run, Task, TaskState},
@@ -19,6 +20,8 @@ const ZOOM_STEP: f32 = 1.2;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 3.;
 const DRAG_THRESHOLD: f64 = 4.;
+/// Artifacts numbered for the keyboard: digits 1–9 after the artifact key.
+const NUMBERED_ARTIFACTS: usize = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Position {
@@ -243,6 +246,8 @@ pub(super) struct DagView {
     pub opening: bool,
     pub message: Option<String>,
     pub refresh_error: Option<String>,
+    /// Waiting for a digit that picks one of several listed artifacts.
+    pub picking_artifact: bool,
     graph: GraphLayout,
     selected: usize,
     viewport: GraphViewport,
@@ -260,6 +265,7 @@ impl DagView {
             opening: false,
             message: None,
             refresh_error: None,
+            picking_artifact: false,
             selected,
             viewport: GraphViewport::new(),
         }
@@ -290,6 +296,7 @@ impl DagView {
     fn select(&mut self, index: usize) {
         self.selected = index;
         self.message = None;
+        self.picking_artifact = false;
         self.viewport.reveal(self.graph.positions[index]);
     }
 
@@ -341,11 +348,22 @@ impl DagView {
         self.task().and_then(current_attempt)
     }
 
+    /// The current attempt's artifacts, newest first.
+    pub fn artifacts(&self) -> Vec<&AttemptArtifact> {
+        self.attempt().map_or_else(Vec::new, newest_first)
+    }
+
+    /// The link of the artifact listed as `number` (1-based), if any.
+    pub fn artifact_link(&self, number: usize) -> Option<String> {
+        numbered_artifact(self.attempt()?, number).map(AttemptArtifact::link)
+    }
+
     pub fn render(
         &self,
         colors: &'static Colors,
         keymap: &Keymap,
         graph_action: impl Fn(GraphAction, &mut App) + Clone + 'static,
+        open_artifact: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
     ) -> impl IntoElement {
         let coordinator = match &self.run.coordinator {
             Coordinator::Agent { agent } => agent,
@@ -360,6 +378,14 @@ impl DagView {
                 .is_some_and(|attempt| attempt.session.is_some())
         {
             actions.push(format!("{open_key} open worker"));
+        }
+        let artifact_key = keymap.first(Scope::Dag, Command::DagArtifact);
+        let artifacts = self.artifacts().len();
+        if self.picking_artifact {
+            let count = artifacts.min(NUMBERED_ARTIFACTS);
+            actions.push(format!("1–{count} preview artifact"));
+        } else if artifacts > 0 && !keymap.keys(Scope::Dag, Command::DagArtifact).is_empty() {
+            actions.push(format!("{artifact_key} preview artifact"));
         }
         if self.task().is_some() {
             let zoom_keys = [
@@ -378,7 +404,11 @@ impl DagView {
             actions.push(format!("{zoom_controls} zoom"));
             actions.push("Drag to pan".into());
         }
-        actions.push(format!("{close_key} close"));
+        actions.push(if self.picking_artifact {
+            format!("{close_key} cancel")
+        } else {
+            format!("{close_key} close")
+        });
         div()
             .absolute()
             .inset_0()
@@ -426,7 +456,7 @@ impl DagView {
                             .border_y_1()
                             .border_color(rgb(colors.border))
                             .child(self.graph_elements(colors, graph_action))
-                            .child(details(colors, task))
+                            .child(details(colors, task, self.picking_artifact, open_artifact))
                             .into_any_element()
                     } else {
                         div()
@@ -663,8 +693,27 @@ fn current_attempt(task: &Task) -> Option<&Attempt> {
     task.attempts.iter().find(|attempt| attempt.id == id)
 }
 
-fn details(colors: &Colors, task: &Task) -> impl IntoElement {
+/// An attempt's artifacts, newest first. The attempt keeps them in publish order.
+fn newest_first(attempt: &Attempt) -> Vec<&AttemptArtifact> {
+    attempt.artifacts.iter().rev().collect()
+}
+
+/// The artifact listed as `number` (1–9) in the details panel.
+fn numbered_artifact(attempt: &Attempt, number: usize) -> Option<&AttemptArtifact> {
+    let index = number
+        .checked_sub(1)
+        .filter(|&index| index < NUMBERED_ARTIFACTS)?;
+    newest_first(attempt).get(index).copied()
+}
+
+fn details(
+    colors: &Colors,
+    task: &Task,
+    picking: bool,
+    open_artifact: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+) -> impl IntoElement {
     let mut fields = Vec::new();
+    let artifacts = current_attempt(task).map_or_else(Vec::new, newest_first);
     if let Some(attempt) = current_attempt(task) {
         fields.push((
             "Assigned agent",
@@ -727,6 +776,43 @@ fn details(colors: &Colors, task: &Task) -> impl IntoElement {
                 .child(div().text_xs().text_color(rgb(colors.muted)).child(label))
                 .child(div().text_sm().child(text))
         }))
+        .when(!artifacts.is_empty(), |panel| {
+            panel.child(
+                div()
+                    .mt_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.muted))
+                            .child("Artifacts"),
+                    )
+                    .children(artifacts.into_iter().enumerate().map(|(index, artifact)| {
+                        let number = (index < NUMBERED_ARTIFACTS).then(|| index + 1);
+                        let link = artifact.link();
+                        let open = open_artifact.clone();
+                        div()
+                            .id(("dag-artifact", index))
+                            .flex()
+                            .gap_2()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|row| row.bg(rgb(blend(colors.surface, colors.accent, 18))))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(rems(1.))
+                                    .text_color(rgb(if picking {
+                                        colors.readable(colors.accent, colors.surface)
+                                    } else {
+                                        colors.muted
+                                    }))
+                                    .children(number.map(|number| number.to_string())),
+                            )
+                            .child(div().min_w_0().truncate().child(artifact.title.clone()))
+                            .on_click(move |_, window, cx| open(link.clone(), window, cx))
+                    })),
+            )
+        })
 }
 
 fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
@@ -743,10 +829,63 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphDrag, GraphViewport, MAX_ZOOM, MIN_ZOOM, Position, layout};
+    use super::{
+        GraphDrag, GraphViewport, MAX_ZOOM, MIN_ZOOM, Position, layout, newest_first,
+        numbered_artifact,
+    };
     use crate::keymap::Command;
+    use domain::dag::AttemptArtifact;
     use gpui::{Bounds, point, px, size};
-    use infrastructure::client::{Task, TaskState};
+    use infrastructure::client::{Attempt, AttemptState, Provider, Task, TaskState};
+
+    fn attempt_with(titles: &[&str]) -> Attempt {
+        Attempt {
+            id: "attempt".into(),
+            number: 1,
+            agent: "agent".into(),
+            session: None,
+            worktree: "/tmp".into(),
+            provider: Provider::Command,
+            model: None,
+            state: AttemptState::Active,
+            summary: None,
+            blocker: None,
+            detail: None,
+            started_at: 0,
+            ended_at: None,
+            artifacts: titles
+                .iter()
+                .map(|title| AttemptArtifact {
+                    id: format!("id-{title}"),
+                    title: (*title).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn artifacts_are_listed_newest_first_and_numbered_up_to_nine() {
+        let titles: Vec<String> = (1..=11).map(|n| format!("a{n}")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let attempt = attempt_with(&titles);
+        let listed: Vec<_> = newest_first(&attempt)
+            .into_iter()
+            .map(|artifact| artifact.title.as_str())
+            .collect();
+        assert_eq!(listed.first(), Some(&"a11"));
+        assert_eq!(listed.last(), Some(&"a1"));
+        assert_eq!(
+            numbered_artifact(&attempt, 1).map(AttemptArtifact::link),
+            Some("pwr://artifact/id-a11".into())
+        );
+        assert_eq!(
+            numbered_artifact(&attempt, 9).map(|artifact| artifact.title.as_str()),
+            Some("a3")
+        );
+        assert_eq!(numbered_artifact(&attempt, 0), None);
+        assert_eq!(numbered_artifact(&attempt, 10), None);
+        assert_eq!(numbered_artifact(&attempt_with(&[]), 1), None);
+    }
 
     fn task(id: &str, deps: &[&str]) -> Task {
         Task {
