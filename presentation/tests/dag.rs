@@ -794,7 +794,7 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
         "alpha",
         &fixture.worktrees[0],
         false,
-        &["success", "alpha-go", "Alpha result"],
+        &["success", "alpha-go", "Alpha result", "alpha-exit"],
     ));
     let (beta, beta_agent) = dispatched(fixture.dispatch(
         run,
@@ -818,6 +818,7 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
         assert_eq!(&agent.worktree, worktree);
         assert_eq!(agent.provider, Provider::Command);
         assert_eq!(json!(agent.state), "running");
+        assert_eq!(json!(agent.status), "working");
         assert_eq!(attempt.agent, agent.id);
         assert_eq!(attempt.session, agent.session);
         assert!(
@@ -838,6 +839,21 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
     fixture.release("alpha-go");
     let alpha = fixture.wait_for_state(run, "alpha", TaskState::Completed);
     assert_eq!(alpha.attempts[0].summary.as_deref(), Some("Alpha result"));
+    let status = |id: &str| {
+        let agents = fixture.json(&["agent", "list", "--box", BOX_ID])["agents"].take();
+        let agent = agents
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["id"] == id);
+        agent.unwrap()["status"].clone()
+    };
+    assert_eq!(status(&alpha_agent.id), "done");
+    assert_eq!(status(&beta_agent.id), "working");
+    fixture.release("alpha-exit");
+    poll("alpha agent to exit", || {
+        (status(&alpha_agent.id) == "exited").then_some(())
+    });
     let snapshot = fixture.show(run);
     assert_eq!(task(&snapshot, "beta").state, TaskState::Working);
     assert_eq!(task(&snapshot, "join").state, TaskState::Waiting);
@@ -948,6 +964,8 @@ fn worker_input_request_appears_in_attention_until_work_resumes() {
         blocked.attempts[0].blocker.as_deref(),
         Some("Which option should I use?")
     );
+    let listed = fixture.agents();
+    assert_eq!(json!(listed[0].status), "needs_input");
     assert_eq!(
         fixture.attention(),
         [BoxAttention {

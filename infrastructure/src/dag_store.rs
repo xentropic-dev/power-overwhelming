@@ -2,7 +2,9 @@ use crate::{persistence::state_directory, wire};
 use anyhow::{Context, Result};
 use application::dag::{DagReader, DagStore, DagTransaction, EventScope, OpenAttempt, now};
 use domain::{
-    dag::{Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState},
+    dag::{
+        AgentStatus, Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState,
+    },
     worktree::{ManagedWorktree, WorktreeCreator},
 };
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
@@ -524,10 +526,15 @@ fn worktree_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedWorktree> {
 
 const AGENT_SELECT: &str =
     "SELECT a.id, a.box_id, a.worktree, a.provider, a.parent, a.session, p.run_id, p.task_id,
-            p.id, a.state, a.label, a.created_at, a.model
+            p.id, a.state, a.label, a.created_at, a.model, p.state
      FROM agents a LEFT JOIN attempts p ON p.agent = a.id";
 
 fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedAgent> {
+    let state = enum_column::<wire::AgentState>(row, 9)?.into();
+    let attempt_state = row
+        .get::<_, Option<String>>(13)?
+        .map(|_| enum_column::<wire::AttemptState>(row, 13).map(Into::into))
+        .transpose()?;
     Ok(ManagedAgent {
         id: row.get(0)?,
         box_id: row.get(1)?,
@@ -538,7 +545,8 @@ fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedAgent> {
         run: row.get(6)?,
         task: row.get(7)?,
         attempt: row.get(8)?,
-        state: enum_column::<wire::AgentState>(row, 9)?.into(),
+        state,
+        status: AgentStatus::derive(state, attempt_state),
         label: row.get(10)?,
         created_at: row.get(11)?,
         model: row.get(12)?,
@@ -679,6 +687,7 @@ mod tests {
             task: None,
             attempt: None,
             state: AgentState::Running,
+            status: AgentStatus::Idle,
             label: id.into(),
             created_at: 1,
         };

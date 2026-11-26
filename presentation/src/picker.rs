@@ -395,9 +395,10 @@ impl Picker {
                 .map(|(agent, depth, marker)| {
                     let indent = " ".repeat(depth);
                     let provider = agent.provider.name();
+                    let status = agent.status.label();
                     let detail = match &agent.model {
-                        Some(model) => format!("{provider} · {model}"),
-                        None => provider.to_owned(),
+                        Some(model) => format!("{status} · {provider} · {model}"),
+                        None => format!("{status} · {provider}"),
                     };
                     Row {
                         label: format!("{indent}{marker} {}", agent.label),

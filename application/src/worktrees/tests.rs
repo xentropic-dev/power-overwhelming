@@ -428,6 +428,7 @@ fn add_agent(
             task: None,
             attempt: None,
             state,
+            status: domain::dag::AgentStatus::derive(state, None),
             label: id.into(),
             created_at: 0,
         })

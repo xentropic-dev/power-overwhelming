@@ -37,6 +37,10 @@ case "$1" in
     success)
         wait_for_marker "$2"
         report success "$3"
+        # An optional fourth marker keeps the session alive after the report, as agents do.
+        if test -n "${4:-}"; then
+            wait_for_marker "$4"
+        fi
         ;;
     input)
         report needs-input "Which option should I use?"

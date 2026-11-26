@@ -4,9 +4,10 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
-        AgentState, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo, Coordinator,
-        ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind,
-        RunStatus, Task, TaskSpec, TaskState, can_dispatch, report_transition, validate_batch,
+        AgentState, AgentStatus, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo,
+        Coordinator, ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent,
+        RunEventKind, RunStatus, Task, TaskSpec, TaskState, can_dispatch, report_transition,
+        validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
@@ -485,6 +486,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             agent.run = Some(target.run.clone());
             agent.task = Some(target.task.clone());
             agent.attempt = Some(target.id.clone());
+            agent.status = AgentStatus::Working;
             let provisioning = matches!(kind, DispatchWorktreeKind::New { .. });
             let mut ownership = None;
             let start = (|| -> Result<_> {
@@ -521,6 +523,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 Err(error) if !provisioning => return Err(error),
                 Err(error) => {
                     agent.state = AgentState::Exited;
+                    agent.status = AgentStatus::Exited;
                     Err(error)
                 }
                 success => success,
@@ -1009,6 +1012,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             task: None,
             attempt: None,
             state: AgentState::Running,
+            status: AgentStatus::Idle,
             created_at: now(),
         }
     }
