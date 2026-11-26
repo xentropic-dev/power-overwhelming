@@ -755,20 +755,28 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                      dispatch with --over-budget to start anyway"
                 );
                 let reason = limit.to_string();
+                let worktree = match kind {
+                    // Pin the base to its commit, so the dispatch starts where it was asked to
+                    // even if the ref moves while it waits. The implicit base is already one.
+                    DispatchWorktreeKind::New { branch, base } => WorktreeRequest::New {
+                        base: Some(
+                            self.application
+                                .workspace
+                                .resolve_commit(&entry.info.repository, &base)
+                                .with_context(|| format!("Resolve --base {base:?}"))?,
+                        ),
+                        branch,
+                    },
+                    DispatchWorktreeKind::Existing | DispatchWorktreeKind::Resume(_) => {
+                        command.worktree
+                    }
+                };
                 db.insert_queued(&QueuedDispatch {
                     id: self.new_id(),
                     run: run.id.clone(),
                     task: task.id.clone(),
                     provider: command.provider,
-                    worktree: match kind {
-                        DispatchWorktreeKind::New { branch, base } => WorktreeRequest::New {
-                            branch,
-                            base: Some(base),
-                        },
-                        DispatchWorktreeKind::Existing | DispatchWorktreeKind::Resume(_) => {
-                            command.worktree
-                        }
-                    },
+                    worktree,
                     retry: command.retry,
                     args: command.args,
                     caller: caller.map(str::to_owned),
@@ -1342,12 +1350,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             }
             bail!("Branch {branch:?} already exists");
         }
-        // Pin an explicit base to its commit now, as the implicit one is, so a queued
-        // dispatch starts where it was asked to even if the ref moves.
+        // An explicit base stays as given here, so an invalid one fails in worktree creation
+        // and records a failed attempt. A queued dispatch pins it when it is stored.
         let base = match base {
-            Some(base) => workspace
-                .resolve_commit(repository, base)
-                .with_context(|| format!("Resolve --base {base:?}"))?,
+            Some(base) => base.to_owned(),
             None => {
                 let caller =
                     caller.context("Specify --base when creating a worktree from outside Power")?;

@@ -722,3 +722,35 @@ fn a_queued_dispatch_starts_on_the_commit_its_explicit_base_named() {
     let head = fs::read_to_string(fixture.temp.path().join("queued.head")).unwrap();
     assert_eq!(head.trim(), original);
 }
+
+#[test]
+fn an_immediate_dispatch_with_a_missing_base_records_a_failed_attempt() {
+    let fixture = Fixture::new();
+    let run = fixture.external_run("7");
+    fixture.add_task(&run, "broken", &[]);
+    let marker = fixture.temp.path().join("worker-launched");
+    let error = rejected(
+        fixture
+            .worker("dispatch", &run, "broken")
+            .args(["--worktree", "new", "--branch", "worker/broken"])
+            .args(["--base", "missing-base", "--", "/usr/bin/touch"])
+            .arg(&marker)
+            .output()
+            .unwrap(),
+        // Git's own rev-parse error.
+        "Needed a single revision",
+    );
+    assert!(!marker.exists(), "{error}");
+    assert!(git(&fixture.repo, &["branch", "--list", "worker/broken"]).is_empty());
+
+    let shown = fixture.json(&["dag", "show", &run]);
+    let task = &shown["run"]["tasks"][0];
+    assert_eq!(task["state"], "failed", "{shown}");
+    let attempts = task["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{shown}");
+    assert_eq!(attempts[0]["state"], "failed", "{shown}");
+    let events = fixture.json(&["dag", "events", &run, "--kind", "attempt_failed"]);
+    let events = events["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["attempt"], attempts[0]["id"], "{events:?}");
+}

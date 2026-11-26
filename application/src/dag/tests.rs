@@ -441,11 +441,27 @@ struct FakeWorktrees {
     branches: BTreeMap<String, Option<PathBuf>>,
     head_lookups: Vec<PathBuf>,
     creation_requests: Vec<(PathBuf, String, String)>,
-    creation_error: Option<&'static str>,
-    /// Commits that refs resolve to. Other commit-ishes resolve to themselves.
+    /// Commits that refs resolve to. `main`, `caller-head`, existing branches and `commits`
+    /// resolve to themselves. Anything else is missing, as it would be in Git.
     refs: BTreeMap<String, String>,
+    commits: BTreeSet<String>,
     missing: BTreeSet<PathBuf>,
     removed: Vec<PathBuf>,
+}
+
+impl FakeWorktrees {
+    fn resolve(&self, commitish: &str) -> Result<String> {
+        if let Some(commit) = self.refs.get(commitish) {
+            return Ok(commit.clone());
+        }
+        ensure!(
+            matches!(commitish, "main" | "caller-head")
+                || self.branches.contains_key(commitish)
+                || self.commits.contains(commitish),
+            "fatal: invalid reference: {commitish}"
+        );
+        Ok(commitish.into())
+    }
 }
 
 impl Workspace for FakeWorkspace {
@@ -489,12 +505,7 @@ impl Workspace for FakeWorkspace {
 
     fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String> {
         assert_eq!(repository, Path::new("/repo"));
-        let worktrees = self.0.lock().unwrap();
-        Ok(worktrees
-            .refs
-            .get(commitish)
-            .cloned()
-            .unwrap_or_else(|| commitish.into()))
+        self.0.lock().unwrap().resolve(commitish)
     }
 
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus> {
@@ -520,9 +531,8 @@ impl Workspace for FakeWorkspace {
         worktrees
             .creation_requests
             .push((path.into(), branch.into(), base.into()));
-        if let Some(error) = worktrees.creation_error {
-            bail!("{error}");
-        }
+        // Git resolves the base before it creates anything.
+        worktrees.resolve(base)?;
         let path = Path::new("/canonical").join(path.strip_prefix("/")?);
         worktrees.branches.insert(branch.into(), Some(path.clone()));
         Ok(CreatedWorktree {
@@ -938,13 +948,14 @@ fn git_creation_error_persists_a_failed_attempt_without_launching() -> Result<()
     let (dag, workspace) = managed_setup();
     let run = external_run(&dag)?;
     let git_error = "fatal: invalid reference: missing-base";
-    workspace.0.lock().unwrap().creation_error = Some(git_error);
     let before = dag.latest_seq()?;
     let error = dag
         .start(new_worktree(&run, "fresh", Some("missing-base")))
         .err()
         .context("Dispatch unexpectedly succeeded")?;
     assert_eq!(error.to_string(), git_error);
+    // The missing base reached worktree creation rather than failing in planning.
+    assert_eq!(workspace.0.lock().unwrap().creation_requests.len(), 1);
     let snapshot = dag.run(&run)?;
     let task = &snapshot.tasks[0];
     assert_eq!(task.state, TaskState::Failed);
@@ -2243,14 +2254,46 @@ fn a_paused_scheduler_never_starts_or_removes_a_replaced_queue_entry() -> Result
 }
 
 #[test]
+fn a_queued_dispatch_with_a_missing_base_is_refused_and_not_stored() -> Result<()> {
+    let memory = FakeMemory::default();
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    let budget = WorkerBudget {
+        max_active_workers: Some(1),
+        ..WorkerBudget::default()
+    };
+    let dag = TestDag::new(
+        application_with_workspace(FakeWorkspace::default()),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_worktree_root(FakeWorktreeRoot)
+    .with_worker_budget(FixedBudget(budget), memory);
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("queued", &[])])?;
+    dag.start(command(&run, false))?;
+    let before = dag.latest_seq()?;
+    let error = dag
+        .dispatch(Dispatch {
+            task: "queued".into(),
+            ..new_worktree(&run, "feature/queued", Some("missing-base"))
+        })
+        .err()
+        .context("Dispatch unexpectedly queued")?;
+    assert!(format!("{error:#}").contains("missing-base"), "{error:#}");
+    assert!(dag.store.read(|db| db.queued_dispatches())?.is_empty());
+    assert_eq!(dag.latest_seq()?, before);
+    Ok(())
+}
+
+#[test]
 fn a_queued_explicit_base_starts_on_the_commit_it_named_when_queued() -> Result<()> {
     let workspace = FakeWorkspace::default();
-    workspace
-        .0
-        .lock()
-        .unwrap()
-        .refs
-        .insert("main".into(), "commit-1".into());
+    {
+        let mut git = workspace.0.lock().unwrap();
+        git.commits.extend(["commit-1".into(), "commit-2".into()]);
+        git.refs.insert("main".into(), "commit-1".into());
+    }
     let memory = FakeMemory::default();
     memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
     let budget = WorkerBudget {
