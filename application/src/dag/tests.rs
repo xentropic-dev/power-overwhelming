@@ -239,7 +239,10 @@ impl DagTransaction for MemoryDb {
                 .borrow()
                 .queued
                 .iter()
-                .any(|entry| entry.run == queued.run && entry.task == queued.task),
+                .any(
+                    |entry| (entry.run == queued.run && entry.task == queued.task)
+                        || entry.id == queued.id
+                ),
             "Duplicate queued dispatch"
         );
         self.set_queued_at(&queued.run, &queued.task, Some(queued.queued_at))?;
@@ -247,17 +250,19 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
-    fn remove_queued(&self, run: &str, task: &str) -> Result<bool> {
-        let before = self.0.borrow().queued.len();
-        self.0
-            .borrow_mut()
+    fn remove_queued(&self, id: &str) -> Result<bool> {
+        let position = self
+            .0
+            .borrow()
             .queued
-            .retain(|entry| entry.run != run || entry.task != task);
-        let removed = self.0.borrow().queued.len() != before;
-        if removed {
-            self.set_queued_at(run, task, None)?;
-        }
-        Ok(removed)
+            .iter()
+            .position(|entry| entry.id == id);
+        let Some(position) = position else {
+            return Ok(false);
+        };
+        let removed = self.0.borrow_mut().queued.remove(position);
+        self.set_queued_at(&removed.run, &removed.task, None)?;
+        Ok(true)
     }
 
     fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()> {
@@ -437,6 +442,8 @@ struct FakeWorktrees {
     head_lookups: Vec<PathBuf>,
     creation_requests: Vec<(PathBuf, String, String)>,
     creation_error: Option<&'static str>,
+    /// Commits that refs resolve to. Other commit-ishes resolve to themselves.
+    refs: BTreeMap<String, String>,
     missing: BTreeSet<PathBuf>,
     removed: Vec<PathBuf>,
 }
@@ -478,6 +485,16 @@ impl Workspace for FakeWorkspace {
             .head_lookups
             .push(worktree.to_owned());
         Ok("caller-head".into())
+    }
+
+    fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String> {
+        assert_eq!(repository, Path::new("/repo"));
+        let worktrees = self.0.lock().unwrap();
+        Ok(worktrees
+            .refs
+            .get(commitish)
+            .cloned()
+            .unwrap_or_else(|| commitish.into()))
     }
 
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus> {
@@ -2158,6 +2175,133 @@ fn a_queued_dispatch_that_cannot_start_leaves_the_queue_with_an_event() -> Resul
             .is_some_and(|summary| summary.contains("Specify a command")),
         "{:?}",
         failed.events[0].summary
+    );
+    Ok(())
+}
+
+fn launched_args(dag: &TestDag) -> Vec<Vec<OsString>> {
+    dag.application
+        .runtime
+        .launches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, options)| options.args.clone())
+        .collect()
+}
+
+#[test]
+fn a_paused_scheduler_never_starts_or_removes_a_replaced_queue_entry() -> Result<()> {
+    let memory = FakeMemory::default();
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    let budget = WorkerBudget {
+        max_active_workers: Some(1),
+        ..WorkerBudget::default()
+    };
+    let (dag, run) = budgeted(budget, &memory)?;
+    let with_args = |args: &str, retry: bool| Dispatch {
+        args: vec![args.into()],
+        retry,
+        ..task_dispatch(&run, "b", BudgetMode::Queue)
+    };
+    let first = dag.start(task_dispatch(&run, "a", BudgetMode::Queue))?;
+    dag.dispatch(with_args("old", false))?;
+    // The scheduler reads the queue, then pauses before it dispatches.
+    let snapshot = dag.store.read(|db| db.queued_dispatches())?;
+    assert_eq!(snapshot.len(), 1);
+    let stale = snapshot[0].id.clone();
+
+    // Meanwhile the old request starts by override and exits, and a retry queues a new one.
+    let old = dag.start_queued_now(&run, "b")?;
+    dag.session_exited(old.agent.session.as_deref().unwrap(), "exited")?;
+    dag.dispatch(with_args("new", true))?;
+    let replacement = dag.store.read(|db| db.queued_dispatch(&run, "b"))?;
+    let replacement = replacement.context("The retry was not queued")?;
+    assert_ne!(replacement.id, stale);
+    dag.report(&run, "a", &first.attempt.id, ReportStatus::Success, "done")?;
+
+    // The scheduler resumes with its stale snapshot. The old command must not launch again,
+    // and the new request stays queued.
+    let launches = launched_args(&dag).len();
+    assert_eq!(dag.start_queued_entries(snapshot)?, 0);
+    assert_eq!(launched_args(&dag).len(), launches);
+    assert_eq!(
+        dag.store.read(|db| db.queued_dispatches())?,
+        std::slice::from_ref(&replacement)
+    );
+    assert_eq!(state_of(&dag, &run, "b")?, TaskState::Queued);
+
+    // A failure cleanup for the stale entry leaves the replacement alone too.
+    assert!(!dag.store.write(|db| db.remove_queued(&stale))?);
+    assert_eq!(dag.start_queued()?, 1);
+    assert_eq!(
+        launched_args(&dag).last(),
+        Some(&vec![OsString::from("new")])
+    );
+    assert!(dag.store.read(|db| db.queued_dispatches())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_queued_explicit_base_starts_on_the_commit_it_named_when_queued() -> Result<()> {
+    let workspace = FakeWorkspace::default();
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .refs
+        .insert("main".into(), "commit-1".into());
+    let memory = FakeMemory::default();
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    let budget = WorkerBudget {
+        max_active_workers: Some(1),
+        ..WorkerBudget::default()
+    };
+    let dag = TestDag::new(
+        application_with_workspace(workspace.clone()),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_worktree_root(FakeWorktreeRoot)
+    .with_worker_budget(FixedBudget(budget), memory);
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("queued", &[])])?;
+    let first = dag.start(command(&run, false))?;
+    let queued = Dispatch {
+        task: "queued".into(),
+        ..new_worktree(&run, "feature/queued", Some("main"))
+    };
+    assert!(matches!(
+        dag.dispatch(queued)?,
+        DispatchOutcome::Queued { .. }
+    ));
+    let entry = dag.store.read(|db| db.queued_dispatch(&run, "queued"))?;
+    assert!(matches!(
+        entry.context("Not queued")?.worktree,
+        WorktreeRequest::New { base: Some(base), .. } if base == "commit-1"
+    ));
+
+    // The branch moves while the dispatch waits.
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .refs
+        .insert("main".into(), "commit-2".into());
+    dag.report(
+        &run,
+        "work",
+        &first.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    assert_eq!(dag.start_queued()?, 1);
+    let git = workspace.0.lock().unwrap();
+    let (_, branch, base) = git.creation_requests.last().context("No worktree")?;
+    assert_eq!(
+        (branch.as_str(), base.as_str()),
+        ("feature/queued", "commit-1")
     );
     Ok(())
 }

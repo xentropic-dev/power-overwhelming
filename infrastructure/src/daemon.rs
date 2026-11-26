@@ -162,10 +162,11 @@ pub fn serve(
         .set(Arc::downgrade(&dag))
         .expect("connect terminal callbacks to the DAG once");
     dag.restore().context("Restore sessions")?;
-    start_queue(dag.clone());
     handle_shutdown(application.clone(), shutting_down)?;
+    delay_bind_for_tests();
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    start_queue(dag.clone(), &listener);
     let server = Arc::new(Server {
         plugins: Plugins::start(application.clone()),
         dag,
@@ -186,8 +187,22 @@ pub fn serve(
 /// that frees up without an event still starts queued work.
 const QUEUE_RECHECK: Duration = Duration::from_secs(5);
 
-/// Starts queued dispatches whenever a run event may have freed capacity.
-fn start_queue(dag: Arc<DaemonDag>) {
+/// Holds the bind in debug builds, so tests can show that nothing a worker needs the
+/// socket for starts before the daemon listens.
+fn delay_bind_for_tests() {
+    #[cfg(debug_assertions)]
+    if let Some(delay) = std::env::var("POWER_TEST_BIND_DELAY_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        thread::sleep(Duration::from_millis(delay));
+    }
+}
+
+/// Starts queued dispatches whenever a run event may have freed capacity. It takes the
+/// bound listener because a queued worker may report at once, and its report needs the
+/// socket.
+fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
     thread::spawn(move || {
         let mut cursor = dag.latest_seq().unwrap_or(0);
         loop {

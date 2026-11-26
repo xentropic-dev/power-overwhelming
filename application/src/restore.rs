@@ -203,6 +203,9 @@ mod tests {
         fn head(&self, _: &Path) -> Result<String> {
             bail!("unused")
         }
+        fn resolve_commit(&self, _: &Path, _: &str) -> Result<String> {
+            bail!("unused")
+        }
         fn branch_exists(&self, _: &Path, _: &str) -> Result<BranchStatus> {
             bail!("unused")
         }

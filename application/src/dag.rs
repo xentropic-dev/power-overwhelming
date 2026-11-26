@@ -47,6 +47,13 @@ pub trait DagReader {
     fn find_worktree_by_path(&self, path: &Path) -> Result<Option<ManagedWorktree>>;
     /// Dispatches waiting for the worker budget, oldest first.
     fn queued_dispatches(&self) -> Result<Vec<QueuedDispatch>>;
+    /// The task's queued dispatch, if any.
+    fn queued_dispatch(&self, run: &str, task: &str) -> Result<Option<QueuedDispatch>> {
+        Ok(self
+            .queued_dispatches()?
+            .into_iter()
+            .find(|entry| entry.run == run && entry.task == task))
+    }
 }
 
 pub trait DagTransaction: DagReader {
@@ -64,8 +71,8 @@ pub trait DagTransaction: DagReader {
     fn remove_worktree(&self, path: &Path) -> Result<()>;
     /// At most one dispatch is queued per task.
     fn insert_queued(&self, queued: &QueuedDispatch) -> Result<()>;
-    /// Returns whether the task had a queued dispatch.
-    fn remove_queued(&self, run: &str, task: &str) -> Result<bool>;
+    /// Removes the queued dispatch with this ID. Returns whether it was still queued.
+    fn remove_queued(&self, id: &str) -> Result<bool>;
     fn event(
         &self,
         run: &str,
@@ -149,10 +156,13 @@ pub enum BudgetMode {
     Override,
 }
 
-/// A dispatch waiting for the worker budget. A new worktree's base is resolved when it is
-/// queued, so the dispatch does not depend on the caller's HEAD later.
+/// A dispatch waiting for the worker budget. A new worktree's base is resolved to a commit
+/// when it is queued, so the dispatch does not depend on the caller's HEAD or a moving ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedDispatch {
+    /// Identifies this request. A later request for the same task gets a new ID, so a stale
+    /// copy of the queue never starts or removes it.
+    pub id: String,
     pub run: String,
     pub task: String,
     pub provider: Provider,
@@ -308,19 +318,29 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         if queued.is_empty() {
             return Ok(0);
         }
+        self.start_queued_entries(queued)
+    }
+
+    /// Starts entries from a snapshot of the queue. Each entry is claimed by ID inside its
+    /// dispatch transaction, so an entry that started, left or was replaced since the
+    /// snapshot is skipped, and only the claimed entry is ever removed.
+    fn start_queued_entries(&self, queued: Vec<QueuedDispatch>) -> Result<usize> {
         let budget = self.worker_budget()?;
         let mut started = 0;
         for entry in queued {
-            let (run, task) = (entry.run.clone(), entry.task.clone());
+            let (id, run, task) = (entry.id.clone(), entry.run.clone(), entry.task.clone());
             match self.dispatch_with(
                 entry.into_dispatch(BudgetMode::Queue),
-                true,
+                Some(&id),
                 budget.as_ref(),
             ) {
                 Ok(DispatchOutcome::Started(_)) => started += 1,
                 Ok(DispatchOutcome::Queued { .. }) => {}
+                // A failure before the attempt was recorded rolls back, so the entry is still
+                // queued. A failure after it, such as worktree creation, already removed it and
+                // committed a failed attempt.
                 Err(error) => self.write(|db| {
-                    if db.remove_queued(&run, &task)? {
+                    if db.remove_queued(&id)? {
                         db.event(
                             &run,
                             RunEventKind::QueuedDispatchFailed,
@@ -344,9 +364,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .into_iter()
             .find(|entry| entry.run == run && entry.task == task)
             .with_context(|| format!("Task {task:?} in run {run:?} is not queued"))?;
-        match self.dispatch(entry.into_dispatch(BudgetMode::Override))? {
+        let id = entry.id.clone();
+        match self.dispatch_with(entry.into_dispatch(BudgetMode::Override), Some(&id), None)? {
             DispatchOutcome::Started(result) => Ok(*result),
-            DispatchOutcome::Queued { reason } => bail!("Task {task:?} stayed queued: {reason}"),
+            DispatchOutcome::Queued { reason } => bail!("Task {task:?} did not start: {reason}"),
         }
     }
 
@@ -656,28 +677,33 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             BudgetMode::Override => None,
             BudgetMode::Queue | BudgetMode::Refuse => self.worker_budget()?,
         };
-        self.dispatch_with(command, false, budget.as_ref())
+        self.dispatch_with(command, None, budget.as_ref())
     }
 
-    /// `from_queue` starts a queued dispatch if the budget has room, and otherwise leaves it
-    /// queued.
+    /// `claim` starts the queued dispatch with that ID, and only while it is still the
+    /// task's queued entry. With `BudgetMode::Queue`, a claimed entry starts only if the
+    /// budget has room, and otherwise stays queued.
     fn dispatch_with(
         &self,
         command: Dispatch,
-        from_queue: bool,
+        claim: Option<&str>,
         budget: Option<&WorkerBudget>,
     ) -> Result<DispatchOutcome> {
         let mut created_path = None;
         let result = self.worker_transaction(|db, launched| {
             let run = load_run(db, &command.run)?;
             let task = find_task(&run, &command.task)?;
-            let queued = task.state == TaskState::Queued;
-            if from_queue && !queued {
-                // Started or dropped since the queue was read.
+            let queued_entry = db.queued_dispatch(&run.id, &task.id)?;
+            let queued = queued_entry.is_some();
+            if let Some(claim) = claim
+                && queued_entry.as_ref().is_none_or(|entry| entry.id != claim)
+            {
+                // Started, dropped or replaced since the queue was read.
                 return Ok(Ok(DispatchOutcome::Queued {
-                    reason: "no longer queued".into(),
+                    reason: "it is no longer queued".into(),
                 }));
             }
+            let from_queue = claim.is_some() && command.budget == BudgetMode::Queue;
             if from_queue && run.archived_at.is_some() {
                 // An archived run starts no workers until it is unarchived.
                 return Ok(Ok(DispatchOutcome::Queued {
@@ -685,7 +711,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 }));
             }
             ensure!(
-                !queued || from_queue || command.budget == BudgetMode::Override,
+                !queued || claim.is_some() || command.budget == BudgetMode::Override,
                 "Task {:?} is already queued for the worker budget. Dispatch it with \
                  --over-budget to start it now",
                 task.id
@@ -730,6 +756,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 );
                 let reason = limit.to_string();
                 db.insert_queued(&QueuedDispatch {
+                    id: self.new_id(),
                     run: run.id.clone(),
                     task: task.id.clone(),
                     provider: command.provider,
@@ -756,8 +783,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 )?;
                 return Ok(Ok(DispatchOutcome::Queued { reason }));
             }
-            if queued {
-                db.remove_queued(&run.id, &task.id)?;
+            if let Some(queued_entry) = &queued_entry {
+                db.remove_queued(&queued_entry.id)?;
             }
             // An external coordinator keeps its reference on the run, so its workers have no
             // parent agent, whatever terminal the CLI happens to run in. A Power caller that this
@@ -1315,8 +1342,12 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             }
             bail!("Branch {branch:?} already exists");
         }
+        // Pin an explicit base to its commit now, as the implicit one is, so a queued
+        // dispatch starts where it was asked to even if the ref moves.
         let base = match base {
-            Some(base) => base.to_owned(),
+            Some(base) => workspace
+                .resolve_commit(repository, base)
+                .with_context(|| format!("Resolve --base {base:?}"))?,
             None => {
                 let caller =
                     caller.context("Specify --base when creating a worktree from outside Power")?;

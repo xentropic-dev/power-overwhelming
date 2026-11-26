@@ -1,3 +1,6 @@
+mod common;
+
+use common::write_config;
 use infrastructure::{
     boxes::{Layout, SavedBox},
     client::protocol::{
@@ -46,9 +49,14 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(root: &Path) -> Self {
+        Self::start_with(root, &[])
+    }
+
+    fn start_with(root: &Path, env: &[(&str, &str)]) -> Self {
         let mut daemon = Self(
             power(root)
                 .arg("daemon")
+                .envs(env.iter().copied())
                 .stdin(Stdio::null())
                 .spawn()
                 .unwrap(),
@@ -242,13 +250,10 @@ impl Fixture {
             include_str!("fixtures/dag-worker.sh"),
         )
         .unwrap();
+        // Keep the host's free memory out of the tests. A fixture that needs its own config
+        // writes it with `write_config` too.
+        write_config(root, "");
         configure(root);
-        // Keep the host's free memory out of the tests. The budget test sets its own limits.
-        let config = root.join("config/power-overwhelming/config.lua");
-        if !config.exists() {
-            fs::create_dir_all(config.parent().unwrap()).unwrap();
-            fs::write(&config, "dag = { min_available_memory = 0 }\n").unwrap();
-        }
         let daemon = Daemon::start(root);
         Self {
             daemon,
@@ -263,8 +268,12 @@ impl Fixture {
     }
 
     fn restart(&mut self) {
+        self.restart_with(&[]);
+    }
+
+    fn restart_with(&mut self, env: &[(&str, &str)]) {
         self.daemon.stop();
-        self.daemon = Daemon::start(self.root());
+        self.daemon = Daemon::start_with(self.root(), env);
     }
 
     fn command(&self, args: &[&str]) -> Output {
@@ -568,10 +577,8 @@ fn archive_hides_a_run_and_refuses_open_attempts_unless_forced() {
 fn legacy_agent_aliases_use_the_configured_profiles() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let config = root.join("config/power-overwhelming");
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("config.lua"),
+    write_config(
+        root,
         r#"
         agents.claude = {
             command = "/bin/echo",
@@ -581,8 +588,7 @@ fn legacy_agent_aliases_use_the_configured_profiles() {
         }
         agents.codex = { command = "/bin/echo", injection = { kind = "none" } }
         "#,
-    )
-    .unwrap();
+    );
     for prefix in [&[][..], &["agent"][..]] {
         for id in ["claude", "codex"] {
             let aliased = output(power(root).args(prefix).args([id, "--", "two words"]));
@@ -619,11 +625,9 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
         )
         .unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
-        let config = root.join("config/power-overwhelming");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(
-            config.join("config.lua"),
-            format!(
+        write_config(
+            root,
+            &format!(
                 r##"
                 keys.prefix.tab = "ctrl-a"
                 power_bar.agent_colors.Codex = "#62a0ea"
@@ -634,8 +638,7 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
                 "##,
                 program.to_str().unwrap()
             ),
-        )
-        .unwrap();
+        );
     });
 
     let wrapped = output(
@@ -706,7 +709,8 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
     let task = fixture.wait_for_state(&run.id, "profile", TaskState::Completed);
     assert_eq!(task.attempts[0].summary.as_deref(), Some("Profile result"));
 
-    fs::remove_file(fixture.root().join("config/power-overwhelming/config.lua")).unwrap();
+    // Drop the profile. The attempt keeps the provider it ran with.
+    write_config(fixture.root(), "");
     fixture.restart();
     let persisted = fixture.show(&run.id);
     assert_eq!(persisted.tasks[0].attempts[0].provider, agent.provider);
@@ -740,16 +744,13 @@ done
         )
         .unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
-        let config = root.join("config/power-overwhelming");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(
-            config.join("config.lua"),
-            format!(
+        write_config(
+            root,
+            &format!(
                 r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
                 program.to_str().unwrap(),
             ),
-        )
-        .unwrap();
+        );
     });
     let run = fixture.create_run().id;
     fixture.json(&[
@@ -1412,13 +1413,7 @@ fn daemon_restart_preserves_graph_and_reconciles_active_attempt() {
 #[test]
 fn worker_budget_queues_past_max_active_workers_and_starts_on_report() {
     let fixture = Fixture::with_configure(|root| {
-        let config = root.join("config/power-overwhelming");
-        fs::create_dir_all(&config).unwrap();
-        fs::write(
-            config.join("config.lua"),
-            "dag = { max_active_workers = 2, min_available_memory = 0 }\n",
-        )
-        .unwrap();
+        write_config(root, "dag.max_active_workers = 2\n");
     });
     let run = fixture.create_run();
     for id in ["one", "two", "three"] {
@@ -1486,4 +1481,45 @@ fn worker_budget_queues_past_max_active_workers_and_starts_on_report() {
         fixture.release(&format!("{id}.go"));
         fixture.wait_for_state(&run.id, id, TaskState::Completed);
     }
+}
+
+#[test]
+fn a_persisted_queued_worker_that_reports_at_once_starts_after_the_socket_listens() {
+    let mut fixture = Fixture::with_configure(|root| {
+        write_config(root, "dag.max_active_workers = 1\n");
+    });
+    let run = fixture.create_run();
+    fixture.add_task(&run.id, "held");
+    fixture.add_task(&run.id, "queued");
+    let worktree = &fixture.worktrees[0];
+    dispatched(fixture.dispatch(
+        &run.id,
+        "held",
+        worktree,
+        false,
+        &["success", "held.go", "x"],
+    ));
+    fixture.wait_for_worker("held.go");
+    // The queued worker reports as soon as it starts.
+    fixture.release("queued.go");
+    let queued = json_output(fixture.dispatch(
+        &run.id,
+        "queued",
+        worktree,
+        false,
+        &["success", "queued.go", "Reported at once"],
+    ));
+    assert_eq!(queued["queued"], true, "{queued}");
+
+    // The restart interrupts the held worker, which frees the budget for the queued one.
+    // The bind waits longer than a report retries for, so a worker started before the
+    // socket listens could not report.
+    fixture.restart_with(&[("POWER_TEST_BIND_DELAY_MS", "4000")]);
+    let task = fixture.wait_for_state(&run.id, "queued", TaskState::Completed);
+    assert_eq!(task.attempts.len(), 1);
+    assert_eq!(
+        task.attempts[0].summary.as_deref(),
+        Some("Reported at once")
+    );
+    assert_eq!(fixture.show(&run.id).tasks[0].state, TaskState::Interrupted);
 }

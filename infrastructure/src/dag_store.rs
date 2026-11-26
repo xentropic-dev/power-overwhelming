@@ -80,6 +80,7 @@ impl SqliteDagStore {
                  )
              );
              CREATE TABLE IF NOT EXISTS queued_dispatches (
+                 id TEXT NOT NULL UNIQUE,
                  run_id TEXT NOT NULL, task_id TEXT NOT NULL, provider TEXT NOT NULL,
                  worktree TEXT NOT NULL, allow_main_checkout INTEGER NOT NULL,
                  retry INTEGER NOT NULL, args TEXT NOT NULL, caller TEXT,
@@ -365,7 +366,7 @@ impl DagReader for DagDb<'_> {
         rows(
             self.0,
             "SELECT run_id, task_id, provider, worktree, allow_main_checkout, retry, args, caller,
-                    queued_at
+                    queued_at, id
              FROM queued_dispatches ORDER BY queued_at, rowid",
             [],
             |row| {
@@ -373,6 +374,7 @@ impl DagReader for DagDb<'_> {
                     serde_json::from_str(&row.get::<_, String>(3)?)
                         .map_err(|error| invalid_column(3, error))?;
                 Ok(QueuedDispatch {
+                    id: row.get(9)?,
                     run: row.get(0)?,
                     task: row.get(1)?,
                     provider: enum_column::<wire::Provider>(row, 2)?.into(),
@@ -449,8 +451,9 @@ impl DagTransaction for DagDb<'_> {
         };
         self.0.execute(
             "INSERT INTO queued_dispatches
-                 (run_id, task_id, provider, worktree, allow_main_checkout, retry, args, caller, queued_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (run_id, task_id, provider, worktree, allow_main_checkout, retry, args, caller,
+                  queued_at, id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 queued.run,
                 queued.task,
@@ -461,16 +464,17 @@ impl DagTransaction for DagDb<'_> {
                 serde_json::to_string(&queued.args)?,
                 queued.caller,
                 queued.queued_at,
+                queued.id,
             ],
         )?;
         Ok(())
     }
 
-    fn remove_queued(&self, run: &str, task: &str) -> Result<bool> {
-        Ok(self.0.execute(
-            "DELETE FROM queued_dispatches WHERE run_id = ?1 AND task_id = ?2",
-            params![run, task],
-        )? > 0)
+    fn remove_queued(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .execute("DELETE FROM queued_dispatches WHERE id = ?1", [id])?
+            > 0)
     }
 
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
