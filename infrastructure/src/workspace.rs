@@ -292,6 +292,11 @@ impl Workspace for LocalWorkspace {
         })
     }
 
+    fn worktree_exists(&self, path: &Path) -> bool {
+        // Only a definite absence counts. A permission or I/O error keeps the agent.
+        !matches!(path.try_exists(), Ok(false))
+    }
+
     fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()> {
         let checkout = Checkout::discover(path)?;
         ensure!(

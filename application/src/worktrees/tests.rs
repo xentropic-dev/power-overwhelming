@@ -90,6 +90,16 @@ impl Workspace for WorktreeWorkspace {
         Ok(())
     }
 
+    fn worktree_exists(&self, path: &Path) -> bool {
+        !self
+            .0
+            .lock()
+            .unwrap()
+            .removals
+            .iter()
+            .any(|(removed, _)| removed == path)
+    }
+
     fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
         bail!("Unexpected artifact operation")
     }
@@ -343,7 +353,7 @@ fn lists_and_prunes_only_owned_worktrees_in_scope() -> Result<()> {
         (dirty.clone(), PruneVerdict::Keep(KeepReason::Dirty)),
         (unmerged.clone(), PruneVerdict::Keep(KeepReason::Unmerged)),
         (live.clone(), PruneVerdict::Keep(KeepReason::InUse)),
-        (open.clone(), PruneVerdict::Keep(KeepReason::InUse)),
+        (open.clone(), PruneVerdict::Keep(KeepReason::OpenAttempt)),
         (removable.clone(), PruneVerdict::Remove),
     ];
     assert_eq!(dag.prune(Some("box-id"), true, true)?, expected);
@@ -392,5 +402,115 @@ fn retains_ownership_when_git_refuses_to_remove_a_worktree() -> Result<()> {
         workspace.0.lock().unwrap().removals,
         [(removed.path, false)]
     );
+    Ok(())
+}
+
+fn add_agent(
+    dag: &TestDag,
+    id: &str,
+    worktree: &Path,
+    session: Option<&str>,
+    state: AgentState,
+) -> Result<()> {
+    dag.store.write(|db| {
+        db.insert_agent(&ManagedAgent {
+            id: id.into(),
+            box_id: "box-id".into(),
+            worktree: worktree.into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: session.map(str::to_owned),
+            run: None,
+            task: None,
+            attempt: None,
+            state,
+            label: id.into(),
+            created_at: 0,
+        })
+    })
+}
+
+fn agent_state(dag: &TestDag, id: &str) -> Result<AgentState> {
+    dag.store.read(|db| db.agent(id)).map(|agent| agent.state)
+}
+
+#[test]
+fn removing_a_worktree_retires_the_agents_left_in_it() -> Result<()> {
+    let removed = record("box-id", "removed");
+    let other = record("box-id", "other");
+    let workspace = WorktreeWorkspace::default();
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .insert(removed.path.clone(), CLEAN_MERGED);
+    let (dag, _) = fixture(workspace.clone())?;
+    record_owners(&dag, &[&removed])?;
+    // The terminal has stopped, but the exit has not been recorded yet.
+    let stale = start_shell(&dag.application, &removed.path)?;
+    dag.application
+        .terminal(&stale.id)?
+        .store(false, Ordering::Release);
+    add_agent(
+        &dag,
+        "with-session",
+        &removed.path,
+        Some(&stale.id),
+        AgentState::Running,
+    )?;
+    add_agent(
+        &dag,
+        "orphan",
+        &removed.path,
+        Some("gone"),
+        AgentState::Running,
+    )?;
+    add_agent(&dag, "no-session", &removed.path, None, AgentState::Running)?;
+    add_agent(&dag, "elsewhere", &other.path, None, AgentState::Running)?;
+
+    assert_eq!(
+        dag.prune(None, false, false)?,
+        [(removed.clone(), PruneVerdict::Remove)]
+    );
+
+    assert!(dag.application.session(&stale.id).is_err());
+    assert_eq!(agent_state(&dag, "orphan")?, AgentState::Exited);
+    assert_eq!(agent_state(&dag, "no-session")?, AgentState::Exited);
+    assert_eq!(agent_state(&dag, "elsewhere")?, AgentState::Running);
+    // The session's exit report marks this one, as for any other exit.
+    assert_eq!(agent_state(&dag, "with-session")?, AgentState::Running);
+    dag.session_exited(&stale.id, "ended")?;
+    assert_eq!(agent_state(&dag, "with-session")?, AgentState::Exited);
+    Ok(())
+}
+
+#[test]
+fn keeps_a_worktree_whose_agent_has_an_open_attempt_elsewhere() -> Result<()> {
+    let worktree = record("box-id", "agent-home");
+    let attempt_path = record("box-id", "attempt-path");
+    let workspace = WorktreeWorkspace::default();
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .insert(worktree.path.clone(), CLEAN_MERGED);
+    let (dag, _) = fixture(workspace.clone())?;
+    record_owners(&dag, &[&worktree])?;
+    // The attempt records a different path, but its agent works in this worktree.
+    add_attempt(&dag, &attempt_path, AttemptState::Active)?;
+    add_agent(&dag, "agent", &worktree.path, None, AgentState::Running)?;
+    let expected = [(
+        worktree.clone(),
+        PruneVerdict::Keep(KeepReason::OpenAttempt),
+    )];
+
+    assert_eq!(dag.prune(None, true, false)?, expected);
+    assert_eq!(dag.prune(None, false, false)?, expected);
+
+    assert!(workspace.0.lock().unwrap().removals.is_empty());
+    assert_eq!(agent_state(&dag, "agent")?, AgentState::Running);
     Ok(())
 }

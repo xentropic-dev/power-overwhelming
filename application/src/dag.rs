@@ -12,7 +12,7 @@ use domain::{
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -31,6 +31,8 @@ pub trait DagReader {
     fn agent(&self, id: &str) -> Result<ManagedAgent>;
     fn session_agent(&self, session: &str) -> Result<Option<ManagedAgent>>;
     fn list_agents(&self, box_id: Option<&str>) -> Result<Vec<ManagedAgent>>;
+    /// Agents of any state whose worktree is exactly `worktree`.
+    fn worktree_agents(&self, worktree: &Path) -> Result<Vec<ManagedAgent>>;
     fn run(&self, id: &str) -> Result<Run>;
     fn run_box(&self, id: &str) -> Result<String>;
     fn list_runs(&self, box_id: Option<&str>) -> Result<Vec<Run>>;
@@ -628,15 +630,27 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     /// Interrupts attempts and stops agents whose session did not survive a restart.
-    /// Those in `restored` keep running under their original session IDs.
+    /// Those in `restored` keep running under their original session IDs, unless their
+    /// worktree is gone and they have no open attempt.
     pub fn reconcile(&self, restored: &[String]) -> Result<()> {
         let restored = |session: Option<&str>| {
             session.is_some_and(|session| restored.iter().any(|id| id == session))
         };
+        let workspace = self.application.workspace.as_ref();
         self.write(|db| {
             interrupt(db, None, RESTART_DETAIL, &restored)?;
+            let attempting: BTreeSet<_> = db
+                .open_attempts(None)?
+                .into_iter()
+                .map(|open| open.attempt.agent)
+                .collect();
             for agent in db.list_agents(None)? {
-                if agent.state == AgentState::Running && !restored(agent.session.as_deref()) {
+                if agent.state != AgentState::Running {
+                    continue;
+                }
+                let orphaned =
+                    !attempting.contains(&agent.id) && !workspace.worktree_exists(&agent.worktree);
+                if orphaned || !restored(agent.session.as_deref()) {
                     db.set_agent_exited(&agent.id)?;
                 }
             }

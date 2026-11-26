@@ -181,6 +181,9 @@ mod tests {
         fn remove_worktree(&self, _: &Path, _: bool) -> Result<()> {
             bail!("unused")
         }
+        fn worktree_exists(&self, _: &Path) -> bool {
+            true
+        }
         fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
             bail!("unused")
         }
