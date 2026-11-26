@@ -424,6 +424,111 @@ read -r finish
 }
 
 #[test]
+fn jcode_gets_typed_instructions_a_private_socket_and_resumes_its_own_session() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    // A deterministic stand-in for jcode's TUI. It reads the typed first message (a
+    // bracketed paste ended by Enter), then reports a task the way jcode's bash tool
+    // runs commands, with `JCODE_SESSION_ID` set.
+    fs::write(
+        root.join("jcode"),
+        r#"#!/bin/sh
+set -eu
+dir="${POWER_SOCKET%/*}"
+if test "${1:-}" = --resume; then
+    printf '%s\n' "$@" > "$dir/resumed.args"
+    printf '%s' "$JCODE_SOCKET" > "$dir/resumed.socket"
+    JCODE_SESSION_ID="$2" "$POWER_BIN" session task resumed
+    read -r finish
+    exit
+fi
+printf '%s\n' "$@" > "$dir/fresh.args"
+printf '%s' "$JCODE_SOCKET" > "$dir/fresh.socket"
+stty -echo
+# Like a TUI in raw mode, announce that typed input is welcome.
+printf '\033[?2004h'
+end="$(printf '\033')[201~"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$dir/fresh.message"
+    case "$line" in *"$end"*) break ;; esac
+done
+# The second Enter arrives as an empty line.
+IFS= read -r second
+test -z "$second"
+JCODE_SESSION_ID=session_fake_1 "$POWER_BIN" session task started
+read -r finish
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(root.join("jcode"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(root.to_owned())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let start = || {
+        Daemon::start_with(
+            root,
+            Command::new(env!("CARGO_BIN_EXE_power"))
+                .env("SHELL", "/bin/sh")
+                .env("PATH", &path),
+        )
+    };
+    let (daemon, socket) = start();
+    let session = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"jcode"}),
+    ))["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let wait_for_task = |task: &str| {
+        let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+        loop {
+            let message = event(&mut attached);
+            if let Some(reported) = message["metadata"]["task"].as_str() {
+                assert_eq!(reported, task);
+                break;
+            }
+        }
+    };
+    wait_for_task("started");
+    let private_socket = root.join(format!("jcode-{session}.sock"));
+    // No arguments: printf still writes one empty line.
+    assert_eq!(fs::read_to_string(root.join("fresh.args")).unwrap(), "\n");
+    assert_eq!(
+        fs::read_to_string(root.join("fresh.socket")).unwrap(),
+        private_socket.to_str().unwrap()
+    );
+    let message = fs::read_to_string(root.join("fresh.message")).unwrap();
+    assert!(
+        message.starts_with("\x1b[200~You are running inside Power Overwhelming."),
+        "{message:?}"
+    );
+    assert!(message.contains("`power session task 'Short task label'`"));
+    assert!(message.trim_end().ends_with("\x1b[201~"), "{message:?}");
+    drop(daemon);
+
+    // The restore resumes the session jcode reported, on the same private socket.
+    let (_restored, _) = start();
+    wait_for_task("resumed");
+    assert_eq!(
+        fs::read_to_string(root.join("resumed.args")).unwrap(),
+        "--resume\nsession_fake_1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("resumed.socket")).unwrap(),
+        private_socket.to_str().unwrap()
+    );
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}
+
+#[test]
 fn agent_task_and_model_follow_the_run_and_survive_reattachment() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use std::os::unix::fs::PermissionsExt;

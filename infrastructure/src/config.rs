@@ -168,6 +168,8 @@ struct ProfileConfig {
     model_callback: Option<ModelCallbackConfig>,
     skills_dir: Option<PathBuf>,
     resume: Option<ResumeConfig>,
+    env: Option<std::collections::BTreeMap<String, String>>,
+    conversation_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +186,7 @@ struct ResumeConfig {
 enum InjectionConfig {
     Flag { flag: String },
     ConfigValue { flag: String, key: String },
+    FirstMessage,
     None,
 }
 
@@ -215,6 +218,12 @@ fn read_agent_profile(
     if let Some(resume) = value.get_mut("resume") {
         normalize_empty_lists(resume, &["assign", "resume", "resume_last", "conflicts"]);
     }
+    // Lua cannot tell an empty table from an empty list.
+    if let Some(env) = value.get_mut("env")
+        && env.as_array().is_some_and(Vec::is_empty)
+    {
+        *env = JsonValue::Object(Default::default());
+    }
     let config: ProfileConfig = serde_json::from_value(value)?;
     let mut profile = profiles
         .0
@@ -230,6 +239,8 @@ fn read_agent_profile(
             model_callback: ModelCallback::None,
             skills_dir: None,
             resume: None,
+            env: Vec::new(),
+            conversation_env: None,
         });
     if let Some(command) = config.command {
         anyhow::ensure!(
@@ -242,6 +253,7 @@ fn read_agent_profile(
         profile.injection = match injection {
             InjectionConfig::Flag { flag } => Injection::Flag { flag },
             InjectionConfig::ConfigValue { flag, key } => Injection::ConfigValue { flag, key },
+            InjectionConfig::FirstMessage => Injection::FirstMessage,
             InjectionConfig::None => Injection::None,
         };
     }
@@ -260,6 +272,17 @@ fn read_agent_profile(
     }
     if let Some(directory) = config.skills_dir {
         profile.skills_dir = Some(directory);
+    }
+    if let Some(env) = config.env {
+        anyhow::ensure!(
+            env.keys()
+                .all(|name| !name.is_empty() && !name.contains(['=', '\0'])),
+            "env names must be non-empty and contain no = or NUL"
+        );
+        profile.env = env.into_iter().collect();
+    }
+    if let Some(name) = config.conversation_env {
+        profile.conversation_env = (!name.is_empty()).then_some(name);
     }
     if let Some(config) = config.resume {
         let defaults = profile.resume.take().unwrap_or_default();
@@ -497,7 +520,7 @@ mod tests {
         let error = profiles.resolve(&"unknown".into()).unwrap_err().to_string();
         assert_eq!(
             error,
-            "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, bare, custom"
+            "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, jcode, bare, custom"
         );
         Ok(())
     }
@@ -523,6 +546,49 @@ mod tests {
             profiles.resolve(&"codex".into())?.resume,
             Some(Resume::default())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_sets_first_message_injection_and_launch_env() -> Result<()> {
+        let sections = evaluate(
+            r#"
+            agents.custom = {
+                injection = { kind = "first_message" },
+                env = { AGENT_SOCKET = "{runtime}/agent-{session}.sock" },
+                conversation_env = "AGENT_SESSION",
+            }
+            agents.jcode = { env = {}, conversation_env = "" }
+            "#,
+            Path::new("config.lua"),
+            [(AGENTS_SECTION.into(), json!({}))].into(),
+        )?;
+        let profiles = agent_profiles(&sections)?;
+        let custom = profiles.resolve(&"custom".into())?;
+        assert_eq!(custom.injection, Injection::FirstMessage);
+        assert_eq!(
+            custom.env,
+            [(
+                "AGENT_SOCKET".into(),
+                "{runtime}/agent-{session}.sock".into()
+            )]
+        );
+        assert_eq!(custom.conversation_env.as_deref(), Some("AGENT_SESSION"));
+        let jcode = profiles.resolve(&"jcode".into())?;
+        assert!(jcode.env.is_empty());
+        assert_eq!(jcode.conversation_env, None);
+        assert_eq!(jcode.injection, Injection::FirstMessage);
+
+        let builtin = AgentProfiles::default();
+        let jcode = builtin.resolve(&"jcode".into())?;
+        assert_eq!(
+            jcode.env,
+            [(
+                "JCODE_SOCKET".into(),
+                "{runtime}/jcode-{session}.sock".into()
+            )]
+        );
+        assert_eq!(jcode.conversation_env.as_deref(), Some("JCODE_SESSION_ID"));
         Ok(())
     }
 

@@ -697,7 +697,7 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
     assert_rejected(&rejected);
     let error = String::from_utf8_lossy(&rejected.stderr);
     assert!(
-        error.contains("Known profiles: claude, codex, grok, fixture-agent"),
+        error.contains("Known profiles: claude, codex, grok, jcode, fixture-agent"),
         "{error}"
     );
     assert!(task(&fixture.show(&run.id), "profile").attempts.is_empty());
@@ -714,6 +714,88 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
     fixture.restart();
     let persisted = fixture.show(&run.id);
     assert_eq!(persisted.tasks[0].attempts[0].provider, agent.provider);
+}
+
+#[test]
+fn jcode_worker_gets_instructions_and_task_as_its_first_message_and_reports() {
+    let fixture = Fixture::with_configure(|root| {
+        let program = root.join("jcode");
+        // A deterministic stand-in for jcode's TUI: it takes no arguments, reads the
+        // typed first message, and reports from a command like jcode's bash tool runs.
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+dir="${POWER_SOCKET%/*}"
+test "$#" -eq 0
+test -n "$POWER_ATTEMPT"
+printf '%s' "$JCODE_SOCKET" > "$dir/jcode.socket"
+stty -echo
+# Like a TUI in raw mode, announce that typed input is welcome.
+printf '\033[?2004h'
+end="$(printf '\033')[201~"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$dir/jcode.message"
+    case "$line" in *"$end"*) break ;; esac
+done
+# The second Enter arrives as an empty line.
+IFS= read -r second
+test -z "$second"
+JCODE_SESSION_ID=session_fake_dag "$POWER_BIN" dag report success --summary "jcode done"
+read -r finish
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        write_config(
+            root,
+            &format!(
+                "agents.jcode = {{ command = {:?} }}",
+                program.to_str().unwrap()
+            ),
+        );
+    });
+    let run = fixture.create_run().id;
+    fixture.json(&[
+        "dag",
+        "add-task",
+        &run,
+        "--id",
+        "light",
+        "--title",
+        "Use a lighter agent",
+    ]);
+    let worktree = &fixture.worktrees[0];
+    let (attempt, agent) = dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "light",
+        "--provider",
+        "jcode",
+        "--worktree",
+        worktree.to_str().unwrap(),
+    ]));
+    assert_eq!(agent.provider, Provider::Agent("jcode".into()));
+    let task = fixture.wait_for_state(&run, "light", TaskState::Completed);
+    assert_eq!(task.attempts[0].summary.as_deref(), Some("jcode done"));
+    let session = attempt.session.unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.root().join("jcode.socket")).unwrap(),
+        fixture
+            .root()
+            .join(format!("jcode-{session}.sock"))
+            .to_str()
+            .unwrap()
+    );
+    let message = fs::read_to_string(fixture.root().join("jcode.message")).unwrap();
+    assert!(
+        message.starts_with("\x1b[200~You are running inside Power Overwhelming."),
+        "{message:?}"
+    );
+    assert!(message.contains("Task: light"), "{message:?}");
+    assert!(message.contains("power dag report success"), "{message:?}");
+    assert!(message.trim_end().ends_with("\x1b[201~"), "{message:?}");
 }
 
 #[test]

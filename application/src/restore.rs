@@ -273,6 +273,8 @@ mod tests {
             model_callback: domain::agent::ModelCallback::None,
             skills_dir: None,
             resume,
+            env: Vec::new(),
+            conversation_env: None,
         }
     }
 
