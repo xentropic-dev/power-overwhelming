@@ -2,11 +2,13 @@ pub mod agents;
 mod commands;
 pub mod dag;
 mod queries;
+mod sessions;
 pub mod skill_install;
 pub mod skills;
 
 pub use commands::{ArtifactPublished, PublishArtifact, SessionOptions, StartSession};
 pub use queries::ResolveArtifact;
+pub use sessions::{MemorySessions, SessionRecord, SessionStore};
 
 use anyhow::{Context, Result};
 use domain::{
