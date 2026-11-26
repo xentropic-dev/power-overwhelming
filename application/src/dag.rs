@@ -4,9 +4,9 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
-        AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, ManagedAgent,
-        Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind, Task, TaskSpec,
-        TaskState, can_dispatch, report_transition, validate_batch,
+        AgentState, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo, Coordinator,
+        ManagedAgent, Provider, ReportStatus, ReportTransition, Run, RunEvent, RunEventKind, Task,
+        TaskSpec, TaskState, can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
@@ -47,6 +47,7 @@ pub trait DagReader {
 pub trait DagTransaction: DagReader {
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()>;
     fn set_agent_exited(&self, id: &str) -> Result<()>;
+    fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()>;
     fn insert_run(&self, run: &Run) -> Result<()>;
     fn insert_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<()>;
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
@@ -84,6 +85,14 @@ pub struct EventsPage {
 
 pub trait BoxRegistry: Send + Sync {
     fn boxes(&self) -> Result<Vec<RegisteredBox>>;
+}
+
+/// Custom images that replace a box's generated identicon.
+pub trait BoxIcons: Send + Sync {
+    /// Stores the image at `source`, an absolute path, as the box's icon.
+    fn set(&self, box_id: &str, source: &Path) -> Result<()>;
+    /// Restores the generated identicon. Succeeds when the box has no icon.
+    fn clear(&self, box_id: &str) -> Result<()>;
 }
 
 pub struct RegisteredBox {
@@ -129,10 +138,11 @@ pub struct ReportResult {
     pub reason: Option<String>,
 }
 
-pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry> {
+pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> {
     application: Arc<Application<T>>,
     store: S,
     registry: B,
+    icons: I,
     worktree_root: Option<Box<dyn WorktreeRoot>>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
@@ -156,12 +166,13 @@ struct WorkerAttempt {
     number: u32,
 }
 
-impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
-    pub fn new(application: Arc<Application<T>>, store: S, registry: B) -> Self {
+impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplication<T, S, B, I> {
+    pub fn new(application: Arc<Application<T>>, store: S, registry: B, icons: I) -> Self {
         Self {
             application,
             store,
             registry,
+            icons,
             worktree_root: None,
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
@@ -190,23 +201,77 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             .clone())
     }
 
+    /// Sets the selected box's icon from an image on disk, or restores the identicon when
+    /// `source` is absent. Returns the box ID.
+    pub fn set_box_icon(&self, selection: BoxSelection, source: Option<PathBuf>) -> Result<String> {
+        let box_id = self
+            .store
+            .read(|db| self.resolve_box(db, &selection))?
+            .context("Select a box with --box or run from a Power terminal")?;
+        match source {
+            Some(source) => {
+                ensure!(source.is_absolute(), "The icon path must be absolute");
+                self.icons.set(&box_id, &source)?;
+            }
+            None => self.icons.clear(&box_id)?,
+        }
+        Ok(box_id)
+    }
+
     pub fn list_agents(&self, selection: BoxSelection) -> Result<Vec<ManagedAgent>> {
         self.store
             .read(|db| db.list_agents(self.resolve_box(db, &selection)?.as_deref()))
     }
 
     pub fn list_runs(&self, selection: BoxSelection) -> Result<Vec<Run>> {
-        self.store.read(|db| {
+        let mut runs = self.store.read(|db| {
             let mut runs = db.list_runs(self.resolve_box(db, &selection)?.as_deref())?;
             for run in &mut runs {
                 run.derive_task_states();
             }
             Ok(runs)
-        })
+        })?;
+        for run in &mut runs {
+            self.attach_artifacts(run)?;
+        }
+        Ok(runs)
     }
 
     pub fn run(&self, id: &str) -> Result<Run> {
-        self.store.read(|db| load_run(db, id))
+        let mut run = self.store.read(|db| load_run(db, id))?;
+        self.attach_artifacts(&mut run)?;
+        Ok(run)
+    }
+
+    /// Fills each attempt's artifacts from the artifact store, with one lookup for the run.
+    fn attach_artifacts(&self, run: &mut Run) -> Result<()> {
+        let mut sessions: Vec<String> = run
+            .tasks
+            .iter()
+            .flat_map(|task| &task.attempts)
+            .filter_map(|attempt| attempt.session.clone())
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut by_session: BTreeMap<String, Vec<AttemptArtifact>> = BTreeMap::new();
+        for published in self.application.artifacts.published(&sessions)? {
+            by_session
+                .entry(published.session)
+                .or_default()
+                .push(published.artifact);
+        }
+        for attempt in run.tasks.iter_mut().flat_map(|task| &mut task.attempts) {
+            attempt.artifacts = attempt
+                .session
+                .as_ref()
+                .and_then(|session| by_session.get(session))
+                .cloned()
+                .unwrap_or_default();
+        }
+        Ok(())
     }
 
     pub fn create_run(
@@ -302,7 +367,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
     }
 
     pub fn dispatch(&self, command: Dispatch) -> Result<DispatchResult> {
-        self.worker_transaction(|db, launched| {
+        let mut created_path = None;
+        let result = self.worker_transaction(|db, launched| {
             let run = load_run(db, &command.run)?;
             let task = find_task(&run, &command.task)?;
             ensure!(
@@ -369,6 +435,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                             &base,
                         )?;
                         agent.worktree.clone_from(&worktree.path);
+                        created_path = Some(worktree.path.clone());
                         ownership = Some(worktree);
                         (Some(branch), false)
                     }
@@ -398,7 +465,15 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                 attempt,
                 branch,
             }))
-        })?
+        });
+        if result.is_err()
+            && let Some(path) = created_path
+            && let Err(cleanup) = self.application.workspace.remove_worktree(&path, true)
+        {
+            return result
+                .with_context(|| format!("Could not undo worktree creation: {cleanup:#}"))?;
+        }
+        result?
     }
 
     fn create_dispatch_worktree(
@@ -482,9 +557,11 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                 args: args.into_iter().map(OsString::from).collect(),
                 env,
                 initial_prompt,
+                ..SessionOptions::default()
             },
         )?;
         *launched = Some(session.id.clone());
+        agent.model = self.session_model(&session)?;
         agent.session = Some(session.id);
         agent.worktree = session.worktree;
         Ok(())
@@ -501,21 +578,56 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
         self.write(|db| report(db, run, task, attempt, status, summary))
     }
 
+    pub fn agent_model_changed(
+        &self,
+        session: &str,
+        agent_type: &Agent,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.write(|db| {
+            let Some(agent) = db.session_agent(session)? else {
+                return Ok(());
+            };
+            if agent.state != AgentState::Running
+                || terminal_agent(&agent.provider) != *agent_type
+                || agent.model.as_deref() == model
+            {
+                return Ok(());
+            }
+            db.set_agent_model(&agent.id, model)?;
+            if let Some(run) = agent.run.as_deref() {
+                db.event(
+                    run,
+                    RunEventKind::AgentModelChanged,
+                    agent.task.as_deref(),
+                    agent.attempt.as_deref(),
+                    model,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn session_exited(&self, session: &str, detail: &str) -> Result<()> {
         self.write(|db| {
             if let Some(agent) = db.session_agent(session)? {
-                interrupt(db, Some(session), detail)?;
+                interrupt(db, Some(session), detail, &|_| false)?;
                 db.set_agent_exited(&agent.id)?;
             }
             Ok(())
         })
     }
 
-    pub fn reconcile(&self) -> Result<()> {
+    /// Interrupts attempts and stops agents whose session did not survive a restart.
+    /// Those in `restored` keep running under their original session IDs.
+    pub fn reconcile(&self, restored: &[String]) -> Result<()> {
+        let restored = |session: Option<&str>| {
+            session.is_some_and(|session| restored.iter().any(|id| id == session))
+        };
         self.write(|db| {
-            interrupt(db, None, "daemon restarted; session unavailable")?;
+            interrupt(db, None, RESTART_DETAIL, &restored)?;
             for agent in db.list_agents(None)? {
-                if agent.state == AgentState::Running {
+                if agent.state == AgentState::Running && !restored(agent.session.as_deref()) {
                     db.set_agent_exited(&agent.id)?;
                 }
             }
@@ -634,6 +746,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             Agent::Coding(id) => Provider::Agent(id),
             Agent::Shell => Provider::Command,
         };
+        let model = self.session_model(&session)?;
         let mut agent = self.new_agent(
             box_id.into(),
             session.worktree,
@@ -641,9 +754,15 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             None,
             session.agent.name().into(),
         );
+        agent.model = model;
         agent.session = Some(session.id);
         db.insert_agent(&agent)?;
         Ok(agent)
+    }
+
+    fn session_model(&self, session: &domain::session::Session) -> Result<Option<String>> {
+        let terminal = self.application.terminal(&session.id)?;
+        Ok(self.application.runtime.model(&terminal, &session.agent))
     }
 
     fn validate_worktree(&self, box_id: &str, request: &WorktreeRequest) -> Result<PathBuf> {
@@ -675,27 +794,39 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
         let workspace = &self.application.workspace;
         let repository = &box_info.repository;
         match &command.worktree {
-            WorktreeRequest::Existing(path) => {
-                if self.worktree_root.is_some()
-                    && command.retry
-                    && let Some(previous) = task.attempts.last()
-                    && let Some(worktree) = db.find_worktree_by_path(&previous.worktree)?
-                    && worktree.box_id == box_info.id
-                {
-                    return Ok(DispatchWorktree {
-                        path: workspace.validate_box_worktree(repository, &worktree.path)?,
-                        kind: DispatchWorktreeKind::Resume(worktree.branch),
-                    });
-                }
+            WorktreeRequest::Existing(path) => Ok(DispatchWorktree {
+                path: workspace.validate_box_worktree(repository, path)?,
+                kind: DispatchWorktreeKind::Existing,
+            }),
+            WorktreeRequest::RetryManaged => {
+                ensure!(command.retry, "Specify --worktree when starting a task");
+                let previous = task
+                    .attempts
+                    .last()
+                    .context("No earlier attempt to retry")?;
+                let worktree = db
+                    .find_worktree_by_path(&previous.worktree)?
+                    .filter(|worktree| worktree.box_id == box_info.id)
+                    .context("Specify --worktree to retry an attempt without a managed worktree")?;
+                let path = workspace.validate_box_worktree(repository, &worktree.path)?;
+                ensure!(
+                    matches!(
+                        workspace.branch_exists(repository, &worktree.branch)?,
+                        BranchStatus::Exists { checked_out_at: Some(ref checkout) } if checkout == &path
+                    ),
+                    "Managed branch {:?} is no longer checked out at {}. Specify --worktree to retry",
+                    worktree.branch,
+                    path.display(),
+                );
                 Ok(DispatchWorktree {
-                    path: workspace.validate_box_worktree(repository, path)?,
-                    kind: DispatchWorktreeKind::Existing,
+                    path,
+                    kind: DispatchWorktreeKind::Resume(worktree.branch),
                 })
             }
             WorktreeRequest::New { branch, base } => {
                 ensure!(
-                    !branch.trim().is_empty(),
-                    "Specify --branch when using --worktree new"
+                    !branch.trim().is_empty() && !matches!(branch.as_str(), "." | ".."),
+                    "Invalid branch name {branch:?}"
                 );
                 let root = self
                     .worktree_root
@@ -752,6 +883,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             id: self.new_id(),
             box_id,
             provider,
+            model: None,
             parent,
             label,
             worktree,
@@ -778,6 +910,7 @@ fn insert_dispatch_attempt(
         session: agent.session.clone(),
         worktree: agent.worktree.clone(),
         provider: agent.provider.clone(),
+        model: agent.model.clone(),
         state: if error.is_some() {
             AttemptState::Failed
         } else {
@@ -788,6 +921,7 @@ fn insert_dispatch_attempt(
         detail: None,
         started_at: agent.created_at,
         ended_at: error.map(|_| now()),
+        artifacts: Vec::new(),
     };
     db.insert_agent(agent)?;
     db.insert_attempt(&target.run, &target.task, &attempt)?;
@@ -833,7 +967,15 @@ fn select_box<'a>(entries: &'a [RegisteredBox], selector: &str) -> Result<&'a Re
     Ok(entry)
 }
 
-fn interrupt(db: &dyn DagTransaction, session: Option<&str>, detail: &str) -> Result<()> {
+const RESTART_DETAIL: &str = "daemon restarted; session unavailable";
+
+/// Interrupts open attempts of one session, or of every session, except those `keep` accepts.
+fn interrupt(
+    db: &dyn DagTransaction,
+    session: Option<&str>,
+    detail: &str,
+    keep: &dyn Fn(Option<&str>) -> bool,
+) -> Result<()> {
     for OpenAttempt {
         run,
         task,
@@ -841,7 +983,7 @@ fn interrupt(db: &dyn DagTransaction, session: Option<&str>, detail: &str) -> Re
         ..
     } in db.open_attempts(session)?
     {
-        if attempt.interrupt(detail, now()) {
+        if !keep(attempt.session.as_deref()) && attempt.interrupt(detail, now()) {
             db.update_attempt(&attempt)?;
             db.event(
                 &run,

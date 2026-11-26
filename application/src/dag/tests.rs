@@ -1,12 +1,12 @@
 use super::*;
 use crate::{
-    ArtifactStore, BranchStatus, CreatedWorktree, RecentArtifact, Workspace, WorktreeStatus,
-    agents::AgentProfileRegistry,
+    ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact, SessionArtifact,
+    Workspace, WorktreeStatus, agents::AgentProfileRegistry,
 };
 use anyhow::bail;
 use domain::{
     agent::{AgentProfile, Injection},
-    artifact::{ArtifactRecord, ResolvedArtifact},
+    artifact::{ArtifactRecord, ResolvedArtifact, Target},
     session::Session,
 };
 use std::{
@@ -215,6 +215,17 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
+    fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()> {
+        let mut db = self.0.borrow_mut();
+        let agent = db
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == id)
+            .context("Unknown agent")?;
+        agent.model = model.map(str::to_owned);
+        Ok(())
+    }
+
     fn insert_run(&self, run: &Run) -> Result<()> {
         self.0.borrow_mut().runs.push(run.clone());
         Ok(())
@@ -408,11 +419,14 @@ impl Workspace for FakeWorkspace {
     }
 }
 
-struct FakeArtifacts;
+/// Records published artifacts in insertion order, which stands for publish order.
+#[derive(Default)]
+struct FakeArtifacts(Mutex<Vec<ArtifactRecord>>);
 
 impl ArtifactStore for FakeArtifacts {
-    fn insert(&self, _: ArtifactRecord) -> Result<()> {
-        bail!("Unexpected artifact operation")
+    fn insert(&self, record: ArtifactRecord) -> Result<()> {
+        self.0.lock().unwrap().push(record);
+        Ok(())
     }
 
     fn find(&self, _: &str) -> Result<ResolvedArtifact> {
@@ -421,6 +435,23 @@ impl ArtifactStore for FakeArtifacts {
 
     fn recent(&self, _: &[String], _: usize) -> Result<Vec<RecentArtifact>> {
         bail!("Unexpected artifact operation")
+    }
+
+    fn published(&self, sessions: &[String]) -> Result<Vec<SessionArtifact>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| sessions.contains(&record.session))
+            .map(|record| SessionArtifact {
+                session: record.session.clone(),
+                artifact: AttemptArtifact {
+                    id: record.id.clone(),
+                    title: record.artifact.title.clone(),
+                },
+            })
+            .collect())
     }
 }
 
@@ -483,7 +514,26 @@ impl BoxRegistry for FakeRegistry {
     }
 }
 
-type TestDag = DagApplication<FakeTerminal, MemoryStore, FakeRegistry>;
+/// Records icon changes as `(box_id, Some(path))` for a set and `(box_id, None)` for a reset.
+#[derive(Default)]
+struct FakeIcons(Mutex<Vec<(String, Option<PathBuf>)>>);
+
+impl BoxIcons for FakeIcons {
+    fn set(&self, box_id: &str, source: &Path) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((box_id.into(), Some(source.into())));
+        Ok(())
+    }
+
+    fn clear(&self, box_id: &str) -> Result<()> {
+        self.0.lock().unwrap().push((box_id.into(), None));
+        Ok(())
+    }
+}
+
+type TestDag = DagApplication<FakeTerminal, MemoryStore, FakeRegistry, FakeIcons>;
 
 struct FakeProfiles(Vec<AgentProfile>);
 
@@ -508,10 +558,12 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             skills_dir: None,
+            resume: None,
         })
         .collect();
     Arc::new(Application::new(
-        FakeArtifacts,
+        FakeArtifacts::default(),
+        Arc::new(MemorySessions::default()),
         workspace,
         FakeTerminal::default(),
         Arc::new(FakeProfiles(profiles)),
@@ -524,6 +576,7 @@ fn setup() -> Result<(TestDag, String)> {
         application(),
         MemoryStore::default(),
         FakeRegistry::default(),
+        FakeIcons::default(),
     );
     let run = external_run(&dag)?;
     Ok((dag, run))
@@ -790,7 +843,10 @@ fn new_worktree_stays_owned_and_reusable_after_terminal_startup_fails() -> Resul
         .runtime
         .fail_start
         .store(false, Ordering::Release);
-    let retry = dag.dispatch(command(&run, true))?;
+    let retry = dag.dispatch(Dispatch {
+        worktree: WorktreeRequest::RetryManaged,
+        ..command(&run, true)
+    })?;
     assert_eq!(retry.worktree, ownership.path);
     assert_eq!(retry.branch.as_deref(), Some("fresh"));
     assert_eq!(workspace.0.lock().unwrap().creation_requests.len(), 1);
@@ -807,7 +863,7 @@ fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> R
         dag.session_exited(previous.session.as_deref().unwrap(), "interrupted")?;
         let retry = dag.dispatch(Dispatch {
             provider: Provider::Agent("codex".into()),
-            worktree: WorktreeRequest::Existing("/ignored-on-managed-retry".into()),
+            worktree: WorktreeRequest::RetryManaged,
             args: Vec::new(),
             ..command(&run, true)
         })?;
@@ -858,6 +914,72 @@ fn concurrent_dispatch_launches_once() -> Result<()> {
     let task = &dag.run(&run)?.tasks[0];
     assert_eq!(task.state, TaskState::Working);
     assert_eq!(task.attempts.len(), 1);
+    Ok(())
+}
+
+fn publish(dag: &TestDag, id: &str, session: &str, title: &str) -> Result<()> {
+    dag.application.artifacts.insert(ArtifactRecord {
+        id: id.into(),
+        session: session.into(),
+        worktree: "/worktree".into(),
+        artifact: ResolvedArtifact {
+            title: title.into(),
+            target: Target::Loopback("http://localhost:3000/".into()),
+        },
+    })
+}
+
+#[test]
+fn attempts_list_their_sessions_artifacts_in_publish_order() -> Result<()> {
+    let (dag, run) = setup()?;
+    let first = dag.dispatch(command(&run, false))?;
+    let first_session = first.agent.session.unwrap();
+    dag.session_exited(&first_session, "worker exited")?;
+    let second = dag.dispatch(command(&run, true))?;
+    let second_session = second.agent.session.unwrap();
+
+    publish(&dag, "b-first", &first_session, "First report")?;
+    publish(&dag, "x-other", "unrelated-session", "Elsewhere")?;
+    publish(&dag, "c-retry", &second_session, "Retry screenshot")?;
+    publish(&dag, "a-later", &first_session, "Late report")?;
+
+    let artifact = |id: &str, title: &str| AttemptArtifact {
+        id: id.into(),
+        title: title.into(),
+    };
+    let expected = [
+        vec![
+            artifact("b-first", "First report"),
+            artifact("a-later", "Late report"),
+        ],
+        vec![artifact("c-retry", "Retry screenshot")],
+    ];
+    let shown = dag.run(&run)?;
+    let attempts: Vec<_> = shown.tasks[0]
+        .attempts
+        .iter()
+        .map(|attempt| attempt.artifacts.clone())
+        .collect();
+    assert_eq!(attempts, expected);
+    assert_eq!(
+        shown.tasks[0].attempts[0].artifacts[0].link(),
+        "pwr://artifact/b-first"
+    );
+
+    let listed = dag.list_runs(BoxSelection {
+        selector: Some("2".into()),
+        caller: None,
+    })?;
+    let listed = listed.iter().find(|listed| listed.id == run).unwrap();
+    assert_eq!(listed.tasks[0].attempts[0].artifacts, expected[0]);
+    // Artifacts are derived at read time, not stored with the run.
+    let stored = dag.store.read(|db| db.run(&run))?;
+    assert!(
+        stored.tasks[0]
+            .attempts
+            .iter()
+            .all(|attempt| attempt.artifacts.is_empty())
+    );
     Ok(())
 }
 
@@ -934,7 +1056,7 @@ fn reconcile_interrupts_active_and_blocked_attempts_and_keeps_reported_results()
     )?;
     let before = dag.latest_seq()?;
     assert_eq!(dag.attention()?.len(), 1);
-    dag.reconcile()?;
+    dag.reconcile(&[])?;
     assert!(dag.attention()?.is_empty());
     let snapshot = dag.run(&run)?;
     assert_eq!(snapshot.tasks[2].state, TaskState::Completed);
@@ -959,8 +1081,32 @@ fn reconcile_interrupts_active_and_blocked_attempts_and_keeps_reported_results()
         Duration::ZERO,
     )?;
     assert_eq!(page.events.len(), 2);
-    dag.reconcile()?;
+    dag.reconcile(&[])?;
     assert_eq!(dag.latest_seq()?, page.cursor);
+    Ok(())
+}
+
+#[test]
+fn reconcile_keeps_attempts_and_agents_whose_session_was_restored() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("lost", &[])])?;
+    let restored = dag.dispatch(command(&run, false))?;
+    let lost = dag.dispatch(Dispatch {
+        task: "lost".into(),
+        ..command(&run, false)
+    })?;
+    let session = restored.agent.session.clone().unwrap();
+
+    dag.reconcile(std::slice::from_ref(&session))?;
+
+    let snapshot = dag.run(&run)?;
+    let kept = snapshot.tasks[0].attempts.last().unwrap();
+    assert_eq!(kept.state, AttemptState::Active);
+    assert_eq!(kept.session.as_deref(), Some(session.as_str()));
+    assert_eq!(snapshot.tasks[1].state, TaskState::Interrupted);
+    let agent = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.state);
+    assert_eq!(agent(&restored.agent.id)?, AgentState::Running);
+    assert_eq!(agent(&lost.agent.id)?, AgentState::Exited);
     Ok(())
 }
 
@@ -975,6 +1121,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
         application,
         MemoryStore::default(),
         FakeRegistry(vec![caller.id.clone()]),
+        FakeIcons::default(),
     );
     let selection = || BoxSelection {
         selector: None,
@@ -1073,5 +1220,45 @@ fn starting_an_agent_ignores_a_caller_session_this_daemon_does_not_host() -> Res
     })?;
     assert_eq!(agent.parent, None);
     assert!(agent.session.is_some());
+    Ok(())
+}
+
+#[test]
+fn box_icons_follow_the_caller_or_selector() -> Result<()> {
+    let dag = TestDag::new(
+        application(),
+        MemoryStore::default(),
+        FakeRegistry(vec!["view-session".into()]),
+        FakeIcons::default(),
+    );
+    let caller = || BoxSelection {
+        selector: None,
+        caller: Some("view-session".into()),
+    };
+    assert_eq!(
+        dag.set_box_icon(caller(), Some("/icons/robot.png".into()))?,
+        "box-id"
+    );
+    let selected = BoxSelection {
+        selector: Some("2".into()),
+        caller: Some("unknown-session".into()),
+    };
+    assert_eq!(dag.set_box_icon(selected, None)?, "box-id");
+    assert!(
+        dag.set_box_icon(caller(), Some("relative.png".into()))
+            .is_err()
+    );
+    let nobody = BoxSelection {
+        selector: None,
+        caller: None,
+    };
+    assert!(dag.set_box_icon(nobody, None).is_err());
+    assert_eq!(
+        *dag.icons.0.lock().unwrap(),
+        [
+            ("box-id".into(), Some("/icons/robot.png".into())),
+            ("box-id".into(), None),
+        ]
+    );
     Ok(())
 }

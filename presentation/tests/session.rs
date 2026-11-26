@@ -335,7 +335,12 @@ fn agent_task_and_model_follow_the_run_and_survive_reattachment() {
         r#"#!/bin/sh
 set -e
 power session task "Initial task"
-power session model "Provider model"
+power session model "Agent-reported model"
+printf '%s' '{"model":"codex-hook-model"}' | power session model --json
+printf '%s' '{"model":{"id":"status-model","display_name":"Status model"}}' | power session model --json
+printf '%s' '{"model":{"id":"status-model","display_name":"Status model"}}' | power session model --json
+printf '%s' '{"model":{"display_name":"Next model"}}' | power session model --json
+printf '%s' '{}' | power session model --json
 power session task "Revised task"
 read finish
 "#,
@@ -364,9 +369,19 @@ read finish
             break message["metadata"].clone();
         }
     };
-    input("./codex\n");
+    input("./codex --model launch-model\n");
+    assert_eq!(wait_for_metadata(&mut attached)["model"], "launch-model");
     assert_eq!(wait_for_metadata(&mut attached)["task"], "Initial task");
-    assert_eq!(wait_for_metadata(&mut attached)["model"], "Provider model");
+    assert_eq!(
+        wait_for_metadata(&mut attached)["model"],
+        "Agent-reported model"
+    );
+    assert_eq!(
+        wait_for_metadata(&mut attached)["model"],
+        "codex-hook-model"
+    );
+    assert_eq!(wait_for_metadata(&mut attached)["model"], "status-model");
+    assert_eq!(wait_for_metadata(&mut attached)["model"], "Next model");
     assert_eq!(wait_for_metadata(&mut attached)["task"], "Revised task");
 
     let mut reattached = subscribe();
@@ -375,7 +390,7 @@ read finish
     assert_eq!(
         wait_for_metadata(&mut reattached),
         json!({
-            "task":"Revised task", "model":"Provider model",
+            "task":"Revised task", "model":"Next model",
         })
     );
     let mut outsider = request(

@@ -2,7 +2,10 @@ use crate::{gui::agent_tree::AgentTree, keymap::Shortcut};
 use domain::session::Session;
 use gpui::{prelude::*, *};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use infrastructure::{client::Run, theme::Scheme};
+use infrastructure::{
+    client::{ManagedAgent, Run},
+    theme::Scheme,
+};
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{AtomKind, CaseMatching, Normalization, Pattern},
@@ -41,14 +44,21 @@ pub enum Kind {
     },
     StatusActions(String),
     Sessions(String),
-    End(String),
+    End {
+        session: String,
+        /// Confirmation text, with keys from the current keymap.
+        message: String,
+    },
     /// Keyboard shortcuts, generated from the keymap.
     Help(Vec<Shortcut>),
     /// Links visible in the active terminal.
     Links,
     /// Shell integration setup, with the lines that explain what it changes. `first_run`
     /// finishes onboarding when it closes; otherwise it returns to the previous view.
-    Setup { lines: Vec<String>, first_run: bool },
+    Setup {
+        lines: Vec<String>,
+        first_run: bool,
+    },
     ColorSchemes {
         first_run: bool,
     },
@@ -139,11 +149,15 @@ impl Kind {
             Self::Agents { .. } => "Agent tree",
             Self::StatusActions(title) => title,
             Self::Sessions(_) => "Recover a session",
-            Self::End(_) => "End terminal session?",
+            Self::End { .. } => "End terminal session?",
             Self::Help(_) => "Keyboard shortcuts",
             Self::Links => "Open a link",
-            Self::Setup { first_run: true, .. } => "Welcome to Power Overwhelming",
-            Self::Setup { first_run: false, .. } => "Shell integration",
+            Self::Setup {
+                first_run: true, ..
+            } => "Welcome to Power Overwhelming",
+            Self::Setup {
+                first_run: false, ..
+            } => "Shell integration",
             Self::ColorSchemes { first_run: true } => "Choose a color scheme",
             Self::ColorSchemes { first_run: false } => "Color schemes",
         }
@@ -161,7 +175,7 @@ impl Kind {
             Self::Help(_) => Some("Search shortcuts"),
             Self::Links => Some("Search links"),
             Self::ColorSchemes { .. } => Some("Search color schemes"),
-            Self::End(_) | Self::Setup { .. } | Self::StatusActions(_) | Self::RunLink => None,
+            Self::End { .. } | Self::Setup { .. } | Self::StatusActions(_) | Self::RunLink => None,
         }
     }
 }
@@ -369,15 +383,18 @@ impl Picker {
         if let Kind::Agents { tree, .. } = &self.kind {
             return tree
                 .rows()
-                .map(|(agent, depth, marker)| Row {
-                    label: format!("{}{marker} {}", " ".repeat(depth), agent.label),
-                    detail: format!(
-                        "{}{} · {}",
-                        " ".repeat(depth),
-                        agent.provider.name(),
-                        agent.worktree.display(),
-                    ),
-                    choice: Choice::Agent(agent.id.clone()),
+                .map(|(agent, depth, marker)| {
+                    let indent = " ".repeat(depth);
+                    let provider = agent.provider.name();
+                    let detail = match &agent.model {
+                        Some(model) => format!("{provider} · {model}"),
+                        None => provider.to_owned(),
+                    };
+                    Row {
+                        label: format!("{indent}{marker} {}", agent.label),
+                        detail: format!("{indent}{detail} · {}", agent.worktree.display()),
+                        choice: Choice::Agent(agent.id.clone()),
+                    }
                 })
                 .collect();
         }
@@ -452,10 +469,19 @@ impl Picker {
         }
     }
 
-    pub fn set_agent_tree(&mut self, mut new_tree: AgentTree) {
+    pub fn set_agents(&mut self, agents: Vec<ManagedAgent>) {
         if let Kind::Agents { tree, .. } = &mut self.kind {
-            self.selected = new_tree.search(&self.query, &mut self.matcher);
-            *tree = new_tree;
+            let previous = tree
+                .rows()
+                .nth(self.selected)
+                .map(|(agent, _, _)| agent.id.clone());
+            if !tree.replace(agents) {
+                return;
+            }
+            let best = tree.search(&self.query, &mut self.matcher);
+            self.selected = previous
+                .and_then(|id| tree.rows().position(|(agent, _, _)| agent.id == id))
+                .unwrap_or(best);
             self.scroll.scroll_to_item(self.selected);
         }
     }
@@ -896,9 +922,13 @@ impl Picker {
                             )
                         },
                     )
-                    .when(matches!(self.kind, Kind::End(_)), |panel| {
-                        panel.child("Enter ends the session and removes its tab. Escape cancels.")
-                    })
+                    .when_some(
+                        match &self.kind {
+                            Kind::End { message, .. } => Some(message.clone()),
+                            _ => None,
+                        },
+                        |panel, message| panel.child(message),
+                    )
                     .when_some(
                         match &self.kind {
                             Kind::Setup { lines, .. } => Some(lines.clone()),

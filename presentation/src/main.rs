@@ -4,13 +4,13 @@ mod picker;
 mod preview;
 mod settings;
 mod status_bar;
-mod terminal_view;
+mod terminal;
 
 use anyhow::{Context, Result};
 use application::{
     PublishArtifact, StartSession,
     agents::AgentProfileRegistry,
-    skill_install::{InstallSkills, SkillAction},
+    skill_install::{InstallSkills, SkillAction, select_profiles},
     skills::{GetSkill, ListSkills, SkillOutput, SkillSelection},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -126,7 +126,11 @@ enum SessionAction {
     },
     /// Report this terminal's active model from a provider integration.
     Model {
-        name: String,
+        #[arg(required_unless_present = "stdin_json")]
+        name: Option<String>,
+        /// Read provider hook or status-line JSON from stdin. Skip reports with no model.
+        #[arg(long = "json", conflicts_with = "name")]
+        stdin_json: bool,
     },
     End {
         id: String,
@@ -171,21 +175,15 @@ enum SkillsAction {
     Update(SkillInstallArgs),
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
-enum SkillAgent {
-    Claude,
-    Codex,
-    Universal,
-}
-
 #[derive(Args)]
 struct SkillInstallArgs {
     /// Select a bundled skill by name. Repeat to select multiple skills. Defaults to all.
     #[arg(long = "skill", value_name = "NAME")]
     names: Vec<String>,
-    /// Select agent targets. Universal selects the shared folder alone. Defaults to detected agents.
-    #[arg(long = "agent", value_enum, value_delimiter = ',')]
-    agents: Vec<SkillAgent>,
+    /// Select agent profile ids to link for. `universal` selects the shared folder alone.
+    /// Defaults to every detected agent.
+    #[arg(long = "agent", value_name = "ID", value_delimiter = ',')]
+    agents: Vec<String>,
     /// Target the current Git worktree.
     #[arg(long)]
     local: bool,
@@ -272,10 +270,7 @@ fn main() -> Result<()> {
                     std::env::var("POWER_SESSION").context("Set a task from a Power terminal")?,
                     label,
                 )?,
-                SessionAction::Model { name } => client::set_model(
-                    std::env::var("POWER_SESSION").context("Set a model from a Power terminal")?,
-                    name,
-                )?,
+                SessionAction::Model { name, .. } => report_model(name)?,
             }
             Ok(())
         }
@@ -314,6 +309,25 @@ fn main() -> Result<()> {
         Some(Action::ExecAgent { id, args }) => exec_agent(&id, args),
         Some(Action::Codex { args }) => exec_agent("codex", args),
         Some(Action::Claude { args }) => exec_agent("claude", args),
+        Some(Action::Box {
+            command:
+                BoxAction::Icon {
+                    path,
+                    reset: _,
+                    box_sel,
+                },
+        }) => {
+            // The daemon runs elsewhere, so resolve the path against this terminal's directory.
+            let path = path
+                .map(|path| {
+                    path.canonicalize()
+                        .with_context(|| format!("Icon is unavailable at {}", path.display()))
+                })
+                .transpose()?;
+            client::ensure_daemon()?;
+            let box_id = client::set_box_icon(box_sel, std::env::var("POWER_SESSION").ok(), path)?;
+            print_json(json!({"box_id": box_id}))
+        }
         Some(Action::Agent { command }) => match command {
             AgentAction::Codex { args } => exec_agent("codex", args),
             AgentAction::Claude { args } => exec_agent("claude", args),
@@ -377,6 +391,19 @@ fn exec_agent(id: &str, args: Vec<OsString>) -> Result<()> {
 #[derive(Subcommand)]
 enum BoxAction {
     List,
+    /// Replace a box's generated icon with an image (PNG, JPEG, WebP, GIF, ...).
+    #[command(arg_required_else_help = true)]
+    Icon {
+        /// Image to use. Large images are scaled down to 64 px; the original is not kept.
+        #[arg(required_unless_present = "reset")]
+        path: Option<PathBuf>,
+        /// Restore the generated icon.
+        #[arg(long, conflicts_with = "path")]
+        reset: bool,
+        /// Box ID, ID prefix, shortcut digit or repo name. Defaults to this terminal's box.
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -523,6 +550,29 @@ fn caller_session() -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+fn report_model(name: Option<String>) -> Result<()> {
+    if let Some(name) = name {
+        return client::set_model(
+            caller_session().context("Set a model from a Power terminal")?,
+            name,
+        );
+    }
+
+    // Read the payload even outside Power so status-line callers can finish writing it.
+    let payload: Value = serde_json::from_reader(std::io::stdin().lock())
+        .context("Read provider model report from stdin")?;
+    let model = &payload["model"];
+    let name = [model, &model["id"], &model["display_name"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|name| !name.is_empty());
+    if let (Some(session), Some(name)) = (caller_session(), name) {
+        client::set_model(session, name.to_owned())?;
+    }
+    Ok(())
+}
+
 fn parse_event_kind(value: &str) -> Result<RunEventKind, serde_json::Error> {
     serde_json::from_value(Value::String(value.replace('-', "_")))
 }
@@ -573,8 +623,9 @@ fn run_skills(command: SkillsAction) -> Result<()> {
 }
 
 fn run_skill_install(args: SkillInstallArgs, update: bool) -> Result<()> {
-    let claude = args.agents.is_empty() || args.agents.contains(&SkillAgent::Claude);
-    let targets = install_targets(args.local, claude)?;
+    let profiles = configured_agents();
+    let selected = select_profiles(profiles.profiles(), &args.agents)?;
+    let targets = install_targets(args.local, &selected)?;
     let outcomes = InstallSkills {
         names: &args.names,
         update,

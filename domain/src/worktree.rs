@@ -28,6 +28,7 @@ pub enum WorktreeCreator {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorktreeRequest {
     Existing(PathBuf),
+    RetryManaged,
     New {
         branch: String,
         base: Option<String>,

@@ -1,19 +1,20 @@
 use crate::{
     agents::AgentProfiles,
+    box_icons::IconFiles,
     boxes::BoxesFile,
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
-    persistence::SqliteArtifacts,
+    persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
-    wire::{self, DagRequest, Request, Response},
+    wire::{self, DagRequest, DagResponse, Request, Response},
     workspace::LocalWorkspace,
 };
 use anyhow::{Context, Result, bail, ensure};
 use application::{Application, PublishArtifact, ResolveArtifact, StartSession};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::session::Geometry;
+use domain::session::{Agent, Geometry};
 use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
@@ -25,14 +26,44 @@ use std::{
             net::{UnixListener, UnixStream},
         },
     },
-    sync::{Arc, OnceLock, RwLock, Weak, mpsc},
+    sync::{
+        Arc, OnceLock, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+type Watchers = std::sync::Mutex<Vec<mpsc::SyncSender<Response>>>;
+
 /// Clients streaming publish events. Senders whose client has gone are dropped on the next publish.
-static ARTIFACT_WATCHERS: std::sync::Mutex<Vec<mpsc::SyncSender<Response>>> =
-    std::sync::Mutex::new(Vec::new());
+static ARTIFACT_WATCHERS: Watchers = std::sync::Mutex::new(Vec::new());
+/// Clients streaming box icon changes, pruned the same way.
+static BOX_ICON_WATCHERS: Watchers = std::sync::Mutex::new(Vec::new());
+
+/// Streams every event sent to the watcher list until the client disconnects.
+fn stream(mut socket: UnixStream, watchers: &Watchers) -> Result<()> {
+    let (tx, rx) = mpsc::sync_channel(64);
+    watchers.lock().unwrap().push(tx);
+    // Keepalives let a closed reader surface as a write error while events are quiet.
+    loop {
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(event) => wire::send(&mut socket, &event)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => wire::send(&mut socket, &Response::Ok)?,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+fn broadcast(watchers: &Watchers, event: impl Fn() -> Response) {
+    watchers.lock().unwrap().retain(|watcher| {
+        !matches!(
+            watcher.try_send(event()),
+            Err(mpsc::TrySendError::Disconnected(_))
+        )
+    });
+}
 
 struct Server {
     application: Arc<Application<PtyRuntime>>,
@@ -71,34 +102,64 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     let artifacts = SqliteArtifacts::open()?;
+    let sessions = SqliteSessions::open().context("Open session registry")?;
     let store = SqliteDagStore::open().context("Open DAG store")?;
-    let exit_handler = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
-    let terminal_exit_handler = exit_handler.clone();
+    let terminal_application = Arc::new(OnceLock::<Weak<Application<PtyRuntime>>>::new());
+    let foreground_application = terminal_application.clone();
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let terminal_dag = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
+    let exit_dag = terminal_dag.clone();
+    let model_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
     let application = Arc::new(Application::new(
         artifacts,
+        Arc::new(sessions),
         LocalWorkspace,
         PtyRuntime {
             socket: socket.clone(),
             scheme: scheme.clone(),
             profiles: profiles.clone(),
             on_exit: Arc::new(move |session, detail| {
-                if let Some(dag) = terminal_exit_handler.get().and_then(Weak::upgrade)
+                if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
                     && let Err(error) = dag.session_exited(session, detail)
                 {
                     eprintln!("Could not record exit for terminal {session}. {error:#}");
                 }
             }),
+            on_model_changed: Arc::new(move |session, agent, model| {
+                if let Some(dag) = model_dag.get().and_then(Weak::upgrade) {
+                    dag.agent_model_changed(session, agent, model)?;
+                }
+                Ok(())
+            }),
+            on_foreground_changed: Arc::new(move |session, agent, conversation, cwd| {
+                if let Some(application) = foreground_application.get().and_then(Weak::upgrade) {
+                    application.record_foreground(session, agent, conversation, cwd)?;
+                }
+                Ok(())
+            }),
+            shutting_down: shutting_down.clone(),
         },
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
-    let dag = Arc::new(DaemonDag::new(application.clone(), store, BoxesFile));
-    dag.reconcile().context("Reconcile DAG sessions")?;
-    exit_handler
+    let dag = Arc::new(DaemonDag::new(
+        application.clone(),
+        store,
+        BoxesFile,
+        IconFiles::open()?,
+    ));
+    terminal_application
+        .set(Arc::downgrade(&application))
+        .expect("connect terminal callbacks to the application once");
+    // Connect exits first, so a restored worker that exits at once is still reported.
+    terminal_dag
         .set(Arc::downgrade(&dag))
-        .expect("install terminal exit handler once");
+        .expect("connect terminal callbacks to the DAG once");
+    let restored = application.restore_sessions().context("Restore sessions")?;
+    dag.reconcile(&restored).context("Reconcile DAG sessions")?;
+    handle_shutdown(application.clone(), shutting_down)?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let server = Arc::new(Server {
@@ -117,22 +178,61 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
     Ok(())
 }
 
+/// Bounds the final save so a reboot is not held up by a stuck terminal.
+const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
+
+/// On SIGTERM or SIGINT, saves scrollback and foreground state for every live
+/// session, then exits. The saved records restore the sessions on the next start.
+fn handle_shutdown(
+    application: Arc<Application<PtyRuntime>>,
+    shutting_down: Arc<AtomicBool>,
+) -> Result<()> {
+    use signal_hook::{
+        consts::{SIGINT, SIGTERM},
+        iterator::Signals,
+    };
+
+    let mut signals = Signals::new([SIGTERM, SIGINT]).context("Install shutdown handler")?;
+    thread::spawn(move || {
+        if signals.forever().next().is_none() {
+            return;
+        }
+        // Agents killed with the daemon must not look like sessions the user ended.
+        shutting_down.store(true, Ordering::Release);
+        let deadline = Instant::now() + SHUTDOWN_FLUSH;
+        let (done, flushed) = mpsc::sync_channel(64);
+        let mut pending = 0;
+        for session in application.list_sessions() {
+            if let Ok(terminal) = application.terminal(&session.id)
+                && terminal
+                    .send(Command::FlushScrollback(done.clone()))
+                    .is_ok()
+            {
+                pending += 1;
+            }
+        }
+        drop(done);
+        for _ in 0..pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if flushed.recv_timeout(remaining).is_err() {
+                eprintln!("Some sessions did not save before shutdown.");
+                break;
+            }
+        }
+        std::process::exit(0);
+    });
+    Ok(())
+}
+
 fn handle(mut socket: UnixStream, server: &Server) -> Result<()> {
     let application = &server.application;
     socket.set_write_timeout(Some(Duration::from_secs(3)))?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
     let request = wire::receive(&mut BufReader::new(&socket))?.context("Missing request")?;
-    if let Request::WatchArtifacts = request {
-        let (tx, rx) = mpsc::sync_channel(64);
-        ARTIFACT_WATCHERS.lock().unwrap().push(tx);
-        // Keepalives let a closed reader surface as a write error while publishing is quiet.
-        loop {
-            match rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(event) => wire::send(&mut socket, &event)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => wire::send(&mut socket, &Response::Ok)?,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-        }
+    match request {
+        Request::WatchArtifacts => return stream(socket, &ARTIFACT_WATCHERS),
+        Request::WatchBoxIcons => return stream(socket, &BOX_ICON_WATCHERS),
+        _ => {}
     }
     if let Request::Subscribe { session } = &request {
         let (tx, rx) = mpsc::sync_channel(64);
@@ -225,7 +325,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         } => {
             let value = value.trim();
             ensure!(
-                value.chars().count() <= 120 && !value.chars().any(char::is_control),
+                crate::terminal::valid_metadata(value),
                 "Session metadata must be at most 120 characters on one line"
             );
             let value = (!value.is_empty()).then(|| value.to_owned());
@@ -237,8 +337,35 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 reply: send,
             })?;
             ensure!(
-                receive.recv_timeout(Duration::from_secs(3))?,
+                receive.recv_timeout(Duration::from_secs(3))??,
                 "Session metadata must come from the active agent"
+            );
+            Ok(Response::Ok)
+        }
+        Request::SetConversation {
+            session,
+            agent,
+            conversation,
+        } => {
+            ensure!(
+                !agent.is_empty()
+                    && !conversation.is_empty()
+                    && crate::terminal::valid_metadata(&agent)
+                    && crate::terminal::valid_metadata(&conversation),
+                "Conversation IDs must be at most 120 characters on one line"
+            );
+            let (send, receive) = mpsc::sync_channel(1);
+            application
+                .terminal(&session)?
+                .send(Command::SetConversation {
+                    pid: peer_pid(socket)?,
+                    agent: Agent::Coding(agent.into()),
+                    conversation,
+                    reply: send,
+                })?;
+            ensure!(
+                receive.recv_timeout(Duration::from_secs(3))?,
+                "Conversations must come from a process in this shell session"
             );
             Ok(Response::Ok)
         }
@@ -283,14 +410,8 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 uri: published.uri.clone(),
                 title: published.title.clone(),
             };
-            ARTIFACT_WATCHERS.lock().unwrap().retain(|watcher| {
-                let event = Response::ArtifactPublished {
-                    artifact: artifact.clone(),
-                };
-                !matches!(
-                    watcher.try_send(event),
-                    Err(mpsc::TrySendError::Disconnected(_))
-                )
+            broadcast(&ARTIFACT_WATCHERS, || Response::ArtifactPublished {
+                artifact: artifact.clone(),
             });
             let uri = if let Some(plugins) = &server.plugins {
                 let uri = published.uri.clone();
@@ -319,10 +440,18 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 .map(Into::into)
                 .collect(),
         }),
-        Request::Dag { dag } => Ok(Response::Dag {
-            dag: dag_adapter::request(&server.dag, dag)?,
-        }),
-        Request::WatchArtifacts => unreachable!("Artifact watches use the streaming handler"),
+        Request::Dag { dag } => {
+            let dag = dag_adapter::request(&server.dag, dag)?;
+            if let DagResponse::BoxIcon { box_id } = &dag {
+                broadcast(&BOX_ICON_WATCHERS, || Response::BoxIconChanged {
+                    box_id: box_id.clone(),
+                });
+            }
+            Ok(Response::Dag { dag: Box::new(dag) })
+        }
+        Request::WatchArtifacts | Request::WatchBoxIcons => {
+            unreachable!("Watches use the streaming handler")
+        }
         Request::Subscribe { .. } => unreachable!("Subscriptions use the streaming handler"),
     }
 }

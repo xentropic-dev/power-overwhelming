@@ -2,11 +2,16 @@ pub mod agents;
 mod commands;
 pub mod dag;
 mod queries;
+mod restore;
+mod sessions;
 pub mod skill_install;
 pub mod skills;
 
-pub use commands::{ArtifactPublished, PublishArtifact, SessionOptions, StartSession};
+pub use commands::{
+    ArtifactPublished, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
+};
 pub use queries::ResolveArtifact;
+pub use sessions::{MemorySessions, SessionRecord, SessionStore};
 
 use anyhow::{Context, Result};
 use domain::{
@@ -25,6 +30,15 @@ pub trait ArtifactStore: Send + Sync {
     fn find(&self, id: &str) -> Result<ResolvedArtifact>;
     /// Artifacts published from these sessions, newest first.
     fn recent(&self, sessions: &[String], limit: usize) -> Result<Vec<RecentArtifact>>;
+    /// Every artifact published from these sessions, in publish order, newest last.
+    fn published(&self, sessions: &[String]) -> Result<Vec<SessionArtifact>>;
+}
+
+/// A published artifact and the session it was published from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionArtifact {
+    pub session: String,
+    pub artifact: domain::dag::AttemptArtifact,
 }
 
 /// A published artifact as listed in history.
@@ -96,6 +110,10 @@ pub trait TerminalRuntime: Send + Sync {
     /// The agent currently in the foreground, which can differ from the launched one
     /// when a shell starts an agent.
     fn agent(&self, handle: &Self::Handle) -> Option<Agent>;
+    /// Model reported or requested for the given foreground agent, when known.
+    fn model(&self, _handle: &Self::Handle, _agent: &Agent) -> Option<String> {
+        None
+    }
 }
 
 struct Live<H> {
@@ -106,6 +124,7 @@ struct Live<H> {
 pub struct Application<T: TerminalRuntime> {
     sessions: Mutex<BTreeMap<String, Live<T::Handle>>>,
     artifacts: Box<dyn ArtifactStore>,
+    records: Arc<dyn SessionStore>,
     workspace: Box<dyn Workspace>,
     runtime: T,
     agents: Arc<dyn agents::AgentProfileRegistry>,
@@ -115,6 +134,7 @@ pub struct Application<T: TerminalRuntime> {
 impl<T: TerminalRuntime> Application<T> {
     pub fn new(
         artifacts: impl ArtifactStore + 'static,
+        records: Arc<dyn SessionStore>,
         workspace: impl Workspace + 'static,
         runtime: T,
         agents: Arc<dyn agents::AgentProfileRegistry>,
@@ -123,6 +143,7 @@ impl<T: TerminalRuntime> Application<T> {
         Self {
             sessions: Mutex::default(),
             artifacts: Box::new(artifacts),
+            records,
             workspace: Box::new(workspace),
             runtime,
             agents,
