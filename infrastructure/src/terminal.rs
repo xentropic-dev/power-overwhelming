@@ -19,7 +19,7 @@ use ghostty_vt::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::{self, File, Permissions},
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -46,6 +46,18 @@ const CWD_INTERVAL: Duration = Duration::from_secs(3);
 /// forgotten. A reboot kills the agent before the daemon, and this keeps the
 /// conversation until the shutdown flush.
 const CLEAR_DELAY: Duration = Duration::from_secs(3);
+/// An agent restored with resume arguments that exits this soon after launch had
+/// nothing to resume, so it is started once more with its fallback arguments.
+const RESUME_WINDOW: Duration = Duration::from_secs(5);
+/// Written to the terminal when a failed resume starts a new conversation.
+const RESUME_NOTICE: &str =
+    "\r\n\x1b[2m── could not resume, started a new conversation ──\x1b[0m\r\n";
+/// How long the end of a shell's output may trail its exit.
+const OUTPUT_DRAIN: Duration = Duration::from_millis(150);
+/// How long an agent session's exit waits before it is reported. A reboot signals
+/// the agents and the daemon at once, and the wait lets shutdown begin first, so a
+/// session that will be restored is not reported as ended.
+const AGENT_EXIT_GRACE: Duration = Duration::from_secs(1);
 
 pub struct PtyRuntime {
     pub socket: PathBuf,
@@ -188,6 +200,8 @@ pub enum Command {
         reply: SyncSender<bool>,
     },
     Output(Vec<u8>),
+    /// A failed resume was replaced by a fresh agent process with this PID.
+    Relaunched(Option<u32>),
     /// Recheck which agent owns the foreground of a shell session.
     Poll,
     OutputClosed,
@@ -212,17 +226,8 @@ fn launch(
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
     let mut process = if let Some(profile) = profile {
-        let mut command = CommandBuilder::new(&profile.command);
-        let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
-        command.args(crate::shell::instruction_args(
-            profile,
-            &options.args,
-            &installed,
-        )?);
-        let (assign, id) = crate::shell::assign_conversation(profile, &options.args);
-        command.args(assign);
+        let (command, id) = agent_command(profile, &session.worktree, &options.args)?;
         conversation = id;
-        command.args(&options.args);
         command
     } else if let Some((program, args)) = options.args.split_first() {
         let mut command = CommandBuilder::new(program);
@@ -231,42 +236,23 @@ fn launch(
     } else {
         CommandBuilder::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
     };
-    if let Some(prompt) = options.initial_prompt {
+    if let Some(prompt) = &options.initial_prompt {
         process.arg(prompt);
     }
-    for (name, value) in options.env {
-        match value {
-            Some(value) => process.env(name, value),
-            None => process.env_remove(name),
+    configure(&mut process, runtime, session, &options, &cwd);
+    // The fresh start never repeats the initial prompt.
+    let fallback = match (profile, &options.fallback_args) {
+        (Some(profile), Some(args)) => {
+            let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
+            configure(&mut command, runtime, session, &options, &cwd);
+            Some((command, conversation))
         }
-    }
-    if let Some(resume) = &options.resume {
-        process.env(
-            "POWER_RESUME",
-            crate::shell::resume_command(&resume.program, &resume.args),
-        );
-    }
-    process.cwd(&cwd);
-    process.env("TERM", "xterm-256color");
-    process.env("COLORTERM", "truecolor");
-    process.env("POWER_SESSION", &session.id);
-    process.env("POWER_SOCKET", &runtime.socket);
-    process.env_remove("TMUX");
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(dir) = executable.parent()
-    {
-        process.env("POWER_BIN", &executable);
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
-        if let Ok(path) = std::env::join_paths(
-            std::iter::once(dir.to_owned()).chain(std::env::split_paths(&inherited)),
-        ) {
-            process.env("PATH", path);
-        }
-    }
+        _ => None,
+    };
 
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
-    let mut process = pair.slave.spawn_command(process)?;
+    let process = pair.slave.spawn_command(process)?;
     let pid = process.process_id();
     let lifecycle = Arc::new(Lifecycle {
         running: AtomicBool::new(true),
@@ -280,7 +266,20 @@ fn launch(
         on_foreground_changed: runtime.on_foreground_changed.clone(),
         shutting_down: runtime.shutting_down.clone(),
     });
-    drop(pair.slave);
+    // A relaunch needs the slave, which also keeps the reader from seeing EOF between
+    // the two processes.
+    let relaunch = match fallback {
+        Some((command, conversation)) => Some(Relaunch {
+            command,
+            conversation,
+            slave: pair.slave,
+            deadline: Instant::now() + RESUME_WINDOW,
+        }),
+        None => {
+            drop(pair.slave);
+            None
+        }
+    };
     if conversation.is_some() {
         lifecycle.record_foreground(&session.agent, conversation.as_deref(), None, false);
     }
@@ -317,21 +316,26 @@ fn launch(
     });
     let waiter_tx = tx.clone();
     let (stop_tx, stop_rx) = mpsc::channel();
+    let waiter_lifecycle = lifecycle.clone();
+    let launched = session.agent.clone();
     thread::spawn(move || {
-        let result = loop {
-            match process.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Err(error) => break Err(error),
-                Ok(None) => {}
-            }
-            match stop_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = process.kill();
-                    break process.wait();
+        let result = wait_process(
+            process,
+            relaunch,
+            &stop_rx,
+            &waiter_lifecycle.shutting_down,
+            |pid, conversation| {
+                eprintln!(
+                    "Could not resume {}, so it starts a new conversation.",
+                    waiter_lifecycle.session
+                );
+                let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
+                let _ = waiter_tx.send(Command::Relaunched(pid));
+                if conversation.is_some() {
+                    waiter_lifecycle.record_foreground(&launched, conversation, None, false);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-        };
+            },
+        );
         let detail = match result {
             Ok(status) => format!("Worker process exited ({status})"),
             Err(error) => format!("Could not wait for worker process ({error})"),
@@ -384,6 +388,124 @@ fn launch(
     })
 }
 
+/// The agent binary with Power's instructions, any pinned conversation ID, and `args`.
+fn agent_command(
+    profile: &AgentProfile,
+    worktree: &Path,
+    args: &[OsString],
+) -> Result<(CommandBuilder, Option<String>)> {
+    let mut command = CommandBuilder::new(&profile.command);
+    let installed = crate::skill_install::LocalInstalledSkills(worktree);
+    command.args(crate::shell::instruction_args(profile, args, &installed)?);
+    let (assign, conversation) = crate::shell::assign_conversation(profile, args);
+    command.args(assign);
+    command.args(args);
+    Ok((command, conversation))
+}
+
+/// Sets the environment and directory every process in a Power terminal starts with.
+fn configure(
+    process: &mut CommandBuilder,
+    runtime: &PtyRuntime,
+    session: &Session,
+    options: &SessionOptions,
+    cwd: &Path,
+) {
+    for (name, value) in &options.env {
+        match value {
+            Some(value) => process.env(name, value),
+            None => process.env_remove(name),
+        }
+    }
+    if let Some(resume) = &options.resume {
+        process.env("POWER_RESUME", crate::shell::resume_command(resume));
+    }
+    process.cwd(cwd);
+    process.env("TERM", "xterm-256color");
+    process.env("COLORTERM", "truecolor");
+    process.env("POWER_SESSION", &session.id);
+    process.env("POWER_SOCKET", &runtime.socket);
+    process.env_remove("TMUX");
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(dir) = executable.parent()
+    {
+        process.env("POWER_BIN", &executable);
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        if let Ok(path) = std::env::join_paths(
+            std::iter::once(dir.to_owned()).chain(std::env::split_paths(&inherited)),
+        ) {
+            process.env("PATH", path);
+        }
+    }
+}
+
+type Child = Box<dyn portable_pty::Child + Send + Sync>;
+
+/// A fresh start for an agent launched with resume arguments.
+struct Relaunch {
+    command: CommandBuilder,
+    /// Conversation the fresh start pins, if its profile can assign one.
+    conversation: Option<String>,
+    slave: Box<dyn portable_pty::SlavePty + Send>,
+    /// An exit after this is a normal exit, not a failed resume.
+    deadline: Instant,
+}
+
+/// Waits for the session's process, killing it when `stop` fires. If it exits before
+/// the relaunch deadline outside shutdown, its fresh start replaces it once, and
+/// `relaunched` gets the new PID and conversation.
+fn wait_process(
+    mut process: Child,
+    mut relaunch: Option<Relaunch>,
+    stop: &Receiver<()>,
+    shutting_down: &AtomicBool,
+    relaunched: impl FnOnce(Option<u32>, Option<&str>),
+) -> io::Result<portable_pty::ExitStatus> {
+    let mut relaunched = Some(relaunched);
+    loop {
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                let Some(next) = relaunch
+                    .take()
+                    .filter(|next| Instant::now() < next.deadline)
+                    .filter(|_| !shutting_down.load(Ordering::Acquire))
+                else {
+                    return Ok(status);
+                };
+                match next.slave.spawn_command(next.command) {
+                    Ok(child) => {
+                        process = child;
+                        if let Some(relaunched) = relaunched.take() {
+                            relaunched(process.process_id(), next.conversation.as_deref());
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("Could not start a new conversation. {error:#}");
+                        return Ok(status);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+            Ok(None) => {}
+        }
+        // Past the deadline, release the slave so the reader sees EOF at exit.
+        if relaunch
+            .as_ref()
+            .is_some_and(|next| Instant::now() >= next.deadline)
+        {
+            relaunch = None;
+        }
+        match stop.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = process.kill();
+                return process.wait();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 fn pty_size(geometry: Geometry) -> PtySize {
     PtySize {
         rows: geometry.rows,
@@ -406,7 +528,7 @@ fn terminal_actor(
     writer: SyncSender<Vec<u8>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     mut geometry: Geometry,
-    shell_pid: Option<u32>,
+    mut shell_pid: Option<u32>,
     launched_agent: Agent,
     env: ActorEnv<'_>,
 ) -> Result<Option<String>> {
@@ -467,15 +589,15 @@ fn terminal_actor(
     let mut restore = RestoreState::new(launched_agent.clone(), cwd);
 
     let mut output_closed = false;
-    let mut process_exit: Option<(String, Instant)> = None;
+    let mut process_exit: Option<PendingExit> = None;
     loop {
         // Give the reader time to deliver the end of the transcript. A descendant may keep
         // the slave open after the launched process exits, so EOF is not required forever.
         if process_exit
             .as_ref()
-            .is_some_and(|(_, deadline)| output_closed || Instant::now() >= *deadline)
+            .is_some_and(|exit| Instant::now() >= exit.due(output_closed))
         {
-            let (detail, _) = process_exit.take().unwrap();
+            let detail = process_exit.take().unwrap().detail;
             lifecycle.notify_exit(&with_terminal_tail(&terminal, detail));
             exited = true;
             lifecycle.foreground.lock().unwrap().model = None;
@@ -494,7 +616,7 @@ fn terminal_actor(
         });
         let deadline = save_at
             .into_iter()
-            .chain(process_exit.as_ref().map(|(_, deadline)| *deadline))
+            .chain(process_exit.as_ref().map(|exit| exit.due(output_closed)))
             .min();
         let received = match deadline {
             Some(deadline) => rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
@@ -709,7 +831,17 @@ fn terminal_actor(
             Command::RefreshTheme => {}
             Command::OutputClosed => output_closed = true,
             Command::ProcessExited(detail) => {
-                process_exit = Some((detail, Instant::now() + Duration::from_millis(150)));
+                process_exit = Some(PendingExit::new(
+                    detail,
+                    launched_agent == Agent::Shell,
+                    Instant::now(),
+                ));
+            }
+            Command::Relaunched(pid) => {
+                shell_pid = pid;
+                if launched_agent != Agent::Shell {
+                    run = pid.map(|pid| (pid, launched_agent.clone()));
+                }
             }
             Command::FlushScrollback(reply) => {
                 if let Some(scrollback) = &mut scrollback {
@@ -745,6 +877,40 @@ fn terminal_actor(
         }
     }
     Ok(None)
+}
+
+/// An exit the actor reports once the end of the output has arrived.
+struct PendingExit {
+    detail: String,
+    /// When the exit may be reported if the output has closed.
+    earliest: Instant,
+    /// When the exit is reported even if a descendant keeps the output open.
+    latest: Instant,
+}
+
+impl PendingExit {
+    fn new(detail: String, shell: bool, now: Instant) -> Self {
+        // Shells report at once. An agent session's exit waits out the grace period,
+        // after which [`Lifecycle::notify_exit`] drops it if shutdown has begun.
+        let (earliest, latest) = if shell {
+            (now, now + OUTPUT_DRAIN)
+        } else {
+            (now + AGENT_EXIT_GRACE, now + AGENT_EXIT_GRACE)
+        };
+        Self {
+            detail,
+            earliest,
+            latest,
+        }
+    }
+
+    fn due(&self, output_closed: bool) -> Instant {
+        if output_closed {
+            self.earliest
+        } else {
+            self.latest
+        }
+    }
 }
 
 /// What a shell session last saved for a restore.
@@ -1161,6 +1327,126 @@ fn parent_pid(pid: u32) -> Option<u32> {
 mod tests {
     use super::*;
     use ghostty_vt::terminal::{Point, PointCoordinate};
+
+    /// Whether each relaunch had a PID, and the conversation it reported.
+    type Reports = Vec<(bool, Option<String>)>;
+
+    /// Runs `first` with a fresh start of `fresh` and returns the exit status, the
+    /// relaunch reports and the PTY output.
+    fn wait_with_relaunch(
+        first: &str,
+        fresh: &str,
+        window: Duration,
+        shutting_down: bool,
+    ) -> Result<(u32, Reports, String)> {
+        let pair = native_pty_system().openpty(pty_size(Geometry::default()))?;
+        let shell = |script: &str| {
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", script]);
+            command
+        };
+        let process = pair.slave.spawn_command(shell(first))?;
+        let relaunch = Relaunch {
+            command: shell(fresh),
+            conversation: Some("conv-1".into()),
+            slave: pair.slave,
+            deadline: Instant::now() + window,
+        };
+        let mut reader = pair.master.try_clone_reader()?;
+        let output = thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = reader.read_to_end(&mut output);
+            String::from_utf8_lossy(&output).into_owned()
+        });
+        let (_stop, stop) = mpsc::channel();
+        let mut reports = Vec::new();
+        let status = wait_process(
+            process,
+            Some(relaunch),
+            &stop,
+            &AtomicBool::new(shutting_down),
+            |pid, conversation| reports.push((pid.is_some(), conversation.map(Into::into))),
+        )?;
+        drop(pair.master);
+        Ok((status.exit_code(), reports, output.join().unwrap()))
+    }
+
+    #[test]
+    fn a_resume_that_exits_at_once_is_relaunched_once_with_its_fresh_start() -> Result<()> {
+        let (code, reports, output) = wait_with_relaunch(
+            "echo resume; exit 1",
+            "echo fresh; exit 3",
+            RESUME_WINDOW,
+            false,
+        )?;
+        // The fresh start also exits at once, but there is no second retry.
+        assert_eq!(code, 3);
+        assert_eq!(reports, [(true, Some("conv-1".into()))]);
+        assert!(
+            output.contains("resume") && output.contains("fresh"),
+            "{output:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_resume_that_runs_past_the_window_is_not_relaunched() -> Result<()> {
+        let (code, reports, output) = wait_with_relaunch(
+            "sleep 0.5; exit 1",
+            "echo fresh",
+            Duration::from_millis(100),
+            false,
+        )?;
+        assert_eq!(code, 1);
+        assert!(reports.is_empty());
+        assert!(!output.contains("fresh"), "{output:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_never_relaunches_a_failed_resume() -> Result<()> {
+        let (code, reports, _) = wait_with_relaunch("exit 1", "echo fresh", RESUME_WINDOW, true)?;
+        assert_eq!(code, 1);
+        assert!(reports.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_exits_wait_for_shutdown_to_begin_before_they_are_reported() {
+        let now = Instant::now();
+        let shell = PendingExit::new("exit".into(), true, now);
+        assert_eq!(shell.due(true), now);
+        assert_eq!(shell.due(false), now + OUTPUT_DRAIN);
+        let agent = PendingExit::new("exit".into(), false, now);
+        assert_eq!(agent.due(true), now + AGENT_EXIT_GRACE);
+        assert_eq!(agent.due(false), now + AGENT_EXIT_GRACE);
+    }
+
+    #[test]
+    fn exits_during_shutdown_are_not_reported() {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle = Lifecycle {
+            running: AtomicBool::new(true),
+            session: "worker".into(),
+            on_exit: {
+                let reported = reported.clone();
+                Arc::new(move |session: &str, _: &str| {
+                    reported.lock().unwrap().push(session.to_owned())
+                })
+            },
+            foreground: Mutex::new(Foreground {
+                agent: Agent::Coding("claude".into()),
+                model: None,
+            }),
+            on_model_changed: Arc::new(|_, _, _| Ok(())),
+            on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        };
+        // A reboot sets shutdown during the agent's exit grace period.
+        lifecycle.shutting_down.store(true, Ordering::Release);
+        lifecycle.notify_exit("Worker process exited");
+        assert!(reported.lock().unwrap().is_empty());
+    }
 
     fn test_terminal() -> Terminal {
         let mut terminal = Terminal::new(Options {

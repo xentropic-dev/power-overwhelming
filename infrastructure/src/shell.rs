@@ -4,6 +4,7 @@
 use crate::{skill_install::LocalInstalledSkills, skills::EmbeddedSkillCatalog};
 use anyhow::{Context, Result, bail};
 use application::{
+    ResumeCommand,
     agents::AgentProfileRegistry,
     skills::{InstalledSkills, LaunchSkills},
 };
@@ -94,10 +95,18 @@ impl Shell {
         script.push_str(match self {
             Self::Bash | Self::Zsh => {
                 r#"if [ -n "${POWER_RESUME-}" ]; then
+    function __power_resume_fallback {
+        [ $((SECONDS - __power_resume_started)) -lt 5 ] || return 1
+        printf '\033[2m── could not resume, started a new conversation ──\033[0m\n'
+        "$@"
+    }
     function __power_resume_once {
-        local power_resume_command="$POWER_RESUME"
+        local power_resume_command="$POWER_RESUME" __power_resume_started=$SECONDS
         unset -f __power_resume_once
         unset POWER_RESUME && eval "$power_resume_command"
+        local power_resume_status=$?
+        unset -f __power_resume_fallback
+        return $power_resume_status
     }
     __power_resume_once
 fi
@@ -105,8 +114,16 @@ fi
             }
             Self::Fish => {
                 r#"if test -n "$POWER_RESUME"
+    function __power_resume_fallback
+        test (math (date +%s) - $__power_resume_started) -lt 5; or return 1
+        printf '\033[2m── could not resume, started a new conversation ──\033[0m\n'
+        eval (string escape -- $argv)
+    end
     set -l power_resume_command "$POWER_RESUME"
+    set -g __power_resume_started (date +%s)
     set -e POWER_RESUME; and eval "$power_resume_command"
+    functions -e __power_resume_fallback
+    set -e __power_resume_started
 end
 "#
             }
@@ -154,8 +171,28 @@ fn has_marker(path: &Path) -> bool {
     fs::read_to_string(path).is_ok_and(|contents| contents.contains(MARKER))
 }
 
+/// Shell function the init script defines for [`resume_command`]'s fallback. It prints
+/// a notice and runs its arguments only if the resume exited within 5 seconds.
+const RESUME_FALLBACK: &str = "__power_resume_fallback";
+
+/// Builds the `POWER_RESUME` command for Bash, Zsh, or Fish. With a fallback it reads
+/// `<resume> || __power_resume_fallback <fresh>`. Claude exits 1 when it finds no
+/// conversation, but a resumed agent the user quits later may also exit non-zero, so
+/// the fallback also requires the resume to have exited within 5 seconds. Both calls
+/// go through the agent's wrapper function, so the fresh one reports its conversation.
+pub(crate) fn resume_command(resume: &ResumeCommand) -> OsString {
+    let mut command = quote_words(&resume.program, &resume.args);
+    if let Some(fallback) = &resume.fallback {
+        command.push(" || ");
+        command.push(RESUME_FALLBACK);
+        command.push(" ");
+        command.push(quote_words(&resume.program, fallback));
+    }
+    command
+}
+
 /// Quotes a program and its arguments for evaluation by Bash, Zsh, or Fish.
-pub(crate) fn resume_command(program: &str, args: &[OsString]) -> OsString {
+fn quote_words(program: &str, args: &[OsString]) -> OsString {
     let mut command = Vec::new();
     for word in std::iter::once(OsStr::new(program)).chain(args.iter().map(OsString::as_os_str)) {
         if !command.is_empty() {
@@ -493,8 +530,28 @@ mod tests {
     fn quotes_resume_command_words() {
         let args = ["--resume", "two words", "a'b", r"a\b", ""].map(OsString::from);
         assert_eq!(
-            resume_command("my agent", &args),
+            quote_words("my agent", &args),
             r"'my agent' '--resume' 'two words' 'a'\''b' 'a'\\'b' ''"
+        );
+    }
+
+    #[test]
+    fn resume_command_falls_back_through_the_guard_function() {
+        let mut resume = ResumeCommand {
+            program: "claude".into(),
+            args: ["--resume", "conv"].map(OsString::from).into(),
+            fallback: None,
+        };
+        assert_eq!(resume_command(&resume), "'claude' '--resume' 'conv'");
+        resume.fallback = Some(["--session-id", "conv"].map(OsString::from).into());
+        assert_eq!(
+            resume_command(&resume),
+            "'claude' '--resume' 'conv' || __power_resume_fallback 'claude' '--session-id' 'conv'"
+        );
+        resume.fallback = Some(Vec::new());
+        assert_eq!(
+            resume_command(&resume),
+            "'claude' '--resume' 'conv' || __power_resume_fallback 'claude'"
         );
     }
 
@@ -548,7 +605,11 @@ printf '<%s>\n' "$@"
         let profiles = AgentProfiles::default();
         let init = temp.path().join("init");
         let args = ["--resume", "two words", r#"a\'b"c"#, r"a\\b\", ""].map(OsString::from);
-        let resume = resume_command("claude", &args);
+        let resume = resume_command(&ResumeCommand {
+            program: "claude".into(),
+            args: args.into(),
+            fallback: Some(vec!["--fresh".into()]),
+        });
         let expected =
             "<exec-agent>\n<claude>\n<-->\n<--resume>\n<two words>\n<a\\'b\"c>\n<a\\\\b\\>\n<>\n";
         for (shell, flags, is_unset) in [
@@ -566,6 +627,76 @@ printf '<%s>\n' "$@"
                 .args(flags)
                 .arg("-c")
                 .arg(format!("{hook}\n{hook}\n{is_unset}"))
+                .env_remove("BASH_ENV")
+                .env("POWER_BIN", &stub)
+                .env("POWER_TEST_INIT", &init)
+                .env("POWER_RESUME", &resume)
+                .output();
+            let output = match output {
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                output => output?,
+            };
+            assert!(
+                output.status.success(),
+                "{shell:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::str::from_utf8(&output.stdout)?, expected, "{shell:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shell_hooks_start_a_fresh_agent_when_the_resume_fails_at_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let stub = temp.path().join("power stub");
+        // Like claude, the resume exits 1 at once when no conversation exists.
+        fs::write(
+            &stub,
+            r#"#!/bin/sh
+if [ "$1" = shell-init ]; then
+    exec cat "$POWER_TEST_INIT"
+fi
+printf '<%s>\n' "$@"
+test "$4" != --resume
+"#,
+        )?;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700))?;
+
+        let profiles = AgentProfiles::default();
+        let init = temp.path().join("init");
+        let resume = resume_command(&ResumeCommand {
+            program: "claude".into(),
+            args: ["--resume", "conv-1"].map(OsString::from).into(),
+            fallback: Some(["--session-id", "conv-1"].map(OsString::from).into()),
+        });
+        let expected = concat!(
+            "<exec-agent>\n<claude>\n<-->\n<--resume>\n<conv-1>\n",
+            "\x1b[2m── could not resume, started a new conversation ──\x1b[0m\n",
+            "<exec-agent>\n<claude>\n<-->\n<--session-id>\n<conv-1>\n",
+        );
+        for (shell, flags, is_gone) in [
+            (
+                Shell::Bash,
+                &["--noprofile", "--norc"][..],
+                "! type __power_resume_fallback >/dev/null 2>&1",
+            ),
+            (
+                Shell::Zsh,
+                &["-f"][..],
+                "! type __power_resume_fallback >/dev/null 2>&1",
+            ),
+            (
+                Shell::Fish,
+                &["--no-config"][..],
+                "not functions -q __power_resume_fallback; and not set -q __power_resume_started",
+            ),
+        ] {
+            fs::write(&init, shell.init_script(&profiles))?;
+            let output = Command::new(shell.name())
+                .args(flags)
+                .arg("-c")
+                .arg(format!("{}\n{is_gone}", shell.hook()))
                 .env_remove("BASH_ENV")
                 .env("POWER_BIN", &stub)
                 .env("POWER_TEST_INIT", &init)

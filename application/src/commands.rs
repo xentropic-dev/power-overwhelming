@@ -25,6 +25,10 @@ pub struct SessionOptions {
     pub cwd: Option<PathBuf>,
     /// Agent a restored shell runs once its integration has loaded.
     pub resume: Option<ResumeCommand>,
+    /// Set when `args` resume a conversation. If the agent exits right after
+    /// launch, the resume failed and the runtime relaunches it once with these
+    /// arguments, which start a new conversation.
+    pub fallback_args: Option<Vec<OsString>>,
 }
 
 /// An agent wrapper call that a restored shell evaluates through `POWER_RESUME`.
@@ -33,6 +37,9 @@ pub struct ResumeCommand {
     /// Shell function name, which is the agent profile ID.
     pub program: String,
     pub args: Vec<OsString>,
+    /// Arguments for a second call that starts a new conversation when the resume
+    /// exits right away. `None` runs no second call.
+    pub fallback: Option<Vec<OsString>>,
 }
 
 pub struct PublishArtifact {
