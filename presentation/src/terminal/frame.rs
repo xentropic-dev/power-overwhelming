@@ -4,7 +4,7 @@ use ghostty_vt::{
     Terminal,
     render::{CellIterator, RenderState, RowIterator},
     screen::CellWide,
-    style::Style,
+    style::{Style, StyleColor, Underline},
     terminal::{Point as VtPoint, PointCoordinate},
 };
 use gpui::{Hsla, rgb};
@@ -23,6 +23,8 @@ pub(super) struct Cell {
     pub(super) bg: Option<Hsla>,
     /// The cell's SGR attributes, as Ghostty stores them; `fg` and `bg` are already resolved.
     pub(super) style: Style,
+    /// The underline's own color (SGR 58), resolved; `None` follows the text.
+    pub(super) underline_color: Option<Hsla>,
     pub(super) wide: CellWide,
     pub(super) link: Option<Arc<str>>,
 }
@@ -50,6 +52,12 @@ pub(super) fn frame(
             row: cursor.y.into(),
             column: cursor.x.into(),
         });
+    let colors = state.colors()?;
+    let default_background = rgba_color(
+        colors.background.r,
+        colors.background.g,
+        colors.background.b,
+    );
     let mut row_iter = RowIterator::new()?;
     let mut cell_iter = CellIterator::new()?;
     let mut source = row_iter.update(&state)?;
@@ -68,7 +76,9 @@ pub(super) fn frame(
         while let Some(cell) = source.next() {
             let mut grapheme = String::new();
             cell.graphemes_utf8(&mut grapheme)?;
-            if grapheme.is_empty() {
+            let style = cell.style()?;
+            if grapheme.is_empty() || style.invisible {
+                grapheme.clear();
                 grapheme.push(' ');
             }
             offsets.push(text.len());
@@ -93,13 +103,28 @@ pub(super) fn frame(
                     .filter(|previous| previous.as_ref() == uri)
                     .unwrap_or_else(|| Arc::from(uri))
             });
+            let mut fg = cell
+                .fg_color()?
+                .map_or(rgb(foreground).into(), |c| rgba_color(c.r, c.g, c.b));
+            let mut bg = cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b));
+            if style.inverse {
+                (fg, bg) = (bg.unwrap_or(default_background), Some(fg));
+            }
+            let underline_color = match style.underline_color {
+                _ if style.underline == Underline::None => None,
+                StyleColor::None => None,
+                StyleColor::Palette(index) => {
+                    let c = colors.palette[usize::from(index.0)];
+                    Some(rgba_color(c.r, c.g, c.b))
+                }
+                StyleColor::Rgb(c) => Some(rgba_color(c.r, c.g, c.b)),
+            };
             cells.push(Cell {
                 text: grapheme,
-                fg: cell
-                    .fg_color()?
-                    .map_or(rgb(foreground).into(), |c| rgba_color(c.r, c.g, c.b)),
-                bg: cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b)),
-                style: cell.style()?,
+                fg,
+                bg,
+                style,
+                underline_color,
                 wide: raw.wide()?,
                 link: osc_link.clone(),
             });

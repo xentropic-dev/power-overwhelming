@@ -26,6 +26,7 @@ impl Render for TerminalView {
         let pressed_link = self.pressed_link().cloned();
         let selection = self.selection_range().filter(|_| pressed_link.is_none());
         let ligatures = self.settings.ligatures;
+        let bold_weight = FontWeight(f32::from(self.settings.font_weight_bold));
         let hovering = hovered_link.is_some();
         let link_color = move |link: &Arc<str>| {
             if pressed_link
@@ -91,6 +92,9 @@ impl Render for TerminalView {
                                             {
                                                 fg = rgba(color).into();
                                             }
+                                            if cell.style.faint {
+                                                fg = fg.opacity(0.6);
+                                            }
                                             (RunCell { cell, fg }, selected)
                                         })
                                         .unzip();
@@ -99,6 +103,7 @@ impl Render for TerminalView {
                                         font_size,
                                         cell_width: cell_size.width,
                                         ligatures,
+                                        bold_weight,
                                         cursor: frame
                                             .cursor
                                             .filter(|cursor| cursor.row == row)
@@ -166,6 +171,14 @@ impl Render for TerminalView {
                                     if let RowOp::Text { column, .. } = op {
                                         let origin = metrics.cell_origin(grid, row, *column);
                                         op.paint(origin + baseline, window);
+                                    }
+                                }
+                            }
+                            for (row, (ops, _)) in rows.iter().enumerate() {
+                                for op in ops {
+                                    if let RowOp::Decoration { from, .. } = op {
+                                        let origin = metrics.cell_origin(grid, row, *from);
+                                        op.paint_decoration(origin, &metrics, window);
                                     }
                                 }
                             }

@@ -7,13 +7,14 @@
 //! public `LineLayout` from stock GPUI and keeps each glyph's offset from its cell, to paint
 //! with `paint_glyph` and `paint_emoji`.
 
-use super::frame::Cell;
+use super::{frame::Cell, metrics::CellMetrics};
 use ghostty_vt::{
     screen::CellWide,
-    style::{Style, StyleColor},
+    style::{Style, StyleColor, Underline},
 };
 use gpui::{
-    Font, FontFeatures, FontId, GlyphId, Hsla, LineLayout, Pixels, Point, TextRun, Window, point,
+    Bounds, Font, FontFeatures, FontId, FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels,
+    Point, TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
 use std::sync::{Arc, LazyLock};
 
@@ -30,6 +31,13 @@ pub(super) enum RowOp {
         column: usize,
         color: Hsla,
         glyphs: Vec<PlacedGlyph>,
+    },
+    /// Underline and strikethrough over cells `from..to` that share both.
+    Decoration {
+        from: usize,
+        to: usize,
+        underline: Option<(Underline, Hsla)>,
+        strike: Option<Hsla>,
     },
 }
 
@@ -59,6 +67,96 @@ impl RowOp {
             } else {
                 window.paint_glyph(at, glyph.font, glyph.id, glyph.font_size, *color)
             };
+        }
+    }
+}
+
+impl RowOp {
+    /// Paints a decoration's underline and strikethrough from `origin`, its first cell's
+    /// top-left corner. Underline styles follow Ghostty's sprite drawing.
+    pub(super) fn paint_decoration(
+        &self,
+        origin: Point<Pixels>,
+        metrics: &CellMetrics,
+        window: &mut Window,
+    ) {
+        let Self::Decoration {
+            from,
+            to,
+            underline,
+            strike,
+        } = self
+        else {
+            return;
+        };
+        let (cell, scale) = (metrics.size, metrics.scale);
+        let width = cell.width * (to - from) as f32;
+        let line = |offset: Pixels, thickness: Pixels| {
+            Bounds::new(origin + point(px(0.), offset), size(width, thickness))
+        };
+        let (top, thick) = (metrics.underline, metrics.underline_thickness);
+        match *underline {
+            None => {}
+            Some((Underline::Single, color)) => {
+                window.paint_quad(fill(line(top, thick), color));
+            }
+            Some((Underline::Double, color)) => {
+                // A line above and a line below where the single one is.
+                let top = top.min(cell.height - thick * 2.);
+                window.paint_quad(fill(line(top - thick, thick), color));
+                window.paint_quad(fill(line(top + thick, thick), color));
+            }
+            Some((Underline::Curly, color)) => {
+                // GPUI's wave is three thicknesses tall, around its middle.
+                let offset = (top - thick).min(cell.height - thick * 3.);
+                let style = UnderlineStyle {
+                    thickness: thick,
+                    color: Some(color),
+                    wavy: true,
+                };
+                window.paint_underline(origin + point(px(0.), offset), width, &style);
+            }
+            Some((Underline::Dotted, color)) => {
+                // Dots wider than the line and about a dot apart, at least one a cell.
+                let (cell_px, radius) = (
+                    f32::from(cell.width) * scale,
+                    std::f32::consts::FRAC_1_SQRT_2 * f32::from(thick) * scale,
+                );
+                let count = (cell_px / (4. * radius))
+                    .ceil()
+                    .min((cell_px / (3. * radius)).floor())
+                    .min((cell_px / (2. * radius + 1.)).floor())
+                    .max(1.);
+                let (step, dot) = (cell.width / count, px(2. * radius / scale));
+                let offset = (top + (thick - dot) / 2.).min(cell.height - dot);
+                for i in 0..(to - from) * count as usize {
+                    let at = origin + point(step * (i as f32 + 0.5) - dot / 2., offset);
+                    window.paint_quad(
+                        fill(Bounds::new(at, size(dot, dot)), color).corner_radii(dot / 2.),
+                    );
+                }
+            }
+            Some((Underline::Dashed, color)) => {
+                // In every cell a dash, a gap, and the start of the next cell's dash.
+                let cell_px = f32::from(cell.width) * scale;
+                let dash = (cell_px / 3.).floor() + 1.;
+                for column in 0..to - from {
+                    let x = cell.width * column as f32;
+                    for (start, len) in [
+                        (0., dash.min(cell_px)),
+                        (2. * dash, (cell_px - 2. * dash).max(0.)),
+                    ] {
+                        let at = origin + point(x + px(start / scale), top);
+                        window
+                            .paint_quad(fill(Bounds::new(at, size(px(len / scale), thick)), color));
+                    }
+                }
+            }
+            // Underline is non-exhaustive; draw an unknown style as a single line.
+            Some((_, color)) => window.paint_quad(fill(line(top, thick), color)),
+        }
+        if let Some(color) = *strike {
+            window.paint_quad(fill(line(metrics.strike, metrics.strike_thickness), color));
         }
     }
 }
@@ -99,6 +197,8 @@ pub(super) struct Shaping<'a> {
     pub(super) font_size: Pixels,
     pub(super) cell_width: Pixels,
     pub(super) ligatures: bool,
+    /// The weight of bold text; regular text keeps `font`'s.
+    pub(super) bold_weight: FontWeight,
     /// The cursor's column on this row. With ligatures on it is shaped on its own, so a plain
     /// glyph under the cursor never covers half of a ligature.
     pub(super) cursor: Option<usize>,
@@ -148,6 +248,12 @@ pub(super) fn row_ops(
         let cells = &row[start..end];
         let plain: String = cells.iter().map(|cell| cell.cell.text.as_str()).collect();
         let mut font = shaping.font.clone();
+        if first.cell.style.bold {
+            font.weight = shaping.bold_weight;
+        }
+        if first.cell.style.italic {
+            font.style = FontStyle::Italic;
+        }
         let ligatures = shaping.ligatures && needs_ligatures(&plain, &font);
         font.features = ligature_features(ligatures);
         let text = RunText::new(cells, ligatures);
@@ -166,7 +272,49 @@ pub(super) fn row_ops(
             glyphs: place_glyphs(&layout, &text, shaping.cell_width),
         });
     }
+    row_decorations(row, &mut ops);
     ops
+}
+
+/// A row's underlines and strikethroughs, from its cells alone, so blanks and wide cells'
+/// spacers get them too. Neighbours that look the same share one.
+fn row_decorations(row: &[RunCell], ops: &mut Vec<RowOp>) {
+    let mut x = 0;
+    while x < row.len() {
+        let run = &row[x];
+        let start = x;
+        x += if run.cell.wide == CellWide::Wide {
+            2
+        } else {
+            1
+        };
+        let style = run.cell.style;
+        let underline = (style.underline != Underline::None).then(|| {
+            let color = run
+                .cell
+                .underline_color
+                .map_or(run.fg, |c| c.opacity(run.fg.a));
+            (style.underline, color)
+        });
+        let strike = style.strikethrough.then_some(run.fg);
+        if underline.is_none() && strike.is_none() {
+            continue;
+        }
+        match ops.last_mut() {
+            Some(RowOp::Decoration {
+                to,
+                underline: u,
+                strike: s,
+                ..
+            }) if *to == start && *u == underline && *s == strike => *to = x,
+            _ => ops.push(RowOp::Decoration {
+                from: start,
+                to: x,
+                underline,
+                strike,
+            }),
+        }
+    }
 }
 
 /// A WORD JOINER. cosmic-text 0.14, which GPUI 0.2.2 shapes with on Linux, shapes each
@@ -338,8 +486,78 @@ mod tests {
             font_size: px(13.),
             cell_width: px(8.),
             ligatures,
+            bold_weight: FontWeight::BOLD,
             cursor,
         }
+    }
+
+    #[test]
+    fn underlines_and_strikethrough_merge_across_neighbours_that_match() {
+        let frame = screen(b"\x1b[4:3;58;2;255;0;0mab\x1b[24;9mcd\x1b[0;4mef \x1b[0;21;9mg");
+        let row = cells(&frame, 0);
+        let font = gpui::font("Test");
+        let mut texts = Vec::new();
+        let ops = row_ops(&row, &shaping(&font, false, None), monospace(&mut texts));
+        let decorations: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOp::Decoration {
+                    from,
+                    to,
+                    underline,
+                    strike,
+                } => Some((*from, *to, underline.map(|(u, _)| u), strike.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            decorations,
+            [
+                (0, 2, Some(Underline::Curly), false),
+                (2, 4, None, true),
+                (4, 7, Some(Underline::Single), false),
+                (7, 8, Some(Underline::Double), true),
+            ]
+        );
+        let RowOp::Decoration { underline, .. } = ops
+            .iter()
+            .find(|op| matches!(op, RowOp::Decoration { from: 0, .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(underline.unwrap().1, Hsla::from(rgb(0xff0000)));
+    }
+
+    #[test]
+    fn inverse_swaps_colors_invisible_hides_text_and_faint_is_a_style() {
+        let frame = screen(b"\x1b[7mA\x1b[0;8mB\x1b[0;2mC");
+        let cells = &frame.rows[0].cells;
+        assert_eq!(cells[0].bg, Some(Hsla::from(rgb(0xdbe3ee))));
+        assert_ne!(cells[0].fg, cells[0].bg.unwrap());
+        assert_eq!(cells[1].text, " ");
+        assert!(cells[2].style.faint);
+    }
+
+    #[test]
+    fn bold_and_italic_text_shape_in_their_own_runs() {
+        let frame = screen(b"a\x1b[1mb\x1b[0;3mc");
+        let row = cells(&frame, 0);
+        let font = gpui::font("Test");
+        let mut fonts = Vec::new();
+        let ops = row_ops(&row, &shaping(&font, false, None), |text, size, runs| {
+            fonts.push((runs[0].font.weight, runs[0].font.style));
+            monospace(&mut Vec::new())(text, size, runs)
+        });
+        assert_eq!(ops.len(), 3);
+        assert_eq!(
+            fonts,
+            [
+                (font.weight, FontStyle::Normal),
+                (FontWeight::BOLD, FontStyle::Normal),
+                (font.weight, FontStyle::Italic),
+            ]
+        );
     }
 
     #[test]
@@ -383,7 +601,7 @@ mod tests {
             .iter()
             .filter_map(|op| match op {
                 RowOp::Text { column, .. } => Some(*column),
-                RowOp::Background { .. } => None,
+                RowOp::Background { .. } | RowOp::Decoration { .. } => None,
             })
             .collect();
         assert_eq!(columns, [0, 3, 7, 9]);
@@ -661,6 +879,7 @@ mod tests {
                             font_size: px(font_size),
                             cell_width,
                             ligatures,
+                            bold_weight: FontWeight::BOLD,
                             cursor: None,
                         };
                         let ops = row_ops(&row, &shaping, &mut shape);
