@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use application::{
     PublishArtifact, StartSession,
     agents::AgentProfileRegistry,
+    skill_install::{InstallSkills, SkillAction},
     skills::{GetSkill, ListSkills, SkillOutput, SkillSelection},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -24,6 +25,7 @@ use infrastructure::{
     },
     config, daemon,
     shell::{self, Shell},
+    skill_install::{LocalSkillFilesystem, install_targets},
     skills::EmbeddedSkillCatalog,
 };
 use serde_json::{Value, json};
@@ -97,7 +99,7 @@ enum Action {
         #[command(subcommand)]
         command: DagAction,
     },
-    /// Read skills bundled with this Power release.
+    /// Read and install skills bundled with this Power release.
     #[command(after_help = AGENT_HELP_FOOTER)]
     Skills {
         #[command(subcommand)]
@@ -163,6 +165,39 @@ enum SkillsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Install bundled skill stubs and link them for detected agents.
+    Install(SkillInstallArgs),
+    /// Refresh existing skill stubs and links.
+    Update(SkillInstallArgs),
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum SkillAgent {
+    Claude,
+    Codex,
+    Universal,
+}
+
+#[derive(Args)]
+struct SkillInstallArgs {
+    /// Select a bundled skill by name. Repeat to select multiple skills. Defaults to all.
+    #[arg(long = "skill", value_name = "NAME")]
+    names: Vec<String>,
+    /// Select agent targets. Universal selects the shared folder alone. Defaults to detected agents.
+    #[arg(long = "agent", value_enum, value_delimiter = ',')]
+    agents: Vec<SkillAgent>,
+    /// Target the current Git worktree.
+    #[arg(long)]
+    local: bool,
+    /// Print the planned actions without writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Back up and replace conflicting copies.
+    #[arg(long)]
+    force: bool,
+    /// Print location outcomes as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> Result<()> {
@@ -532,7 +567,88 @@ fn run_skills(command: SkillsAction) -> Result<()> {
             };
             print_skill(&name, selection, json)
         }
+        SkillsAction::Install(args) => run_skill_install(args, false),
+        SkillsAction::Update(args) => run_skill_install(args, true),
     }
+}
+
+fn run_skill_install(args: SkillInstallArgs, update: bool) -> Result<()> {
+    let claude = args.agents.is_empty() || args.agents.contains(&SkillAgent::Claude);
+    let targets = install_targets(args.local, claude)?;
+    let outcomes = InstallSkills {
+        names: &args.names,
+        update,
+        dry_run: args.dry_run,
+        force: args.force,
+    }
+    .execute(
+        &LocalSkillFilesystem,
+        EmbeddedSkillCatalog.stubs()?,
+        &targets,
+    )?;
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.error.is_some())
+        .count();
+    if args.json {
+        let locations: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| {
+                json!({
+                    "name": outcome.name,
+                    "path": outcome.path.to_string_lossy(),
+                    "action": outcome.action.map(|action| action.label()),
+                    "reason": outcome.reason.map(|reason| reason.label()),
+                    "backup_required": outcome.needs_backup,
+                    "backup": outcome.backup.as_ref().map(|path| path.to_string_lossy()),
+                    "error": outcome.error,
+                })
+            })
+            .collect();
+        print_json(json!({"dry_run": args.dry_run, "locations": locations, "failed": failed}))?;
+    } else {
+        print_skill_install_outcomes(&outcomes, args.dry_run)?;
+    }
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_skill_install_outcomes(
+    outcomes: &[application::skill_install::SkillOutcome],
+    dry_run: bool,
+) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    if outcomes.is_empty() {
+        writeln!(
+            stdout,
+            "No installed Power skills found in the selected locations."
+        )?;
+    }
+    for outcome in outcomes {
+        let path = outcome.path.display();
+        if let Some(error) = &outcome.error {
+            eprintln!("failed  {path} ({error})");
+            continue;
+        }
+        let action = outcome.action.expect("successful locations have an action");
+        let reason = outcome
+            .reason
+            .map(|reason| format!(" ({})", reason.label()))
+            .unwrap_or_default();
+        let backup = match &outcome.backup {
+            Some(backup) => format!(" [backup at {}]", backup.display()),
+            None if outcome.needs_backup => " [backup before replacement]".into(),
+            None => String::new(),
+        };
+        if action == SkillAction::LeftAlone && !dry_run {
+            eprintln!("warning: {}  {path}{reason}", action.label());
+        } else {
+            writeln!(stdout, "{}  {path}{reason}{backup}", action.label())?;
+        }
+    }
+    Ok(())
 }
 
 fn print_skill(name: &str, selection: SkillSelection<'_>, json: bool) -> Result<()> {

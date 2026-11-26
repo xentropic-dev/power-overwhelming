@@ -1,21 +1,26 @@
 use anyhow::{Context, Result, bail, ensure};
-use application::skills::SkillCatalog;
+use application::{skill_install::SkillStub, skills::SkillCatalog};
 use domain::skill::{Skill, SkillReference, SkillSummary};
+use sha2::{Digest, Sha256};
 
 struct EmbeddedSkill {
     stub: &'static str,
+    shipped_stub_hashes: &'static [&'static str],
     guide: &'static str,
     references: &'static [(&'static str, &'static str)],
 }
 
+// When changing a stub, append its new SHA-256 and keep the previous release hashes.
 const SKILLS: &[EmbeddedSkill] = &[
     EmbeddedSkill {
         stub: include_str!("../../skills/power-artifacts/SKILL.md"),
+        shipped_stub_hashes: &["a4f012b3bd28d1f7207b112ba55673896ed2cf21123a48908f771395c3226ea3"],
         guide: include_str!("../../skills/power-artifacts/guide.md"),
         references: &[],
     },
     EmbeddedSkill {
         stub: include_str!("../../skills/power-dag/SKILL.md"),
+        shipped_stub_hashes: &["776c7037a75329bb90681af1e0929c95e86bc8ad4b7eab41ee258456e5216513"],
         guide: include_str!("../../skills/power-dag/guide.md"),
         references: &[
             (
@@ -35,6 +40,28 @@ const SKILLS: &[EmbeddedSkill] = &[
 ];
 
 pub struct EmbeddedSkillCatalog;
+
+impl EmbeddedSkillCatalog {
+    pub fn stubs(&self) -> Result<Vec<SkillStub>> {
+        SKILLS
+            .iter()
+            .map(|skill| {
+                let summary = parse_frontmatter(skill.stub)?;
+                Ok(SkillStub {
+                    name: summary.name,
+                    description: summary.description,
+                    markdown: skill.stub,
+                    current_hash: stub_hash(skill.stub.as_bytes()),
+                    shipped_hashes: skill.shipped_stub_hashes,
+                })
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn stub_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 impl SkillCatalog for EmbeddedSkillCatalog {
     fn list(&self) -> Result<Vec<SkillSummary>> {
@@ -67,7 +94,7 @@ impl SkillCatalog for EmbeddedSkillCatalog {
 }
 
 /// Bundled stubs use single-line plain scalars for name and description.
-fn parse_frontmatter(stub: &str) -> Result<SkillSummary> {
+pub(crate) fn parse_frontmatter(stub: &str) -> Result<SkillSummary> {
     let mut lines = stub.lines();
     ensure!(lines.next() == Some("---"), "Skill is missing frontmatter");
     let mut name = None;
@@ -99,6 +126,18 @@ fn parse_frontmatter(stub: &str) -> Result<SkillSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_stubs_have_shipped_hashes() {
+        for stub in EmbeddedSkillCatalog.stubs().unwrap() {
+            assert!(
+                stub.shipped_hashes.contains(&stub.current_hash.as_str()),
+                "{} is missing its current SHA-256 {}",
+                stub.name,
+                stub.current_hash
+            );
+        }
+    }
 
     #[test]
     fn reads_fields_from_the_frontmatter_only() {
