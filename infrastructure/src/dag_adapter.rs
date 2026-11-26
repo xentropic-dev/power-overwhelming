@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use application::dag::{
     BoxRegistry, BoxSelection, DagApplication, Dispatch, EventScope, StartAgent,
 };
-use domain::worktree::WorktreeRequest;
 use std::{os::unix::net::UnixStream, time::Duration};
 
 pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile, IconFiles>;
@@ -76,6 +75,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             caller,
             provider,
             worktree,
+            allow_main_checkout,
             parent,
             label,
             prompt,
@@ -88,7 +88,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
                         caller,
                     },
                     provider: provider.into(),
-                    worktree: WorktreeRequest::Existing(worktree),
+                    worktree: worktree.into_domain(allow_main_checkout),
                     parent,
                     label,
                     prompt,
@@ -101,6 +101,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             task,
             provider,
             worktree,
+            allow_main_checkout,
             retry,
             args,
             caller,
@@ -109,7 +110,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
                 run,
                 task,
                 provider: provider.into(),
-                worktree: worktree.into(),
+                worktree: worktree.into_domain(allow_main_checkout),
                 retry,
                 args,
                 caller,

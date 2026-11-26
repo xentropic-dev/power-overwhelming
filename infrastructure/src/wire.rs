@@ -590,12 +590,16 @@ pub enum WorktreeRequest {
     Existing(PathBuf),
 }
 
-impl From<WorktreeRequest> for worktree::WorktreeRequest {
-    fn from(value: WorktreeRequest) -> Self {
-        match value {
-            WorktreeRequest::New { branch, base } => Self::New { branch, base },
-            WorktreeRequest::RetryManaged => Self::RetryManaged,
-            WorktreeRequest::Existing(path) => Self::Existing(path),
+impl WorktreeRequest {
+    /// `allow_main_checkout` applies only to an existing path.
+    pub fn into_domain(self, allow_main_checkout: bool) -> worktree::WorktreeRequest {
+        match self {
+            Self::New { branch, base } => worktree::WorktreeRequest::New { branch, base },
+            Self::RetryManaged => worktree::WorktreeRequest::RetryManaged,
+            Self::Existing(path) => worktree::WorktreeRequest::Existing {
+                path,
+                allow_main_checkout,
+            },
         }
     }
 }
@@ -743,7 +747,10 @@ pub enum DagRequest {
         box_sel: Option<String>,
         caller: Option<String>,
         provider: Provider,
-        worktree: PathBuf,
+        worktree: WorktreeRequest,
+        /// Lets an existing `worktree` be the repository's main checkout.
+        #[serde(default)]
+        allow_main_checkout: bool,
         parent: Option<String>,
         label: String,
         prompt: Option<String>,
@@ -781,6 +788,9 @@ pub enum DagRequest {
         task: String,
         provider: Provider,
         worktree: WorktreeRequest,
+        /// Lets an existing `worktree` be the repository's main checkout.
+        #[serde(default)]
+        allow_main_checkout: bool,
         /// Required to start a new attempt after a failed or interrupted one.
         #[serde(default)]
         retry: bool,

@@ -166,6 +166,9 @@ mod tests {
         fn validate_box_worktree(&self, _: &Path, _: &Path) -> Result<PathBuf> {
             bail!("unused")
         }
+        fn main_checkout(&self, _: &Path) -> Result<Option<PathBuf>> {
+            bail!("unused")
+        }
         fn head(&self, _: &Path) -> Result<String> {
             bail!("unused")
         }

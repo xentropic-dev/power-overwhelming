@@ -28,6 +28,9 @@ impl Workspace for WorktreeWorkspace {
     fn validate_box_worktree(&self, _: &Path, _: &Path) -> Result<PathBuf> {
         bail!("Unexpected worktree validation")
     }
+    fn main_checkout(&self, _: &Path) -> Result<Option<PathBuf>> {
+        bail!("Unexpected main checkout lookup")
+    }
 
     fn head(&self, path: &Path) -> Result<String> {
         ensure!(path == Path::new("/view-source"), "Wrong source worktree");

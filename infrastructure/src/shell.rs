@@ -472,7 +472,9 @@ pub(crate) fn instruction_args(
         "When you can verify the active model for this session, run ",
         "`power session model 'Verified model name'` from this terminal at the start of your work ",
         "and again when the model changes. Leave it unset if the model is unknown.\n\n",
-        "To give this box a custom icon, run `power box icon <image-path>`.",
+        "To give this box a custom icon, run `power box icon <image-path>`.\n\n",
+        "Make code changes in a Git worktree of your own, never in the repository's main ",
+        "checkout, where the user and other agents work.",
     ));
     Ok(match &profile.injection {
         Injection::Flag { flag } => vec![flag.into(), instructions.into()],
@@ -579,6 +581,10 @@ mod tests {
     );
 
     const ICON_LINE: &str = "To give this box a custom icon, run `power box icon <image-path>`.";
+    const WORKTREE_LINE: &str = concat!(
+        "Make code changes in a Git worktree of your own, never in the repository's main ",
+        "checkout, where the user and other agents work."
+    );
 
     fn launch_text(installed: &Installed) -> String {
         let profiles = AgentProfiles::default();
@@ -604,7 +610,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "You are running inside Power Overwhelming.\n\n{TASK_LINE}\n\n{MODEL_LINE}\n\n{ICON_LINE}"
+                "You are running inside Power Overwhelming.\n\n{TASK_LINE}\n\n{MODEL_LINE}\n\n{ICON_LINE}\n\n{WORKTREE_LINE}"
             )
         );
     }
@@ -835,6 +841,8 @@ mod tests {
         assert_eq!(lines.next(), Some(MODEL_LINE));
         assert_eq!(lines.next(), Some(""));
         assert_eq!(lines.next(), Some(ICON_LINE));
+        assert_eq!(lines.next(), Some(""));
+        assert_eq!(lines.next(), Some(WORKTREE_LINE));
         assert_eq!(lines.next(), None);
 
         let codex = instruction_args(
