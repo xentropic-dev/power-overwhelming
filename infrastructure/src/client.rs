@@ -159,22 +159,38 @@ pub fn recent_artifacts(sessions: Vec<String>, limit: usize) -> Result<Vec<Recen
 
 /// Delivers every artifact publish until `deliver` returns false, reconnecting as needed.
 pub fn watch_artifacts(deliver: impl Fn(RecentArtifact) -> bool) {
+    watch(&Request::WatchArtifacts, |response| match response {
+        Response::ArtifactPublished { artifact } => Ok(deliver(artifact.into())),
+        _ => bail!("Unexpected daemon response"),
+    })
+}
+
+/// Delivers the box ID of every icon change until `deliver` returns false, reconnecting as
+/// needed.
+pub fn watch_box_icons(deliver: impl Fn(String) -> bool) {
+    watch(&Request::WatchBoxIcons, |response| match response {
+        Response::BoxIconChanged { box_id } => Ok(deliver(box_id)),
+        _ => bail!("Unexpected daemon response"),
+    })
+}
+
+/// Streams events for `request`, skipping keepalives, until `deliver` returns false.
+fn watch(request: &Request, deliver: impl Fn(Response) -> Result<bool>) {
     loop {
         let result = (|| -> Result<bool> {
             let mut socket = UnixStream::connect(wire::socket_path())?;
             socket.set_read_timeout(Some(Duration::from_secs(15)))?;
-            wire::send(&mut socket, &Request::WatchArtifacts)?;
+            wire::send(&mut socket, request)?;
             let mut reader = BufReader::new(socket);
             loop {
                 match wire::receive::<Response>(&mut reader)?.context("Daemon disconnected")? {
-                    Response::ArtifactPublished { artifact } => {
-                        if !deliver(artifact.into()) {
+                    Response::Ok => {}
+                    Response::Error { message } => bail!("{message}"),
+                    response => {
+                        if !deliver(response)? {
                             return Ok(false);
                         }
                     }
-                    Response::Ok => {}
-                    Response::Error { message } => bail!("{message}"),
-                    _ => bail!("Unexpected daemon response"),
                 }
             }
         })();
@@ -352,6 +368,26 @@ fn domain_list<T: Into<U>, U>(values: Vec<T>) -> Vec<U> {
 pub fn list_boxes() -> Result<Vec<BoxInfo>> {
     match dag(DagRequest::ListBoxes, DAG_TIMEOUT)? {
         DagResponse::Boxes { boxes } => Ok(domain_list(boxes)),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Sets a box's icon from an absolute image path, or resets it when `path` is absent.
+/// Returns the box ID.
+pub fn set_box_icon(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    path: Option<PathBuf>,
+) -> Result<String> {
+    match dag(
+        DagRequest::SetBoxIcon {
+            box_sel,
+            caller,
+            path,
+        },
+        DAG_TIMEOUT,
+    )? {
+        DagResponse::BoxIcon { box_id } => Ok(box_id),
         _ => bail!("Unexpected daemon response"),
     }
 }

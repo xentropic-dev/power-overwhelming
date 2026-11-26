@@ -3514,6 +3514,7 @@ dependencies = [
  "domain",
  "fs2",
  "ghostty-vt",
+ "image",
  "libc",
  "mlua",
  "portable-pty",
