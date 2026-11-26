@@ -1,3 +1,5 @@
+![Power Overwhelming](pwr-archon.gif)
+
 # Power Overwhelming
 
 A native Wayland desktop multiplexer for coding agents such as Claude Code, Codex, and Grok. The local daemon keeps terminals and agents running when the GPUI window closes. Artifact links open in a closable pane beside the terminal.
