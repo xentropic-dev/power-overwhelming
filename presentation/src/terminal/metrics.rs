@@ -6,6 +6,7 @@
 //! file with `fontdb` and reads it with `ttf-parser`, and falls back to what stock GPUI
 //! reports when the file can't be found.
 
+use domain::session::Geometry;
 use gpui::{Font, FontId, LineLayout, Pixels, Point, Size, TextSystem, point, px, size};
 use std::{cell::RefCell, collections::HashMap, sync::LazyLock};
 
@@ -68,6 +69,31 @@ impl CellMetrics {
     /// A logical length in whole device pixels.
     pub fn device_pixels(&self, length: Pixels) -> u32 {
         (f32::from(length) * self.scale).round().max(0.) as u32
+    }
+
+    /// A logical size in whole device pixels, rounding down, as the cells it holds are counted.
+    pub fn whole_device_size(&self, length: Size<Pixels>) -> Size<u32> {
+        // The tolerance keeps a length that is a whole number of device pixels from losing one
+        // to float error.
+        let whole = |length: Pixels| (f32::from(length) * self.scale + 1e-3).floor().max(0.) as u32;
+        size(whole(length.width), whole(length.height))
+    }
+
+    /// The PTY grid that fits in `grid`: the whole cells, at most `Geometry::MAX_CELLS` each
+    /// way. Cell sizes are in device pixels, as Ghostty reports them.
+    pub fn grid(&self, grid: Size<Pixels>) -> Geometry {
+        let cell = self.device_size();
+        let grid = self.whole_device_size(grid);
+        let fit = |length: u32, cell: u32| {
+            (length / cell.max(1)).clamp(1, u32::from(Geometry::MAX_CELLS)) as u16
+        };
+        let pixels = |cell: u32| cell.clamp(1, u32::from(Geometry::MAX_CELL_PIXELS)) as u16;
+        Geometry {
+            cols: fit(grid.width, cell.width),
+            rows: fit(grid.height, cell.height),
+            cell_width: pixels(cell.width),
+            cell_height: pixels(cell.height),
+        }
     }
 
     /// Moves a point onto the nearest device pixel.
@@ -293,7 +319,7 @@ impl FaceMetrics {
     /// The grid for this face, all in device pixels until the final division by `scale`.
     fn cell(&self, font_size: f32, scale: f32, line_height: f32, cell_width: f32) -> CellMetrics {
         // FreeType uses integer y_ppem for metrics; CoreText uses the requested size.
-        let em = if cfg!(target_os = "macos") {
+        let em = if CORETEXT {
             font_size * scale
         } else {
             (font_size * scale).round().max(1.)
@@ -312,7 +338,12 @@ impl FaceMetrics {
             baseline_bottom - face_baseline,
             line_height,
         );
-        let baseline = baseline + top;
+        // A cell taller than the PTY can report is cut to the tallest it can, about the face's
+        // centre, so the painted cell and the PTY's cell stay the same size.
+        let max = f32::from(Geometry::MAX_CELL_PIXELS);
+        let cut = (height - max).max(0.);
+        let height = height - cut;
+        let baseline = (baseline + top - (cut / 2.).floor()).clamp(1., height);
         let ex = self
             .x_height
             .unwrap_or_else(|| self.cap_height.unwrap_or(ascent * 0.75) * 0.75);
@@ -336,16 +367,26 @@ impl FaceMetrics {
             });
         let face_width = self.advance * font_size * scale / self.units_per_em;
         // As Ghostty's adjust-cell-width: scale the rounded cell; glyph_x re-centres the face.
-        let width = adjusted_cell_width(face_width.round().max(1.), cell_width);
+        let width = adjusted_cell_width(face_width.round().max(1.), cell_width).min(max);
+        let underline_thickness = underline_thickness.ceil().clamp(1., height);
+        let strike_thickness = strike_thickness.ceil().clamp(1., height);
         let logical = |device: f32| px(device / scale);
         CellMetrics {
             size: size(logical(width), logical(height)),
             glyph_x: logical(glyph_x(width, face_width)),
             baseline: logical(baseline),
-            underline: logical((baseline - underline_position).round()),
-            underline_thickness: logical(underline_thickness.ceil().max(1.)),
-            strike: logical((baseline - strike_position).round()),
-            strike_thickness: logical(strike_thickness.ceil().max(1.)),
+            underline: logical(
+                (baseline - underline_position)
+                    .round()
+                    .clamp(0., height - underline_thickness),
+            ),
+            underline_thickness: logical(underline_thickness),
+            strike: logical(
+                (baseline - strike_position)
+                    .round()
+                    .clamp(0., height - strike_thickness),
+            ),
+            strike_thickness: logical(strike_thickness),
             scale,
         }
     }
@@ -376,8 +417,15 @@ fn adjusted_cell_height(height: f32, face_height: f32, face_y: f32, multiplier: 
 /// their subpixel phase without sliding a pixel left; FreeType (`font/face/freetype.zig`)
 /// moves only into a wider cell, by whole pixels, to keep hinting.
 fn glyph_x(cell_width: f32, face_width: f32) -> f32 {
+    rasterizer_glyph_x(cell_width, face_width, CORETEXT)
+}
+
+/// Whether glyphs rasterize with CoreText, as on macOS, rather than FreeType.
+const CORETEXT: bool = cfg!(target_os = "macos");
+
+fn rasterizer_glyph_x(cell_width: f32, face_width: f32, coretext: bool) -> f32 {
     let dx = (cell_width - face_width) / 2.;
-    if cfg!(target_os = "macos") {
+    if coretext {
         if dx < 0. { dx - dx.trunc() } else { dx }
     } else if dx > 0. {
         dx.round()
@@ -417,20 +465,23 @@ mod tests {
         );
         // (size, scale, line height, cell width) → device (width, height, baseline, glyph_x,
         // underline top, underline thickness, strike top).
+        // glyph_x differs by rasterizer: FreeType moves whole pixels into a wider cell only,
+        // CoreText keeps the subpixel offset.
+        let gx = |freetype: f32, coretext: f32| if CORETEXT { coretext } else { freetype };
         #[rustfmt::skip]
         let cases = [
             // 13 px: face 7.8 × 17.16 rounds to 8 × 17; baseline 4 px up from the bottom.
-            ((13., 1., 1., 1.), (8., 17., 13., 0., 15., 1., 9.)),
+            ((13., 1., 1., 1.), (8., 17., 13., gx(0., 0.1), 15., 1., 9.)),
             // 13 px at 2×: 15.6 × 34.32 → 16 × 34, thickness 1.3 → 2.
-            ((13., 2., 1., 1.), (16., 34., 26., 0., 30., 2., 18.)),
+            ((13., 2., 1., 1.), (16., 34., 26., gx(0., 0.2), 30., 2., 18.)),
             // 14 px: 8.4 × 18.48 → 8 × 18; a narrower cell never shifts glyphs on FreeType.
-            ((14., 1., 1., 1.), (8., 18., 14., 0., 16., 1., 10.)),
+            ((14., 1., 1., 1.), (8., 18., 14., gx(0., -0.2), 16., 1., 10.)),
             // 16 px at 1.25×: em 20 → 12 × 26.4 → 12 × 26.
             ((16., 1.25, 1., 1.), (12., 26., 20., 0., 23., 1., 14.)),
             // Line height 1.2: 17 → 20.4 → 20, the odd pixel goes on top.
-            ((13., 1., 1.2, 1.), (8., 20., 15., 0., 17., 1., 11.)),
-            // Cell width 1.1: 8 → 8.8 → 9; glyphs move right by round(0.6) = 1.
-            ((13., 1., 1., 1.1), (9., 17., 13., 1., 15., 1., 9.)),
+            ((13., 1., 1.2, 1.), (8., 20., 15., gx(0., 0.1), 17., 1., 11.)),
+            // Cell width 1.1: 8 → 8.8 → 9; glyphs move right by round(0.6) = 1 on FreeType.
+            ((13., 1., 1., 1.1), (9., 17., 13., gx(1., 0.6), 15., 1., 9.)),
         ];
         for ((font_size, scale, line_height, cell_width), expected) in cases {
             let cell = face.cell(font_size, scale, line_height, cell_width);
@@ -491,8 +542,47 @@ mod tests {
         assert_eq!(adjusted_cell_width(8., 0.8), 6.);
         assert_eq!(adjusted_cell_height(17., 17.16, 0.1, 1.2), (20., 2.));
         assert_eq!(adjusted_cell_height(17., 17.16, -0.5, 1.2), (20., 1.));
-        assert_eq!(glyph_x(9., 7.8), 1.);
-        assert_eq!(glyph_x(8., 8.4), 0.);
+    }
+
+    /// Both rasterizers' re-centring, checked on every platform.
+    #[test]
+    fn glyph_x_recentres_glyphs_as_ghostty() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // FreeType: whole pixels, and only into a wider cell.
+        assert!(close(rasterizer_glyph_x(9., 7.8, false), 1.));
+        assert!(close(rasterizer_glyph_x(8., 7.8, false), 0.));
+        assert!(close(rasterizer_glyph_x(8., 8.4, false), 0.));
+        // CoreText: the exact offset into a wider cell; only the subpixel part into a narrower.
+        assert!(close(rasterizer_glyph_x(9., 7.8, true), 0.6));
+        assert!(close(rasterizer_glyph_x(8., 7.8, true), 0.1));
+        assert!(close(rasterizer_glyph_x(8., 8.4, true), -0.2));
+        assert!(close(rasterizer_glyph_x(6., 9., true), -0.5));
+        assert!(close(rasterizer_glyph_x(5., 9., true), 0.));
+    }
+
+    /// The PTY reports at most 100-pixel cells, so a cell measured larger is cut to 100 for
+    /// painting too: a 72 px face at line height 2 measures 190 px tall.
+    #[test]
+    fn cells_past_the_pty_limit_are_cut_to_it() {
+        let face = jetbrains_mono();
+        let tall = face.cell(72., 1., 2., 1.);
+        assert_eq!(tall.device_size().height, 100);
+        assert_eq!(tall.size.height, px(100.));
+        assert!(tall.baseline <= tall.size.height);
+        assert!(tall.underline + tall.underline_thickness <= tall.size.height);
+        assert!(tall.strike + tall.strike_thickness <= tall.size.height);
+        // 72 px at 2× with cell width 2: 86.4 → 86 → 172 px wide, cut to 100.
+        let wide = face.cell(72., 2., 1., 2.);
+        assert_eq!(wide.device_size(), size(100, 100));
+        assert_eq!(wide.size, size(px(50.), px(50.)));
+        // The PTY gets exactly the painted cell, and the grid counts painted cells.
+        let grid = tall.grid(size(px(1000.), px(500.)));
+        assert_eq!(
+            (grid.cols, grid.rows, grid.cell_width, grid.cell_height),
+            (23, 5, 43, 100)
+        );
+        // Just under the limit is untouched: 50 px at line height 1 is 66 px tall.
+        assert_eq!(face.cell(50., 1., 1., 1.).device_size().height, 66);
     }
 
     #[test]

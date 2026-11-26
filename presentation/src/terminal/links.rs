@@ -59,7 +59,7 @@ impl TerminalView {
     }
 
     pub(super) fn link_at_point(&self, point: Point<Pixels>) -> Option<&Arc<str>> {
-        if !self.bounds.contains(&point) {
+        if !self.grid.bounds.contains(&point) {
             return None;
         }
         self.link_at(self.at(point))

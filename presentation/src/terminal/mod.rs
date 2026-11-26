@@ -1,4 +1,5 @@
 mod frame;
+mod grid;
 mod input;
 mod links;
 mod metrics;
@@ -9,9 +10,10 @@ use self::metrics::preload_font_files;
 pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
 use self::frame::{CellPosition, Frame, frame};
+use self::grid::PtyGrid;
 use crate::settings::TerminalSettings;
 use anyhow::{Result, bail};
-use domain::session::{Agent, Geometry, Session};
+use domain::session::{Agent, Session};
 use ghostty_vt::{Terminal, key, mouse, render::RenderState, snapshot, terminal::Options};
 use gpui::*;
 use infrastructure::{
@@ -68,12 +70,10 @@ pub struct TerminalView {
     scheme: &'static Scheme,
     settings: TerminalSettings,
     font: TerminalFont,
-    /// The grid as last measured in `render`.
-    metrics: CellMetrics,
+    grid: PtyGrid,
     terminal: Terminal,
     renderer: RenderState,
     frame: Arc<Frame>,
-    bounds: Bounds<Pixels>,
     selection: Option<(CellPosition, CellPosition)>,
     pointer: Option<Point<Pixels>>,
     pressed_link: Option<Arc<str>>,
@@ -84,7 +84,6 @@ pub struct TerminalView {
     reporting_mouse: bool,
     exited: bool,
     status: Option<String>,
-    geometry: Option<Geometry>,
     encoder: key::Encoder,
     mouse: mouse::Encoder,
     commands: async_channel::Sender<TerminalControl>,
@@ -156,11 +155,10 @@ impl TerminalView {
             scheme,
             font: terminal_font(&settings, cx),
             settings,
-            metrics: CellMetrics::default(),
+            grid: PtyGrid::default(),
             terminal,
             renderer: RenderState::new().expect("allocate render state"),
             frame: Arc::default(),
-            bounds: Bounds::default(),
             selection: None,
             pointer: None,
             pressed_link: None,
@@ -170,7 +168,6 @@ impl TerminalView {
             reporting_mouse: false,
             exited: false,
             status: None,
-            geometry: None,
             encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             commands,
@@ -188,13 +185,17 @@ impl TerminalView {
     }
 
     /// Applies new terminal settings, with zoom already in `font_size`. A new cell size
-    /// resizes the PTY on the next frame.
+    /// resizes the PTY now, whether or not this terminal is on screen.
     pub fn set_settings(&mut self, settings: TerminalSettings, cx: &mut Context<Self>) {
         if settings == self.settings {
             return;
         }
         self.font = terminal_font(&settings, cx);
         self.settings = settings;
+        if !self.exited {
+            let metrics = cell_metrics(cx.text_system(), &self.font, self.grid.metrics.scale);
+            self.grid.remeasure(metrics, &self.commands);
+        }
         cx.notify();
     }
 
@@ -257,35 +258,12 @@ impl TerminalView {
     }
 
     /// Records the grid's bounds, inside the padding, and resizes the PTY to the cells that
-    /// fit. Cell sizes go to the PTY in device pixels, as Ghostty reports them.
+    /// fit.
     fn set_bounds(&mut self, bounds: Bounds<Pixels>, metrics: CellMetrics) {
-        self.bounds = Bounds::new(metrics.snap(bounds.origin), bounds.size);
-        self.metrics = metrics;
-        let cell = metrics.device_size();
-        let fit = |length: Pixels, cell: Pixels| {
-            (f32::from(length) / f32::from(cell)).clamp(1., 500.) as u16
-        };
-        let geometry = Geometry {
-            cols: fit(bounds.size.width, metrics.size.width),
-            rows: fit(bounds.size.height, metrics.size.height),
-            cell_width: cell.width.clamp(1, 100) as u16,
-            cell_height: cell.height.clamp(1, 100) as u16,
-        };
-        if self.geometry != Some(geometry)
-            && self
-                .commands
-                .try_send(TerminalControl::Resize(geometry))
-                .is_ok()
-        {
-            self.geometry = Some(geometry);
-        }
+        self.grid.lay_out(bounds, metrics, &self.commands);
     }
 
     fn at(&self, position: Point<Pixels>) -> CellPosition {
-        let local = position - self.bounds.origin;
-        CellPosition {
-            row: (f32::from(local.y) / f32::from(self.metrics.size.height)).max(0.) as usize,
-            column: (f32::from(local.x) / f32::from(self.metrics.size.width)).max(0.) as usize,
-        }
+        self.grid.at(position)
     }
 }

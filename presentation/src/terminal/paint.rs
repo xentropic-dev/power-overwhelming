@@ -6,7 +6,7 @@ use std::sync::Arc;
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = cell_metrics(window.text_system(), &self.font, window.scale_factor());
-        self.metrics = metrics;
+        self.grid.metrics = metrics;
         let (cell_size, pad) = (metrics.size, px(self.settings.padding));
         let font_size = px(self.font.size);
         let terminal = cx.entity();

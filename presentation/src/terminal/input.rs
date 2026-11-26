@@ -1,4 +1,4 @@
-use super::{OpenLink, TerminalView};
+use super::{OpenLink, TerminalView, grid::PtyGrid};
 use ghostty_vt::{
     key::{self, Key},
     mouse,
@@ -6,6 +6,35 @@ use ghostty_vt::{
 };
 use gpui::*;
 use infrastructure::client::TerminalControl;
+
+/// The surface the mouse encoder maps positions on: the grid with its padding. Space past
+/// the PTY's last column and row, including whole cells beyond its 500-cell limit, counts as
+/// padding, so clicks there report the edge cell.
+fn encoder_size(grid: &PtyGrid, pad: Pixels) -> mouse::EncoderSize {
+    let metrics = grid.metrics;
+    let pad = metrics.device_pixels(pad);
+    let geometry = grid.geometry();
+    let (cell_width, cell_height) = (
+        u32::from(geometry.cell_width),
+        u32::from(geometry.cell_height),
+    );
+    let used = size(
+        u32::from(geometry.cols) * cell_width,
+        u32::from(geometry.rows) * cell_height,
+    );
+    let area = grid.device_size();
+    let (width, height) = (area.width.max(used.width), area.height.max(used.height));
+    mouse::EncoderSize {
+        screen_width: width + pad * 2,
+        screen_height: height + pad * 2,
+        cell_width,
+        cell_height,
+        padding_top: pad,
+        padding_left: pad,
+        padding_right: pad + width - used.width,
+        padding_bottom: pad + height - used.height,
+    }
+}
 
 impl TerminalView {
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
@@ -34,17 +63,9 @@ impl TerminalView {
             return;
         };
         // Ghostty encodes surface positions in device pixels, padding included.
-        let metrics = self.metrics;
+        let metrics = self.grid.metrics;
         let pad = px(self.settings.padding);
-        let surface = Bounds::new(
-            self.bounds.origin - point(pad, pad),
-            self.bounds.size + size(pad * 2., pad * 2.),
-        );
-        let local = position - surface.origin;
-        let cell = metrics.device_size();
-        let (pad_left, pad_top) = (metrics.device_pixels(pad), metrics.device_pixels(pad));
-        let grid_width = metrics.device_pixels(self.bounds.size.width);
-        let grid_height = metrics.device_pixels(self.bounds.size.height);
+        let local = position - (self.grid.bounds.origin - point(pad, pad));
         event
             .set_action(action)
             .set_button(Some(button))
@@ -56,17 +77,7 @@ impl TerminalView {
         self.mouse
             .set_options_from_terminal(&self.terminal)
             .set_any_button_pressed(self.reporting_mouse)
-            .set_size(mouse::EncoderSize {
-                screen_width: metrics.device_pixels(surface.size.width),
-                screen_height: metrics.device_pixels(surface.size.height),
-                cell_width: cell.width.max(1),
-                cell_height: cell.height.max(1),
-                padding_top: pad_top,
-                padding_left: pad_left,
-                // The grid's leftover space past its last whole cell counts as padding.
-                padding_right: metrics.device_pixels(pad) + grid_width % cell.width.max(1),
-                padding_bottom: metrics.device_pixels(pad) + grid_height % cell.height.max(1),
-            });
+            .set_size(encoder_size(&self.grid, pad));
         let mut bytes = Vec::new();
         if self.mouse.encode_to_vec(&event, &mut bytes).is_ok() {
             self.input(bytes, cx);
@@ -269,7 +280,7 @@ impl TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let line = self.metrics.size.height;
+        let line = self.grid.metrics.size.height;
         let amount =
             -(f32::from(event.delta.pixel_delta(line).y) / f32::from(line)).round() as isize;
         if amount != 0 {
@@ -395,5 +406,80 @@ fn key_code(key: &str) -> Key {
         "f11" => F11,
         "f12" => F12,
         _ => Unidentified,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PtyGrid, encoder_size};
+    use crate::terminal::CellMetrics;
+    use ghostty_vt::mouse;
+    use gpui::{Bounds, Pixels, Point, Size, point, px, size};
+
+    fn sgr_press(grid: &PtyGrid, pad: f32, at: Point<Pixels>) -> String {
+        let mut encoder = mouse::Encoder::new().unwrap();
+        encoder
+            .set_tracking_mode(mouse::TrackingMode::Normal)
+            .set_format(mouse::Format::Sgr)
+            .set_size(encoder_size(grid, px(pad)));
+        let mut event = mouse::Event::new().unwrap();
+        event
+            .set_action(mouse::Action::Press)
+            .set_button(Some(mouse::Button::Left));
+        let local = at - (grid.bounds.origin - point(px(pad), px(pad)));
+        event.set_position(mouse::Position {
+            x: f32::from(local.x),
+            y: f32::from(local.y),
+        });
+        let mut bytes = Vec::new();
+        encoder.encode_to_vec(&event, &mut bytes).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn grid(width: f32, height: f32, cell: Size<Pixels>) -> PtyGrid {
+        let (tx, _rx) = async_channel::unbounded();
+        let mut grid = PtyGrid::default();
+        let metrics = CellMetrics {
+            size: cell,
+            ..CellMetrics::default()
+        };
+        let bounds = Bounds::new(point(px(4.), px(4.)), size(px(width), px(height)));
+        grid.lay_out(bounds, metrics, &tx);
+        grid
+    }
+
+    /// A 1912-pixel grid of 3-pixel cells fits 637 columns; the PTY takes 500, so a click at
+    /// the right edge must report column 500, not 637.
+    #[test]
+    fn clicks_past_the_capped_grid_report_its_last_column() {
+        let grid = grid(1912., 180., size(px(3.), px(18.)));
+        assert_eq!(grid.geometry().cols, 500);
+        assert_eq!(
+            sgr_press(&grid, 4., point(px(1910.), px(10.))),
+            "\x1b[<0;500;1M"
+        );
+        assert_eq!(
+            sgr_press(&grid, 4., point(px(1495.), px(10.))),
+            "\x1b[<0;498;1M"
+        );
+    }
+
+    #[test]
+    fn clicks_in_the_leftover_strip_report_the_edge_cell() {
+        // 805 × 190: 100 columns and 10 rows with 5 and 10 pixels left over.
+        let grid = grid(805., 190., size(px(8.), px(18.)));
+        assert_eq!((grid.geometry().cols, grid.geometry().rows), (100, 10));
+        assert_eq!(
+            sgr_press(&grid, 4., point(px(807.), px(5.))),
+            "\x1b[<0;100;1M"
+        );
+        assert_eq!(
+            sgr_press(&grid, 4., point(px(5.), px(192.))),
+            "\x1b[<0;1;10M"
+        );
+        assert_eq!(
+            sgr_press(&grid, 4., point(px(13.), px(23.))),
+            "\x1b[<0;2;2M"
+        );
     }
 }
