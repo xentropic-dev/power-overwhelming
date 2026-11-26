@@ -2,11 +2,14 @@ pub mod agents;
 mod commands;
 pub mod dag;
 mod queries;
+mod restore;
 mod sessions;
 pub mod skill_install;
 pub mod skills;
 
-pub use commands::{ArtifactPublished, PublishArtifact, SessionOptions, StartSession};
+pub use commands::{
+    ArtifactPublished, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
+};
 pub use queries::ResolveArtifact;
 pub use sessions::{MemorySessions, SessionRecord, SessionStore};
 
@@ -112,6 +115,7 @@ struct Live<H> {
 pub struct Application<T: TerminalRuntime> {
     sessions: Mutex<BTreeMap<String, Live<T::Handle>>>,
     artifacts: Box<dyn ArtifactStore>,
+    records: Arc<dyn SessionStore>,
     workspace: Box<dyn Workspace>,
     runtime: T,
     agents: Arc<dyn agents::AgentProfileRegistry>,
@@ -121,6 +125,7 @@ pub struct Application<T: TerminalRuntime> {
 impl<T: TerminalRuntime> Application<T> {
     pub fn new(
         artifacts: impl ArtifactStore + 'static,
+        records: Arc<dyn SessionStore>,
         workspace: impl Workspace + 'static,
         runtime: T,
         agents: Arc<dyn agents::AgentProfileRegistry>,
@@ -129,6 +134,7 @@ impl<T: TerminalRuntime> Application<T> {
         Self {
             sessions: Mutex::default(),
             artifacts: Box::new(artifacts),
+            records,
             workspace: Box::new(workspace),
             runtime,
             agents,

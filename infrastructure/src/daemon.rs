@@ -4,7 +4,7 @@ use crate::{
     boxes::BoxesFile,
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
-    persistence::SqliteArtifacts,
+    persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
@@ -14,7 +14,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use application::{Application, PublishArtifact, ResolveArtifact, StartSession};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::session::Geometry;
+use domain::session::{Agent, Geometry};
 use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
@@ -26,9 +26,13 @@ use std::{
             net::{UnixListener, UnixStream},
         },
     },
-    sync::{Arc, OnceLock, RwLock, Weak, mpsc},
+    sync::{
+        Arc, OnceLock, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Watchers = std::sync::Mutex<Vec<mpsc::SyncSender<Response>>>;
@@ -98,7 +102,11 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     let artifacts = SqliteArtifacts::open()?;
+    let sessions = SqliteSessions::open().context("Open session registry")?;
     let store = SqliteDagStore::open().context("Open DAG store")?;
+    let terminal_application = Arc::new(OnceLock::<Weak<Application<PtyRuntime>>>::new());
+    let foreground_application = terminal_application.clone();
+    let shutting_down = Arc::new(AtomicBool::new(false));
     let terminal_dag = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
     let exit_dag = terminal_dag.clone();
     let model_dag = terminal_dag.clone();
@@ -106,6 +114,7 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
     let profiles = Arc::new(profiles);
     let application = Arc::new(Application::new(
         artifacts,
+        Arc::new(sessions),
         LocalWorkspace,
         PtyRuntime {
             socket: socket.clone(),
@@ -124,6 +133,13 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
                 }
                 Ok(())
             }),
+            on_foreground_changed: Arc::new(move |session, agent, conversation, cwd| {
+                if let Some(application) = foreground_application.get().and_then(Weak::upgrade) {
+                    application.record_foreground(session, agent, conversation, cwd)?;
+                }
+                Ok(())
+            }),
+            shutting_down: shutting_down.clone(),
         },
         profiles,
         || uuid::Uuid::new_v4().to_string(),
@@ -134,10 +150,16 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
         BoxesFile,
         IconFiles::open()?,
     ));
-    dag.reconcile().context("Reconcile DAG sessions")?;
+    terminal_application
+        .set(Arc::downgrade(&application))
+        .expect("connect terminal callbacks to the application once");
+    // Connect exits first, so a restored worker that exits at once is still reported.
     terminal_dag
         .set(Arc::downgrade(&dag))
         .expect("connect terminal callbacks to the DAG once");
+    let restored = application.restore_sessions().context("Restore sessions")?;
+    dag.reconcile(&restored).context("Reconcile DAG sessions")?;
+    handle_shutdown(application.clone(), shutting_down)?;
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let server = Arc::new(Server {
@@ -153,6 +175,52 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
             let _ = handle(socket, &server);
         });
     }
+    Ok(())
+}
+
+/// Bounds the final save so a reboot is not held up by a stuck terminal.
+const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
+
+/// On SIGTERM or SIGINT, saves scrollback and foreground state for every live
+/// session, then exits. The saved records restore the sessions on the next start.
+fn handle_shutdown(
+    application: Arc<Application<PtyRuntime>>,
+    shutting_down: Arc<AtomicBool>,
+) -> Result<()> {
+    use signal_hook::{
+        consts::{SIGINT, SIGTERM},
+        iterator::Signals,
+    };
+
+    let mut signals = Signals::new([SIGTERM, SIGINT]).context("Install shutdown handler")?;
+    thread::spawn(move || {
+        if signals.forever().next().is_none() {
+            return;
+        }
+        // Agents killed with the daemon must not look like sessions the user ended.
+        shutting_down.store(true, Ordering::Release);
+        let deadline = Instant::now() + SHUTDOWN_FLUSH;
+        let (done, flushed) = mpsc::sync_channel(64);
+        let mut pending = 0;
+        for session in application.list_sessions() {
+            if let Ok(terminal) = application.terminal(&session.id)
+                && terminal
+                    .send(Command::FlushScrollback(done.clone()))
+                    .is_ok()
+            {
+                pending += 1;
+            }
+        }
+        drop(done);
+        for _ in 0..pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if flushed.recv_timeout(remaining).is_err() {
+                eprintln!("Some sessions did not save before shutdown.");
+                break;
+            }
+        }
+        std::process::exit(0);
+    });
     Ok(())
 }
 
@@ -271,6 +339,33 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             ensure!(
                 receive.recv_timeout(Duration::from_secs(3))??,
                 "Session metadata must come from the active agent"
+            );
+            Ok(Response::Ok)
+        }
+        Request::SetConversation {
+            session,
+            agent,
+            conversation,
+        } => {
+            ensure!(
+                !agent.is_empty()
+                    && !conversation.is_empty()
+                    && crate::terminal::valid_metadata(&agent)
+                    && crate::terminal::valid_metadata(&conversation),
+                "Conversation IDs must be at most 120 characters on one line"
+            );
+            let (send, receive) = mpsc::sync_channel(1);
+            application
+                .terminal(&session)?
+                .send(Command::SetConversation {
+                    pid: peer_pid(socket)?,
+                    agent: Agent::Coding(agent.into()),
+                    conversation,
+                    reply: send,
+                })?;
+            ensure!(
+                receive.recv_timeout(Duration::from_secs(3))?,
+                "Conversations must come from a process in this shell session"
             );
             Ok(Response::Ok)
         }

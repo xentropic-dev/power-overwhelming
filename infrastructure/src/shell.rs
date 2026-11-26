@@ -155,7 +155,6 @@ fn has_marker(path: &Path) -> bool {
 }
 
 /// Quotes a program and its arguments for evaluation by Bash, Zsh, or Fish.
-#[allow(dead_code, reason = "The session restore path will call this helper")]
 pub(crate) fn resume_command(program: &str, args: &[OsString]) -> OsString {
     let mut command = Vec::new();
     for word in std::iter::once(OsStr::new(program)).chain(args.iter().map(OsString::as_os_str)) {
@@ -174,6 +173,32 @@ pub(crate) fn resume_command(program: &str, args: &[OsString]) -> OsString {
         command.push(b'\'');
     }
     OsString::from_vec(command)
+}
+
+/// Arguments that pin a new conversation ID, and the ID to record for a restore.
+/// Management subcommands and help or version queries start no conversation, so
+/// they get no ID and cannot replace the one a restore would resume.
+pub(crate) fn assign_conversation(
+    profile: &AgentProfile,
+    user: &[OsString],
+) -> (Vec<OsString>, Option<String>) {
+    let Some(resume) = &profile.resume else {
+        return (Vec::new(), None);
+    };
+    let skipped = user
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| profile.skip_subcommands.iter().any(|skip| skip == arg))
+        || user.iter().any(|arg| {
+            matches!(
+                arg.to_str(),
+                Some("-h" | "--help" | "-v" | "-V" | "--version")
+            )
+        });
+    if skipped {
+        return (Vec::new(), None);
+    }
+    resume.launch(user, || uuid::Uuid::new_v4().to_string())
 }
 
 /// Arguments Power adds in front of the user's arguments when it starts an agent.
@@ -232,13 +257,26 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     let program = find_program(&profile.command)
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
-    command
-        .args(instruction_args(
-            profile,
-            &args,
-            &LocalInstalledSkills(&std::env::current_dir()?),
-        )?)
-        .args(&args);
+    command.args(instruction_args(
+        profile,
+        &args,
+        &LocalInstalledSkills(&std::env::current_dir()?),
+    )?);
+    {
+        let (assign, conversation) = assign_conversation(profile, &args);
+        command.args(assign);
+        if let (Some(conversation), Some(session)) =
+            (conversation, std::env::var_os("POWER_SESSION"))
+        {
+            // The agent starts either way. Without the report it restarts fresh.
+            let _ = crate::client::set_conversation(
+                session.to_string_lossy().into_owned(),
+                profile.id.as_str().to_owned(),
+                conversation,
+            );
+        }
+    }
+    command.args(&args);
     let error = command.exec();
     bail!("Start {}. {error}", program.display())
 }
@@ -428,6 +466,27 @@ mod tests {
         assert_eq!(contents.matches(MARKER).count(), 1);
         assert!(contents.starts_with("export A=1\n\n"));
         assert!(has_marker(&rc));
+    }
+
+    #[test]
+    fn assigns_conversations_only_to_interactive_agent_launches() {
+        let profiles = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into()).unwrap();
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+
+        let (assign, conversation) = assign_conversation(claude, &args(&["--model", "opus"]));
+        let conversation = conversation.expect("an interactive launch gets an ID");
+        assert_eq!(assign, args(&["--session-id", &conversation]));
+
+        for skipped in [&["mcp", "list"][..], &["update"], &["--help"], &["-v"]] {
+            assert_eq!(
+                assign_conversation(claude, &args(skipped)),
+                (Vec::new(), None),
+                "{skipped:?}"
+            );
+        }
+        let codex = profiles.resolve(&"codex".into()).unwrap();
+        assert_eq!(assign_conversation(codex, &[]), (Vec::new(), None));
     }
 
     #[test]

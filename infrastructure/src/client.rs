@@ -68,6 +68,15 @@ pub fn set_model(session: String, value: String) -> Result<()> {
     })
 }
 
+/// Reports the conversation an agent wrapper is about to start, so a restore can resume it.
+pub fn set_conversation(session: String, agent: String, conversation: String) -> Result<()> {
+    expect_ok(&Request::SetConversation {
+        session,
+        agent,
+        conversation,
+    })
+}
+
 pub fn end_session(session: String) -> Result<()> {
     expect_ok(&Request::End { session })
 }

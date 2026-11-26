@@ -1,22 +1,38 @@
-use crate::{Application, Live, TerminalRuntime};
+use crate::{Application, Live, SessionRecord, TerminalRuntime};
 use anyhow::{Context, Result, ensure};
 use domain::{
     artifact::{ArtifactRecord, ResolvedArtifact, URI_PREFIX},
     session::{Agent, Session},
 };
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 pub struct StartSession {
     pub worktree: PathBuf,
     pub agent: Agent,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionOptions {
     /// Extra coding-agent arguments, or the full argv for a shell command.
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, Option<OsString>)>,
+    /// Sent once at launch and never persisted, so a restore cannot replay it.
     pub initial_prompt: Option<OsString>,
+    /// Starting directory. Defaults to the worktree.
+    pub cwd: Option<PathBuf>,
+    /// Agent a restored shell runs once its integration has loaded.
+    pub resume: Option<ResumeCommand>,
+}
+
+/// An agent wrapper call that a restored shell evaluates through `POWER_RESUME`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeCommand {
+    /// Shell function name, which is the agent profile ID.
+    pub program: String,
+    pub args: Vec<OsString>,
 }
 
 pub struct PublishArtifact {
@@ -42,14 +58,33 @@ impl<T: TerminalRuntime> Application<T> {
         command: StartSession,
         options: SessionOptions,
     ) -> Result<Session> {
-        let profile = match &command.agent {
-            Agent::Shell => None,
-            Agent::Coding(id) => Some(self.agents.resolve(id)?),
-        };
         let session = Session {
             id: (self.new_id)(),
             worktree: self.workspace.open_worktree(&command.worktree)?,
             agent: command.agent,
+        };
+        // Save first so the runtime can record a conversation while it launches.
+        self.records.save(&SessionRecord {
+            id: session.id.clone(),
+            worktree: session.worktree.clone(),
+            agent: session.agent.clone(),
+            args: options.args.clone(),
+            env: options.env.clone(),
+            foreground: session.agent.clone(),
+            conversation: None,
+            cwd: None,
+        })?;
+        let id = session.id.clone();
+        self.launch(session, options).inspect_err(|_| {
+            let _ = self.records.remove(&id);
+        })
+    }
+
+    /// Starts a terminal under the session's existing ID without touching its record.
+    pub(crate) fn launch(&self, session: Session, options: SessionOptions) -> Result<Session> {
+        let profile = match &session.agent {
+            Agent::Shell => None,
+            Agent::Coding(id) => Some(self.agents.resolve(id)?),
         };
         let terminal = self.runtime.start(&session, options, profile)?;
         self.sessions.lock().unwrap().insert(
@@ -62,14 +97,25 @@ impl<T: TerminalRuntime> Application<T> {
         Ok(session)
     }
 
+    /// Ends a session and forgets it, so it is not restored after a restart.
     pub fn end_session(&self, id: &str) -> Result<()> {
-        let live = self
-            .sessions
-            .lock()
-            .unwrap()
-            .remove(id)
-            .context("Terminal session is unavailable")?;
-        self.runtime.end(live.terminal)
+        let live = self.sessions.lock().unwrap().remove(id);
+        // Remove the record even when the terminal is already gone.
+        self.records.remove(id)?;
+        self.runtime
+            .end(live.context("Terminal session is unavailable")?.terminal)
+    }
+
+    /// Saves the foreground state a restore resumes from.
+    pub fn record_foreground(
+        &self,
+        id: &str,
+        foreground: &Agent,
+        conversation: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<()> {
+        self.records
+            .update_foreground(id, foreground, conversation, cwd)
     }
 
     pub fn publish_artifact(&self, command: PublishArtifact) -> Result<ArtifactPublished> {
