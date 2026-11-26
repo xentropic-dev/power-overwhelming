@@ -1906,6 +1906,16 @@ impl Workspace {
                     dag.step(command);
                     cx.notify();
                 }
+                Some(command @ (Command::DagZoomIn | Command::DagZoomOut)) => {
+                    let steps = if command == Command::DagZoomIn {
+                        1.
+                    } else {
+                        -1.
+                    };
+                    if dag.zoom(steps) {
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }
             return;
@@ -2477,11 +2487,11 @@ impl Render for Workspace {
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
-            dag.render(colors, &self.keymap, move |index, cx| {
+            dag.render(colors, &self.keymap, move |action, cx| {
                 let _ = entity.update(cx, |this, cx| {
-                    if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == id && !dag.opening)
+                    if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == id)
+                        && dag.graph_action(action)
                     {
-                        dag.select(index);
                         cx.notify();
                     }
                 });
