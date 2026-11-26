@@ -95,7 +95,6 @@ impl ArtifactStore for SqliteArtifacts {
     }
 }
 
-#[allow(dead_code, reason = "Daemon integration follows the session registry")]
 pub struct SqliteSessions(Mutex<Connection>);
 
 #[allow(dead_code, reason = "Daemon integration follows the session registry")]
@@ -128,6 +127,7 @@ impl SqliteSessions {
     }
 }
 
+#[allow(dead_code, reason = "Daemon integration follows the session registry")]
 impl SessionStore for SqliteSessions {
     fn save(&self, record: &SessionRecord) -> Result<()> {
         let args: Vec<_> = record
