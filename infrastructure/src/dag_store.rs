@@ -1,10 +1,17 @@
 use crate::{persistence::state_directory, wire};
 use anyhow::{Context, Result};
 use application::dag::{DagReader, DagStore, DagTransaction, EventScope, OpenAttempt, now};
-use domain::dag::{Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState};
+use domain::{
+    dag::{Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState},
+    worktree::ManagedWorktree,
+};
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::IntoDeserializer};
-use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 pub(crate) struct SqliteDagStore(Mutex<Connection>);
 
@@ -135,6 +142,18 @@ impl DagDb<'_> {
 }
 
 impl DagReader for DagDb<'_> {
+    fn list_worktrees(&self, _box_id: Option<&str>) -> Result<Vec<ManagedWorktree>> {
+        todo!()
+    }
+
+    fn find_worktree_by_attempt(&self, _attempt: &str) -> Result<Option<ManagedWorktree>> {
+        todo!()
+    }
+
+    fn find_worktree_by_path(&self, _path: &Path) -> Result<Option<ManagedWorktree>> {
+        todo!()
+    }
+
     fn list_agents(&self, box_id: Option<&str>) -> Result<Vec<ManagedAgent>> {
         Ok(rows(
             self.0,
@@ -263,6 +282,14 @@ impl DagReader for DagDb<'_> {
 }
 
 impl DagTransaction for DagDb<'_> {
+    fn insert_worktree(&self, _worktree: &ManagedWorktree) -> Result<()> {
+        todo!()
+    }
+
+    fn remove_worktree(&self, _path: &Path) -> Result<()> {
+        todo!()
+    }
+
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
         self.0.execute(
             "INSERT INTO agents (id, box_id, worktree, provider, parent, session, state, label, created_at)

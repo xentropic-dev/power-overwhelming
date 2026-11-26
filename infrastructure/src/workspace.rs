@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use application::Workspace;
+use application::{BranchStatus, CreatedWorktree, Workspace, WorktreeRoot, WorktreeStatus};
 use std::{
     ffi::OsStr,
     os::unix::ffi::OsStrExt,
@@ -8,6 +8,14 @@ use std::{
 };
 
 pub struct LocalWorkspace;
+
+pub struct LocalWorktreeRoot;
+
+impl WorktreeRoot for LocalWorktreeRoot {
+    fn worktree_root(&self) -> Result<PathBuf> {
+        todo!()
+    }
+}
 
 pub struct Checkout {
     pub repository: PathBuf,
@@ -95,6 +103,32 @@ impl Workspace for LocalWorkspace {
             "Choose an existing worktree root"
         );
         Ok(worktree)
+    }
+
+    fn head(&self, _worktree: &Path) -> Result<String> {
+        todo!()
+    }
+
+    fn branch_exists(&self, _repository: &Path, _branch: &str) -> Result<BranchStatus> {
+        todo!()
+    }
+
+    fn create_worktree(
+        &self,
+        _repository: &Path,
+        _path: &Path,
+        _branch: &str,
+        _base: &str,
+    ) -> Result<CreatedWorktree> {
+        todo!()
+    }
+
+    fn worktree_status(&self, _path: &Path) -> Result<WorktreeStatus> {
+        todo!()
+    }
+
+    fn remove_worktree(&self, _path: &Path, _delete_branch: bool) -> Result<()> {
+        todo!()
     }
 
     fn open_artifact_file(&self, path: &Path) -> Result<PathBuf> {
