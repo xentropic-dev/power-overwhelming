@@ -16,7 +16,7 @@ use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
-    dag::{Coordinator, RunStatus},
+    dag::{AgentStatus, Coordinator, RunStatus},
     link::dag_run_id,
     session::{Agent, Session},
 };
@@ -91,6 +91,35 @@ fn empty_message(
         none.to_owned()
     } else {
         format!("{none_live} {toggle} shows {finished}.")
+    }
+}
+
+/// What one press of the end-worker key does to the selected agent.
+#[derive(Debug, Eq, PartialEq)]
+enum EndWorker {
+    NoSession,
+    /// The worker is still busy; the next press of the key ends it.
+    Confirm(String),
+    End(String),
+}
+
+/// A still-working worker needs a second press, so a stray key never cuts it off.
+fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndWorker {
+    let Some(session) = agent.session.clone() else {
+        return EndWorker::NoSession;
+    };
+    if armed == Some(agent.id.as_str()) {
+        return EndWorker::End(session);
+    }
+    match agent.status {
+        AgentStatus::Working | AgentStatus::NeedsInput => EndWorker::Confirm(format!(
+            "Worker is still working — press {key} again to end it."
+        )),
+        // Idle agents are interactive sessions such as coordinators, not finished workers.
+        AgentStatus::Idle => EndWorker::Confirm(format!(
+            "This agent has no task and may be in use — press {key} again to end its session."
+        )),
+        _ => EndWorker::End(session),
     }
 }
 
@@ -1667,6 +1696,40 @@ impl Workspace {
         let _ = self.dag_refresh.try_send(());
     }
 
+    /// Ends the agent tree's selected worker through the same path as ending its tab.
+    fn end_selected_worker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.keymap.first(Scope::AgentTree, Command::EndWorker);
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let Some(Choice::Agent(id)) = picker.selection() else {
+            return;
+        };
+        let Kind::Agents { tree, .. } = &picker.kind else {
+            return;
+        };
+        let Some(agent) = tree.agent(&id) else {
+            return;
+        };
+        let step = end_worker_step(agent, picker.armed_end.as_deref(), &key);
+        picker.armed_end = None;
+        let session = match step {
+            EndWorker::NoSession => {
+                self.show_error("This worker has no terminal session.", cx);
+                return;
+            }
+            EndWorker::Confirm(message) => {
+                picker.armed_end = Some(id);
+                picker.message = Some(message);
+                cx.notify();
+                return;
+            }
+            EndWorker::End(session) => session,
+        };
+        picker.message = None;
+        self.end_session(session, window, cx);
+    }
+
     fn open_worker(
         &mut self,
         modal_id: u64,
@@ -2190,11 +2253,14 @@ impl Workspace {
         }
     }
 
+    /// Ends a session, with or without an open tab, and removes any saved view of it.
     fn end_session(&mut self, session: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.terminals.get_mut(&session).filter(|tab| !tab.closing) else {
-            return;
-        };
-        tab.closing = true;
+        if let Some(tab) = self.terminals.get_mut(&session) {
+            if tab.closing {
+                return;
+            }
+            tab.closing = true;
+        }
         let target = session.clone();
         let end = cx.background_executor().spawn(async move {
             let result = client::end_session(target.clone());
@@ -2221,6 +2287,7 @@ impl Workspace {
                     }
                     this.error = None;
                     this.save();
+                    let _ = this.dag_refresh.try_send(());
                     this.restore_focus(window, cx);
                 }
                 Err(error) => {
@@ -2324,7 +2391,12 @@ impl Workspace {
             } else {
                 Scope::Dialog
             };
-            match self.keymap.command(scope, stroke) {
+            let command = self.keymap.command(scope, stroke);
+            if command != Some(Command::EndWorker) && picker.armed_end.take().is_some() {
+                picker.message = None;
+                cx.notify();
+            }
+            match command {
                 Some(Command::PickerCancel) => self.dismiss_picker(window, cx),
                 Some(Command::PickerSelect) => {
                     if event.is_held || picker.waiting {
@@ -2355,6 +2427,11 @@ impl Workspace {
                     if !picker.waiting {
                         picker.show_finished = !picker.show_finished;
                         let _ = self.dag_refresh.try_send(());
+                    }
+                }
+                Some(Command::EndWorker) => {
+                    if !event.is_held && !picker.waiting {
+                        self.end_selected_worker(window, cx);
                     }
                 }
                 Some(command @ (Command::AgentCollapse | Command::AgentExpand)) => {
@@ -3105,8 +3182,62 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Coordinator, LinkAction, Run, Task, empty_message, link_action, running_progress};
-    use domain::dag::TaskState;
+    use super::{
+        AgentStatus, Coordinator, EndWorker, LinkAction, ManagedAgent, Run, Task, empty_message,
+        end_worker_step, link_action, running_progress,
+    };
+    use domain::dag::{AgentState, Provider, TaskState};
+
+    #[test]
+    fn ending_a_busy_worker_needs_a_second_press() {
+        let mut agent = ManagedAgent {
+            id: "worker".into(),
+            box_id: "box".into(),
+            worktree: "/repo".into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: None,
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            status: AgentStatus::Working,
+            label: "worker".into(),
+            created_at: 0,
+        };
+        assert_eq!(
+            end_worker_step(&agent, None, "Ctrl+X"),
+            EndWorker::NoSession
+        );
+        agent.session = Some("session".into());
+        let end = EndWorker::End("session".into());
+        for status in [AgentStatus::Working, AgentStatus::NeedsInput] {
+            agent.status = status;
+            assert_eq!(
+                end_worker_step(&agent, None, "Ctrl+X"),
+                EndWorker::Confirm(
+                    "Worker is still working — press Ctrl+X again to end it.".into()
+                )
+            );
+            // Arming another worker does not confirm this one.
+            assert!(matches!(
+                end_worker_step(&agent, Some("other"), "Ctrl+X"),
+                EndWorker::Confirm(_)
+            ));
+            assert_eq!(end_worker_step(&agent, Some("worker"), "Ctrl+X"), end);
+        }
+        agent.status = AgentStatus::Idle;
+        assert!(matches!(
+            end_worker_step(&agent, None, "Ctrl+X"),
+            EndWorker::Confirm(_)
+        ));
+        assert_eq!(end_worker_step(&agent, Some("worker"), "Ctrl+X"), end);
+        for status in [AgentStatus::Done, AgentStatus::Failed] {
+            agent.status = status;
+            assert_eq!(end_worker_step(&agent, None, "Ctrl+X"), end);
+        }
+    }
 
     #[test]
     fn empty_pickers_name_the_toggle_while_finished_items_are_hidden() {

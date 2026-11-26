@@ -131,6 +131,8 @@ pub struct Picker {
     pub accept_pending: bool,
     /// Whether the run picker and agent tree list finished items too.
     pub show_finished: bool,
+    /// The still-working agent whose end key was pressed once, awaiting a second press.
+    pub armed_end: Option<String>,
     pub focus: FocusHandle,
     query: String,
     cursor: usize,
@@ -211,6 +213,7 @@ impl Picker {
             loading: false,
             accept_pending: false,
             show_finished: false,
+            armed_end: None,
             focus,
             query: String::new(),
             cursor: 0,

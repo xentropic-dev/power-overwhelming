@@ -372,6 +372,17 @@ fn main() -> Result<()> {
                 client::ensure_daemon()?;
                 print_json(json!({"agents": protocol_agents(box_sel, all)?}))
             }
+            AgentAction::End { id, box_sel } => {
+                client::ensure_daemon()?;
+                let agent = protocol_agents(box_sel, true)?
+                    .into_iter()
+                    .find(|agent| agent.id == id)
+                    .with_context(|| format!("No agent {id} in this box."))?;
+                let session = agent
+                    .session
+                    .with_context(|| format!("Agent {id} has no terminal session."))?;
+                client::end_session(session)
+            }
             AgentAction::Start {
                 box_sel,
                 provider,
@@ -459,6 +470,12 @@ enum AgentAction {
         /// Include exited and done agents.
         #[arg(long)]
         all: bool,
+    },
+    /// End an agent's terminal session, interrupting any attempt it still has open.
+    End {
+        id: String,
+        #[arg(long = "box")]
+        box_sel: Option<String>,
     },
     Start {
         #[arg(long = "box")]

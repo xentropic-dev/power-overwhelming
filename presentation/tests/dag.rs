@@ -1165,6 +1165,37 @@ fn interrupted_worker_requires_retry_and_old_reports_cannot_change_new_attempt()
 }
 
 #[test]
+fn agent_end_interrupts_a_working_worker() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.json(&[
+        "dag", "add-task", &run, "--id", "stop-me", "--title", "Stop me",
+    ]);
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "stop-me",
+        &fixture.worktrees[0],
+        false,
+        &["success", "never-released", "Unused"],
+    ));
+    fixture.wait_for_state(&run, "stop-me", TaskState::Working);
+    let ended = fixture.command(&["agent", "end", &agent.id, "--box", BOX_ID]);
+    assert_success(&ended);
+    let interrupted = fixture.wait_for_state(&run, "stop-me", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert_eq!(interrupted.attempts[0].state, AttemptState::Interrupted);
+    poll("ended agent to exit", || {
+        fixture
+            .agents()
+            .into_iter()
+            .find(|listed| listed.id == agent.id && json!(listed.state) == "exited")
+    });
+    let missing = fixture.command(&["agent", "end", "no-such-agent", "--box", BOX_ID]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No agent no-such-agent"));
+}
+
+#[test]
 fn dispatch_rejects_a_worktree_from_another_repository() {
     let fixture = Fixture::new();
     let foreign = fixture.root().join("foreign-repo");
