@@ -12,6 +12,8 @@ power dag report needs-input --summary "Which configuration should I use?"
 power dag report working --summary "Configuration confirmed"
 ```
 
+Publish screenshots, reports, HTML pages, and other visual results from your worker session with `power artifact publish <file> --title "..."` so they appear on your task's node. Mention relevant artifacts and their links in your final summary.
+
 Before exiting this terminal, report the outcome with one of these commands.
 
 - When done: `power dag report success --summary "Reviewed setup and identified two missing steps"`
