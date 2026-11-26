@@ -142,9 +142,9 @@ impl Default for AgentProfiles {
 /// jcode takes no instructions flag, no prompt argument and no session ID of Power's
 /// choosing, so Power types its instructions and the initial prompt as the first message.
 /// The TUI runs its agents in a `jcode serve` daemon, and the bash tool runs there too
-/// with the daemon's environment. A private socket per Power session gives each agent its
-/// own daemon, started by that agent's TUI, so its commands see the worker's `POWER_*`
-/// variables and ending the worker's process tree ends its daemon. The bash tool exports
+/// with the daemon's environment. A private socket per launch gives each agent its own
+/// daemon, started by that agent's TUI, so its commands see the worker's `POWER_*`
+/// variables. A restore gets a new daemon and stops the one its previous launch left. The bash tool exports
 /// `JCODE_SESSION_ID`, which `power session task` reports for a restore to resume.
 fn jcode() -> AgentProfile {
     let mut profile = builtin(
@@ -200,10 +200,7 @@ fn jcode() -> AgentProfile {
         // conversation rather than pick one from the session list.
         resume(&[], &["--resume", "{id}"], &[], &["--resume"]),
     );
-    profile.env = vec![(
-        "JCODE_SOCKET".into(),
-        "{runtime}/jcode-{session}.sock".into(),
-    )];
+    profile.server_socket_env = Some("JCODE_SOCKET".into());
     profile.conversation_env = Some("JCODE_SESSION_ID".into());
     profile
 }
@@ -228,6 +225,7 @@ fn builtin(
         resume: Some(resume),
         env: Vec::new(),
         conversation_env: None,
+        server_socket_env: None,
     }
 }
 

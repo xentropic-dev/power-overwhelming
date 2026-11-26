@@ -351,6 +351,7 @@ mod tests {
             resume: None,
             env: Vec::new(),
             conversation_env: None,
+            server_socket_env: None,
         }
     }
 

@@ -225,6 +225,9 @@ fn launch(
         .clone()
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
+    // No process of this session runs now, so a server still listening on one of its
+    // earlier launch sockets is an orphan of a previous daemon.
+    crate::agent_socket::reclaim(&session.id, &runtime.socket);
     let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
     // Profiles that take no prompt argument get the initial prompt typed with their
     // instructions instead.
@@ -253,11 +256,12 @@ fn launch(
     {
         process.arg(prompt);
     }
-    configure(&mut process, runtime, session, &options, &cwd, profile);
+    let server = configure(&mut process, runtime, session, &options, &cwd, profile);
     // The fresh start never repeats the initial prompt.
     let fallback = match (profile, &options.fallback_args) {
         (Some(profile), Some(args)) => {
             let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
+            // The fresh start gets its own server socket.
             configure(
                 &mut command,
                 runtime,
@@ -294,6 +298,7 @@ fn launch(
         Some((command, conversation, fresh_typed)) => Some(Relaunch {
             command,
             conversation,
+            stale_server: server,
             slave: pair.slave,
             deadline: Instant::now() + RESUME_WINDOW,
             typed: fresh_typed.as_deref().map(crate::shell::typed_message),
@@ -383,9 +388,9 @@ fn launch(
                 );
                 let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
                 let _ = waiter_tx.send(Command::Relaunched(pid));
-                if conversation.is_some() {
-                    waiter_lifecycle.record_foreground(&launched, conversation, None, false);
-                }
+                // A fresh start without a preassigned ID clears the rejected one, so a
+                // later restore cannot return to it. The new ID is saved when it reports.
+                waiter_lifecycle.record_foreground(&launched, conversation, None, false);
             },
         );
         let detail = match result {
@@ -464,11 +469,11 @@ fn configure(
     options: &SessionOptions,
     cwd: &Path,
     profile: Option<&AgentProfile>,
-) {
-    for (name, value) in profile
+) -> Option<PathBuf> {
+    let (env, server) = profile
         .map(|profile| crate::shell::profile_env(profile, &session.id, &runtime.socket))
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    for (name, value) in env {
         process.env(name, value);
     }
     for (name, value) in &options.env {
@@ -497,6 +502,7 @@ fn configure(
             process.env("PATH", path);
         }
     }
+    server
 }
 
 type Child = Box<dyn portable_pty::Child + Send + Sync>;
@@ -506,6 +512,8 @@ struct Relaunch {
     command: CommandBuilder,
     /// Conversation the fresh start pins, if its profile can assign one.
     conversation: Option<String>,
+    /// The failed resume's server socket. Any server it started is stopped first.
+    stale_server: Option<PathBuf>,
     slave: Box<dyn portable_pty::SlavePty + Send>,
     /// An exit after this is a normal exit, not a failed resume.
     deadline: Instant,
@@ -537,6 +545,10 @@ fn wait_process(
                     return Ok(status);
                 };
                 input.held = None;
+                if let Some(server) = &next.stale_server {
+                    crate::agent_socket::stop_listeners(server);
+                    let _ = std::fs::remove_file(server);
+                }
                 let seen = input.ready.count();
                 match next.slave.spawn_command(next.command) {
                     Ok(child) => {
@@ -1554,6 +1566,7 @@ mod tests {
         let relaunch = Relaunch {
             command: shell(fresh),
             conversation: Some("conv-1".into()),
+            stale_server: None,
             slave: pair.slave,
             deadline: Instant::now() + window,
             typed: Some(b"fresh input".to_vec()),
@@ -1856,6 +1869,7 @@ mod tests {
             resume: None,
             env: Vec::new(),
             conversation_env: None,
+            server_socket_env: None,
         });
         assert_eq!(
             agent_for_program("/opt/agent/bin/assistant.mjs", &profiles),

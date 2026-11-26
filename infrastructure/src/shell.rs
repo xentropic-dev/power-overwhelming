@@ -507,16 +507,23 @@ pub(crate) fn typed_message(message: &str) -> Vec<u8> {
     input
 }
 
-/// The profile's launch environment for a session of the daemon listening on `socket`.
+/// The profile's launch environment for a session of the daemon listening on `socket`,
+/// and the private server socket this launch gets, if the profile asks for one.
 pub(crate) fn profile_env(
     profile: &AgentProfile,
     session: &str,
     socket: &Path,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, Option<PathBuf>) {
     // A relative socket from `POWER_SOCKET` would leave the directory empty.
-    let socket = std::path::absolute(socket).unwrap_or_else(|_| socket.to_owned());
-    let runtime = socket.parent().unwrap_or(Path::new("/"));
-    profile.launch_env(session, &runtime.to_string_lossy())
+    let absolute = std::path::absolute(socket).unwrap_or_else(|_| socket.to_owned());
+    let runtime = absolute.parent().unwrap_or(Path::new("/"));
+    let mut env = profile.launch_env(session, &runtime.to_string_lossy());
+    let server = profile.server_socket_env.as_ref().map(|name| {
+        let server = crate::agent_socket::launch_socket(session, socket);
+        env.push((name.clone(), server.to_string_lossy().into_owned()));
+        server
+    });
+    (env, server)
 }
 
 /// Power's instructions for an agent it starts.
@@ -559,11 +566,7 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
         std::env::var_os("POWER_SESSION"),
         std::env::var_os("POWER_SOCKET"),
     ) {
-        command.envs(profile_env(
-            profile,
-            &session.to_string_lossy(),
-            Path::new(&socket),
-        ));
+        command.envs(profile_env(profile, &session.to_string_lossy(), Path::new(&socket)).0);
     }
     command.args(instruction_args(
         profile,
@@ -764,22 +767,23 @@ mod tests {
     }
 
     #[test]
-    fn jcode_gets_a_private_socket_per_session() -> Result<()> {
+    fn jcode_gets_a_private_socket_per_launch() -> Result<()> {
         let profiles = AgentProfiles::default();
-        let env = profile_env(
-            profiles.resolve(&"jcode".into())?,
-            "abc",
-            Path::new("/run/user/1000/power-overwhelming.sock"),
-        );
+        let jcode = profiles.resolve(&"jcode".into())?;
+        let runtime = tempfile::tempdir()?;
+        let power = &runtime.path().join("power-overwhelming.sock");
+        let (env, server) = profile_env(jcode, "abc", power);
+        let server = server.unwrap();
         assert_eq!(
             env,
-            [(
-                "JCODE_SOCKET".to_owned(),
-                "/run/user/1000/jcode-abc.sock".to_owned()
-            )]
+            [("JCODE_SOCKET".to_owned(), server.to_string_lossy().into())]
         );
-        assert!(
-            profile_env(profiles.resolve(&"claude".into())?, "abc", Path::new("/s")).is_empty()
+        assert_eq!(server.parent(), power.parent());
+        assert_ne!(profile_env(jcode, "abc", power).1, Some(server));
+        let claude = profiles.resolve(&"claude".into())?;
+        assert_eq!(
+            profile_env(claude, "abc", Path::new("/s")),
+            (Vec::new(), None)
         );
         Ok(())
     }

@@ -55,6 +55,11 @@ pub struct AgentProfile {
     /// commands it runs. `power session task`, `power session model` and `power dag
     /// report` read it and report the conversation, so a restore can resume it.
     pub conversation_env: Option<String>,
+    /// Environment variable that names a private server socket for the agent. Each
+    /// launch gets its own short socket path, and a new launch of a session stops any
+    /// server still listening on an earlier launch's socket, so a restore never reattaches
+    /// to a server outside its process tree.
+    pub server_socket_env: Option<String>,
 }
 
 impl AgentProfile {
@@ -125,6 +130,33 @@ impl Resume {
             Some(id) if !self.assign.is_empty() => Self::substitute(&self.assign, id),
             _ => Vec::new(),
         }
+    }
+
+    /// `args` without the options that select a conversation by ID, such as
+    /// `--resume <id>` or `--resume=<id>`, so a restore can pass its own selector instead
+    /// of a second, conflicting one.
+    pub fn without_selectors(&self, args: &[OsString]) -> Vec<OsString> {
+        let flags: Vec<&str> = self
+            .assign
+            .windows(2)
+            .chain(self.resume.windows(2))
+            .filter(|pair| pair[1] == "{id}")
+            .map(|pair| pair[0].as_str())
+            .collect();
+        let mut kept = Vec::with_capacity(args.len());
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            let text = arg.to_string_lossy();
+            if flags.iter().any(|flag| text == *flag) {
+                args.next();
+            } else if !flags.iter().any(|flag| {
+                text.strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+            }) {
+                kept.push(arg.clone());
+            }
+        }
+        kept
     }
 
     fn substitute(args: &[String], id: &str) -> Vec<OsString> {
@@ -259,10 +291,30 @@ mod tests {
             resume: None,
             env: vec![("SOCKET".into(), "{runtime}/agent-{session}.sock".into())],
             conversation_env: None,
+            server_socket_env: None,
         };
         assert_eq!(
             profile.launch_env("abc", "/run/user/1"),
             [("SOCKET".to_owned(), "/run/user/1/agent-abc.sock".to_owned())]
+        );
+    }
+
+    #[test]
+    fn without_selectors_drops_id_options_in_both_spellings() {
+        let args: Vec<OsString> = [
+            "--model",
+            "m",
+            "--resume",
+            "old",
+            "--session-id=x",
+            "--resume=other",
+            "--resumes",
+        ]
+        .map(Into::into)
+        .into();
+        assert_eq!(
+            resume_spec().without_selectors(&args),
+            ["--model", "m", "--resumes"].map(OsString::from)
         );
     }
 

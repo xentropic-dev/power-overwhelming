@@ -720,6 +720,7 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
             }),
             env: Vec::new(),
             conversation_env: None,
+            server_socket_env: None,
         })
         .collect();
     Arc::new(Application::new(

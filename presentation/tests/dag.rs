@@ -779,15 +779,10 @@ read -r finish
     assert_eq!(agent.provider, Provider::Agent("jcode".into()));
     let task = fixture.wait_for_state(&run, "light", TaskState::Completed);
     assert_eq!(task.attempts[0].summary.as_deref(), Some("jcode done"));
-    let session = attempt.session.unwrap();
-    assert_eq!(
-        fs::read_to_string(fixture.root().join("jcode.socket")).unwrap(),
-        fixture
-            .root()
-            .join(format!("jcode-{session}.sock"))
-            .to_str()
-            .unwrap()
-    );
+    assert!(attempt.session.is_some());
+    let socket = fs::read_to_string(fixture.root().join("jcode.socket")).unwrap();
+    assert_eq!(Path::new(&socket).parent(), Some(fixture.root()));
+    assert!(socket.len() <= 107, "{socket}");
     let message = fs::read_to_string(fixture.root().join("jcode.message")).unwrap();
     assert!(
         message.starts_with("\x1b[200~You are running inside Power Overwhelming."),
@@ -796,6 +791,152 @@ read -r finish
     assert!(message.contains("Task: light"), "{message:?}");
     assert!(message.contains("power dag report success"), "{message:?}");
     assert!(message.trim_end().ends_with("\x1b[201~"), "{message:?}");
+}
+
+/// Configures a fake jcode at `root/jcode` running `script` after a common preamble that
+/// counts launches and records each one's working directory, arguments and socket.
+fn fake_jcode(root: &Path, script: &str) {
+    let program = root.join("jcode");
+    fs::write(
+        &program,
+        format!(
+            r#"#!/bin/sh
+set -eu
+dir="${{POWER_SOCKET%/*}}"
+n=$(($(cat "$dir/jcode.count" 2>/dev/null || echo 0) + 1))
+echo "$n" > "$dir/jcode.count"
+pwd -P > "$dir/jcode.$n.cwd"
+printf '%s\n' "$@" > "$dir/jcode.$n.args"
+printf '%s' "$JCODE_SOCKET" > "$dir/jcode.$n.socket"
+stty -echo
+# Like a TUI in raw mode, announce that typed input is welcome.
+printf '\033[?2004h'
+end="$(printf '\033')[201~"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$dir/jcode.$n.message"
+    case "$line" in *"$end"*) break ;; esac
+done
+# The second Enter arrives as an empty line.
+IFS= read -r second
+test -z "$second"
+{script}
+read -r finish
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    write_config(
+        root,
+        &format!(
+            "agents.jcode = {{ command = {:?} }}",
+            program.to_str().unwrap()
+        ),
+    );
+}
+
+#[test]
+fn restart_resumes_an_active_jcode_worker_once_in_its_worktree_and_it_continues() {
+    let mut fixture = Fixture::with_configure(|root| {
+        // The first launch reports its conversation and works until the restart. The
+        // resumed one reports the result.
+        fake_jcode(
+            root,
+            r#"if test "$n" = 1; then
+    JCODE_SESSION_ID=session_dag_1 "$POWER_BIN" session task working
+    touch "$dir/jcode.reported"
+else
+    JCODE_SESSION_ID="$2" "$POWER_BIN" dag report success --summary "resumed $2"
+fi"#,
+        );
+    });
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "long");
+    let worktree = fixture.worktrees[0].clone();
+    // A selector from the dispatch must not reach the restore as a second `--resume`.
+    let (attempt, _) = dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "long",
+        "--provider",
+        "jcode",
+        "--worktree",
+        worktree.to_str().unwrap(),
+        "--",
+        "--resume",
+        "session_stale",
+    ]));
+    let reported = fixture.root().join("jcode.reported");
+    poll("jcode to report its conversation", || {
+        reported.is_file().then_some(())
+    });
+
+    fixture.restart();
+
+    let task = fixture.wait_for_state(&run, "long", TaskState::Completed);
+    assert_eq!(task.attempts.len(), 1);
+    assert_eq!(task.attempts[0].id, attempt.id);
+    assert_eq!(
+        task.attempts[0].summary.as_deref(),
+        Some("resumed session_dag_1")
+    );
+    let read = |name: &str| fs::read_to_string(fixture.root().join(name)).unwrap();
+    assert_eq!(read("jcode.count"), "2\n");
+    assert_eq!(read("jcode.1.args"), "--resume\nsession_stale\n");
+    assert_eq!(read("jcode.2.args"), "--resume\nsession_dag_1\n");
+    for launch in 1..=2 {
+        assert_eq!(
+            read(&format!("jcode.{launch}.cwd")).trim_end(),
+            worktree.to_str().unwrap()
+        );
+    }
+    assert_ne!(read("jcode.1.socket"), read("jcode.2.socket"));
+    let first = read("jcode.1.message");
+    assert!(first.contains("Task: long"), "{first:?}");
+    // The resumed worker is told to continue, and the initial prompt is not replayed.
+    let resumed = read("jcode.2.message");
+    assert!(
+        resumed.contains("Power restarted and resumed this session."),
+        "{resumed:?}"
+    );
+    assert!(
+        resumed.contains(&format!("run {run}, task long")),
+        "{resumed:?}"
+    );
+    assert!(!resumed.contains("Task: long"), "{resumed:?}");
+}
+
+#[test]
+#[ignore = "enable when #83 lands: cgroup cleanup ends a worker's tree after a terminal report"]
+fn jcode_worker_tree_ends_after_its_terminal_report() {
+    let fixture = Fixture::with_configure(|root| {
+        // Like jcode's server, the child leaves the worker's Unix session.
+        fake_jcode(
+            root,
+            r#"setsid sleep 300 < /dev/null > /dev/null 2>&1 &
+echo "$!" > "$dir/detached.pid"
+"$POWER_BIN" dag report success --summary "done""#,
+        );
+    });
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "tree");
+    dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "tree",
+        "--provider",
+        "jcode",
+        "--worktree",
+        fixture.worktrees[0].to_str().unwrap(),
+    ]));
+    fixture.wait_for_state(&run, "tree", TaskState::Completed);
+    let pid = fs::read_to_string(fixture.root().join("detached.pid")).unwrap();
+    let proc = PathBuf::from(format!("/proc/{}", pid.trim()));
+    poll("the detached child to exit", || {
+        (!proc.exists()).then_some(())
+    });
 }
 
 #[test]

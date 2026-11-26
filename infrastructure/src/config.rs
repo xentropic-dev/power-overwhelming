@@ -142,6 +142,9 @@ pub fn agent_profiles(sections: &Sections) -> Result<AgentProfiles> {
     let entries = section
         .as_object()
         .context("agents must be a table keyed by profile ID")?;
+    // Lua tables have no order, so new profiles follow the built-in ones by ID.
+    let mut entries: Vec<_> = entries.iter().collect();
+    entries.sort_by_key(|(id, _)| *id);
     for (id, value) in entries {
         let profile = read_agent_profile(id, value.clone(), &profiles)
             .with_context(|| format!("Read agents[{id:?}] from config.lua"))?;
@@ -170,6 +173,7 @@ struct ProfileConfig {
     resume: Option<ResumeConfig>,
     env: Option<std::collections::BTreeMap<String, String>>,
     conversation_env: Option<String>,
+    server_socket_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +245,7 @@ fn read_agent_profile(
             resume: None,
             env: Vec::new(),
             conversation_env: None,
+            server_socket_env: None,
         });
     if let Some(command) = config.command {
         anyhow::ensure!(
@@ -283,6 +288,13 @@ fn read_agent_profile(
     }
     if let Some(name) = config.conversation_env {
         profile.conversation_env = (!name.is_empty()).then_some(name);
+    }
+    if let Some(name) = config.server_socket_env {
+        anyhow::ensure!(
+            !name.contains(['=', '\0']),
+            "server_socket_env must contain no = or NUL"
+        );
+        profile.server_socket_env = (!name.is_empty()).then_some(name);
     }
     if let Some(config) = config.resume {
         let defaults = profile.resume.take().unwrap_or_default();
@@ -557,8 +569,9 @@ mod tests {
                 injection = { kind = "first_message" },
                 env = { AGENT_SOCKET = "{runtime}/agent-{session}.sock" },
                 conversation_env = "AGENT_SESSION",
+                server_socket_env = "AGENT_SERVER",
             }
-            agents.jcode = { env = {}, conversation_env = "" }
+            agents.jcode = { env = {}, conversation_env = "", server_socket_env = "" }
             "#,
             Path::new("config.lua"),
             [(AGENTS_SECTION.into(), json!({}))].into(),
@@ -574,20 +587,17 @@ mod tests {
             )]
         );
         assert_eq!(custom.conversation_env.as_deref(), Some("AGENT_SESSION"));
+        assert_eq!(custom.server_socket_env.as_deref(), Some("AGENT_SERVER"));
         let jcode = profiles.resolve(&"jcode".into())?;
         assert!(jcode.env.is_empty());
         assert_eq!(jcode.conversation_env, None);
+        assert_eq!(jcode.server_socket_env, None);
         assert_eq!(jcode.injection, Injection::FirstMessage);
 
         let builtin = AgentProfiles::default();
         let jcode = builtin.resolve(&"jcode".into())?;
-        assert_eq!(
-            jcode.env,
-            [(
-                "JCODE_SOCKET".into(),
-                "{runtime}/jcode-{session}.sock".into()
-            )]
-        );
+        assert!(jcode.env.is_empty());
+        assert_eq!(jcode.server_socket_env.as_deref(), Some("JCODE_SOCKET"));
         assert_eq!(jcode.conversation_env.as_deref(), Some("JCODE_SESSION_ID"));
         Ok(())
     }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod daemon;
 pub mod plugins;
 
+mod agent_socket;
 mod dag_adapter;
 mod dag_store;
 mod persistence;
