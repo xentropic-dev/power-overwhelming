@@ -1,4 +1,6 @@
-use crate::{Application, SessionOptions, StartSession, TerminalRuntime};
+use crate::{
+    Application, BranchStatus, SessionOptions, StartSession, TerminalRuntime, WorktreeRoot,
+};
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
     dag::{
@@ -7,7 +9,7 @@ use domain::{
         TaskState, can_dispatch, report_transition, validate_batch,
     },
     session::Agent,
-    worktree::{ManagedWorktree, WorktreeRequest},
+    worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
 };
 use std::{
     collections::BTreeMap,
@@ -117,6 +119,9 @@ pub struct Dispatch {
 pub struct DispatchResult {
     pub agent: ManagedAgent,
     pub attempt: Attempt,
+    pub worktree: PathBuf,
+    /// The branch when this dispatch creates or resumes a managed worktree.
+    pub branch: Option<String>,
 }
 
 pub struct ReportResult {
@@ -128,15 +133,20 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry> {
     application: Arc<Application<T>>,
     store: S,
     registry: B,
+    worktree_root: Option<Box<dyn WorktreeRoot>>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
 
-struct Worker {
-    agent: ManagedAgent,
-    args: Vec<String>,
-    prompt: Option<String>,
-    attempt: Option<WorkerAttempt>,
+struct DispatchWorktree {
+    path: PathBuf,
+    kind: DispatchWorktreeKind,
+}
+
+enum DispatchWorktreeKind {
+    Existing,
+    Resume(String),
+    New { branch: String, base: String },
 }
 
 struct WorkerAttempt {
@@ -152,9 +162,16 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             application,
             store,
             registry,
+            worktree_root: None,
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
+    }
+
+    /// Enables managed worktree dispatch for stores and workspaces that support it.
+    pub fn with_worktree_root(mut self, root: impl WorktreeRoot + 'static) -> Self {
+        self.worktree_root = Some(Box::new(root));
+        self
     }
 
     pub fn boxes(&self) -> Result<Vec<BoxInfo>> {
@@ -263,7 +280,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             .read(|db| self.resolve_box(db, &command.selection))?
             .context("Choose a box with --box or start the agent from a Power terminal")?;
         let worktree = self.validate_worktree(&box_id, &command.worktree)?;
-        self.spawn_worker(|db| {
+        self.worker_transaction(|db, launched| {
             let parent = if let Some(id) = command.parent {
                 ensure!(
                     db.agent(&id)?.box_id == box_id,
@@ -276,20 +293,16 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                     .transpose()?
                     .map(|agent| agent.id)
             };
-            Ok(Worker {
-                agent: self.new_agent(box_id, worktree, command.provider, parent, command.label),
-                args: command.args,
-                prompt: command.prompt,
-                attempt: None,
-            })
+            let mut agent =
+                self.new_agent(box_id, worktree, command.provider, parent, command.label);
+            self.launch_worker(&mut agent, command.args, command.prompt, launched)?;
+            db.insert_agent(&agent)?;
+            Ok(agent)
         })
-        .map(|(agent, _)| agent)
     }
 
     pub fn dispatch(&self, command: Dispatch) -> Result<DispatchResult> {
-        let box_id = self.store.read(|db| db.run_box(&command.run))?;
-        let worktree = self.validate_worktree(&box_id, &command.worktree)?;
-        let (agent, attempt) = self.spawn_worker(|db| {
+        self.worker_transaction(|db, launched| {
             let run = load_run(db, &command.run)?;
             let task = find_task(&run, &command.task)?;
             ensure!(
@@ -311,132 +324,170 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
                     .checked_add(1)
                     .context("Too many attempts for this task")
             })?;
-            let prompt = (command.provider != Provider::Command)
-                .then(|| worker_prompt(&run, task, &worktree));
-            let label = task.title.clone();
+            let entry = self.registered_box(&run.box_id)?;
+            let caller = self.hosted_caller(command.caller.as_deref());
+            let DispatchWorktree { path, kind } =
+                self.dispatch_worktree(db, &entry.info, task, &command, caller)?;
             // An external coordinator keeps its reference on the run, so its workers have no
             // parent agent, whatever terminal the CLI happens to run in. A Power caller that this
             // daemon hosts becomes the parent; otherwise the run's coordinating agent is.
-            let parent = match run.coordinator {
+            let parent = match &run.coordinator {
                 Coordinator::External { .. } => None,
-                Coordinator::Agent { agent } => match self.hosted_caller(command.caller.as_deref()) {
-                    Some(session) => Some(self.register_caller(db, session, &box_id)?.id),
-                    None => Some(agent),
+                Coordinator::Agent { agent } => match caller {
+                    Some(session) => Some(self.register_caller(db, session, &run.box_id)?.id),
+                    None => Some(agent.clone()),
                 },
             };
-            Ok(Worker {
-                agent: self.new_agent(box_id, worktree, command.provider, parent, label),
-                args: command.args,
-                prompt,
-                attempt: Some(WorkerAttempt {
-                    id: self.new_id(),
-                    run: command.run,
-                    task: command.task,
-                    number,
-                }),
-            })
-        })?;
-        Ok(DispatchResult {
-            agent,
-            attempt: attempt.expect("dispatch creates an attempt"),
+            let target = WorkerAttempt {
+                id: self.new_id(),
+                run: command.run,
+                task: command.task,
+                number,
+            };
+            let mut agent = self.new_agent(
+                run.box_id.clone(),
+                path,
+                command.provider,
+                parent,
+                task.title.clone(),
+            );
+            agent.run = Some(target.run.clone());
+            agent.task = Some(target.task.clone());
+            agent.attempt = Some(target.id.clone());
+            let provisioning = matches!(kind, DispatchWorktreeKind::New { .. });
+            let mut ownership = None;
+            let start = (|| -> Result<_> {
+                let (branch, resuming) = match kind {
+                    DispatchWorktreeKind::Existing => (None, false),
+                    DispatchWorktreeKind::Resume(branch) => (Some(branch), true),
+                    DispatchWorktreeKind::New { branch, base } => {
+                        let worktree = self.create_dispatch_worktree(
+                            &agent,
+                            &target,
+                            entry.info.repository,
+                            &branch,
+                            &base,
+                        )?;
+                        agent.worktree.clone_from(&worktree.path);
+                        ownership = Some(worktree);
+                        (Some(branch), false)
+                    }
+                };
+                let prompt = (agent.provider != Provider::Command).then(|| {
+                    worker_prompt(&run, task, &agent.worktree, branch.as_deref(), resuming)
+                });
+                self.launch_worker(&mut agent, command.args, prompt, launched)?;
+                Ok(branch)
+            })();
+            let start = match start {
+                Err(error) if !provisioning => return Err(error),
+                Err(error) => {
+                    agent.state = AgentState::Exited;
+                    Err(error)
+                }
+                success => success,
+            };
+            let attempt = insert_dispatch_attempt(db, &agent, target, start.as_ref().err())?;
+            if let Some(ownership) = ownership {
+                db.insert_worktree(&ownership)?;
+            }
+            // Commit the failed attempt, if any, before returning the error to the caller.
+            Ok(start.map(|branch| DispatchResult {
+                worktree: attempt.worktree.clone(),
+                agent,
+                attempt,
+                branch,
+            }))
+        })?
+    }
+
+    fn create_dispatch_worktree(
+        &self,
+        agent: &ManagedAgent,
+        target: &WorkerAttempt,
+        repository: PathBuf,
+        branch: &str,
+        base: &str,
+    ) -> Result<ManagedWorktree> {
+        let created = self.application.workspace.create_worktree(
+            &repository,
+            &agent.worktree,
+            branch,
+            base,
+        )?;
+        Ok(ManagedWorktree {
+            box_id: agent.box_id.clone(),
+            repository,
+            path: created.path,
+            branch: branch.to_owned(),
+            base_commit: created.base_commit,
+            created_at: now(),
+            creator: WorktreeCreator::Attempt {
+                run: target.run.clone(),
+                task: target.task.clone(),
+                attempt: target.id.clone(),
+            },
         })
     }
 
-    fn spawn_worker(
+    fn worker_transaction<R>(
         &self,
-        prepare: impl FnOnce(&dyn DagTransaction) -> Result<Worker>,
-    ) -> Result<(ManagedAgent, Option<Attempt>)> {
+        operation: impl FnOnce(&dyn DagTransaction, &mut Option<String>) -> Result<R>,
+    ) -> Result<R> {
         // A fast worker can connect immediately. A report or exit waits for this
         // transaction to commit so it observes the new agent and attempt together.
         let mut launched = None;
-        let result = self.write(|db| {
-            let Worker {
-                mut agent,
-                args,
-                prompt,
-                attempt,
-            } = prepare(db)?;
-            if let Some(target) = &attempt {
-                agent.run = Some(target.run.clone());
-                agent.task = Some(target.task.clone());
-                agent.attempt = Some(target.id.clone());
-            }
-            let terminal = terminal_agent(&agent.provider);
-            let initial_prompt = if agent.provider == Provider::Command {
-                ensure!(
-                    args.first().is_some_and(|program| !program.is_empty()),
-                    "Specify a command after --"
-                );
-                None
-            } else {
-                prompt.map(Into::into)
-            };
-            let env = [
-                ("POWER_BOX", Some(agent.box_id.as_str())),
-                ("POWER_AGENT", Some(agent.id.as_str())),
-                ("POWER_RUN", agent.run.as_deref()),
-                ("POWER_TASK", agent.task.as_deref()),
-                ("POWER_ATTEMPT", agent.attempt.as_deref()),
-            ]
-            .into_iter()
-            .map(|(name, value)| (name.into(), value.map(OsString::from)))
-            .collect();
-            let session = self.application.start_session_with(
-                StartSession {
-                    worktree: agent.worktree.clone(),
-                    agent: terminal,
-                },
-                SessionOptions {
-                    args: args.into_iter().map(OsString::from).collect(),
-                    env,
-                    initial_prompt,
-                },
-            )?;
-            launched = Some(session.id.clone());
-            agent.session = Some(session.id);
-            agent.worktree = session.worktree;
-            db.insert_agent(&agent)?;
-            let attempt = if let Some(WorkerAttempt {
-                run,
-                task,
-                id,
-                number,
-            }) = attempt
-            {
-                let attempt = Attempt {
-                    id,
-                    number,
-                    agent: agent.id.clone(),
-                    session: agent.session.clone(),
-                    worktree: agent.worktree.clone(),
-                    provider: agent.provider.clone(),
-                    state: AttemptState::Active,
-                    summary: None,
-                    blocker: None,
-                    detail: None,
-                    started_at: agent.created_at,
-                    ended_at: None,
-                };
-                db.insert_attempt(&run, &task, &attempt)?;
-                db.event(
-                    &run,
-                    RunEventKind::AttemptStarted,
-                    Some(&task),
-                    Some(&attempt.id),
-                    None,
-                )?;
-                Some(attempt)
-            } else {
-                None
-            };
-            Ok((agent, attempt))
-        });
+        let result = self.write(|db| operation(db, &mut launched));
         if result.is_err()
             && let Some(session) = launched
         {
             let _ = self.application.end_session(&session);
         }
         result
+    }
+
+    fn launch_worker(
+        &self,
+        agent: &mut ManagedAgent,
+        args: Vec<String>,
+        prompt: Option<String>,
+        launched: &mut Option<String>,
+    ) -> Result<()> {
+        let terminal = terminal_agent(&agent.provider);
+        let initial_prompt = if agent.provider == Provider::Command {
+            ensure!(
+                args.first().is_some_and(|program| !program.is_empty()),
+                "Specify a command after --"
+            );
+            None
+        } else {
+            prompt.map(Into::into)
+        };
+        let env = [
+            ("POWER_BOX", Some(agent.box_id.as_str())),
+            ("POWER_AGENT", Some(agent.id.as_str())),
+            ("POWER_RUN", agent.run.as_deref()),
+            ("POWER_TASK", agent.task.as_deref()),
+            ("POWER_ATTEMPT", agent.attempt.as_deref()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.map(OsString::from)))
+        .collect();
+        let session = self.application.start_session_with(
+            StartSession {
+                worktree: agent.worktree.clone(),
+                agent: terminal,
+            },
+            SessionOptions {
+                args: args.into_iter().map(OsString::from).collect(),
+                env,
+                initial_prompt,
+            },
+        )?;
+        *launched = Some(session.id.clone());
+        agent.session = Some(session.id);
+        agent.worktree = session.worktree;
+        Ok(())
     }
 
     pub fn report(
@@ -551,7 +602,11 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
     /// Power terminal, which can belong to another daemon when a coordinator runs in a
     /// multiplexer inside Power and targets a different socket.
     fn hosted_caller<'a>(&self, caller: Option<&'a str>) -> Option<&'a str> {
-        caller.filter(|session| self.application.session_is_running(session).unwrap_or(false))
+        caller.filter(|session| {
+            self.application
+                .session_is_running(session)
+                .unwrap_or(false)
+        })
     }
 
     fn register_caller(
@@ -595,15 +650,90 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
         let WorktreeRequest::Existing(worktree) = request else {
             bail!("Worktree provisioning is unavailable");
         };
-        let entry = self
-            .registry
-            .boxes()?
-            .into_iter()
-            .find(|entry| entry.info.id == box_id)
-            .with_context(|| format!("Unknown box {box_id:?}"))?;
+        let entry = self.registered_box(box_id)?;
         self.application
             .workspace
             .validate_box_worktree(&entry.info.repository, worktree)
+    }
+
+    fn registered_box(&self, box_id: &str) -> Result<RegisteredBox> {
+        self.registry
+            .boxes()?
+            .into_iter()
+            .find(|entry| entry.info.id == box_id)
+            .with_context(|| format!("Unknown box {box_id:?}"))
+    }
+
+    fn dispatch_worktree(
+        &self,
+        db: &dyn DagReader,
+        box_info: &BoxInfo,
+        task: &Task,
+        command: &Dispatch,
+        caller: Option<&str>,
+    ) -> Result<DispatchWorktree> {
+        let workspace = &self.application.workspace;
+        let repository = &box_info.repository;
+        match &command.worktree {
+            WorktreeRequest::Existing(path) => {
+                if self.worktree_root.is_some()
+                    && command.retry
+                    && let Some(previous) = task.attempts.last()
+                    && let Some(worktree) = db.find_worktree_by_path(&previous.worktree)?
+                    && worktree.box_id == box_info.id
+                {
+                    return Ok(DispatchWorktree {
+                        path: workspace.validate_box_worktree(repository, &worktree.path)?,
+                        kind: DispatchWorktreeKind::Resume(worktree.branch),
+                    });
+                }
+                Ok(DispatchWorktree {
+                    path: workspace.validate_box_worktree(repository, path)?,
+                    kind: DispatchWorktreeKind::Existing,
+                })
+            }
+            WorktreeRequest::New { branch, base } => {
+                ensure!(
+                    !branch.trim().is_empty(),
+                    "Specify --branch when using --worktree new"
+                );
+                let root = self
+                    .worktree_root
+                    .as_ref()
+                    .context("Worktree provisioning is unavailable")?;
+                if let BranchStatus::Exists { checked_out_at } =
+                    workspace.branch_exists(repository, branch)?
+                {
+                    if let Some(path) = checked_out_at {
+                        bail!(
+                            "Branch {branch:?} already exists and is checked out at {}",
+                            path.display()
+                        );
+                    }
+                    bail!("Branch {branch:?} already exists");
+                }
+                let base = match base {
+                    Some(base) => base.clone(),
+                    None => {
+                        let caller = caller.context(
+                            "Specify --base when dispatching a new worktree from outside Power",
+                        )?;
+                        workspace.head(&self.application.session(caller)?.worktree)?
+                    }
+                };
+                let path =
+                    default_worktree_path(&root.worktree_root()?, &box_info.name, branch, |path| {
+                        path.symlink_metadata().is_ok()
+                    });
+                Ok(DispatchWorktree {
+                    path,
+                    kind: DispatchWorktreeKind::New {
+                        branch: branch.clone(),
+                        base,
+                    },
+                })
+            }
+        }
     }
 
     fn new_id(&self) -> String {
@@ -633,6 +763,48 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry> DagApplication<T, S, B> {
             created_at: now(),
         }
     }
+}
+
+fn insert_dispatch_attempt(
+    db: &dyn DagTransaction,
+    agent: &ManagedAgent,
+    target: WorkerAttempt,
+    error: Option<&anyhow::Error>,
+) -> Result<Attempt> {
+    let attempt = Attempt {
+        id: target.id,
+        number: target.number,
+        agent: agent.id.clone(),
+        session: agent.session.clone(),
+        worktree: agent.worktree.clone(),
+        provider: agent.provider.clone(),
+        state: if error.is_some() {
+            AttemptState::Failed
+        } else {
+            AttemptState::Active
+        },
+        summary: error.map(|error| format!("{error:#}")),
+        blocker: None,
+        detail: None,
+        started_at: agent.created_at,
+        ended_at: error.map(|_| now()),
+    };
+    db.insert_agent(agent)?;
+    db.insert_attempt(&target.run, &target.task, &attempt)?;
+    let event = if error.is_some() {
+        db.update_attempt(&attempt)?;
+        RunEventKind::AttemptFailed
+    } else {
+        RunEventKind::AttemptStarted
+    };
+    db.event(
+        &target.run,
+        event,
+        Some(&target.task),
+        Some(&attempt.id),
+        attempt.summary.as_deref(),
+    )?;
+    Ok(attempt)
 }
 
 fn select_box<'a>(entries: &'a [RegisteredBox], selector: &str) -> Result<&'a RegisteredBox> {
@@ -697,16 +869,28 @@ fn terminal_agent(provider: &Provider) -> Agent {
     }
 }
 
-fn worker_prompt(run: &Run, task: &Task, worktree: &Path) -> String {
+fn worker_prompt(
+    run: &Run,
+    task: &Task,
+    worktree: &Path,
+    branch: Option<&str>,
+    resuming: bool,
+) -> String {
     use std::fmt::Write as _;
     let mut prompt = format!(
-        "Run: {}\nTask: {} — {}\nWorktree: {}\n\nInstructions:\n{}\n",
+        "Run: {}\nTask: {} — {}\nWorktree: {}\n",
         run.title,
         task.id,
         task.title,
         worktree.display(),
-        task.instructions,
     );
+    if let Some(branch) = branch {
+        let _ = writeln!(prompt, "Branch: {branch}");
+    }
+    if resuming {
+        prompt.push_str("You are resuming in the existing worktree. Review any partial work before continuing.\n");
+    }
+    let _ = writeln!(prompt, "\nInstructions:\n{}", task.instructions);
     if !task.deps.is_empty() {
         prompt.push_str("\nCompleted prerequisites:\n");
         for dep in &task.deps {
