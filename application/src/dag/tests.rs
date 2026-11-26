@@ -630,7 +630,7 @@ fn managed_setup() -> (TestDag, FakeWorkspace) {
         application_with_workspace(workspace.clone()),
         MemoryStore::default(),
         FakeRegistry::default(),
-        FakeIcons,
+        FakeIcons::default(),
     )
     .with_worktree_root(FakeWorktreeRoot);
     (dag, workspace)
