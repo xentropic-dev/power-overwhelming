@@ -1,4 +1,4 @@
-use crate::terminal_view::terminal_font_family;
+use crate::terminal::{column_width, terminal_font_family};
 use gpui::{prelude::*, *};
 use infrastructure::plugins::{
     ActiveView,
@@ -11,9 +11,9 @@ use infrastructure::{
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 const PADDING: f32 = 16.;
-const CELL_WIDTH: f32 = 7.;
 const GROUP_GAP: usize = 3;
 const JOIN_WIDTH: f32 = 11.;
+const TEXT_SIZE: f32 = 11.;
 
 #[derive(Clone, Copy)]
 enum Separator<'a> {
@@ -31,10 +31,11 @@ impl<'a> Separator<'a> {
         }
     }
 
-    fn columns(self) -> usize {
+    /// Columns of `cell_width` logical pixels the separator takes.
+    fn columns(self, cell_width: f32) -> usize {
         match self {
             Self::Text(text) => text.width(),
-            Self::Arrow | Self::Round => (JOIN_WIDTH / CELL_WIDTH).ceil() as usize,
+            Self::Arrow | Self::Round => (JOIN_WIDTH / cell_width).ceil() as usize,
         }
     }
 }
@@ -265,16 +266,23 @@ fn join(separator: Separator<'_>, left: u32, right: u32, points_left: bool) -> D
 }
 
 impl Render for StatusBar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(row) = &self.row else {
             return div().into_any_element();
         };
+        let cell_width = f32::from(column_width(
+            window.text_system(),
+            &font(self.font_family),
+            px(TEXT_SIZE),
+            window.scale_factor(),
+        ));
         let mut left = row.left.clone();
         let mut right = row.right.clone();
         let separator = Separator::from_glyph(&row.separator);
         let joined = !matches!(separator, Separator::Text(_));
         let caps = if joined {
-            (usize::from(!left.is_empty()) + usize::from(!right.is_empty())) * separator.columns()
+            (usize::from(!left.is_empty()) + usize::from(!right.is_empty()))
+                * separator.columns(cell_width)
         } else {
             0
         };
@@ -282,7 +290,7 @@ impl Render for StatusBar {
             &mut left,
             &mut right,
             self.columns.saturating_sub(caps),
-            separator.columns(),
+            separator.columns(cell_width),
         );
         if left.is_empty() && right.is_empty() {
             return div().into_any_element();
@@ -306,16 +314,16 @@ impl Render for StatusBar {
             .items_center()
             .when(left.is_empty(), |bar| bar.justify_end())
             .when(!left.is_empty(), |bar| bar.justify_between())
-            .gap(px(GROUP_GAP as f32 * CELL_WIDTH))
+            .gap(px(GROUP_GAP as f32 * cell_width))
             .font_family(self.font_family)
-            .text_size(px(11.))
+            .text_size(px(TEXT_SIZE))
             .children((!left.is_empty()).then(|| self.group(left, separator, background, false)))
             .children((!right.is_empty()).then(|| self.group(right, separator, background, true)))
             .child(
                 canvas(
                     move |bounds, window, cx| {
                         let columns =
-                            ((f32::from(bounds.size.width) - padding) / CELL_WIDTH) as usize;
+                            ((f32::from(bounds.size.width) - padding) / cell_width) as usize;
                         if current_columns != columns {
                             window.defer(cx, move |_, cx| {
                                 let _ = width_owner.update(cx, |bar, cx| {

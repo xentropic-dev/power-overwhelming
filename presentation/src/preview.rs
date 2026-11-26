@@ -51,20 +51,7 @@ impl Preview {
     pub fn open(target: &Target, window: &mut Window, cx: &mut App) -> Self {
         let opened = (|| -> Result<Self> {
             Ok(match target {
-                Target::Image(path) => {
-                    let image = image::ImageReader::open(path)
-                        .with_context(|| format!("Image is unavailable at {}", path.display()))?
-                        .with_guessed_format()?
-                        .decode()
-                        .with_context(|| format!("Could not decode {}", path.display()))?
-                        .into_rgba8();
-                    let (width, height) = image.dimensions();
-                    let mut data = image.into_raw();
-                    for pixel in data.chunks_exact_mut(4) {
-                        pixel.swap(0, 2);
-                    }
-                    Self::Image(render_image(width, height, data).context("Invalid image size")?)
-                }
+                Target::Image(path) => Self::Image(decode_image(path)?),
                 Target::Video(path) => {
                     if !path.is_file() {
                         bail!("Video is unavailable at {}", path.display());
@@ -147,6 +134,22 @@ impl Preview {
             _ => self.set_active(false, cx),
         }
     }
+}
+
+/// Decodes an image file into the BGRA frame GPUI renders.
+pub(crate) fn decode_image(path: &Path) -> Result<Arc<RenderImage>> {
+    let image = image::ImageReader::open(path)
+        .with_context(|| format!("Image is unavailable at {}", path.display()))?
+        .with_guessed_format()?
+        .decode()
+        .with_context(|| format!("Could not decode {}", path.display()))?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    let mut data = image.into_raw();
+    for pixel in data.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    render_image(width, height, data).context("Invalid image size")
 }
 
 fn render_image(width: u32, height: u32, pixels: Vec<u8>) -> Option<Arc<RenderImage>> {

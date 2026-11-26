@@ -1,6 +1,6 @@
 ## Example
 
-From outside Power, set `BOX` to your selector and `REPOSITORY` to the `repository` path from `power box list`. Set `WORKTREE` to the coordinator's checkout from `git -C "$REPOSITORY" worktree list`. This example uses `origin/main` as the starting point for the parallel edits. Use an installed provider for each dispatch.
+From outside Power, set `BOX` to your selector and `REPOSITORY` to the `repository` path from `power box list`. Set `WORKTREE` to the coordinator's checkout from `git -C "$REPOSITORY" worktree list`. This example uses `origin/main` as the starting point for the parallel edits. Set `PROFILE` to the agent profile ID of an installed agent, such as `codex`, `claude`, or `grok`.
 
 Inside Power, set `WORKTREE` to your current checkout. Omit `--box` and `--coordinator` on create, and omit `--base origin/main` if you want to start the parallel edits at your current HEAD.
 
@@ -22,9 +22,9 @@ cat > "$TASKS_FILE" <<'JSON'
 JSON
 power dag apply "$RUN" --file "$TASKS_FILE"
 power dag ready "$RUN"  # setup, usage, and review
-power dag dispatch "$RUN" setup --provider codex --worktree new --branch docs/setup --base origin/main
-power dag dispatch "$RUN" usage --provider codex --worktree new --branch docs/usage --base origin/main
-power dag dispatch "$RUN" review --provider codex --worktree "$WORKTREE"
+power dag dispatch "$RUN" setup --provider "$PROFILE" --worktree new --branch docs/setup --base origin/main
+power dag dispatch "$RUN" usage --provider "$PROFILE" --worktree new --branch docs/usage --base origin/main
+power dag dispatch "$RUN" review --provider "$PROFILE" --worktree "$WORKTREE"
 CURSOR=0
 power dag wait "$RUN" --since "$CURSOR" --timeout 60
 ```
@@ -32,7 +32,7 @@ power dag wait "$RUN" --since "$CURSOR" --timeout 60
 After each wait, update `CURSOR` from the response. Repeat until all three tasks succeed and `power dag ready "$RUN"` lists `combine`. Use `--base docs/setup` to start from the setup task's branch. The combine task then brings in the usage changes.
 
 ```sh
-power dag dispatch "$RUN" combine --provider codex --worktree new --branch docs/combined --base docs/setup
+power dag dispatch "$RUN" combine --provider "$PROFILE" --worktree new --branch docs/combined --base docs/setup
 power dag wait "$RUN" --since "$CURSOR" --timeout 60
 power dag show "$RUN"
 ```

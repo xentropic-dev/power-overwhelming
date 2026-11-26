@@ -4,6 +4,8 @@
 
 Use the same Power executable that served this guide to load the reference for your task.
 From an external box, substitute `power` on PATH for `"$POWER_BIN"`.
+`power dag guide` is an alias for `power skills get power-dag --full`, which prints this guide
+followed by every reference.
 
 | When | Load |
 | --- | --- |
@@ -35,11 +37,11 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 
 ## Dispatch and monitor
 
-1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Choose `codex` or `claude` based on the installed provider. For test fixtures, `--provider command` runs the command supplied after `--`.
+1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Set `PROFILE` to an installed agent profile ID, such as `claude`, `codex`, `grok`, or a profile from `config.lua`. For test fixtures, `--provider command` runs the command supplied after `--`.
 2. Dispatch each ready task with the appropriate worktree.
 
-   - For concurrent edits, run `power dag dispatch "$RUN" "$TASK" --provider codex --worktree new --branch "$BRANCH"`. Choose a distinct, unused branch name for each task. Inside Power, the new branch starts at the coordinator's current HEAD. Pass `--base` with a branch or other commit-ish to override it. For a dependent task that builds on a prerequisite's commits, pass the prerequisite's branch, for example `--base docs/setup`. Outside Power, `--base` is required when creating a worktree.
-   - For read-only tasks, pass the coordinator's worktree path with `power dag dispatch "$RUN" "$TASK" --provider codex --worktree "$WORKTREE"`. Use `git -C "$REPOSITORY" worktree list` to find existing worktrees of the box's repository.
+   - For concurrent edits, run `power dag dispatch "$RUN" "$TASK" --provider "$PROFILE" --worktree new --branch "$BRANCH"`. Choose a distinct, unused branch name for each task. Inside Power, the new branch starts at the coordinator's current HEAD. Pass `--base` with a branch or other commit-ish to override it. For a dependent task that builds on a prerequisite's commits, pass the prerequisite's branch, for example `--base docs/setup`. Outside Power, `--base` is required when creating a worktree.
+   - For read-only tasks, pass the coordinator's worktree path with `power dag dispatch "$RUN" "$TASK" --provider "$PROFILE" --worktree "$WORKTREE"`. Use `git -C "$REPOSITORY" worktree list` to find existing worktrees of the box's repository.
 
    Power starts the worker in a background terminal and gives it the task instructions, completed prerequisite summaries, and reporting contract. If Power creates a worktree, the dispatch output includes its path and branch.
 
@@ -47,3 +49,5 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 4. On `needs_input`, surface the worker's question to the user. They can open the worker from the graph (Ctrl+B then `d`) or the agent tree (Ctrl+B then `a`) and answer in that worker's terminal. The worker reports `working` once answered, clearing the request.
 
 When retrying, Power reuses the task's Power-created worktree and branch by default. See the recovery reference for retry commands. To preview which Power-created worktrees can be removed, run `power worktree prune --dry-run`.
+
+Use `power dag show "$RUN"` to read each attempt's `artifacts` (`id`, `title`, `link`) in publish order, newest last. In the DAG view (Ctrl+B then `d`), the selected node's Artifacts list shows the current attempt's artifacts. Open a listed artifact or its `pwr://artifact/<id>` link in the preview pane.
