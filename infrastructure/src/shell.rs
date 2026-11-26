@@ -15,6 +15,7 @@ use std::{
     io::Write,
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -293,27 +294,86 @@ pub(crate) fn model_callback_args(
 }
 
 /// Whether Claude Code's managed, user, project or local settings for `cwd` define a
-/// `statusLine`. Project and local settings are read from `cwd` up to its repository root.
+/// `statusLine`.
 fn claude_status_line_configured(cwd: &Path) -> bool {
-    let user = std::env::var_os("CLAUDE_CONFIG_DIR")
+    let managed = Path::new("/etc/claude-code");
+    let mut files = vec![managed.join("managed-settings.json")];
+    if let Ok(entries) = fs::read_dir(managed.join("managed-settings.d")) {
+        files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.extension().is_some_and(|ext| ext == "json")
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        }));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(user) = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-        .map(|directory| directory.join("settings.json"));
-    let mut files: Vec<PathBuf> = [
-        Some(PathBuf::from("/etc/claude-code/managed-settings.json")),
-        user,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    for directory in cwd.ancestors() {
-        files.push(directory.join(".claude/settings.json"));
-        files.push(directory.join(".claude/settings.local.json"));
-        if directory.join(".git").exists() {
-            break;
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")))
+    {
+        files.push(user.join("settings.json"));
+    }
+    files.extend(claude_project_settings(cwd, home.as_deref()));
+    files.iter().any(|path| settings_define_status_line(path))
+}
+
+/// The project settings files Claude Code reads for a session started in `cwd`. Shared
+/// settings come only from `cwd`. Local settings come from `cwd` and from the repository
+/// root, which for a linked worktree is the main checkout's root.
+fn claude_project_settings(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut files = vec![
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+    ];
+    if let Some(root) = local_settings_root(cwd, home) {
+        let local = root.join(".claude/settings.local.json");
+        if !files.contains(&local) {
+            files.push(local);
         }
     }
-    files.iter().any(|path| settings_define_status_line(path))
+    files
+}
+
+/// Where Claude Code keeps `settings.local.json` for a session in `cwd`, when that is
+/// a repository root rather than `cwd` itself.
+fn local_settings_root(cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let (root, dot_git) = cwd
+        .ancestors()
+        .map(|directory| (directory, directory.join(".git")))
+        .find(|(_, dot_git)| dot_git.exists())?;
+    let root = main_checkout_root(root, &dot_git).unwrap_or_else(|| root.to_path_buf());
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let user = unsafe { libc::geteuid() };
+    let owned = |path: &Path| {
+        path.symlink_metadata()
+            .is_ok_and(|metadata| metadata.uid() == user)
+    };
+    let claude = root.join(".claude");
+    let usable = owned(&root)
+        && owned(&root.join(".git"))
+        && (!claude.exists() || owned(&claude))
+        && home.is_none_or(|home| !same_directory(&root, home));
+    usable.then_some(root)
+}
+
+/// The main checkout's root for a linked worktree whose `.git` file is `dot_git`.
+/// `None` for a main checkout, a submodule or a worktree of a bare repository.
+fn main_checkout_root(worktree: &Path, dot_git: &Path) -> Option<PathBuf> {
+    if dot_git.is_dir() {
+        return None;
+    }
+    let text = fs::read_to_string(dot_git).ok()?;
+    let git_dir = worktree.join(text.strip_prefix("gitdir:")?.trim());
+    let common = git_dir.join(fs::read_to_string(git_dir.join("commondir")).ok()?.trim());
+    let common = common.canonicalize().ok()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn settings_define_status_line(path: &Path) -> bool {
@@ -592,6 +652,31 @@ mod tests {
         Ok(())
     }
 
+    fn project_status_line(cwd: &Path) -> bool {
+        claude_project_settings(cwd, None)
+            .iter()
+            .any(|path| settings_define_status_line(path))
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> Result<()> {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Power",
+                "-c",
+                "user.email=power@example.com",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        anyhow::ensure!(status.success(), "git {args:?} failed");
+        Ok(())
+    }
+
     #[test]
     fn detects_status_lines_in_project_and_local_settings() -> Result<()> {
         let repo = tempfile::tempdir()?;
@@ -608,10 +693,59 @@ mod tests {
             r#"{ "statusLine": { "type": "command", "command": "x" } }"#,
         )?;
         assert!(settings_define_status_line(&local));
-        assert!(claude_status_line_configured(&nested));
+        assert!(project_status_line(&nested));
+        assert!(project_status_line(repo.path()));
+        // Claude Code keeps the local file in the starting directory when the
+        // repository root is the home directory.
+        assert!(!claude_project_settings(&nested, Some(repo.path())).contains(&local));
         fs::write(&local, r#"{ "statusLine": "#)?;
         assert!(settings_define_status_line(&local));
         assert!(!settings_define_status_line(&claude.join("settings.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn linked_worktrees_read_the_main_checkouts_local_settings() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let main = temp.path().join("main");
+        fs::create_dir(&main)?;
+        git(&main, &["init", "-q"])?;
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"])?;
+        git(&main, &["worktree", "add", "-q", "../linked"])?;
+        let linked = temp.path().join("linked");
+        let nested = linked.join("nested");
+        fs::create_dir(&nested)?;
+        assert!(!project_status_line(&linked));
+
+        // Untracked, so the linked worktree has no copy of its own.
+        fs::create_dir(main.join(".claude"))?;
+        fs::write(
+            main.join(".claude/settings.local.json"),
+            r#"{ "statusLine": { "type": "command", "command": "mine" } }"#,
+        )?;
+        assert!(project_status_line(&linked));
+        assert!(project_status_line(&nested));
+        assert!(project_status_line(&main));
+        Ok(())
+    }
+
+    #[test]
+    fn subdirectories_ignore_a_parents_shared_status_line() -> Result<()> {
+        let repo = tempfile::tempdir()?;
+        let nested = repo.path().join("nested");
+        fs::create_dir(&nested)?;
+        fs::create_dir(repo.path().join(".git"))?;
+        fs::create_dir(repo.path().join(".claude"))?;
+        fs::write(
+            repo.path().join(".claude/settings.json"),
+            r#"{ "statusLine": { "type": "command", "command": "shared" } }"#,
+        )?;
+        assert!(project_status_line(repo.path()));
+        assert!(!project_status_line(&nested));
+        let profiles = AgentProfiles::default();
+        let claude = profiles.resolve(&"claude".into())?;
+        let args = model_callback_args(claude, &[], || project_status_line(&nested));
+        assert_eq!(args[0], "--settings");
         Ok(())
     }
 
