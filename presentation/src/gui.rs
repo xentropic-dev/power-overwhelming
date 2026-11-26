@@ -10,7 +10,7 @@ use crate::{
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, Previews, Settings},
     status_bar::{ConfigChanged, StatusBar},
-    terminal_view::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
+    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView},
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
