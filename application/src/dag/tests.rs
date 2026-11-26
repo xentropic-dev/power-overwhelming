@@ -184,6 +184,17 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
+    fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()> {
+        let mut db = self.0.borrow_mut();
+        let agent = db
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == id)
+            .context("Unknown agent")?;
+        agent.model = model.map(str::to_owned);
+        Ok(())
+    }
+
     fn insert_run(&self, run: &Run) -> Result<()> {
         self.0.borrow_mut().runs.push(run.clone());
         Ok(())

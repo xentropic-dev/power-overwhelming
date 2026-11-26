@@ -2,7 +2,7 @@ use crate::{
     theme::Scheme,
     wire::{MetadataField, Response, SessionMetadata},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use application::{SessionOptions, TerminalRuntime, agents::AgentProfileRegistry};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
@@ -17,6 +17,7 @@ use ghostty_vt::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
+    ffi::OsStr,
     io::{Read, Write},
     path::PathBuf,
     sync::{
@@ -29,11 +30,13 @@ use std::{
 };
 
 pub(crate) type ActiveScheme = Arc<RwLock<&'static Scheme>>;
+type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send + Sync>;
 
 pub struct PtyRuntime {
     pub socket: PathBuf,
     pub scheme: ActiveScheme,
     pub on_exit: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    pub on_model_changed: ModelChanged,
     pub profiles: Arc<dyn AgentProfileRegistry>,
 }
 
@@ -41,6 +44,13 @@ struct Lifecycle {
     running: AtomicBool,
     session: String,
     on_exit: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    foreground: Mutex<Foreground>,
+    on_model_changed: ModelChanged,
+}
+
+struct Foreground {
+    agent: Agent,
+    model: Option<String>,
 }
 
 impl Lifecycle {
@@ -49,12 +59,22 @@ impl Lifecycle {
             (self.on_exit)(&self.session, detail);
         }
     }
+
+    fn set_model(&self, agent: &Agent, model: Option<String>) -> Result<()> {
+        let previous = std::mem::replace(&mut self.foreground.lock().unwrap().model, model.clone());
+        // Registration takes the DAG lock before reading the live model. Release the
+        // model lock before writing to the DAG so either operation can finish first.
+        if let Err(error) = (self.on_model_changed)(&self.session, agent, model.as_deref()) {
+            self.foreground.lock().unwrap().model = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct Handle {
     commands: SyncSender<Command>,
-    agent: Arc<Mutex<Agent>>,
     lifecycle: Arc<Lifecycle>,
 }
 
@@ -94,7 +114,16 @@ impl TerminalRuntime for PtyRuntime {
     }
 
     fn agent(&self, handle: &Self::Handle) -> Option<Agent> {
-        Some(handle.agent.lock().unwrap().clone())
+        Some(handle.lifecycle.foreground.lock().unwrap().agent.clone())
+    }
+
+    fn model(&self, handle: &Self::Handle, agent: &Agent) -> Option<String> {
+        let foreground = handle.lifecycle.foreground.lock().unwrap();
+        if foreground.agent == *agent {
+            foreground.model.clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -108,7 +137,7 @@ pub enum Command {
         pid: u32,
         field: MetadataField,
         value: Option<String>,
-        reply: SyncSender<bool>,
+        reply: SyncSender<Result<bool>>,
     },
     Output(Vec<u8>),
     /// Recheck which agent owns the foreground of a shell session.
@@ -126,6 +155,7 @@ fn launch(
 ) -> Result<Handle> {
     let geometry = Geometry::default();
     let pair = native_pty_system().openpty(pty_size(geometry))?;
+    let model = requested_model(&session.agent, &options.args);
     let mut process = if let Some(profile) = profile {
         let mut command = CommandBuilder::new(&profile.command);
         let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
@@ -178,6 +208,11 @@ fn launch(
         running: AtomicBool::new(true),
         session: session.id.clone(),
         on_exit: runtime.on_exit.clone(),
+        foreground: Mutex::new(Foreground {
+            agent: session.agent.clone(),
+            model,
+        }),
+        on_model_changed: runtime.on_model_changed.clone(),
     });
     drop(pair.slave);
 
@@ -234,7 +269,6 @@ fn launch(
         };
         let _ = waiter_tx.send(Command::ProcessExited(detail));
     });
-    let agent = Arc::new(Mutex::new(session.agent.clone()));
     if session.agent == Agent::Shell {
         let poll_tx = tx.clone();
         let lifecycle = lifecycle.clone();
@@ -244,7 +278,6 @@ fn launch(
             }
         });
     }
-    let actor_agent = agent.clone();
     let launched_agent = session.agent.clone();
     let actor_lifecycle = lifecycle.clone();
     let active_scheme = runtime.scheme.clone();
@@ -257,7 +290,6 @@ fn launch(
             geometry,
             pid,
             launched_agent,
-            actor_agent,
             &actor_lifecycle,
             active_scheme,
             profiles.as_ref(),
@@ -276,7 +308,6 @@ fn launch(
     });
     Ok(Handle {
         commands: tx,
-        agent,
         lifecycle,
     })
 }
@@ -297,7 +328,6 @@ fn terminal_actor(
     mut geometry: Geometry,
     shell_pid: Option<u32>,
     launched_agent: Agent,
-    agent: Arc<Mutex<Agent>>,
     lifecycle: &Lifecycle,
     active_scheme: ActiveScheme,
     profiles: &dyn AgentProfileRegistry,
@@ -324,7 +354,10 @@ fn terminal_actor(
     } else {
         shell_pid.map(|pid| (pid, launched_agent.clone()))
     };
-    let mut metadata = SessionMetadata::default();
+    let mut metadata = SessionMetadata {
+        model: lifecycle.foreground.lock().unwrap().model.clone(),
+        ..SessionMetadata::default()
+    };
 
     let mut output_closed = false;
     let mut process_exit: Option<(String, Instant)> = None;
@@ -338,6 +371,7 @@ fn terminal_actor(
             let (detail, _) = process_exit.take().unwrap();
             lifecycle.notify_exit(&with_terminal_tail(&terminal, detail));
             exited = true;
+            lifecycle.foreground.lock().unwrap().model = None;
             clear_metadata(&mut metadata, &mut clients);
             clients.retain(|client| client.try_send(Response::Exit).is_ok());
         }
@@ -386,9 +420,17 @@ fn terminal_actor(
                 let current = run
                     .as_ref()
                     .map_or(Agent::Shell, |(_, agent)| agent.clone());
-                let mut stored = agent.lock().unwrap();
-                if *stored != current {
-                    *stored = current.clone();
+                let initial_model = run
+                    .as_ref()
+                    .and_then(|(pid, agent)| process_model(*pid, agent));
+                let previous = std::mem::replace(
+                    &mut *lifecycle.foreground.lock().unwrap(),
+                    Foreground {
+                        agent: current.clone(),
+                        model: initial_model.clone(),
+                    },
+                );
+                if previous.agent != current {
                     clients.retain(|client| {
                         client
                             .try_send(Response::Agent {
@@ -397,7 +439,14 @@ fn terminal_actor(
                             .is_ok()
                     });
                 }
-                clear_metadata(&mut metadata, &mut clients);
+                let next = SessionMetadata {
+                    model: initial_model,
+                    task: None,
+                };
+                if next != metadata {
+                    metadata = next;
+                    notify_metadata(&metadata, &mut clients);
+                }
             }
         }
         match command {
@@ -412,7 +461,7 @@ fn terminal_actor(
                     .is_ok()
                     && client
                         .try_send(Response::Agent {
-                            agent: agent.lock().unwrap().clone().into(),
+                            agent: lifecycle.foreground.lock().unwrap().agent.clone().into(),
                         })
                         .is_ok()
                     && (metadata == SessionMetadata::default()
@@ -471,21 +520,29 @@ fn terminal_actor(
                 value,
                 reply,
             } => {
-                let accepted = !exited
-                    && run
+                let result = (|| {
+                    let Some((_, agent)) = run
                         .as_ref()
-                        .is_some_and(|(owner, _)| descends_from(pid, *owner));
-                if accepted {
+                        .filter(|(owner, _)| !exited && descends_from(pid, *owner))
+                    else {
+                        return Ok(false);
+                    };
                     let field = match field {
                         MetadataField::Task => &mut metadata.task,
-                        MetadataField::Model => &mut metadata.model,
+                        MetadataField::Model => {
+                            lifecycle
+                                .set_model(agent, value.clone())
+                                .context("Could not save agent model")?;
+                            &mut metadata.model
+                        }
                     };
                     if *field != value {
                         *field = value;
                         notify_metadata(&metadata, &mut clients);
                     }
-                }
-                let _ = reply.send(accepted);
+                    Ok(true)
+                })();
+                let _ = reply.send(result);
             }
             Command::Output(bytes) => {
                 terminal.vt_write(&bytes);
@@ -617,6 +674,61 @@ fn process_agent(pid: u32, profiles: &dyn AgentProfileRegistry) -> Option<Agent>
         program
     };
     agent_for_program(program, profiles)
+}
+
+fn process_model(pid: u32, agent: &Agent) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    requested_model(
+        agent,
+        cmdline
+            .split(|&byte| byte == 0)
+            .skip(1)
+            .map(OsStr::from_bytes),
+    )
+}
+
+fn requested_model(
+    agent: &Agent,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Option<String> {
+    let short_flag = match agent.as_str() {
+        "codex" | "grok" => true,
+        "claude" => false,
+        _ => return None,
+    };
+    let mut model = None;
+    let mut expecting_value = false;
+    for arg in args {
+        let arg = arg.as_ref();
+        if arg == "--" {
+            break;
+        }
+        if std::mem::take(&mut expecting_value) {
+            model = arg
+                .to_str()
+                .filter(|value| !value.starts_with('-'))
+                .and_then(model_name);
+        }
+        if arg == "--model" || (short_flag && arg == "-m") {
+            expecting_value = true;
+        } else if let Some((flag, value)) = arg.to_str().and_then(|arg| arg.split_once('='))
+            && (flag == "--model" || (short_flag && flag == "-m"))
+        {
+            model = model_name(value);
+        }
+    }
+    if expecting_value { None } else { model }
+}
+
+fn model_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (valid_metadata(value) && !value.is_empty()).then(|| value.to_owned())
+}
+
+pub(crate) fn valid_metadata(value: &str) -> bool {
+    value.chars().count() <= 120 && !value.chars().any(char::is_control)
 }
 
 fn program_name(arg: &str) -> &str {

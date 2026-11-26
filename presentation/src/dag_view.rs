@@ -11,7 +11,7 @@ use std::{
 };
 
 const NODE_WIDTH: f32 = 182.;
-const NODE_HEIGHT: f32 = 68.;
+const NODE_HEIGHT: f32 = 84.;
 const COLUMN_GAP: f32 = 66.;
 const ROW_GAP: f32 = 22.;
 const PADDING: f32 = 20.;
@@ -557,6 +557,7 @@ impl DagView {
                 let (label, tint) = task_style(colors, task.state);
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
+                let model = current_attempt(task).and_then(|attempt| attempt.model.clone());
                 div()
                     .id(("dag-node", index))
                     .absolute()
@@ -590,6 +591,15 @@ impl DagView {
                             .text_color(rgb(color))
                             .child(label),
                     )
+                    .when_some(model, |node, model| {
+                        node.child(
+                            div()
+                                .text_size(rems(0.75 * scale))
+                                .text_color(rgb(colors.readable(colors.muted, fill)))
+                                .truncate()
+                                .child(model),
+                        )
+                    })
                     .on_click(move |_, _, cx| action(GraphAction::Select(index), cx))
             }))
     }
@@ -656,11 +666,14 @@ fn current_attempt(task: &Task) -> Option<&Attempt> {
 fn details(colors: &Colors, task: &Task) -> impl IntoElement {
     let mut fields = Vec::new();
     if let Some(attempt) = current_attempt(task) {
+        fields.push((
+            "Assigned agent",
+            format!("{} · {}", attempt.provider.name(), attempt.agent),
+        ));
+        if let Some(model) = &attempt.model {
+            fields.push(("Model", model.clone()));
+        }
         fields.extend([
-            (
-                "Assigned agent",
-                format!("{} · {}", attempt.provider.name(), attempt.agent),
-            ),
             ("Worktree", attempt.worktree.display().to_string()),
             (
                 "Session",

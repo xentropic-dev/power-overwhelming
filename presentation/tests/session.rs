@@ -364,7 +364,8 @@ read finish
             break message["metadata"].clone();
         }
     };
-    input("./codex\n");
+    input("./codex --model launch-model\n");
+    assert_eq!(wait_for_metadata(&mut attached)["model"], "launch-model");
     assert_eq!(wait_for_metadata(&mut attached)["task"], "Initial task");
     assert_eq!(wait_for_metadata(&mut attached)["model"], "Provider model");
     assert_eq!(wait_for_metadata(&mut attached)["task"], "Revised task");

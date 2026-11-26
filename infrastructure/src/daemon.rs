@@ -99,8 +99,9 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
     }
     let artifacts = SqliteArtifacts::open()?;
     let store = SqliteDagStore::open().context("Open DAG store")?;
-    let exit_handler = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
-    let terminal_exit_handler = exit_handler.clone();
+    let terminal_dag = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
+    let exit_dag = terminal_dag.clone();
+    let model_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
     let application = Arc::new(Application::new(
@@ -111,11 +112,17 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
             scheme: scheme.clone(),
             profiles: profiles.clone(),
             on_exit: Arc::new(move |session, detail| {
-                if let Some(dag) = terminal_exit_handler.get().and_then(Weak::upgrade)
+                if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
                     && let Err(error) = dag.session_exited(session, detail)
                 {
                     eprintln!("Could not record exit for terminal {session}. {error:#}");
                 }
+            }),
+            on_model_changed: Arc::new(move |session, agent, model| {
+                if let Some(dag) = model_dag.get().and_then(Weak::upgrade) {
+                    dag.agent_model_changed(session, agent, model)?;
+                }
+                Ok(())
             }),
         },
         profiles,
@@ -128,9 +135,9 @@ pub fn serve(profiles: AgentProfiles) -> Result<()> {
         IconFiles::open()?,
     ));
     dag.reconcile().context("Reconcile DAG sessions")?;
-    exit_handler
+    terminal_dag
         .set(Arc::downgrade(&dag))
-        .expect("install terminal exit handler once");
+        .expect("connect terminal callbacks to the DAG once");
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let server = Arc::new(Server {
@@ -250,7 +257,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         } => {
             let value = value.trim();
             ensure!(
-                value.chars().count() <= 120 && !value.chars().any(char::is_control),
+                crate::terminal::valid_metadata(value),
                 "Session metadata must be at most 120 characters on one line"
             );
             let value = (!value.is_empty()).then(|| value.to_owned());
@@ -262,7 +269,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 reply: send,
             })?;
             ensure!(
-                receive.recv_timeout(Duration::from_secs(3))?,
+                receive.recv_timeout(Duration::from_secs(3))??,
                 "Session metadata must come from the active agent"
             );
             Ok(Response::Ok)

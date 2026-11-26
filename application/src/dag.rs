@@ -45,6 +45,7 @@ pub trait DagReader {
 pub trait DagTransaction: DagReader {
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()>;
     fn set_agent_exited(&self, id: &str) -> Result<()>;
+    fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()>;
     fn insert_run(&self, run: &Run) -> Result<()>;
     fn insert_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<()>;
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
@@ -421,6 +422,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 },
             )?;
             launched = Some(session.id.clone());
+            agent.model = self.session_model(&session)?;
             agent.session = Some(session.id);
             agent.worktree = session.worktree;
             db.insert_agent(&agent)?;
@@ -438,6 +440,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     session: agent.session.clone(),
                     worktree: agent.worktree.clone(),
                     provider: agent.provider.clone(),
+                    model: agent.model.clone(),
                     state: AttemptState::Active,
                     summary: None,
                     blocker: None,
@@ -476,6 +479,36 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         summary: &str,
     ) -> Result<ReportResult> {
         self.write(|db| report(db, run, task, attempt, status, summary))
+    }
+
+    pub fn agent_model_changed(
+        &self,
+        session: &str,
+        agent_type: &Agent,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.write(|db| {
+            let Some(agent) = db.session_agent(session)? else {
+                return Ok(());
+            };
+            if agent.state != AgentState::Running
+                || terminal_agent(&agent.provider) != *agent_type
+                || agent.model.as_deref() == model
+            {
+                return Ok(());
+            }
+            db.set_agent_model(&agent.id, model)?;
+            if let Some(run) = agent.run.as_deref() {
+                db.event(
+                    run,
+                    RunEventKind::AgentModelChanged,
+                    agent.task.as_deref(),
+                    agent.attempt.as_deref(),
+                    model,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn session_exited(&self, session: &str, detail: &str) -> Result<()> {
@@ -611,6 +644,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             Agent::Coding(id) => Provider::Agent(id),
             Agent::Shell => Provider::Command,
         };
+        let model = self.session_model(&session)?;
         let mut agent = self.new_agent(
             box_id.into(),
             session.worktree,
@@ -618,9 +652,15 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             None,
             session.agent.name().into(),
         );
+        agent.model = model;
         agent.session = Some(session.id);
         db.insert_agent(&agent)?;
         Ok(agent)
+    }
+
+    fn session_model(&self, session: &domain::session::Session) -> Result<Option<String>> {
+        let terminal = self.application.terminal(&session.id)?;
+        Ok(self.application.runtime.model(&terminal, &session.agent))
     }
 
     fn validate_worktree(&self, box_id: &str, request: &WorktreeRequest) -> Result<PathBuf> {
@@ -654,6 +694,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             id: self.new_id(),
             box_id,
             provider,
+            model: None,
             parent,
             label,
             worktree,

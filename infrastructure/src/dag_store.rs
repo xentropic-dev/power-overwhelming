@@ -30,7 +30,8 @@ impl SqliteDagStore {
              CREATE TABLE IF NOT EXISTS agents (
                  id TEXT PRIMARY KEY, box_id TEXT NOT NULL, worktree TEXT NOT NULL,
                  provider TEXT NOT NULL, parent TEXT REFERENCES agents(id), session TEXT UNIQUE,
-                 state TEXT NOT NULL, label TEXT NOT NULL, created_at INTEGER NOT NULL
+                 state TEXT NOT NULL, label TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 model TEXT
              );
              CREATE TABLE IF NOT EXISTS tasks (
                  run_id TEXT NOT NULL REFERENCES runs(id), id TEXT NOT NULL,
@@ -58,6 +59,14 @@ impl SqliteDagStore {
              );
              CREATE INDEX IF NOT EXISTS run_events ON events(run_id, seq);",
         )?;
+        let has_model: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name = 'model')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_model {
+            db.execute("ALTER TABLE agents ADD COLUMN model TEXT", [])?;
+        }
         Ok(Self(Mutex::new(db)))
     }
 }
@@ -121,11 +130,12 @@ impl DagDb<'_> {
         for (task, attempt) in rows(
             self.0,
             "SELECT a.id, a.number, a.agent, g.session, g.worktree, g.provider,
-                    a.state, a.summary, a.blocker, a.detail, a.started_at, a.ended_at, a.task_id
+                    a.state, a.summary, a.blocker, a.detail, a.started_at, a.ended_at,
+                    g.model, a.task_id
              FROM attempts a JOIN agents g ON g.id = a.agent
              WHERE a.run_id = ?1 ORDER BY a.number",
             [&run.id],
-            |row| Ok((row.get(12)?, attempt_from_row(row)?)),
+            |row| Ok((row.get(13)?, attempt_from_row(row)?)),
         )? {
             attempts.entry(task).or_default().push(attempt);
         }
@@ -214,7 +224,7 @@ impl DagReader for DagDb<'_> {
             self.0,
             "SELECT a.id, a.number, a.agent, g.session, g.worktree, g.provider,
                     a.state, a.summary, a.blocker, a.detail, a.started_at, a.ended_at,
-                    a.run_id, g.box_id, a.task_id
+                    g.model, a.run_id, g.box_id, a.task_id
              FROM attempts a JOIN agents g ON g.id = a.agent
              WHERE a.state IN ('active', 'needs_input') AND (?1 IS NULL OR g.session = ?1)
              ORDER BY g.rowid",
@@ -222,9 +232,9 @@ impl DagReader for DagDb<'_> {
             |row| {
                 Ok(OpenAttempt {
                     attempt: attempt_from_row(row)?,
-                    run: row.get(12)?,
-                    box_id: row.get(13)?,
-                    task: row.get(14)?,
+                    run: row.get(13)?,
+                    box_id: row.get(14)?,
+                    task: row.get(15)?,
                 })
             },
         )?)
@@ -292,12 +302,12 @@ impl DagTransaction for DagDb<'_> {
 
     fn insert_agent(&self, agent: &ManagedAgent) -> Result<()> {
         self.0.execute(
-            "INSERT INTO agents (id, box_id, worktree, provider, parent, session, state, label, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO agents (id, box_id, worktree, provider, parent, session, state, label, created_at, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 agent.id, agent.box_id, agent.worktree.to_str().context("Worktree path must be UTF-8")?,
                 enum_name(wire::Provider::from(agent.provider.clone()))?, agent.parent, agent.session, enum_name(wire::AgentState::from(agent.state))?,
-                agent.label, agent.created_at,
+                agent.label, agent.created_at, agent.model,
             ],
         )?;
         Ok(())
@@ -306,6 +316,14 @@ impl DagTransaction for DagDb<'_> {
     fn set_agent_exited(&self, id: &str) -> Result<()> {
         self.0
             .execute("UPDATE agents SET state = 'exited' WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()> {
+        self.0.execute(
+            "UPDATE agents SET model = ?2 WHERE id = ?1",
+            params![id, model],
+        )?;
         Ok(())
     }
 
@@ -401,7 +419,7 @@ impl DagTransaction for DagDb<'_> {
 
 const AGENT_SELECT: &str =
     "SELECT a.id, a.box_id, a.worktree, a.provider, a.parent, a.session, p.run_id, p.task_id,
-            p.id, a.state, a.label, a.created_at
+            p.id, a.state, a.label, a.created_at, a.model
      FROM agents a LEFT JOIN attempts p ON p.agent = a.id";
 
 fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedAgent> {
@@ -418,6 +436,7 @@ fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedAgent> {
         state: enum_column::<wire::AgentState>(row, 9)?.into(),
         label: row.get(10)?,
         created_at: row.get(11)?,
+        model: row.get(12)?,
     })
 }
 
@@ -448,6 +467,7 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
         detail: row.get(9)?,
         started_at: row.get(10)?,
         ended_at: row.get(11)?,
+        model: row.get(12)?,
     })
 }
 
@@ -486,14 +506,22 @@ mod tests {
 
     #[test]
     fn reads_prior_agent_and_attempt_records() -> Result<()> {
-        let store = SqliteDagStore::initialize(Connection::open_in_memory()?)?;
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE agents (
+                id TEXT PRIMARY KEY, box_id TEXT NOT NULL, worktree TEXT NOT NULL,
+                provider TEXT NOT NULL, parent TEXT REFERENCES agents(id), session TEXT UNIQUE,
+                state TEXT NOT NULL, label TEXT NOT NULL, created_at INTEGER NOT NULL
+             );
+             INSERT INTO agents VALUES
+                ('a', 'box', '/repo', 'codex', NULL, 'session-a', 'exited', 'Codex', 1),
+                ('b', 'box', '/repo', 'claude', NULL, 'session-b', 'exited', 'Claude', 1),
+                ('c', 'box', '/repo', 'command', NULL, 'session-c', 'exited', 'Command', 1);",
+        )?;
+        let store = SqliteDagStore::initialize(db)?;
         store.0.lock().unwrap().execute_batch(
             r#"
             INSERT INTO runs VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
-            INSERT INTO agents VALUES
-                ('a', 'box', '/repo', 'codex', NULL, 'session-a', 'exited', 'Codex', 1),
-                ('b', 'box', '/repo', 'claude', NULL, 'session-b', 'exited', 'Claude', 1),
-                ('c', 'box', '/repo', 'command', NULL, 'session-c', 'exited', 'Command', 1);
             INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');
             INSERT INTO attempts VALUES
                 ('attempt-a', 'run', 'task', 1, 'a', 'failed', NULL, NULL, NULL, 1, 2),
@@ -512,7 +540,10 @@ mod tests {
                 Provider::Command,
             ]) {
                 assert_eq!(attempt.provider, expected);
-                assert_eq!(db.agent(&attempt.agent)?.provider, expected);
+                assert_eq!(attempt.model, None);
+                let agent = db.agent(&attempt.agent)?;
+                assert_eq!(agent.provider, expected);
+                assert_eq!(agent.model, None);
             }
             Ok(())
         })
