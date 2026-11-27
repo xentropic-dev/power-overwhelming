@@ -1,5 +1,6 @@
 use crate::{
-    Application, BranchStatus, SessionOptions, StartSession, TerminalRuntime, WorktreeRoot,
+    Application, BranchStatus, RestoreChoice, Scheduler, SessionOptions, StartSession,
+    TerminalRuntime, WorktreeRoot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
@@ -224,15 +225,35 @@ pub struct ReportResult {
     pub reason: Option<String>,
 }
 
+/// How long a worker keeps running after it reports success or failure, so it can
+/// finish its last message before its session ends.
+pub const FINISHED_WORKER_GRACE: Duration = Duration::from_secs(10);
+
 pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> {
     application: Arc<Application<T>>,
     store: S,
     registry: B,
     icons: I,
     worktree_root: Option<Box<dyn WorktreeRoot>>,
+    /// How long a worker runs after its terminal report, and what ends it then.
+    /// `None` keeps finished workers running.
+    finished_cleanup: Option<FinishedCleanup>,
     budget: Option<(Box<dyn WorkerBudgetSource>, Box<dyn MemoryProbe>)>,
+    /// This application, once shared, so a scheduled reclaim can call back.
+    weak: Mutex<std::sync::Weak<Self>>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
+}
+
+/// Ends finished workers. Due teardowns and the record writes that follow them run
+/// on separate schedulers, so a blocked session store write never delays the next
+/// worker's teardown.
+struct FinishedCleanup {
+    grace: Duration,
+    /// Runs due teardowns, which never touch a store.
+    teardown: Arc<dyn Scheduler>,
+    /// Forgets each ended session's record afterwards.
+    persistence: Arc<dyn Scheduler>,
 }
 
 struct DispatchWorktree {
@@ -261,15 +282,42 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             registry,
             icons,
             worktree_root: None,
+            finished_cleanup: None,
             budget: None,
+            weak: Mutex::new(std::sync::Weak::new()),
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
     }
 
+    /// Shares the application so scheduled reclaims can reach it. Without this, a
+    /// session that kept processes is retried only by the next daemon start.
+    pub fn shared(self) -> Arc<Self> {
+        let shared = Arc::new(self);
+        *shared.weak.lock().unwrap() = Arc::downgrade(&shared);
+        shared
+    }
+
     /// Enables managed worktree dispatch for stores and workspaces that support it.
     pub fn with_worktree_root(mut self, root: impl WorktreeRoot + 'static) -> Self {
         self.worktree_root = Some(Box::new(root));
+        self
+    }
+
+    /// Ends a worker's session `grace` after it reports success or failure, using
+    /// `teardown` to wait, then forgets its record through `persistence`. Without
+    /// this, finished workers keep running.
+    pub fn with_finished_worker_cleanup(
+        mut self,
+        grace: Duration,
+        teardown: Arc<dyn Scheduler>,
+        persistence: Arc<dyn Scheduler>,
+    ) -> Self {
+        self.finished_cleanup = Some(FinishedCleanup {
+            grace,
+            teardown,
+            persistence,
+        });
         self
     }
 
@@ -1051,8 +1099,48 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         attempt: &str,
         status: ReportStatus,
         summary: &str,
-    ) -> Result<ReportResult> {
-        self.write(|db| report(db, run, task, attempt, status, summary))
+    ) -> Result<ReportResult>
+    where
+        T: 'static,
+    {
+        let (result, finished) =
+            self.write(|db| report(db, run, task, attempt, status, summary))?;
+        if let (Some(session), Some(cleanup)) = (finished, &self.finished_cleanup) {
+            self.end_finished_session(session, cleanup);
+        }
+        Ok(result)
+    }
+
+    /// Ends a finished worker's session after the grace. Ending takes everything the
+    /// worker started down. Its record, which is how a restart finds what may still
+    /// run, is forgotten only once the session's exit confirms that all of it is gone
+    /// (see `session_exited`). The due teardown holds the terminal handle taken now, so
+    /// it takes no lock a launch holds across a store write and never writes a store
+    /// itself. A scheduler that refuses the teardown leaves the work here, so the
+    /// session ends now.
+    fn end_finished_session(&self, session: String, cleanup: &FinishedCleanup)
+    where
+        T: 'static,
+    {
+        let Ok(terminal) = self.application.terminal(&session) else {
+            return;
+        };
+        let application = self.application.clone();
+        let scheduled = session.clone();
+        let handle = terminal.clone();
+        let job = Box::new(move || {
+            if let Err(error) = application.stop_terminal(&handle) {
+                eprintln!("Could not end finished worker session {scheduled}. {error:#}");
+            }
+        });
+        if let Err(error) = cleanup.teardown.schedule(cleanup.grace, job) {
+            eprintln!(
+                "Could not schedule the end of finished worker session {session}, so it ends now. {error:#}"
+            );
+            if let Err(error) = self.application.stop_terminal(&terminal) {
+                eprintln!("Could not end finished worker session {session}. {error:#}");
+            }
+        }
     }
 
     pub fn agent_model_changed(
@@ -1085,39 +1173,192 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         })
     }
 
-    pub fn session_exited(&self, session: &str, detail: &str) -> Result<()> {
-        self.write(|db| {
-            if let Some(agent) = db.session_agent(session)? {
-                interrupt(db, Some(session), detail, &|_| false)?;
+    /// Records that a session's process exited. `complete` says whether everything it
+    /// started has exited too. Only then is its agent exited, and a finished worker's
+    /// record forgotten so a restart cannot bring it back. Otherwise the agent stays
+    /// running and the record stays, so a later reclaim can end what remains.
+    pub fn session_exited(&self, session: &str, detail: &str, complete: bool) -> Result<()>
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let finished = self.write(|db| {
+            let Some(agent) = db.session_agent(session)? else {
+                return Ok(false);
+            };
+            interrupt(db, Some(session), detail, &|_| false)?;
+            if complete {
                 db.set_agent_exited(&agent.id)?;
             }
-            Ok(())
-        })
+            Ok(agent.attempt.is_some())
+        })?;
+        if !complete {
+            eprintln!("Session {session} left processes running, so it stays for a reclaim.");
+            // The exited terminal no longer owns anything, so the retry must not
+            // mistake its handle for a live one. The record stays for a restart.
+            self.application.retire_terminal(session);
+            self.schedule_reclaim(session.to_owned());
+            return Ok(());
+        }
+        if finished && self.finished_cleanup.is_some() {
+            self.forget_ended(session.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Forgets an ended worker's record off the caller's thread, which may be a
+    /// terminal's, so a slow session store never holds it.
+    fn forget_ended(&self, session: String)
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let application = self.application.clone();
+        let forget = Box::new(move || {
+            if let Err(error) = application.forget_session(&session) {
+                eprintln!("Could not forget ended session {session}. {error:#}");
+            }
+        });
+        let refused = match &self.finished_cleanup {
+            Some(cleanup) => cleanup.persistence.schedule(Duration::ZERO, forget).err(),
+            None => Some(anyhow::anyhow!("no cleanup")),
+        };
+        if let Some(error) = refused {
+            // The attempt is finished, so a restart forgets the record anyway.
+            eprintln!("Could not schedule forgetting an ended session. {error:#}");
+        }
+    }
+
+    /// Retries ending what still runs of `session` until it is gone, then exits its
+    /// agent and forgets its record if its attempt is over. Only a live daemon with
+    /// cleanup enabled retries. Otherwise the next start does.
+    fn schedule_reclaim(&self, session: String)
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let Some(cleanup) = &self.finished_cleanup else {
+            return;
+        };
+        let Some(dag) = self.weak.lock().unwrap().upgrade() else {
+            return;
+        };
+        let teardown = cleanup.teardown.clone();
+        // The timer only starts the retry. The reclaim can wait seconds for a stuck
+        // scope and the record write can wait on the store, so both run on a thread
+        // of their own and never delay a due teardown of another worker.
+        let job = Box::new(move || {
+            let retry = dag.clone();
+            let retried = session.clone();
+            let spawned = std::thread::Builder::new()
+                .name("power-reclaim".into())
+                .spawn(move || retry.retry_reclaim(retried));
+            if let Err(error) = spawned {
+                eprintln!("Could not start a reclaim of session {session}. {error}");
+                dag.schedule_reclaim(session);
+            }
+        });
+        if let Err(error) = teardown.schedule(RECLAIM_RETRY, job) {
+            eprintln!("Could not schedule another reclaim. {error:#}");
+        }
+    }
+
+    fn retry_reclaim(&self, session: String)
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        if self.application.terminal_running(&session) {
+            // A live terminal owns the session again.
+            return;
+        }
+        match self.application.reclaim(&session) {
+            Ok(()) => {
+                if let Err(error) = self.reclaimed(&session) {
+                    eprintln!("Could not record the end of session {session}. {error:#}");
+                }
+            }
+            Err(error) => {
+                eprintln!("Session {session} still has processes running. {error:#}");
+                self.schedule_reclaim(session);
+            }
+        }
+    }
+
+    /// Records that nothing of `session` runs any more.
+    fn reclaimed(&self, session: &str) -> Result<()> {
+        let finished = self.write(|db| {
+            let Some(agent) = db.session_agent(session)? else {
+                return Ok(true);
+            };
+            db.set_agent_exited(&agent.id)?;
+            Ok(db.open_attempts(Some(session))?.is_empty())
+        })?;
+        if finished {
+            self.application.forget_session(session)?;
+        }
+        Ok(())
     }
 
     /// Restores saved sessions on daemon start, then reconciles attempts with them.
     /// A resumed conversation waits for input, so a worker whose attempt is still active
     /// is told to continue, and its run records `AttemptResumed`. Workers waiting on the
-    /// user, coordinators and plain sessions resume without a prompt.
-    pub fn restore(&self) -> Result<Vec<String>> {
-        let active: BTreeMap<String, OpenAttempt> = self.store.read(|db| {
-            Ok(db
-                .open_attempts(None)?
-                .into_iter()
-                .filter(|open| open.attempt.state == AttemptState::Active)
-                .filter_map(|open| Some((open.attempt.session.clone()?, open)))
-                .collect())
+    /// user, coordinators and plain sessions resume without a prompt. A worker whose
+    /// attempt already succeeded, failed or was interrupted is forgotten, not restored.
+    pub fn restore(&self) -> Result<Vec<String>>
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let (open, finished): (BTreeMap<String, OpenAttempt>, BTreeSet<String>) =
+            self.store.read(|db| {
+                let open: BTreeMap<_, _> = db
+                    .open_attempts(None)?
+                    .into_iter()
+                    .filter_map(|open| Some((open.attempt.session.clone()?, open)))
+                    .collect();
+                // A worker whose attempt is no longer open has nothing left to do.
+                let finished = db
+                    .list_agents(None)?
+                    .into_iter()
+                    .filter(|agent| agent.attempt.is_some())
+                    .filter_map(|agent| agent.session)
+                    .filter(|session| !open.contains_key(session))
+                    .collect();
+                Ok((open, finished))
+            })?;
+        let active: BTreeMap<String, OpenAttempt> = open
+            .into_iter()
+            .filter(|(_, open)| open.attempt.state == AttemptState::Active)
+            .collect();
+        let restore = self.application.restore_sessions_deferring(|session| {
+            if finished.contains(session) {
+                RestoreChoice::Forget("its DAG attempt already finished")
+            } else {
+                RestoreChoice::Resume(active.get(session).map(continuation_prompt))
+            }
         })?;
-        let restored = self
-            .application
-            .restore_sessions_with(|session| active.get(session).map(continuation_prompt))?;
+        let (restored, deferred) = (restore.restored, restore.deferred);
         let resumed: Vec<_> = restored
             .iter()
             .filter(|session| session.prompted)
             .filter_map(|session| active.get(&session.id))
             .collect();
         let restored: Vec<_> = restored.into_iter().map(|session| session.id).collect();
-        self.reconcile_restored(&restored, &resumed)?;
+        self.reconcile_with(&restored, &deferred, &resumed)?;
+        for session in deferred {
+            self.schedule_reclaim(session);
+        }
         Ok(restored)
     }
 
@@ -1131,6 +1372,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Reconciles like `reconcile`, and records `AttemptResumed` for each attempt in
     /// `resumed`, whose worker was told to continue.
     fn reconcile_restored(&self, restored: &[String], resumed: &[&OpenAttempt]) -> Result<()> {
+        self.reconcile_with(restored, &[], resumed)
+    }
+
+    /// Reconciles like `reconcile_restored`. An agent of a session in `running`, whose
+    /// earlier processes could not be ended, stays running until a reclaim ends them,
+    /// though its open attempt is interrupted since no daemon follows it.
+    fn reconcile_with(
+        &self,
+        restored: &[String],
+        running: &[String],
+        resumed: &[&OpenAttempt],
+    ) -> Result<()> {
         let restored_ids = restored;
         let restored = |session: Option<&str>| {
             session.is_some_and(|session| restored.iter().any(|id| id == session))
@@ -1175,6 +1428,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 }
                 let orphaned =
                     !attempting.contains(&agent.id) && !workspace.worktree_exists(&agent.worktree);
+                let still_running = agent
+                    .session
+                    .as_deref()
+                    .is_some_and(|session| running.iter().any(|id| id == session));
+                if still_running {
+                    continue;
+                }
                 if orphaned || !restored(agent.session.as_deref()) {
                     db.set_agent_exited(&agent.id)?;
                 }
@@ -1751,6 +2011,9 @@ fn find_task<'a>(run: &'a Run, id: &str) -> Result<&'a Task> {
         .with_context(|| format!("Unknown task {id:?} in run {:?}", run.id))
 }
 
+/// How long a session that still has processes waits before the next reclaim.
+const RECLAIM_RETRY: Duration = Duration::from_secs(5);
+
 fn report(
     db: &dyn DagTransaction,
     run_id: &str,
@@ -1758,7 +2021,7 @@ fn report(
     attempt_id: &str,
     status: ReportStatus,
     summary: &str,
-) -> Result<ReportResult> {
+) -> Result<(ReportResult, Option<String>)> {
     use RunEventKind as Event;
     let run = load_run(db, run_id)?;
     let task = find_task(&run, task_id)?;
@@ -1778,22 +2041,39 @@ fn report(
     ) {
         ReportTransition::Stale => {
             emit(Event::StaleReport)?;
-            return Ok(ReportResult {
-                applied: false,
-                reason: Some("stale attempt".into()),
-            });
+            return Ok((
+                ReportResult {
+                    applied: false,
+                    reason: Some("stale attempt".into()),
+                },
+                None,
+            ));
         }
         ReportTransition::AlreadyReported => {
-            return Ok(ReportResult {
-                applied: false,
-                reason: Some("already reported".into()),
-            });
+            // A replayed terminal report asks for the cleanup again, so a cleanup
+            // lost after the first report still happens.
+            let finished = matches!(
+                attempt.state,
+                AttemptState::Succeeded | AttemptState::Failed
+            )
+            .then(|| attempt.session.clone())
+            .flatten();
+            return Ok((
+                ReportResult {
+                    applied: false,
+                    reason: Some("already reported".into()),
+                },
+                finished,
+            ));
         }
         ReportTransition::Unchanged => {
-            return Ok(ReportResult {
-                applied: true,
-                reason: None,
-            });
+            return Ok((
+                ReportResult {
+                    applied: true,
+                    reason: None,
+                },
+                None,
+            ));
         }
         ReportTransition::Update {
             state,
@@ -1831,10 +2111,16 @@ fn report(
             }
         }
     }
-    Ok(ReportResult {
-        applied: true,
-        reason: None,
-    })
+    let finished = matches!(status, ReportStatus::Success | ReportStatus::Failed)
+        .then(|| attempt.session.clone())
+        .flatten();
+    Ok((
+        ReportResult {
+            applied: true,
+            reason: None,
+        },
+        finished,
+    ))
 }
 
 #[path = "worktrees.rs"]

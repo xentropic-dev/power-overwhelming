@@ -8,7 +8,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct Daemon(Child);
+struct Daemon(Child, String);
+
+/// Gives the daemon `command` starts a systemd slice of its own for its worker
+/// scopes, and returns the slice's name, which the caller stops when done.
+fn own_slice(command: &mut Command) -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let slice = format!(
+        "app-powertest{}x{}.slice",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    command.env("POWER_WORKER_SLICE", &slice);
+    slice
+}
+
+/// Stops a test slice, which ends anything a failed test left in it.
+fn stop_slice(slice: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", slice])
+        .stderr(std::process::Stdio::null())
+        .status();
+}
 
 impl Daemon {
     fn start(root: &Path) -> (Self, PathBuf) {
@@ -20,6 +41,7 @@ impl Daemon {
 
     fn start_with(root: &Path, command: &mut Command) -> (Self, PathBuf) {
         let socket = root.join("power.sock");
+        let slice = own_slice(command);
         let daemon = Self(
             command
                 .arg("daemon")
@@ -29,6 +51,7 @@ impl Daemon {
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .spawn()
                 .unwrap(),
+            slice,
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while UnixStream::connect(&socket).is_err() {
@@ -43,6 +66,7 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        stop_slice(&self.1);
     }
 }
 
@@ -665,17 +689,16 @@ fn shell_hook_gives_hand_started_agents_instructions() {
 
     let socket = root.join("power.sock");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let _daemon = Daemon(
-        Command::new(env!("CARGO_BIN_EXE_power"))
-            .arg("daemon")
-            .env("POWER_SOCKET", &socket)
-            .env("POWER_STATE_DIR", root.join("state"))
-            .env("HOME", &root)
-            .env("SHELL", "/bin/bash")
-            .env("PATH", path)
-            .spawn()
-            .unwrap(),
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_power"));
+    command
+        .arg("daemon")
+        .env("POWER_SOCKET", &socket)
+        .env("POWER_STATE_DIR", root.join("state"))
+        .env("HOME", &root)
+        .env("SHELL", "/bin/bash")
+        .env("PATH", path);
+    let slice = own_slice(&mut command);
+    let _daemon = Daemon(command.spawn().unwrap(), slice);
     let deadline = Instant::now() + Duration::from_secs(5);
     while UnixStream::connect(&socket).is_err() {
         assert!(Instant::now() < deadline, "Daemon did not start");

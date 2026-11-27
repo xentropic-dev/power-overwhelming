@@ -75,6 +75,13 @@ enum Action {
         #[arg(value_parser = ["bash", "zsh", "fish"])]
         shell: String,
     },
+    /// Runs a worker under a subreaper that ends everything it starts. The daemon
+    /// uses it without cgroup ownership.
+    #[command(hide = true)]
+    Reap {
+        #[arg(last = true)]
+        argv: Vec<OsString>,
+    },
     #[command(hide = true)]
     ExecAgent {
         id: String,
@@ -259,6 +266,7 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
+            finished_worker_grace(),
             config::load_talk_policy(settings::Settings::defaults()).unwrap_or_else(|error| {
                 eprintln!("Could not load talk settings. {error:#}");
                 domain::talk::NoticePolicy::default()
@@ -361,6 +369,7 @@ fn main() -> Result<()> {
             client::ensure_daemon()?;
             print_json(json!({"boxes": protocol_boxes()?}))
         }
+        Some(Action::Reap { argv }) => match infrastructure::reaper::run(argv)? {},
         Some(Action::ExecAgent { id, args }) => exec_agent(&id, args),
         Some(Action::Codex { args }) => exec_agent("codex", args),
         Some(Action::Claude { args }) => exec_agent("claude", args),
@@ -470,6 +479,13 @@ fn configured_agents() -> AgentProfiles {
     config::load_agent_profiles(settings::Settings::defaults()).unwrap_or_else(|error| {
         eprintln!("Could not load agent profiles. {error:#}");
         AgentProfiles::default()
+    })
+}
+
+fn finished_worker_grace() -> Option<std::time::Duration> {
+    config::load_finished_worker_grace(settings::Settings::defaults()).unwrap_or_else(|error| {
+        eprintln!("Could not load dag settings. {error:#}");
+        Some(application::dag::FINISHED_WORKER_GRACE)
     })
 }
 

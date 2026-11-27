@@ -3,10 +3,12 @@ use crate::{
     box_icons::IconFiles,
     boxes::BoxesFile,
     budget::{LocalWorkerBudget, ProcMemory},
+    cgroup::{self, WorkerScopes},
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
+    scheduler::{self, TimerScheduler},
     talk_adapter::{self, DaemonTalk},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
@@ -79,9 +81,12 @@ struct Server {
     talk_wake: mpsc::SyncSender<()>,
 }
 
+/// Runs the daemon. `finished_worker_grace` is how long a DAG worker runs after its
+/// terminal report before its session ends, or `None` to leave it running.
 pub fn serve(
     profiles: AgentProfiles,
     worktree_root: LocalWorktreeRoot,
+    finished_worker_grace: Option<Duration>,
     talk_policy: NoticePolicy,
     budget: LocalWorkerBudget,
 ) -> Result<()> {
@@ -125,6 +130,7 @@ pub fn serve(
     let foreground_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
+    let scopes = worker_scopes();
     let (talk_wake, talk_activity) = mpsc::sync_channel(1);
     let application = Arc::new(Application::new(
         artifacts,
@@ -135,9 +141,9 @@ pub fn serve(
             scheme: scheme.clone(),
             profiles: profiles.clone(),
             talk_wake: talk_wake.clone(),
-            on_exit: Arc::new(move |session, detail| {
+            on_exit: Arc::new(move |session, detail, complete| {
                 if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
-                    && let Err(error) = dag.session_exited(session, detail)
+                    && let Err(error) = dag.session_exited(session, detail, complete)
                 {
                     eprintln!("Could not record exit for terminal {session}. {error:#}");
                 }
@@ -162,20 +168,26 @@ pub fn serve(
                 }
             }),
             shutting_down: shutting_down.clone(),
+            scopes,
         },
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
-    let dag = Arc::new(
-        DaemonDag::new(
-            application.clone(),
-            store.clone(),
-            BoxesFile,
-            IconFiles::open()?,
-        )
-        .with_worktree_root(worktree_root)
-        .with_worker_budget(budget, ProcMemory),
-    );
+    let mut dag = DaemonDag::new(
+        application.clone(),
+        store.clone(),
+        BoxesFile,
+        IconFiles::open()?,
+    )
+    .with_worktree_root(worktree_root)
+    .with_worker_budget(budget, ProcMemory);
+    if let Some(grace) = finished_worker_grace {
+        // Teardowns never wait behind the store writes that follow them.
+        let teardown = TimerScheduler::start("power-teardown", scheduler::DEFAULT_CAPACITY)?;
+        let persistence = TimerScheduler::start("power-forget", scheduler::DEFAULT_CAPACITY)?;
+        dag = dag.with_finished_worker_cleanup(grace, Arc::new(teardown), Arc::new(persistence));
+    }
+    let dag = dag.shared();
     terminal_application
         .set(Arc::downgrade(&application))
         .expect("connect terminal callbacks to the application once");
@@ -256,6 +268,37 @@ fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
             }
         }
     });
+}
+
+/// Finds how this system lets Power own workers, and logs it. Without cgroup
+/// ownership, Power falls back to process discovery.
+fn worker_scopes() -> Option<Arc<WorkerScopes>> {
+    if std::env::var_os(cgroup::DISABLE_ENV).is_some_and(|value| value == "0") {
+        eprintln!(
+            "WARNING: {}=0, so workers run without cgroup ownership. Each runs under a \
+             subreaper that ends everything it started.",
+            cgroup::DISABLE_ENV
+        );
+        return None;
+    }
+    let slice = std::env::var(cgroup::SLICE_ENV).unwrap_or_else(|_| cgroup::DEFAULT_SLICE.into());
+    match WorkerScopes::detect(&slice) {
+        Ok(scopes) => {
+            eprintln!(
+                "Each worker runs in its own systemd user scope in {}, whose cgroup owns every process it starts.",
+                scopes.slice()
+            );
+            Some(Arc::new(scopes))
+        }
+        Err(error) => {
+            eprintln!(
+                "WARNING: workers run without cgroup ownership ({error:#}). Each runs under a \
+                 subreaper instead, which adopts and ends everything it started, though it \
+                 cannot freeze them."
+            );
+            None
+        }
+    }
 }
 
 /// Bounds the final save so a reboot is not held up by a stuck terminal.

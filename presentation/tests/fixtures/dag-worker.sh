@@ -42,6 +42,62 @@ case "$1" in
             wait_for_marker "$4"
         fi
         ;;
+    linger)
+        # Reports success, then keeps running with a child and a grandchild that
+        # left the session, the way an agent keeps its MCP servers and shells.
+        wait_for_marker "$2"
+        sleep 600 &
+        child=$!
+        setsid sleep 600 &
+        escaped=$!
+        printf '%s %s %s\n' "$$" "$child" "$escaped" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        wait
+        ;;
+    detach)
+        # Reports success, starts a child in its own session, and exits first.
+        wait_for_marker "$2"
+        setsid sleep 600 &
+        printf '%s %s\n' "$$" "$!" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        ;;
+    escape|escape-stay)
+        # Starts a helper that leaves the session and drops its whole environment,
+        # POWER_SESSION included, so it is reparented once its parent exits. Then
+        # reports success, and exits or, with escape-stay, keeps running.
+        wait_for_marker "$2"
+        helper="$fixture_dir/$4.helper"
+        setsid -f env -i /bin/sh -c 'echo $$ > "$0.tmp"; mv "$0.tmp" "$0"; exec sleep 600' "$helper"
+        until test -f "$helper"; do sleep 0.05; done
+        printf '%s %s\n' "$$" "$(cat "$helper")" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        if test "$1" = escape-stay; then
+            exec sleep 600
+        fi
+        ;;
+    stubborn)
+        # Like escape-stay, but the helper ignores SIGTERM, so only a kill ends it.
+        wait_for_marker "$2"
+        helper="$fixture_dir/$4.helper"
+        setsid -f env -i /bin/sh -c 'trap "" TERM; echo $$ > "$0.tmp"; mv "$0.tmp" "$0"; while :; do sleep 1; done' "$helper"
+        until test -f "$helper"; do sleep 0.05; done
+        printf '%s %s\n' "$$" "$(cat "$helper")" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        exec sleep 600
+        ;;
+    graced)
+        # Reports success, then marks each tenth of a second it still runs.
+        wait_for_marker "$2"
+        report success "$3"
+        while :; do
+            date +%s%N >> "$fixture_dir/$4"
+            sleep 0.1
+        done
+        ;;
     input)
         report needs-input "Which option should I use?"
         wait_for_marker "$2"

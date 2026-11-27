@@ -44,6 +44,29 @@ fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     defaults
 }
 
+/// How long a DAG worker runs after reporting success or failure, from
+/// `dag.end_finished_workers_after` in seconds. `false` keeps finished workers running.
+pub fn load_finished_worker_grace(defaults: Sections) -> Result<Option<Duration>> {
+    finished_worker_grace(&load(with_bundled_defaults(defaults))?)
+}
+
+pub(crate) fn finished_worker_grace(sections: &Sections) -> Result<Option<Duration>> {
+    let default = Some(application::dag::FINISHED_WORKER_GRACE);
+    let Some(value) = sections.get(DAG_SECTION) else {
+        return Ok(default);
+    };
+    let table = value.as_object().context("dag must be a table")?;
+    match table.get("end_finished_workers_after") {
+        None | Some(JsonValue::Null) => Ok(default),
+        Some(JsonValue::Bool(false)) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && (0.0..=86_400.0).contains(seconds))
+            .map(|seconds| Some(Duration::from_secs_f64(seconds)))
+            .context("dag.end_finished_workers_after must be seconds from 0 to 86400, or false"),
+    }
+}
+
 pub(crate) fn load_worker_budget(defaults: Sections) -> Result<WorkerBudget> {
     worker_budget(&load(with_bundled_defaults(defaults))?)
 }
@@ -73,6 +96,7 @@ pub(crate) fn worker_budget(sections: &Sections) -> Result<WorkerBudget> {
                 })?;
                 budget.min_available_memory = (bytes > 0).then_some(bytes);
             }
+            "end_finished_workers_after" => {}
             _ => bail!("dag.{name} is not a setting"),
         }
     }
@@ -460,6 +484,30 @@ mod tests {
     use application::agents::AgentProfileRegistry;
     use domain::dag::GIB;
     use serde_json::json;
+
+    #[test]
+    fn finished_worker_grace_reads_seconds_or_false() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("config.lua");
+        let grace = |source: &str| {
+            fs::write(&path, source)?;
+            finished_worker_grace(&load_from(&path, with_bundled_defaults(Sections::new()))?)
+        };
+        assert_eq!(grace("")?, Some(application::dag::FINISHED_WORKER_GRACE));
+        assert_eq!(
+            grace("dag.end_finished_workers_after = 2.5")?,
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(grace("dag.end_finished_workers_after = false")?, None);
+        for invalid in [
+            "dag.end_finished_workers_after = -1",
+            "dag.end_finished_workers_after = true",
+            "dag.end_finished_workers_after = 'soon'",
+        ] {
+            assert!(grace(invalid).is_err(), "{invalid} was accepted");
+        }
+        Ok(())
+    }
 
     #[test]
     fn worker_budget_reads_the_dag_section() -> Result<()> {
