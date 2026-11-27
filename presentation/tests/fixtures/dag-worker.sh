@@ -140,13 +140,14 @@ case "$1" in
         report success "Used the selected option"
         ;;
     idle)
-        # Sits silent with a child that does nothing, like an agent whose build was killed.
-        sleep 600 &
-        wait
+        # Sits silent with nothing running, like an agent whose build was killed.
+        exec sleep 600
         ;;
     busy)
-        # Sits silent while a child keeps working, like an agent waiting on a build.
-        /bin/sh -c 'while :; do sleep 0.2; done' &
+        # Sits silent while a quiet, long-lived command runs, like an agent waiting on a
+        # test that waits on a timer. The command clears its environment, so only its
+        # ancestry and cgroup tie it to the session.
+        env -i /bin/sleep 600 &
         wait
         ;;
     exit)

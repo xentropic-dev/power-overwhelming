@@ -26,12 +26,9 @@ use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
     io::BufReader,
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
-        },
+    os::unix::{
+        fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
     },
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -599,7 +596,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             let value = (!value.is_empty()).then(|| value.to_owned());
             let (send, receive) = mpsc::sync_channel(1);
             application.terminal(&session)?.send(Command::SetMetadata {
-                pid: peer_pid(socket)?,
+                pid: wire::peer_pid(socket)?,
                 field,
                 value,
                 reply: send,
@@ -626,7 +623,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             application
                 .terminal(&session)?
                 .send(Command::SetConversation {
-                    pid: peer_pid(socket)?,
+                    pid: wire::peer_pid(socket)?,
                     agent: Agent::Coding(agent.into()),
                     conversation,
                     reply: send,
@@ -728,28 +725,4 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         }
         Request::Subscribe { .. } => unreachable!("Subscriptions use the streaming handler"),
     }
-}
-
-fn peer_pid(socket: &UnixStream) -> Result<u32> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Linux supplies the credentials of the process that connected to this socket.
-    let result = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    ensure!(
-        length as usize == std::mem::size_of::<libc::ucred>(),
-        "Missing peer credentials"
-    );
-    let credentials = unsafe { credentials.assume_init() };
-    Ok(credentials.pid.try_into()?)
 }

@@ -57,12 +57,17 @@ enum Action {
     Gui,
     Daemon,
     /// Check that restarting the daemon would not kill DAG workers mid-task. Lists the
-    /// open attempts and asks to confirm, or fails when it cannot ask. Exits 0 when no
-    /// daemon runs. Run it before anything that restarts the daemon.
+    /// open attempts and asks to confirm, or fails when it cannot ask or the daemon does
+    /// not answer. Prints the PID of the daemon it cleared, which is the only one to
+    /// restart, or nothing when no daemon listens. Run it before anything that restarts
+    /// the daemon.
     RestartCheck {
-        /// Allow the restart even with workers mid-task.
+        /// Allow the restart even with workers mid-task or a daemon that does not answer.
         #[arg(long)]
         force: bool,
+        /// Only print the PID of the daemon listening on this socket, without checking.
+        #[arg(long, conflicts_with = "force")]
+        target: bool,
     },
     Session {
         #[command(subcommand)]
@@ -285,8 +290,9 @@ fn main() -> Result<()> {
                 Some(application::dag::STALL_AFTER)
             }),
         ),
-        Some(Action::RestartCheck { force }) => restart_check(
+        Some(Action::RestartCheck { force, target }) => restart_check(
             force || std::env::var_os("POWER_FORCE_RESTART").is_some_and(|value| value == "1"),
+            target,
         ),
         Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {
@@ -1313,12 +1319,45 @@ fn set_paused(ids: Vec<String>, paused: bool) -> Result<()> {
     print_json(json!({"agents": agents}))
 }
 
-/// Never starts a daemon: with none running there is nothing to interrupt.
-fn restart_check(force: bool) -> Result<()> {
+/// Never starts a daemon: with none running there is nothing to interrupt. On success it
+/// prints the PID of the daemon it checked, the one a restart may end, or nothing when
+/// none listens. It fails closed: a daemon that cannot be asked for its workers is not
+/// cleared for a restart unless forced.
+fn restart_check(force: bool, target_only: bool) -> Result<()> {
     use client::protocol::AgentStatus;
     use std::io::IsTerminal as _;
-    let Ok(agents) = list_agents(None, None, false) else {
+    if target_only {
+        if let Some(pid) = client::daemon_pid()? {
+            println!("{pid}");
+        }
         return Ok(());
+    }
+    let target = match client::restart_target(RESTART_CHECK_TIMEOUT) {
+        Ok(target) => target,
+        // Nothing is known about the daemon, not even its PID, so there is nothing to
+        // clear for a restart even when forced.
+        Err(error) if force => {
+            anyhow::bail!("{error:#}\nCould not identify the daemon to restart")
+        }
+        Err(error) => anyhow::bail!(
+            "{error:#}\nRestart cancelled: the daemon may have workers mid-task. Set \
+             POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        ),
+    };
+    let Some((pid, agents)) = target else {
+        return Ok(());
+    };
+    let agents = match agents {
+        Ok(agents) => agents,
+        Err(error) if force => {
+            eprintln!("{error:#}\nRestarting anyway (--force).");
+            println!("{pid}");
+            return Ok(());
+        }
+        Err(error) => anyhow::bail!(
+            "{error:#}\nRestart cancelled: it may have workers mid-task. Wait until it \
+             answers, or set POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        ),
     };
     let open: Vec<_> = agents
         .iter()
@@ -1330,12 +1369,16 @@ fn restart_check(force: bool) -> Result<()> {
                 )
         })
         .collect();
+    let confirmed = || {
+        println!("{pid}");
+        Ok(())
+    };
     if open.is_empty() {
-        return Ok(());
+        return confirmed();
     }
     eprintln!(
-        "{} DAG worker{} mid-task. Restarting the daemon kills every command they run, \
-         such as builds and tests:",
+        "{} DAG worker{} mid-task on the daemon (pid {pid}). Restarting it kills every \
+         command they run, such as builds and tests:",
         open.len(),
         if open.len() == 1 { " is" } else { "s are" }
     );
@@ -1353,21 +1396,24 @@ fn restart_check(force: bool) -> Result<()> {
     }
     if force {
         eprintln!("Restarting anyway (--force).");
-        return Ok(());
+        return confirmed();
     }
     if std::io::stdin().is_terminal() {
         eprint!("Restart anyway? [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if matches!(answer.trim(), "y" | "Y" | "yes") {
-            return Ok(());
+            return confirmed();
         }
     }
     anyhow::bail!(
-        "Restart cancelled. Wait for these workers to report, pause their runs, or set \
-         POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        "Restart cancelled. Wait for these workers to report, or set POWER_FORCE_RESTART=1 \
+         (or pass --force) to restart anyway"
     )
 }
+
+/// How long `restart-check` waits for the daemon to list its workers.
+const RESTART_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn protocol_agents(
     box_sel: Option<String>,

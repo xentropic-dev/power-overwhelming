@@ -1,11 +1,21 @@
-//! What the stall check sees of a worker: its terminal's idle time, and whether the
-//! processes its session started did any work since the last look.
+//! What the stall check sees of a worker: its terminal's idle time, and whether a
+//! command it started, such as a build or test, is still alive.
+//!
+//! A session owns the processes in the cgroups its launches recorded, every process
+//! that carries its `POWER_SESSION`, and every descendant of those. The oldest of them
+//! outside the others' trees is the worker. A command is any other owned process that
+//! runs under a shell, started after the worker's startup, or left the worker's tree.
+//! Helpers an agent starts with itself, such as MCP servers, do not count. A command
+//! counts while it is alive, however quiet: a test waiting on a timer or a build
+//! waiting on a lock still runs. A helper started later counts too, which can only
+//! hide a stall, never report a false one.
 
 use crate::terminal::PtyRuntime;
 use application::{Application, dag::WorkerProbe};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -13,30 +23,70 @@ use std::{
 /// A fresh process scan is reused for this long, so one stall check scans once. It is
 /// shorter than the shortest stall check interval, so each check scans afresh.
 const SNAPSHOT_AGE: Duration = Duration::from_millis(500);
-/// CPU use, as a share of one core, above which a session's processes count as working.
-const BUSY_SHARE: f64 = 0.02;
+/// Programs whose children are commands a worker runs.
+const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "ash"];
+/// Processes that start within this long of the worker are its own helpers.
+const STARTUP: Duration = Duration::from_secs(30);
 
 pub(crate) struct LocalWorkerProbe {
     application: Arc<Application<PtyRuntime>>,
-    state: Mutex<ProbeState>,
+    /// The daemon's state directory, which holds each session's cgroup ledger.
+    state: Option<PathBuf>,
+    /// The last process scan. It is replaced on each scan, so it never holds a
+    /// session that has gone.
+    snapshot: Mutex<Option<(Instant, Arc<Processes>)>>,
+}
+
+/// One live process, as the scan read it.
+struct Process {
+    parent: u32,
+    /// When it started, in clock ticks since boot.
+    started: u64,
+    shell: bool,
+    /// Its cgroup v2 path, as `/proc/<pid>/cgroup` names it.
+    cgroup: String,
+    /// The `POWER_SESSION` it started with.
+    session: Option<String>,
 }
 
 #[derive(Default)]
-struct ProbeState {
-    snapshot: Option<(Instant, BTreeMap<String, Usage>)>,
-    previous: BTreeMap<String, (Instant, Usage)>,
-}
-
-/// The processes that carry one session's `POWER_SESSION`, with each one's CPU time.
-#[derive(Clone, Default)]
-struct Usage(BTreeMap<u32, u64>);
+struct Processes(BTreeMap<u32, Process>);
 
 impl LocalWorkerProbe {
     pub(crate) fn new(application: Arc<Application<PtyRuntime>>) -> Self {
         Self {
             application,
-            state: Mutex::new(ProbeState::default()),
+            state: crate::persistence::state_directory().ok(),
+            snapshot: Mutex::new(None),
         }
+    }
+
+    fn processes(&self) -> Arc<Processes> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let now = Instant::now();
+        match snapshot.as_ref() {
+            Some((at, processes)) if now.duration_since(*at) < SNAPSHOT_AGE => processes.clone(),
+            _ => {
+                let processes = Arc::new(scan());
+                *snapshot = Some((now, processes.clone()));
+                processes
+            }
+        }
+    }
+
+    /// The cgroups `session`'s launches recorded, as `/proc/<pid>/cgroup` names them.
+    fn scopes(&self, session: &str) -> Vec<String> {
+        let Some(state) = &self.state else {
+            return Vec::new();
+        };
+        crate::owned::scopes(state, session)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|path| {
+                let relative = path.strip_prefix("/sys/fs/cgroup").ok()?;
+                Some(format!("/{}", relative.display()))
+            })
+            .collect()
     }
 }
 
@@ -52,98 +102,223 @@ impl WorkerProbe for LocalWorkerProbe {
         Some(Duration::from_millis(now.saturating_sub(last)))
     }
 
-    fn children_working(&self, session: &str) -> bool {
-        let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
-        if state
-            .snapshot
-            .as_ref()
-            .is_none_or(|(at, _)| now.duration_since(*at) >= SNAPSHOT_AGE)
-        {
-            state.snapshot = Some((now, scan()));
-        }
-        let current = state
-            .snapshot
-            .as_ref()
-            .and_then(|(_, sessions)| sessions.get(session))
-            .cloned()
-            .unwrap_or_default();
-        let previous = state
-            .previous
-            .insert(session.into(), (now, current.clone()));
-        // Without an earlier sample there is nothing to compare, so assume work.
-        let Some((then, before)) = previous else {
-            return true;
-        };
-        if current.0.keys().any(|pid| !before.0.contains_key(pid)) {
-            return true;
-        }
-        // Only processes seen both times, so an exited one cannot hide new work.
-        let ticks: u64 = current
-            .0
-            .iter()
-            .filter_map(|(pid, now)| Some(now.saturating_sub(*before.0.get(pid)?)))
-            .sum();
-        let elapsed = now.duration_since(then).as_secs_f64();
-        let used = ticks as f64 / clock_ticks();
-        elapsed > 0. && used / elapsed > BUSY_SHARE
+    fn commands_running(&self, session: &str) -> bool {
+        self.processes()
+            .commands_running(session, &self.scopes(session))
     }
 }
 
-fn clock_ticks() -> f64 {
-    // SAFETY: sysconf has no preconditions.
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks > 0 { ticks as f64 } else { 100. }
+impl Processes {
+    /// Every process `session` owns: those in its cgroups or carrying its
+    /// `POWER_SESSION`, and their descendants, which may have cleared their environment.
+    fn owned(&self, session: &str, scopes: &[String]) -> BTreeSet<u32> {
+        let in_scope = |cgroup: &str| {
+            scopes.iter().any(|scope| {
+                cgroup
+                    .strip_prefix(scope.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        };
+        let mut owned: BTreeSet<u32> = self
+            .0
+            .iter()
+            .filter(|(_, process)| {
+                process.session.as_deref() == Some(session) || in_scope(&process.cgroup)
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+        loop {
+            let before = owned.len();
+            for (pid, process) in &self.0 {
+                if owned.contains(&process.parent) {
+                    owned.insert(*pid);
+                }
+            }
+            if owned.len() == before {
+                return owned;
+            }
+        }
+    }
+
+    /// Whether a command the worker of `session` started is alive: an owned process
+    /// below the worker with a shell between them, or below a worker that is a shell,
+    /// or one that left the worker's tree, such as a command reparented to init.
+    fn commands_running(&self, session: &str, scopes: &[String]) -> bool {
+        let owned = self.owned(session, scopes);
+        // Owned processes whose parent is not owned. The oldest is the worker; any
+        // other detached from it.
+        let roots: Vec<u32> = owned
+            .iter()
+            .copied()
+            .filter(|pid| !owned.contains(&self.0[pid].parent))
+            .collect();
+        let worker = roots
+            .iter()
+            .copied()
+            .min_by_key(|pid| (self.0[pid].started, *pid));
+        let Some(worker) = worker else { return false };
+        if roots.len() > 1 {
+            return true;
+        }
+        let startup = self.0[&worker].started + STARTUP.as_secs() * clock_ticks();
+        owned.iter().any(|pid| {
+            if *pid != worker && self.0[pid].started > startup {
+                return true;
+            }
+            let mut current = *pid;
+            let mut below_shell = false;
+            loop {
+                let Some(process) = self.0.get(&current) else {
+                    return false;
+                };
+                if !owned.contains(&process.parent) {
+                    // `current` is the worker itself. It is no command of its own.
+                    return current != *pid && (below_shell || process.shell);
+                }
+                if current != *pid && process.shell {
+                    below_shell = true;
+                }
+                current = process.parent;
+            }
+        })
+    }
 }
 
-/// Every process this user can read, grouped by the `POWER_SESSION` it started with.
-fn scan() -> BTreeMap<String, Usage> {
-    let mut sessions: BTreeMap<String, Usage> = BTreeMap::new();
+fn clock_ticks() -> u64 {
+    // SAFETY: sysconf has no preconditions.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(ticks)
+        .ok()
+        .filter(|ticks| *ticks > 0)
+        .unwrap_or(100)
+}
+
+/// Every live process this user can read.
+fn scan() -> Processes {
+    let mut processes = BTreeMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return sessions;
+        return Processes(processes);
     };
     for pid in entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
     {
-        let Some(session) = session_of(pid) else {
-            continue;
-        };
-        let Some(ticks) = cpu_ticks(pid) else {
-            continue;
-        };
-        sessions.entry(session).or_default().0.insert(pid, ticks);
+        if let Some(process) = read(pid) {
+            processes.insert(pid, process);
+        }
     }
-    sessions
+    Processes(processes)
 }
 
-fn session_of(pid: u32) -> Option<String> {
-    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
-    environ.split(|byte| *byte == 0).find_map(|item| {
-        let value = item.strip_prefix(b"POWER_SESSION=")?;
-        String::from_utf8(value.to_vec()).ok()
-    })
-}
-
-/// User plus system CPU time, in clock ticks.
-fn cpu_ticks(pid: u32) -> Option<u64> {
+fn read(pid: u32) -> Option<Process> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // proc_pid_stat(5): the name may contain spaces, so fields follow the last ')'.
-    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    if matches!(*fields.first()?, "Z" | "X") {
+    let (head, tail) = stat.rsplit_once(')')?;
+    let name = head.split_once('(')?.1;
+    let mut fields = tail.split_whitespace();
+    if matches!(fields.next()?, "Z" | "X") {
         return None;
     }
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(utime + stime)
+    let parent = fields.next()?.parse().ok()?;
+    // Fields after the state: ppid is the first, starttime the 19th.
+    let started = fields.nth(17)?.parse().ok()?;
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|cgroup| {
+            cgroup
+                .lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+        })
+        .unwrap_or_default();
+    let session = fs::read(format!("/proc/{pid}/environ"))
+        .ok()
+        .and_then(|environ| {
+            environ.split(|byte| *byte == 0).find_map(|item| {
+                let value = item.strip_prefix(b"POWER_SESSION=")?;
+                String::from_utf8(value.to_vec()).ok()
+            })
+        });
+    Some(Process {
+        parent,
+        started,
+        shell: SHELLS.contains(&name),
+        cgroup,
+        session,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn process(parent: u32, name: &str, session: Option<&str>) -> Process {
+        Process {
+            parent,
+            started: 0,
+            shell: SHELLS.contains(&name),
+            cgroup: String::new(),
+            session: session.map(Into::into),
+        }
+    }
+
     #[test]
-    fn reads_this_process_cpu_time() {
-        assert!(cpu_ticks(std::process::id()).is_some());
+    fn reads_this_process() {
+        let me = read(std::process::id()).unwrap();
+        assert_eq!(me.parent, std::os::unix::process::parent_id());
+    }
+
+    #[test]
+    fn a_quiet_command_under_a_shell_counts_and_an_agent_helper_does_not() {
+        // agent (10) -> mcp server (11), agent -> bash (12) -> cargo (13) -> test (14).
+        let mut processes = Processes(BTreeMap::from([
+            (1, process(0, "systemd", None)),
+            (10, process(1, "jcode", Some("s"))),
+            (11, process(10, "node", Some("s"))),
+        ]));
+        assert!(!processes.commands_running("s", &[]));
+        processes.0.insert(12, process(10, "bash", Some("s")));
+        // A shell the agent holds open runs no command yet.
+        assert!(!processes.commands_running("s", &[]));
+        processes.0.insert(13, process(12, "cargo", Some("s")));
+        // The test cleared its environment, and is still owned through its parent.
+        processes
+            .0
+            .insert(14, process(13, "integration-test", None));
+        processes.0.remove(&13);
+        processes.0.get_mut(&14).unwrap().parent = 12;
+        assert!(processes.commands_running("s", &[]));
+        assert!(!processes.commands_running("other", &[]));
+        // `bash -c` execs a lone command, so it runs right under the agent. Started
+        // after the agent's startup, it counts too.
+        processes.0.remove(&12);
+        processes.0.remove(&14);
+        assert!(!processes.commands_running("s", &[]));
+        let mut exec = process(10, "cargo", Some("s"));
+        exec.started = 31 * clock_ticks();
+        processes.0.insert(15, exec);
+        assert!(processes.commands_running("s", &[]));
+    }
+
+    #[test]
+    fn a_shell_worker_counts_any_child_and_cgroups_own_reparented_processes() {
+        let mut processes = Processes(BTreeMap::from([
+            (1, process(0, "systemd", None)),
+            (20, process(1, "sh", Some("w"))),
+        ]));
+        assert!(!processes.commands_running("w", &[]));
+        processes.0.insert(21, process(20, "sleep", Some("w")));
+        assert!(processes.commands_running("w", &[]));
+        // A detached command that cleared its environment, reparented to init, is
+        // still owned through the session's cgroup.
+        processes.0.remove(&21);
+        let mut detached = process(1, "make", None);
+        detached.started = 5;
+        detached.cgroup = "/app.slice/power-w-1.scope".into();
+        processes.0.insert(22, detached);
+        processes.0.get_mut(&20).unwrap().cgroup = "/app.slice/power-w-1.scope".into();
+        let mut child = process(22, "cc", None);
+        child.cgroup = "/app.slice/power-w-1.scope".into();
+        processes.0.insert(23, child);
+        assert!(processes.commands_running("w", &["/app.slice/power-w-1.scope".into()]));
     }
 }

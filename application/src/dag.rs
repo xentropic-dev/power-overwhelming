@@ -232,12 +232,12 @@ pub trait WorkerProbe: Send + Sync {
     /// How long the session's agent has produced no output and received no input, or
     /// `None` when the session is not running here.
     fn idle_for(&self, session: &str) -> Option<Duration>;
-    /// Whether anything the agent started, such as a build or test, did work since the
-    /// previous call for this session: a new process started, or they used CPU.
-    fn children_working(&self, session: &str) -> bool;
+    /// Whether a command the agent started, such as a build or test, is still alive,
+    /// however quiet it is.
+    fn commands_running(&self, session: &str) -> bool;
 }
 
-/// How long a worker may sit idle, with nothing it started working, before its attempt
+/// How long a worker may sit idle, with no command it started still running, before its attempt
 /// is flagged stalled.
 pub const STALL_AFTER: Duration = Duration::from_secs(15 * 60);
 
@@ -374,7 +374,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     /// Flags an active attempt stalled once its worker has been idle for `after`, with
-    /// nothing it started working. Without this, `check_stalls` does nothing.
+    /// no command it started still running. Without this, `check_stalls` does nothing.
     pub fn with_stall_check(mut self, after: Duration, probe: impl WorkerProbe + 'static) -> Self {
         self.stalls = Some(StallCheck {
             after,
@@ -392,7 +392,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     /// Records `AttemptStalled` for each active, unpaused attempt whose worker has been
-    /// idle past the threshold with no child process working, once per idle period.
+    /// idle past the threshold with no command it started still running, once per idle
+    /// period. Eligibility is checked again when the event is written.
     /// Returns the attempts newly flagged.
     pub fn check_stalls(&self) -> Result<Vec<String>> {
         let Some(check) = &self.stalls else {
@@ -414,33 +415,34 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             let Some(session) = entry.attempt.session.as_deref() else {
                 continue;
             };
-            // Sample children every time, so a sample always covers one interval.
-            let working = check.probe.children_working(session);
             let idle = check
                 .probe
                 .idle_for(session)
                 .is_some_and(|idle| idle >= check.after);
-            if idle && !working {
+            if idle && !check.probe.commands_running(session) {
                 stalled.push(entry);
             }
         }
-        let mut flagged = check.flagged.lock().unwrap();
-        let fresh: Vec<_> = stalled
-            .iter()
-            .filter(|entry| !flagged.contains(&entry.attempt.id))
-            .copied()
-            .collect();
-        *flagged = stalled
-            .iter()
-            .map(|entry| entry.attempt.id.clone())
-            .collect();
-        drop(flagged);
-        if !fresh.is_empty() {
-            let minutes = check.after.as_secs_f64() / 60.;
-            let summary =
-                format!("worker idle for {minutes:.1} min or more with no build or test running");
-            self.write(|db| {
-                for entry in &fresh {
+        let previously = check.flagged.lock().unwrap().clone();
+        let minutes = check.after.as_secs_f64() / 60.;
+        let summary =
+            format!("worker idle for {minutes:.1} min or more with no build or test running");
+        // Eligibility is checked again inside the write: an exit, report, input request or
+        // pause while the probe sampled must not be followed by a stale stall.
+        let (still, fresh) = self.write(|db| {
+            let mut still = BTreeSet::new();
+            let mut fresh = Vec::new();
+            for entry in &stalled {
+                let current = db.open_attempts(entry.attempt.session.as_deref())?;
+                let eligible = current.iter().any(|open| {
+                    open.attempt.id == entry.attempt.id
+                        && open.attempt.state == AttemptState::Active
+                }) && !db.agent(&entry.attempt.agent)?.paused;
+                if !eligible {
+                    continue;
+                }
+                still.insert(entry.attempt.id.clone());
+                if !previously.contains(&entry.attempt.id) {
                     db.event(
                         &entry.run,
                         RunEventKind::AttemptStalled,
@@ -448,14 +450,14 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                         Some(&entry.attempt.id),
                         Some(&summary),
                     )?;
+                    fresh.push(entry.attempt.id.clone());
                 }
-                Ok(())
-            })?;
-        }
-        Ok(fresh
-            .into_iter()
-            .map(|entry| entry.attempt.id.clone())
-            .collect())
+            }
+            Ok((still, fresh))
+        })?;
+        // Published only after the events commit, so a failed write leaves no badge.
+        *check.flagged.lock().unwrap() = still;
+        Ok(fresh)
     }
 
     /// Marks the attempts the last stall check flagged.

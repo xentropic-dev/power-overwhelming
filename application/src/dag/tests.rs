@@ -3581,7 +3581,7 @@ impl WorkerProbe for FakeProbe {
         self.0.lock().unwrap().get(session).map(|entry| entry.0)
     }
 
-    fn children_working(&self, session: &str) -> bool {
+    fn commands_running(&self, session: &str) -> bool {
         self.0
             .lock()
             .unwrap()
@@ -3642,5 +3642,72 @@ fn an_idle_worker_with_no_working_children_is_flagged_stalled_once() -> Result<(
     assert!(!dag.run(&run)?.tasks[0].attempts[0].stalled);
     probe.set(&idle_session, Duration::from_secs(61), false);
     assert_eq!(dag.check_stalls()?, [idle.attempt.id]);
+    Ok(())
+}
+
+/// A probe that, while it samples, lets a hook change the worker, as a report or an
+/// exit could between the read and the write of a stall check.
+struct RacingProbe {
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl WorkerProbe for RacingProbe {
+    fn idle_for(&self, _: &str) -> Option<Duration> {
+        if let Some(hook) = self.hook.lock().unwrap().take() {
+            hook();
+        }
+        Some(Duration::from_secs(3600))
+    }
+
+    fn commands_running(&self, _: &str) -> bool {
+        false
+    }
+}
+
+#[test]
+fn an_attempt_that_reports_while_it_is_sampled_is_not_flagged_stalled() -> Result<()> {
+    let late: Arc<Mutex<Option<Arc<TestDag>>>> = Arc::default();
+    let report: Arc<Mutex<Option<(String, String)>>> = Arc::default();
+    let hook = {
+        let late = late.clone();
+        let report = report.clone();
+        Box::new(move || {
+            let dag = late.lock().unwrap().clone().unwrap();
+            let (run, attempt) = report.lock().unwrap().clone().unwrap();
+            dag.report(&run, "work", &attempt, ReportStatus::Success, "Done")
+                .unwrap();
+        }) as Box<dyn FnOnce() + Send>
+    };
+    let dag = TestDag::new(
+        application(),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_stall_check(
+        Duration::from_secs(60),
+        RacingProbe {
+            hook: Mutex::new(Some(hook)),
+        },
+    )
+    .shared();
+    *late.lock().unwrap() = Some(dag.clone());
+    let run = external_run(&dag)?;
+    let started = dag.start(command(&run, false))?;
+    *report.lock().unwrap() = Some((run.clone(), started.attempt.id.clone()));
+    let before = dag.latest_seq()?;
+
+    assert!(dag.check_stalls()?.is_empty());
+    let page = dag.events(EventScope::Run(&run, &[]), before, Duration::ZERO)?;
+    assert!(
+        !page
+            .events
+            .iter()
+            .any(|event| event.kind == RunEventKind::AttemptStalled),
+        "{:?}",
+        page.events
+    );
+    assert!(!dag.run(&run)?.tasks[0].attempts[0].stalled);
+    *late.lock().unwrap() = None;
     Ok(())
 }

@@ -10,15 +10,17 @@ run = """
 set -euo pipefail
 # SIGTERM lets the daemon save its sessions. Running processes still end, including the tab
 # this may run in, and the new daemon recreates each session and resumes its agent.
-pattern='(^|/)power daemon$'
-# Refuses, or asks, while DAG workers are mid-task: a restart kills their builds and tests.
-./target/release/power restart-check
-if pkill -f "$pattern"; then
+# The check asks the daemon on this caller's socket (POWER_SOCKET or the default) and
+# prints its PID, so only the daemon it cleared is signalled. It refuses, or asks, while
+# DAG workers are mid-task, and refuses when that daemon does not answer.
+pid="$(./target/release/power restart-check)"
+if [[ -n "$pid" ]]; then
+  kill "$pid" 2>/dev/null || true
   for _ in $(seq 50); do
-    pgrep -f "$pattern" >/dev/null || break
+    kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
   done
-  pkill -9 -f "$pattern" || true
+  kill -9 "$pid" 2>/dev/null || true
 fi
 # The GUI starts a fresh daemon from this binary when none is listening.
 exec ./target/release/power
@@ -62,31 +64,30 @@ if command -v update-desktop-database >/dev/null; then
 fi
 echo "Installed $apps_dir/power.desktop"
 
-# The daemon and client share one binary. Restart only a daemon running different bytes.
-# Restarting ends every session it hosts, including the tab this may run in.
-pattern='(^|/)power daemon$'
-stale=()
-for pid in $(pgrep -f "$pattern" || true); do
-  cmp -s "/proc/$pid/exe" "$dest" || stale+=("$pid")
-done
-if [[ -z "${stale[*]-}" ]]; then
-  pgrep -f "$pattern" >/dev/null && echo "Daemon already up to date"
+# The daemon and client share one binary. Restart only the daemon on this caller's socket
+# (POWER_SOCKET or the default), and only when it runs different bytes. Restarting ends
+# every session it hosts, including the tab this may run in.
+pid="$("$dest" restart-check --target)"
+if [[ -z "$pid" ]]; then
   exit 0
 fi
-# Refuses, or asks, while DAG workers are mid-task: a restart kills their builds and tests.
-if ! "$dest" restart-check; then
+if cmp -s "/proc/$pid/exe" "$dest"; then
+  echo "Daemon already up to date"
+  exit 0
+fi
+# Refuses, or asks, while DAG workers are mid-task, and refuses when the daemon does not
+# answer. It prints the PID it cleared, which must be the daemon found above.
+if ! checked="$("$dest" restart-check)" || [[ "$checked" != "$pid" ]]; then
   echo "Installed, but left the running daemon alone. It restarts from $dest next time." >&2
   exit 1
 fi
-echo "Restarting daemon (pid ${stale[*]})"
-kill "${stale[@]}" 2>/dev/null || true
+echo "Restarting daemon (pid $pid)"
+kill "$pid" 2>/dev/null || true
 for _ in $(seq 50); do
-  alive=0
-  for pid in "${stale[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
-  ((alive)) || break
+  kill -0 "$pid" 2>/dev/null || break
   sleep 0.1
 done
-kill -9 "${stale[@]}" 2>/dev/null || true
+kill -9 "$pid" 2>/dev/null || true
 # Any session command starts a detached daemon from the installed binary.
 "$dest" session list >/dev/null
 echo "Daemon restarted from $dest"

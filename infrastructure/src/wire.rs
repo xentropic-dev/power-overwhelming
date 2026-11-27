@@ -263,6 +263,62 @@ fn connect_to(path: &std::path::Path, patience: std::time::Duration) -> Result<U
     }
 }
 
+/// The PID of the process on the other end of a connected socket.
+pub(crate) fn peer_pid(socket: &UnixStream) -> Result<u32> {
+    use std::os::fd::AsRawFd as _;
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Linux supplies the credentials of the process that connected to, or listened on,
+    // this socket.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    anyhow::ensure!(
+        length as usize == std::mem::size_of::<libc::ucred>(),
+        "Missing peer credentials"
+    );
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(credentials.pid.try_into()?)
+}
+
+/// What connecting to the daemon socket found.
+pub enum Probe {
+    /// Nothing listens: the socket file is missing, or refuses connections.
+    Absent,
+    /// A daemon accepted, and this is its PID.
+    Listening(UnixStream, u32),
+}
+
+/// Connects to the daemon at `path` once. Only a definite "nothing listens" is
+/// `Absent`. Any other failure, such as a permission error, is an error.
+pub fn probe(path: &std::path::Path) -> Result<Probe> {
+    use std::io::ErrorKind;
+    match UnixStream::connect(path) {
+        Ok(socket) => {
+            let pid = peer_pid(&socket).context("Read the daemon's PID")?;
+            Ok(Probe::Listening(socket, pid))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(Probe::Absent)
+        }
+        Err(error) => Err(error).with_context(|| format!("Connect to {}", path.display())),
+    }
+}
+
 fn is_busy(error: &std::io::Error, path: &std::path::Path) -> bool {
     use std::io::ErrorKind;
     match error.kind() {
