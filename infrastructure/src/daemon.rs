@@ -545,6 +545,25 @@ fn handle(mut socket: UnixStream, request: Request, server: &Server) -> Result<(
         return Ok(());
     }
 
+    if let Request::Talk {
+        talk:
+            talk @ wire::TalkRequest {
+                command: wire::talk::TalkCommand::HookWait,
+                ..
+            },
+    } = request
+    {
+        if let Err(error) = talk_adapter::hook_wait(&server.talk, &server.dag, talk, &socket) {
+            wire::send(
+                socket,
+                &Response::Error {
+                    message: format!("{error:#}"),
+                },
+            )?;
+        }
+        return Ok(());
+    }
+
     let is_talk = matches!(&request, Request::Talk { .. });
     let response =
         handle_request(request, server, &socket).unwrap_or_else(|error| Response::Error {

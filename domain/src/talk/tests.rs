@@ -439,3 +439,32 @@ fn notify_only_submission_holds_notices_until_the_turn_end_report() {
     };
     assert_eq!(policy.decide(ended, false, false, &msg, 1_000_000), Notify);
 }
+
+#[test]
+fn hooks_hand_over_only_unannounced_messages_in_their_envelopes() {
+    let peer = message();
+    let idle = Activity::default();
+    assert!(hook_deliverable(&peer.queued(), idle, false));
+    assert!(!hook_deliverable(&peer.queued(), idle, true));
+    for held in [
+        Activity {
+            paused: true,
+            ..idle
+        },
+        Activity {
+            restoring: true,
+            ..idle
+        },
+    ] {
+        assert!(!hook_deliverable(&peer.queued(), held, false));
+    }
+    let mut noticed = peer.clone();
+    noticed.delivery.notified_at = Some(1);
+    assert!(!hook_deliverable(&noticed.queued(), idle, false));
+    let mut user = peer.clone();
+    user.sender = Sender::User;
+    assert!(hook_deliverable(&user.queued(), idle, true));
+    let reason = hook_reason(std::slice::from_ref(&peer));
+    assert!(reason.contains(&envelope(&peer)));
+    assert!(reason.contains("Not from the user"));
+}

@@ -311,6 +311,9 @@ fn skips_injection(profile: &AgentProfile, user: &[OsString]) -> bool {
 pub(crate) const MODEL_CALLBACK: &str = "power session model --json";
 
 /// Launcher hooks and whether the provider reports only turn ends (Codex `notify`).
+/// Claude Code kills an asyncRewake hook at its timeout. The next turn end starts another.
+const HOOK_WAIT_SECONDS: u64 = 24 * 60 * 60;
+
 pub(crate) fn launch_callbacks(
     profile: &AgentProfile,
     user: &[OsString],
@@ -363,7 +366,13 @@ fn callback_args(
         }
         if profile.turn_hook == TurnHook::ClaudeSettings {
             settings.insert("hooks".into(), serde_json::json!({
-                "Stop": [{ "hooks": [{ "type": "command", "command": "power talk ready" }] }],
+                // The first hook reports the turn end and hands over queued messages. The
+                // second waits in the background and wakes the idle agent when one arrives.
+                "Stop": [{ "hooks": [
+                    { "type": "command", "command": "power talk hook stop" },
+                    { "type": "command", "command": "power talk hook wait",
+                      "asyncRewake": true, "timeout": HOOK_WAIT_SECONDS },
+                ] }],
                 "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "power talk busy" }] }],
             }));
         }
@@ -923,8 +932,11 @@ mod tests {
         );
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-            "power talk ready"
+            "power talk hook stop"
         );
+        let wait = &settings["hooks"]["Stop"][0]["hooks"][1];
+        assert_eq!(wait["command"], "power talk hook wait");
+        assert_eq!(wait["asyncRewake"], true);
         assert_eq!(
             settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
             "power talk busy"

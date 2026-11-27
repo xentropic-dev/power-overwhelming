@@ -1430,3 +1430,111 @@ fn a_coding_agent_in_a_shell_tab_is_never_paused_or_stopped_with_the_shell_and_i
     let _ = Command::new("kill").arg(&sibling).status();
     fs::write(path.join("release-sender"), "").unwrap();
 }
+
+fn hook(path: &Path, agent: &ManagedAgent, event: &str) -> Command {
+    let mut command = power(path, Some(agent));
+    command
+        .args(["talk", "hook", event])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+#[test]
+fn an_idle_hooked_session_gets_messages_from_its_waiting_hook_and_no_notice() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    // The Stop hook reports the turn end before the waiter starts.
+    let output = hook(path, &fixture.b, "stop").output().unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    let waiter = hook(path, &fixture.b, "wait").spawn().unwrap();
+    // The waiter holds notices once it attaches. Give it a moment before sending.
+    thread::sleep(Duration::from_millis(300));
+    let sent = fixture.messages(
+        Some(&fixture.a),
+        &["send", "task:b", "hooked body", "--json"],
+    );
+    let output = waiter.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let reason = String::from_utf8(output.stderr).unwrap();
+    assert!(reason.contains(field(&sent[0], "id")));
+    assert!(reason.contains("Not from the user"));
+    assert!(reason.contains("> hooked body"));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(notice_count(path, "b"), 0);
+    let all = fixture.messages(Some(&fixture.b), &["inbox", "--all", "--json"]);
+    assert!(all[0]["delivery"]["notified_at"].is_u64());
+    assert!(all[0]["delivery"]["read_at"].is_u64());
+    assert!(
+        fixture
+            .messages(Some(&fixture.b), &["inbox", "--json"])
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_message_sent_mid_turn_is_handed_over_by_the_hook_at_the_turn_end_once() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    success(fixture.talk(Some(&fixture.b), &["busy"]));
+    let sent = fixture.messages(Some(&fixture.a), &["send", "task:b", "mid turn", "--json"]);
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(notice_count(path, "b"), 0);
+    let output = hook(path, &fixture.b, "stop").output().unwrap();
+    assert!(output.status.success());
+    let decision: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(decision["decision"], "block");
+    let reason = decision["reason"].as_str().unwrap();
+    assert!(reason.contains(field(&sent[0], "id")) && reason.contains("> mid turn"));
+    // The next turn end has nothing left to hand over, and no notice repeats it.
+    let output = hook(path, &fixture.b, "stop").output().unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(notice_count(path, "b"), 0);
+}
+
+#[test]
+fn a_message_announced_by_a_notice_is_never_handed_over_by_a_hook() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    fixture.messages(Some(&fixture.a), &["send", "task:b", "noticed", "--json"]);
+    poll("terminal notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    let output = hook(path, &fixture.b, "stop").output().unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    assert_eq!(
+        fixture
+            .messages(Some(&fixture.b), &["inbox", "--peek", "--json"])
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_failed_hook_falls_back_to_a_terminal_notice_without_losing_messages() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    success(fixture.talk(Some(&fixture.b), &["busy"]));
+    fixture.messages(Some(&fixture.a), &["send", "task:b", "kept", "--json"]);
+    // A hook that cannot reach the daemon prints nothing, so the agent stops normally.
+    let output = hook(path, &fixture.b, "stop")
+        .env("POWER_SOCKET", path.join("missing.sock"))
+        .output()
+        .unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(notice_count(path, "b"), 0);
+    // A waiter that dies hands delivery back to notices once the turn ends.
+    let mut waiter = hook(path, &fixture.b, "wait").spawn().unwrap();
+    thread::sleep(Duration::from_millis(300));
+    waiter.kill().unwrap();
+    waiter.wait().unwrap();
+    success(fixture.talk(Some(&fixture.b), &["ready"]));
+    poll("fallback notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    let inbox = fixture.messages(Some(&fixture.b), &["inbox", "--json"]);
+    assert_eq!(field(&inbox[0], "body"), "kept");
+}

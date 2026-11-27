@@ -55,6 +55,18 @@ pub enum TalkCommand {
     },
     Summary,
     Watch,
+    /// Unread messages a turn hook may hand over now. `turn_ended` also reports the
+    /// turn's end.
+    HookPending {
+        turn_ended: bool,
+    },
+    /// Streams keepalive `Ok` responses until messages a hook may hand over arrive, then
+    /// sends them and ends. While it waits, the session gets no terminal notices.
+    HookWait,
+    /// The hook handed these messages to the agent.
+    HookDelivered {
+        ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

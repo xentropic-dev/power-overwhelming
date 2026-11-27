@@ -220,8 +220,48 @@ pub(crate) fn request(
         TalkCommand::Summary => TalkResponse::Summary {
             agents: talk.summary(caller)?.into_iter().map(Into::into).collect(),
         },
-        TalkCommand::Watch => unreachable!("Talk watch uses the streaming handler"),
+        TalkCommand::HookPending { turn_ended } => items(talk.hook_pending(&caller, turn_ended)?),
+        TalkCommand::HookDelivered { ids } => items(
+            talk.hook_delivered(&caller, &ids.into_iter().map(MessageId).collect::<Vec<_>>())?,
+        ),
+        TalkCommand::Watch | TalkCommand::HookWait => {
+            unreachable!("Talk watches use the streaming handler")
+        }
     })
+}
+
+/// Holds the session's hook waiter until messages arrive or the client goes away. A
+/// keepalive every few seconds detects a client that died, which hands delivery back to
+/// terminal notices.
+pub(crate) fn hook_wait(
+    talk: &DaemonTalk,
+    dag: &DaemonDag,
+    request: TalkRequest,
+    mut socket: &UnixStream,
+) -> Result<()> {
+    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
+    let lease = talk.attach_hook(&caller)?;
+    let ok = || Response::Talk {
+        talk: TalkResponse::Ok,
+    };
+    wire::send(&mut socket, &ok())?;
+    loop {
+        let messages = talk.hook_wait(&lease, &caller, Instant::now() + Duration::from_secs(5))?;
+        if lease.superseded() {
+            return Ok(());
+        }
+        if !messages.is_empty() {
+            return wire::send(
+                &mut socket,
+                &Response::Talk {
+                    talk: TalkResponse::Messages {
+                        messages: messages.into_iter().map(Into::into).collect(),
+                    },
+                },
+            );
+        }
+        wire::send(&mut socket, &ok())?;
+    }
 }
 
 pub(crate) fn watch(

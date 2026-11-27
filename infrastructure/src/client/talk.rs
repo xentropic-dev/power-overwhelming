@@ -302,3 +302,34 @@ impl From<TalkAgentSummary> for AgentTalkSummary {
         }
     }
 }
+
+/// Messages the session's turn hook may hand over now. `turn_ended` reports the turn end.
+pub fn hook_pending(caller: Caller, turn_ended: bool) -> Result<Vec<Message>> {
+    messages(caller, TalkCommand::HookPending { turn_ended })
+}
+
+/// Records that the hook handed these messages over. Returns those it may still show.
+pub fn hook_delivered(caller: Caller, ids: Vec<MessageId>) -> Result<Vec<Message>> {
+    messages(
+        caller,
+        TalkCommand::HookDelivered {
+            ids: ids.into_iter().map(|id| id.0).collect(),
+        },
+    )
+}
+
+/// Waits until messages arrive for the session's hook. None if a later hook took over
+/// or the daemon ended the wait.
+pub fn hook_wait(caller: Caller) -> Result<Option<Vec<Message>>> {
+    let mut socket = connect(caller, TalkCommand::HookWait, Duration::from_secs(15))?;
+    while let Some(response) = wire::receive(&mut socket)? {
+        match decode(response)? {
+            TalkResponse::Ok => {}
+            TalkResponse::Messages { messages } => {
+                return Ok(Some(messages.into_iter().map(Into::into).collect()));
+            }
+            _ => bail!("Unexpected talk hook response"),
+        }
+    }
+    Ok(None)
+}

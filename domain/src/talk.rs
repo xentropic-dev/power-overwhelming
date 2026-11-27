@@ -483,6 +483,37 @@ impl Default for NoticePolicy {
     }
 }
 
+/// Whether a provider turn hook may hand over the message now. A hook delivers each message
+/// once, in full, so it takes only messages that no notice has announced yet and keeps the
+/// same holds as terminal notices for restores, pauses and agents that need input.
+pub fn hook_deliverable(message: &Queued, activity: Activity, needs_input: bool) -> bool {
+    message.recipient != Recipient::User
+        && message.delivery.read_at.is_none()
+        && message.delivery.notified_at.is_none()
+        && !activity.restoring
+        && !activity.paused
+        && (!needs_input || message.sender.has_user_authority())
+}
+
+/// Messages a turn hook hands to the agent, each in its envelope.
+pub fn hook_reason(messages: &[Message]) -> String {
+    let mut reason = format!(
+        "[power talk] {} new {} delivered by Power while your turn ended. Reply with \
+         power talk reply <id>.",
+        messages.len(),
+        if messages.len() == 1 {
+            "message"
+        } else {
+            "messages"
+        },
+    );
+    for message in messages {
+        reason.push_str("\n\n");
+        reason.push_str(&envelope(message));
+    }
+    reason
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NoticeDecision {
     Notify,
