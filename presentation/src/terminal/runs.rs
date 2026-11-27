@@ -31,6 +31,8 @@ pub(super) enum RowOp {
         column: usize,
         /// How many cells the run covers.
         cells: usize,
+        /// Whether the run is a single wide cell.
+        wide: bool,
         color: Hsla,
         /// For faint text, the background that color emoji fade into.
         fade: Option<Hsla>,
@@ -83,7 +85,7 @@ impl RowOp {
     /// with the background to fade them into.
     pub(super) fn faded_emoji(&self, cell_width: Pixels) -> Vec<(usize, usize, Hsla)> {
         let Self::Text {
-            cells,
+            wide,
             fade: Some(fade),
             glyphs,
             ..
@@ -93,8 +95,9 @@ impl RowOp {
         };
         let mut spans: Vec<(usize, usize, Hsla)> = Vec::new();
         for glyph in glyphs.iter().filter(|glyph| glyph.emoji) {
-            // A wide cell is a run of its own, so its emoji covers both columns.
-            let (column, count) = if *cells >= 2 {
+            // A wide cell is a run of its own, so its emoji covers both columns. In a run of
+            // narrow cells, the emoji covers only its own cell.
+            let (column, count) = if *wide {
                 (0, 2)
             } else {
                 let column = f32::from(glyph.offset.x) / f32::from(cell_width) + 0.01;
@@ -331,6 +334,7 @@ pub(super) fn row_ops(
             } else {
                 end - start
             },
+            wide: first.cell.wide == CellWide::Wide,
             color: first.fg,
             fade: first.fade,
             glyphs: place_glyphs(&layout, &text, shaping.cell_width),
@@ -658,6 +662,36 @@ mod tests {
             .find(|op| matches!(op, RowOp::Text { .. }))
             .unwrap();
         assert!(op.faded_emoji(px(8.)).is_empty());
+    }
+
+    #[test]
+    fn faint_narrow_emoji_veil_only_its_own_cell() {
+        let frame = screen("\x1b[2mA\u{2665}Z\x1b[0m".as_bytes());
+        let mut row = cells(&frame, 0);
+        let veil = Hsla::from(rgb(0x102030));
+        for cell in &mut row {
+            cell.fade = Some(veil);
+        }
+        let font = gpui::font("Test");
+        let mut ops = row_ops(
+            &row,
+            &shaping(&font, false, None),
+            monospace(&mut Vec::new()),
+        );
+        let RowOp::Text { glyphs, cells, .. } = ops
+            .iter_mut()
+            .find(|op| matches!(op, RowOp::Text { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(*cells, 3);
+        glyphs[1].emoji = true;
+        let op = ops
+            .iter()
+            .find(|op| matches!(op, RowOp::Text { .. }))
+            .unwrap();
+        assert_eq!(op.faded_emoji(px(7.)), [(1, 1, veil)]);
     }
 
     #[test]
