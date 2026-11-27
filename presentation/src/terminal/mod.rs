@@ -52,14 +52,16 @@ const BUNDLED_FONTS: [&[u8]; 4] = [
     include_bytes!("../../assets/fonts/JetBrainsMono-Italic.ttf"),
     include_bytes!("../../assets/fonts/JetBrainsMono-BoldItalic.ttf"),
 ];
+/// Symbols Nerd Font, shipped so Nerd Font icons the terminal font lacks still draw.
+pub(crate) const SYMBOLS_FONT: &[u8] =
+    include_bytes!("../../assets/fonts/SymbolsNerdFont-Regular.ttf");
 const BUNDLED_FAMILY: &str = "JetBrains Mono";
 
 /// Adds the bundled font to GPUI's text system; call once before any terminal is drawn.
 pub fn load_bundled_fonts(cx: &App) {
-    if let Err(error) = cx
-        .text_system()
-        .add_fonts(BUNDLED_FONTS.map(std::borrow::Cow::Borrowed).to_vec())
-    {
+    let mut fonts = BUNDLED_FONTS.map(std::borrow::Cow::Borrowed).to_vec();
+    fonts.push(std::borrow::Cow::Borrowed(SYMBOLS_FONT));
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
         eprintln!("Could not load the bundled terminal font. {error:#}");
     }
 }
