@@ -787,3 +787,66 @@ fn publishing_streams_an_event_and_lists_history_newest_first() {
         .collect();
     assert_eq!(uris, [newer, older]);
 }
+
+#[test]
+fn agent_started_through_a_symlink_to_another_binary_sets_metadata() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::fs;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let builds = root.join("builds");
+    fs::create_dir(&builds).unwrap();
+    // A copy of sh stands in for a versioned agent binary whose name matches no
+    // profile. Only the `jcode` symlink on PATH points at it.
+    let build = builds.join("agent-build-7");
+    fs::copy("/bin/sh", &build).unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(&build, bin.join("jcode")).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let (_daemon, socket) = Daemon::start_with(
+        &root,
+        Command::new(env!("CARGO_BIN_EXE_power"))
+            .env("SHELL", "/bin/sh")
+            .env("PATH", &path),
+    );
+    let launched = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"shell"}),
+    ));
+    let session = &launched["session"]["id"];
+    let subscribe = || request(&socket, json!({"request":"subscribe", "session":session}));
+    let mut attached = subscribe();
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    let input = |data: &str| {
+        event(&mut request(
+            &socket,
+            json!({"request":"input", "session":session, "data":STANDARD.encode(data)}),
+        ));
+    };
+    // Started by its own path, as a launcher re-executing its versioned build does.
+    input(
+        "builds/agent-build-7 -c 'power session task \"Linked task\"; power session model \"Linked model\"; read finish'\n",
+    );
+    let mut metadata = json!(null);
+    while metadata["model"] != "Linked model" {
+        let message = event(&mut attached);
+        if message["event"] == "metadata" {
+            metadata = message["metadata"].clone();
+        }
+    }
+    assert_eq!(metadata["task"], "Linked task");
+    let mut reattached = subscribe();
+    assert_eq!(event(&mut reattached)["event"], "snapshot");
+    assert_eq!(event(&mut reattached)["agent"], "jcode");
+    input("\n");
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}

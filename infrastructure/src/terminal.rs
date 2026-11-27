@@ -1917,15 +1917,41 @@ fn process_agent(process: &Path, profiles: &dyn AgentProfileRegistry) -> Option<
     let mut args = cmdline.split('\0').filter(|arg| !arg.is_empty());
     let program = args.next()?;
     // Interpreters such as `node /usr/bin/codex` carry the agent in the next argument.
-    let program = if matches!(
+    let interpreted = matches!(
         program_name(program),
         "node" | "bun" | "deno" | "sh" | "bash" | "dash" | "zsh" | "python" | "python3"
-    ) {
-        args.find(|arg| !arg.starts_with('-'))?
+    );
+    let (program, executable) = if interpreted {
+        let script = args.find(|arg| !arg.starts_with('-'))?;
+        let path = Path::new(script);
+        let path = if path.is_relative() {
+            fs::read_link(process.join("cwd")).ok()?.join(path)
+        } else {
+            path.to_owned()
+        };
+        (script, path.canonicalize().ok())
     } else {
-        program
+        (program, fs::read_link(process.join("exe")).ok())
     };
-    agent_for_program(program, profiles)
+    agent_for_program(program, profiles).or_else(|| {
+        // A wrapper or symlink on PATH can start a binary under another name, such as
+        // `~/.jcode/builds/versions/1.1.2/jcode-linux-x86_64.bin`.
+        let executable = executable?;
+        profiles
+            .profiles()
+            .iter()
+            .find(|profile| {
+                resolve_command(&profile.command).is_some_and(|target| target == executable)
+            })
+            .map(|profile| Agent::Coding(profile.id.clone()))
+    })
+}
+
+/// The file a profile command runs once PATH and symlinks are resolved.
+fn resolve_command(command: &str) -> Option<PathBuf> {
+    crate::cgroup::find_program(OsStr::new(command), std::env::var_os("PATH"), None)?
+        .canonicalize()
+        .ok()
 }
 
 fn process_model(pid: u32, agent: &Agent) -> Option<String> {
@@ -1958,6 +1984,59 @@ fn program_name(arg: &str) -> &str {
         .unwrap_or(name)
 }
 
+/// Whether `name` is a versioned build of `command`: the command followed by platform
+/// and version parts, as in `jcode-linux-x86_64.bin` or `claude-2.0.1-darwin-arm64`.
+fn versioned_build_of(name: &str, command: &str) -> bool {
+    let name = [".bin", ".exe"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    let Some(rest) = name
+        .strip_prefix(command)
+        .and_then(|rest| rest.strip_prefix('-').or_else(|| rest.strip_prefix('_')))
+    else {
+        return false;
+    };
+    !rest.is_empty() && rest.split(['-', '_']).all(is_platform_or_version)
+}
+
+fn is_platform_or_version(part: &str) -> bool {
+    matches!(
+        part,
+        "linux"
+            | "darwin"
+            | "macos"
+            | "windows"
+            | "x86"
+            | "x64"
+            | "amd64"
+            | "arm64"
+            | "aarch64"
+            | "armv7"
+            | "musl"
+            | "gnu"
+            | "unknown"
+            | "apple"
+            | "pc"
+            | "64"
+    ) || is_version(part.strip_prefix('v').unwrap_or(part))
+}
+
+fn is_version(part: &str) -> bool {
+    !part.is_empty()
+        && part.starts_with(|c: char| c.is_ascii_digit())
+        && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// The agent a program under a versions folder belongs to, such as `claude` for
+/// `~/.local/share/claude/versions/2.0.1`, whose file name is only a version.
+fn versions_owner(program: &str) -> Option<&str> {
+    let mut parts = program.rsplit('/');
+    let version = parts.next()?;
+    (is_version(version) && parts.next()? == "versions").then_some(())?;
+    parts.next()
+}
+
 fn agent_for_program(program: &str, profiles: &dyn AgentProfileRegistry) -> Option<Agent> {
     let name = program_name(program);
     let profiles = profiles.profiles();
@@ -1968,6 +2047,17 @@ fn agent_for_program(program: &str, profiles: &dyn AgentProfileRegistry) -> Opti
             profiles
                 .iter()
                 .find(|profile| program_name(&profile.command) == name)
+        })
+        .or_else(|| {
+            profiles
+                .iter()
+                .find(|profile| versioned_build_of(name, program_name(&profile.command)))
+        })
+        .or_else(|| {
+            let owner = versions_owner(program)?;
+            profiles
+                .iter()
+                .find(|profile| program_name(&profile.command) == owner)
         })
         .map(|profile| Agent::Coding(profile.id.clone()))
 }
@@ -2579,6 +2669,33 @@ mod tests {
             Some(Agent::Coding("codex".into()))
         );
         assert_eq!(agent_for_program("vim", &profiles), None);
+    }
+
+    #[test]
+    fn recognizes_versioned_agent_builds() {
+        let profiles = crate::agents::AgentProfiles::default();
+        let agent = |program| agent_for_program(program, &profiles);
+        let jcode = Some(Agent::Coding("jcode".into()));
+        assert_eq!(
+            agent("/home/u/.jcode/builds/versions/1.1.2/jcode-linux-x86_64.bin"),
+            jcode
+        );
+        assert_eq!(agent("jcode-v1.1.2-darwin-arm64"), jcode);
+        assert_eq!(
+            agent("/home/u/.local/share/claude/versions/2.0.1"),
+            Some(Agent::Coding("claude".into()))
+        );
+        for unrelated in [
+            "jcodex",
+            "jcode-helper",
+            "jcode-linux-helper.bin",
+            "jcode-",
+            "/opt/versions/1.0/vim",
+            "/opt/other/versions/1.0",
+            "/home/u/.local/share/claude/releases/2.0.1",
+        ] {
+            assert_eq!(agent(unrelated), None, "{unrelated}");
+        }
     }
 
     #[test]
