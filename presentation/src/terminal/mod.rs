@@ -218,6 +218,21 @@ impl TerminalView {
                 |event| tx.send_blocking(event).is_ok(),
             );
         });
+        Self::with_channels(session, scheme, settings, hold, commands, rx, window, cx)
+    }
+
+    /// A view fed by `rx` that sends its controls to `commands`.
+    #[allow(clippy::too_many_arguments)]
+    fn with_channels(
+        session: Session,
+        scheme: &'static Scheme,
+        settings: TerminalSettings,
+        hold: InputHold,
+        commands: async_channel::Sender<TerminalControl>,
+        rx: async_channel::Receiver<TerminalEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let follow = cx.spawn_in(window, async move |view, cx| {
             while let Ok(first) = rx.recv().await {
                 let deadline = Instant::now() + OUTPUT_TURN;

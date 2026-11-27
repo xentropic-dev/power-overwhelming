@@ -1,3 +1,6 @@
+//! Mouse motion deduplication and wheel reporting adapted from herdr-app `src/vt.rs` and
+//! `src/terminal.rs` (Apache-2.0).
+
 use super::{
     OpenLink, TerminalView,
     grid::PtyGrid,
@@ -130,10 +133,15 @@ impl TerminalView {
         }
     }
 
-    /// Whether the program takes the mouse: it turned tracking on and Shift isn't held,
-    /// since Shift keeps the mouse for selecting.
+    /// Whether the program turned mouse tracking on.
+    fn tracks_mouse(&self) -> bool {
+        self.terminal.is_mouse_tracking().unwrap_or(false)
+    }
+
+    /// Whether the program takes the mouse buttons: it tracks the mouse and Shift isn't
+    /// held, since Shift keeps the mouse for selecting.
     fn takes_mouse(&self, modifiers: Modifiers) -> bool {
-        !modifiers.shift && self.terminal.is_mouse_tracking().unwrap_or(false)
+        !modifiers.shift && self.tracks_mouse()
     }
 
     /// Reports a press (`Some(true)`), release (`Some(false)`) or drag (`None`) of `button`
@@ -260,15 +268,16 @@ impl TerminalView {
         }
         self.focus.focus(window);
         self.set_pointer(Some(event.position));
-        if self.grab_scrollbar(event.position) {
+        let link = self
+            .clickable_link_at(event.position, event.modifiers)
+            .cloned();
+        // A modifier-click on a link opens it even where the scrollbar overlaps it.
+        if link.is_none() && self.grab_scrollbar(event.position) {
             cx.stop_propagation();
             cx.notify();
             return;
         }
         let cell = self.at(event.position);
-        let link = self
-            .clickable_link_at(event.position, event.modifiers)
-            .cloned();
         if link.is_none()
             && self.report_button(
                 Some(true),
@@ -330,9 +339,13 @@ impl TerminalView {
             }
             return;
         }
-        if let Some(button) = event.pressed_button
-            && self.buttons.contains(&button)
-        {
+        // GPUI keeps one pressed button, and forgets it when any button is released while
+        // others are still held, so the drag reports the earliest button this view holds.
+        let button = event
+            .pressed_button
+            .filter(|button| self.buttons.contains(button))
+            .or_else(|| self.buttons.first().copied());
+        if let Some(button) = button {
             self.report_button(None, button, event.position, event.modifiers, cx);
         }
     }
@@ -424,7 +437,9 @@ impl TerminalView {
         if steps.x == 0 && steps.y == 0 {
             return;
         }
-        if self.takes_mouse(event.modifiers) {
+        if self.tracks_mouse() {
+            // Wheel reports go to the program whatever the modifiers, Shift included, as in
+            // herdr-app. GPUI already turns Shift+wheel into horizontal steps.
             // Up and left are buttons 4 and 6, down and right 5 and 7.
             for (count, positive, negative) in [
                 (steps.y, mouse::Button::Four, mouse::Button::Five),
@@ -443,11 +458,17 @@ impl TerminalView {
             }
             return;
         }
-        if steps.y == 0 {
+        // Without tracking, Shift+wheel arrives horizontal from GPUI: scroll it vertically.
+        let lines = if event.modifiers.shift && steps.y == 0 {
+            steps.x
+        } else {
+            steps.y
+        };
+        if lines == 0 {
             return;
         }
-        let up = steps.y > 0;
-        let lines = steps.y.unsigned_abs() as usize;
+        let up = lines > 0;
+        let lines = lines.unsigned_abs() as usize;
         if self.alternate_screen() {
             // A full-screen program that doesn't track the mouse scrolls by arrow keys.
             let bytes = self.typing.arrows(&self.terminal, up, lines);
@@ -466,15 +487,24 @@ impl TerminalView {
 
     fn scroll_viewport(&mut self, scroll: ScrollViewport, cx: &mut Context<Self>) {
         self.terminal.scroll_viewport(scroll);
-        self.pressed_link = None;
-        self.refresh();
+        self.viewport_moved();
         cx.notify();
     }
 
-    /// Scrolls the scrollback by keyboard command. The alternate screen has none.
-    pub fn scroll_history(&mut self, target: ScrollTarget, cx: &mut Context<Self>) {
+    /// The viewport moved: a selection holds viewport cells, so it would now copy other
+    /// text. Drop it, and any link press.
+    fn viewport_moved(&mut self) {
+        self.selection = None;
+        self.dragging = false;
+        self.pressed_link = None;
+        self.refresh();
+    }
+
+    /// Scrolls the scrollback by keyboard command. False on the alternate screen, which
+    /// has none, so the key can go to the program instead.
+    pub fn scroll_history(&mut self, target: ScrollTarget, cx: &mut Context<Self>) -> bool {
         if self.alternate_screen() {
-            return;
+            return false;
         }
         let rows = self.grid.geometry().rows as isize;
         let scroll = match target {
@@ -484,6 +514,7 @@ impl TerminalView {
             ScrollTarget::Bottom => ScrollViewport::Bottom,
         };
         self.scroll_viewport(scroll, cx);
+        true
     }
 
     /// The scrollbar's track and thumb, when there is scrollback to show and the primary
@@ -536,8 +567,10 @@ impl TerminalView {
         self.scrollbar_grab = Some(grab);
         if !thumb.contains(&position) {
             self.place_thumb(track, f32::from(position.y - track.origin.y) - grab);
+            self.viewport_moved();
+        } else {
+            self.refresh();
         }
-        self.refresh();
         true
     }
 
@@ -545,8 +578,12 @@ impl TerminalView {
         let (Some(grab), Some((track, _))) = (self.scrollbar_grab, self.scrollbar()) else {
             return;
         };
+        let before = self.terminal.scrollbar().ok().map(|bar| bar.offset);
         self.place_thumb(track, f32::from(position.y - track.origin.y) - grab);
-        if self.refresh() {
+        if self.terminal.scrollbar().ok().map(|bar| bar.offset) != before {
+            self.viewport_moved();
+            cx.notify();
+        } else if self.refresh() {
             cx.notify();
         }
     }
@@ -690,6 +727,333 @@ mod tests {
         assert_eq!(
             sgr_press(&grid, 4., point(px(13.), px(23.))),
             "\x1b[<0;2;2M"
+        );
+    }
+}
+
+/// Real GPUI dispatch into a laid-out view, with the PTY replaced by channels.
+#[cfg(test)]
+mod event_tests {
+    use super::super::{InputHold, TerminalView};
+    use crate::settings::TerminalSettings;
+    use domain::session::{Agent, Session};
+    use gpui::{
+        AppContext, Context, Entity, IntoElement, Modifiers, MouseButton, NavigationDirection,
+        ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Styled,
+        TestAppContext, TouchPhase, VisualTestContext, Window, div, point, px,
+    };
+    use infrastructure::client::{TerminalControl, TerminalEvent};
+
+    /// Lays the terminal out as the workspace does, in a flex column.
+    struct Host(Entity<TerminalView>);
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().child(self.0.clone())
+        }
+    }
+
+    struct Harness {
+        view: Entity<TerminalView>,
+        cx: VisualTestContext,
+        sent: async_channel::Receiver<TerminalControl>,
+        events: async_channel::Sender<TerminalEvent>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self::with(TerminalSettings::default())
+        }
+
+        fn with(settings: TerminalSettings) -> Self {
+            let mut app = TestAppContext::single();
+            let (commands, sent) = async_channel::unbounded();
+            let (events, rx) = async_channel::unbounded();
+            let window = app.add_window(|window, cx| {
+                let view = cx.new(|cx| {
+                    TerminalView::with_channels(
+                        Session {
+                            id: "test".into(),
+                            worktree: "/".into(),
+                            agent: Agent::Shell,
+                        },
+                        infrastructure::theme::default_scheme(),
+                        settings,
+                        InputHold::default(),
+                        commands,
+                        rx,
+                        window,
+                        cx,
+                    )
+                });
+                Host(view)
+            });
+            let view = window.root(&mut app.clone()).unwrap();
+            let view = app.read_entity(&view, |host, _| host.0.clone());
+            let cx = VisualTestContext::from_window(window.into(), &app);
+            let mut harness = Self {
+                view,
+                cx,
+                sent,
+                events,
+            };
+            harness.cx.run_until_parked();
+            // Answer the layout's resize as the daemon does.
+            while let Ok(control) = harness.sent.try_recv() {
+                if let TerminalControl::Resize(geometry) = control {
+                    harness
+                        .events
+                        .try_send(TerminalEvent::Geometry(geometry))
+                        .unwrap();
+                }
+            }
+            harness.cx.run_until_parked();
+            harness.drain();
+            harness
+        }
+
+        /// Feeds program output and lets the view draw it.
+        fn output(&mut self, data: &str) {
+            self.events
+                .try_send(TerminalEvent::Output(data.as_bytes().to_vec()))
+                .unwrap();
+            self.cx.run_until_parked();
+            self.view.update(&mut self.cx, |view, cx| {
+                view.refresh();
+                cx.notify();
+            });
+            self.cx.run_until_parked();
+        }
+
+        /// Input bytes sent to the program since the last call.
+        fn drain(&mut self) -> String {
+            let mut out = Vec::new();
+            while let Ok(control) = self.sent.try_recv() {
+                if let TerminalControl::Input(bytes) = control {
+                    out.extend(bytes);
+                }
+            }
+            String::from_utf8(out).unwrap()
+        }
+
+        /// The middle of a cell, zero-based.
+        fn cell(&mut self, column: usize, row: usize) -> Point<Pixels> {
+            self.view.read_with(&self.cx, |view, _| {
+                let size = view.grid.metrics.size;
+                view.grid.bounds.origin
+                    + point(
+                        size.width * (column as f32 + 0.5),
+                        size.height * (row as f32 + 0.5),
+                    )
+            })
+        }
+
+        fn wheel(&mut self, at: Point<Pixels>, lines: Point<f32>, modifiers: Modifiers) {
+            self.cx.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Lines(lines),
+                modifiers,
+                touch_phase: TouchPhase::Moved,
+            });
+        }
+
+        fn selection(&mut self) -> Option<String> {
+            self.view
+                .read_with(&self.cx, |view, _| view.selected_text())
+        }
+    }
+
+    const TRACK_ANY_SGR: &str = "\x1b[?1003h\x1b[?1006h";
+    const SHIFT: Modifiers = Modifiers {
+        shift: true,
+        control: false,
+        alt: false,
+        platform: false,
+        function: false,
+    };
+
+    fn history() -> String {
+        (0..200).map(|n| format!("line {n}\r\n")).collect()
+    }
+
+    #[test]
+    fn side_buttons_press_drag_and_release() {
+        let mut h = Harness::new();
+        h.output(TRACK_ANY_SGR);
+        let (a, b) = (h.cell(1, 0), h.cell(3, 0));
+        for (button, code) in [
+            (MouseButton::Navigate(NavigationDirection::Back), 128),
+            (MouseButton::Navigate(NavigationDirection::Forward), 129),
+        ] {
+            h.cx.simulate_mouse_down(a, button, Modifiers::none());
+            h.cx.simulate_mouse_move(b, button, Modifiers::none());
+            h.cx.simulate_mouse_up(b, button, Modifiers::none());
+            assert_eq!(
+                h.drain(),
+                format!("\x1b[<{code};2;1M\x1b[<{};4;1M\x1b[<{code};4;1m", code + 32)
+            );
+        }
+    }
+
+    #[test]
+    fn releasing_a_second_button_keeps_the_first_drag() {
+        let mut h = Harness::new();
+        h.output(TRACK_ANY_SGR);
+        let (a, b, c) = (h.cell(0, 0), h.cell(2, 0), h.cell(4, 0));
+        h.cx.simulate_mouse_down(a, MouseButton::Left, Modifiers::none());
+        h.cx.simulate_mouse_down(a, MouseButton::Right, Modifiers::none());
+        h.cx.simulate_mouse_up(b, MouseButton::Right, Modifiers::none());
+        h.drain();
+        // GPUI forgets the left button after the right one's release.
+        h.cx.simulate_mouse_move(c, None, Modifiers::none());
+        assert_eq!(h.drain(), "\x1b[<32;5;1M");
+        h.cx.simulate_mouse_up(c, MouseButton::Left, Modifiers::none());
+        assert_eq!(h.drain(), "\x1b[<0;5;1m");
+    }
+
+    #[test]
+    fn wheel_reports_carry_modifiers_on_both_axes() {
+        let mut h = Harness::new();
+        h.output(TRACK_ANY_SGR);
+        let at = h.cell(0, 0);
+        h.wheel(at, point(0., 1.), Modifiers::none());
+        assert_eq!(h.drain(), "\x1b[<64;1;1M");
+        h.wheel(at, point(0., -1.), Modifiers::control());
+        assert_eq!(h.drain(), "\x1b[<81;1;1M");
+        h.wheel(at, point(1., 0.), Modifiers::none());
+        assert_eq!(h.drain(), "\x1b[<66;1;1M");
+        // GPUI turns Shift+wheel horizontal; the program hears it, with Shift.
+        h.wheel(at, point(-1., 0.), SHIFT);
+        assert_eq!(h.drain(), "\x1b[<71;1;1M");
+    }
+
+    #[test]
+    fn shift_wheel_without_tracking_scrolls_the_scrollback() {
+        let mut h = Harness::new();
+        h.output(&history());
+        let at = h.cell(0, 0);
+        let offset = |h: &mut Harness| {
+            h.view
+                .read_with(&h.cx, |view, _| view.terminal.scrollbar().unwrap().offset)
+        };
+        let bottom = offset(&mut h);
+        h.wheel(at, point(3., 0.), SHIFT);
+        assert!(offset(&mut h) < bottom);
+        assert_eq!(h.drain(), "");
+    }
+
+    #[test]
+    fn scrolling_drops_the_selection() {
+        let mut h = Harness::new();
+        h.output(&history());
+        let select = |h: &mut Harness| {
+            let (a, b) = (h.cell(0, 0), h.cell(5, 0));
+            h.cx.simulate_mouse_down(a, MouseButton::Left, Modifiers::none());
+            h.cx.simulate_mouse_move(b, MouseButton::Left, Modifiers::none());
+            h.cx.simulate_mouse_up(b, MouseButton::Left, Modifiers::none());
+            assert!(h.selection().is_some());
+        };
+        select(&mut h);
+        let at = h.cell(0, 0);
+        h.wheel(at, point(0., 3.), Modifiers::none());
+        assert_eq!(h.selection(), None);
+
+        select(&mut h);
+        h.view.update(&mut h.cx, |view, cx| {
+            assert!(view.scroll_history(super::ScrollTarget::Top, cx));
+        });
+        assert_eq!(h.selection(), None);
+
+        // A press on the scrollbar track away from the thumb.
+        select(&mut h);
+        let track = h
+            .view
+            .read_with(&h.cx, |view, _| view.scrollbar().unwrap().0);
+        let on_track = point(
+            track.center().x,
+            track.origin.y + track.size.height - px(2.),
+        );
+        h.cx.simulate_mouse_down(on_track, MouseButton::Left, Modifiers::none());
+        h.cx.simulate_mouse_up(on_track, MouseButton::Left, Modifiers::none());
+        assert_eq!(h.selection(), None);
+
+        // A drag of the thumb.
+        select(&mut h);
+        let thumb = h
+            .view
+            .read_with(&h.cx, |view, _| view.scrollbar().unwrap().1);
+        let grab = thumb.center();
+        h.cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        assert!(h.selection().is_some());
+        h.cx.simulate_mouse_move(
+            point(grab.x, track.origin.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        h.cx.simulate_mouse_up(
+            point(grab.x, track.origin.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert_eq!(h.selection(), None);
+    }
+
+    #[test]
+    fn scrollback_shortcuts_reach_the_program_on_the_alternate_screen() {
+        let mut h = Harness::new();
+        h.output("\x1b[?1049h");
+        h.view.update(&mut h.cx, |view, cx| {
+            assert!(!view.scroll_history(super::ScrollTarget::Pages(-1), cx));
+            assert!(!view.scroll_history(super::ScrollTarget::Top, cx));
+        });
+        h.output("\x1b[?1049l");
+        h.output(&history());
+        h.view.update(&mut h.cx, |view, cx| {
+            assert!(view.scroll_history(super::ScrollTarget::Pages(-1), cx));
+        });
+    }
+
+    #[test]
+    fn a_link_click_beats_the_scrollbar() {
+        // No padding, so the bar lies over the last column.
+        let mut h = Harness::with(TerminalSettings {
+            padding: 0.,
+            ..TerminalSettings::default()
+        });
+        let cols = h
+            .view
+            .read_with(&h.cx, |view, _| view.grid.geometry().cols as usize);
+        let url = "https://example.com/";
+        let text = format!("{}{}\r\n{}", " ".repeat(cols - url.len()), url, history());
+        h.output(&text);
+        h.view.update(&mut h.cx, |view, cx| {
+            view.scroll_history(super::ScrollTarget::Top, cx);
+        });
+        h.cx.run_until_parked();
+        let last = h.cell(cols - 1, 0);
+        let last = h.view.read_with(&h.cx, |view, _| {
+            let bounds = view.grid.bounds;
+            let width = view.grid.metrics.size.width * cols as f32;
+            point(bounds.origin.x + width - px(1.), last.y)
+        });
+        let track = h
+            .view
+            .read_with(&h.cx, |view, _| view.scrollbar().unwrap().0);
+        assert!(track.contains(&last));
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = opened.clone();
+        h.cx.update(|_, cx| {
+            cx.subscribe(&h.view, move |_, event: &super::OpenLink, _| {
+                seen.borrow_mut().push(event.0.clone());
+            })
+            .detach();
+        });
+        h.cx.simulate_mouse_down(last, MouseButton::Left, Modifiers::control());
+        h.cx.simulate_mouse_up(last, MouseButton::Left, Modifiers::control());
+        assert_eq!(*opened.borrow(), [url.to_owned()]);
+        assert!(
+            h.view
+                .read_with(&h.cx, |view, _| view.scrollbar_grab.is_none())
         );
     }
 }

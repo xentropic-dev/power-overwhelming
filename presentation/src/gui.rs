@@ -3061,18 +3061,28 @@ impl Workspace {
             && let Some(tab) = self.active_view().and_then(|id| self.terminals.get(&id))
             && tab.view.read(cx).focus.is_focused(window)
         {
-            cx.stop_propagation();
-            tab.view.update(cx, |view, cx| match command {
-                Command::TerminalCopy if !event.is_held => view.copy(cx),
-                Command::TerminalPaste => view.paste(cx),
+            // A scrollback shortcut with no scrollback (the alternate screen) goes on to
+            // the terminal, so the program hears Shift+PageUp and the like.
+            let handled = tab.view.update(cx, |view, cx| match command {
+                Command::TerminalCopy if !event.is_held => {
+                    view.copy(cx);
+                    true
+                }
+                Command::TerminalPaste => {
+                    view.paste(cx);
+                    true
+                }
                 Command::TerminalScrollLineUp => view.scroll_history(ScrollTarget::Lines(-1), cx),
                 Command::TerminalScrollLineDown => view.scroll_history(ScrollTarget::Lines(1), cx),
                 Command::TerminalScrollPageUp => view.scroll_history(ScrollTarget::Pages(-1), cx),
                 Command::TerminalScrollPageDown => view.scroll_history(ScrollTarget::Pages(1), cx),
                 Command::TerminalScrollTop => view.scroll_history(ScrollTarget::Top, cx),
                 Command::TerminalScrollBottom => view.scroll_history(ScrollTarget::Bottom, cx),
-                _ => {}
+                _ => true,
             });
+            if handled {
+                cx.stop_propagation();
+            }
             return;
         }
 
