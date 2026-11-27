@@ -2,6 +2,8 @@
 pub(crate) mod agent_tree;
 #[path = "dag_view.rs"]
 mod dag_view;
+#[path = "workspace_talk.rs"]
+mod workspace_talk;
 
 use self::{agent_tree::AgentTree, dag_view::DagView};
 use crate::{
@@ -10,13 +12,14 @@ use crate::{
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
+    talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView, load_bundled_fonts},
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
-    dag::{AgentStatus, Coordinator, RunStatus},
+    dag::{AgentStatus, Coordinator, RunStatus, TaskState},
     link::dag_run_id,
     session::{Agent, Session},
 };
@@ -243,6 +246,8 @@ struct Workspace {
     picker: Option<Picker>,
     dag: Option<DagView>,
     dag_refresh: async_channel::Sender<()>,
+    talk: Option<TalkDialog>,
+    talk_refresh: async_channel::Sender<()>,
     dag_progress: Option<(String, String)>,
     attention: HashMap<String, HashSet<String>>,
     previews: Vec<PreviewTab>,
@@ -341,6 +346,7 @@ impl Workspace {
         Self::watch_artifacts(window, cx);
         Self::watch_box_icons(window, cx);
         let dag_refresh = Self::watch_dag(window, cx);
+        let talk_refresh = Self::watch_talk(window, cx);
         let status_bar =
             cx.new(|cx| StatusBar::new(window, cx, Settings::defaults(), Settings::from_sections));
         let bar_config = cx.subscribe_in(
@@ -379,6 +385,8 @@ impl Workspace {
             picker: None,
             dag: None,
             dag_refresh,
+            talk: None,
+            talk_refresh,
             dag_progress: None,
             attention: HashMap::new(),
             previews: Vec::new(),
@@ -1215,7 +1223,9 @@ impl Workspace {
         if self.hinting.is_some() {
             self.end_hints(cx);
         }
-        if let Some(dag) = &self.dag {
+        if let Some(talk) = &self.talk {
+            talk.focus(window);
+        } else if let Some(dag) = &self.dag {
             dag.focus.focus(window);
         } else if let Some(picker) = &self.picker {
             picker.focus.focus(window);
@@ -1527,6 +1537,34 @@ impl Workspace {
         .detach();
     }
 
+    /// Starts the task graph's queued task now, over the worker budget. An error shows in the
+    /// graph's message line.
+    fn start_queued_task(
+        &mut self,
+        view: u64,
+        run: String,
+        task: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = cx
+            .background_executor()
+            .spawn(async move { client::start_queued(run, task) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = start.await;
+            let _ = app.update(cx, |this, cx| {
+                if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == view) {
+                    dag.message = result
+                        .err()
+                        .map(|error| format!("Could not start the task. {error:#}"));
+                }
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Archives the run picker's selected run, or unarchives it when `archived`. A refusal,
     /// such as open attempts, shows in the picker message; there is no confirm step.
     fn toggle_run_archive(
@@ -1668,6 +1706,7 @@ impl Workspace {
         focus.focus(window);
         self.picker = None;
         self.dag = Some(DagView::new(self.next_id(), run, focus));
+        let _ = self.talk_refresh.try_send(());
         let _ = self.dag_refresh.try_send(());
         cx.notify();
     }
@@ -1731,6 +1770,7 @@ impl Workspace {
             picker.message = Some("Looking up agents…".into());
         }
         let _ = self.dag_refresh.try_send(());
+        let _ = self.talk_refresh.try_send(());
     }
 
     /// Ends the agent tree's selected worker through the same path as ending its tab.
@@ -2341,6 +2381,10 @@ impl Workspace {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let key = stroke.key.as_str();
+        if self.talk.is_some() {
+            self.talk_key(event, window, cx);
+            return;
+        }
         if let Some(dag) = &mut self.dag {
             cx.stop_propagation();
             if dag.picking_artifact {
@@ -2378,6 +2422,29 @@ impl Workspace {
                     } else {
                         self.show_error("This task has no assigned worker.", cx);
                     }
+                }
+                Some(Command::AgentTalk) if !event.is_held => {
+                    if let Some(attempt) = dag.attempt() {
+                        let label = dag
+                            .task()
+                            .map_or_else(|| attempt.agent.clone(), |task| task.title.clone());
+                        let target = TalkTarget::Agent {
+                            id: attempt.agent.clone(),
+                            label,
+                        };
+                        let box_id = dag.run.box_id.clone();
+                        self.open_talk(box_id, target, window, cx);
+                    }
+                }
+                Some(Command::DagStartNow) if !event.is_held && !dag.opening => {
+                    match dag.task().filter(|task| task.state == TaskState::Queued) {
+                        Some(task) => {
+                            let (id, run, task) = (dag.id, dag.run.id.clone(), task.id.clone());
+                            self.start_queued_task(id, run, task, window, cx);
+                        }
+                        None => dag.message = Some("This task is not queued.".into()),
+                    }
+                    cx.notify();
                 }
                 Some(Command::DagArtifact) if !event.is_held && !dag.opening => {
                     let artifacts = dag.artifacts();
@@ -2465,6 +2532,9 @@ impl Workspace {
                         picker.show_finished = !picker.show_finished;
                         let _ = self.dag_refresh.try_send(());
                     }
+                }
+                Some(Command::AgentTalk) if !event.is_held && !picker.waiting => {
+                    self.open_agent_talk(window, cx);
                 }
                 Some(Command::EndWorker) => {
                     if !event.is_held && !picker.waiting {
@@ -2561,6 +2631,11 @@ impl Workspace {
             Some(Command::BoxPick) => self.pick_boxes(window, cx),
             Some(Command::BoxRuns) => self.pick_runs(window, cx),
             Some(Command::BoxAgents) => self.pick_agents(window, cx),
+            Some(Command::BoxTalk) => {
+                if let Some(box_id) = self.layout.active_box.clone() {
+                    self.open_talk(box_id, TalkTarget::User, window, cx);
+                }
+            }
             Some(Command::Reload) => {
                 self.status_bar.update(cx, StatusBar::reload);
             }
@@ -3068,21 +3143,25 @@ impl Render for Workspace {
             });
         let previews = self.previews(window, cx);
         let entity = cx.weak_entity();
-        let modal = self.picker.as_ref().map(|picker| {
-            let picker_id = picker.id;
-            picker.render(colors, move |index, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    if let Some(choice) = this
-                        .picker
-                        .as_ref()
-                        .filter(|picker| picker.id == picker_id)
-                        .and_then(|picker| picker.choice(index))
-                    {
-                        this.choose(choice, window, cx);
-                    }
-                });
-            })
-        });
+        let modal = self
+            .picker
+            .as_ref()
+            .filter(|_| self.talk.is_none())
+            .map(|picker| {
+                let picker_id = picker.id;
+                picker.render(colors, move |index, window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        if let Some(choice) = this
+                            .picker
+                            .as_ref()
+                            .filter(|picker| picker.id == picker_id)
+                            .and_then(|picker| picker.choice(index))
+                        {
+                            this.choose(choice, window, cx);
+                        }
+                    });
+                })
+            });
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
@@ -3215,6 +3294,11 @@ impl Render for Workspace {
             )
             .children(modal)
             .children(graph)
+            .children(
+                self.talk
+                    .as_ref()
+                    .map(|talk| talk.render(colors, &self.keymap)),
+            )
     }
 }
 
@@ -3324,6 +3408,7 @@ mod tests {
                 instructions: String::new(),
                 deps: Vec::new(),
                 state,
+                queued_at: None,
                 current_attempt: None,
                 attempts: Vec::new(),
             });

@@ -60,6 +60,8 @@ pub trait Workspace: Send + Sync {
     fn main_checkout(&self, repository: &Path) -> Result<Option<PathBuf>>;
     /// The full commit ID at the worktree's HEAD.
     fn head(&self, worktree: &Path) -> Result<String>;
+    /// The full commit ID that a commit-ish such as a branch name names in the repository.
+    fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String>;
     /// Looks up a local branch and reports where it is checked out, if anywhere.
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus>;
     /// Creates a new branch and checks it out at `path`, starting at the given commit-ish.
@@ -130,6 +132,12 @@ pub trait TerminalRuntime: Send + Sync {
     fn reclaim(&self, _id: &str) -> Result<()> {
         Ok(())
     }
+    /// Rechecks the foreground process now, rather than trusting the last periodic check.
+    /// None when the terminal cannot answer. Never call it while holding a store lock: the
+    /// terminal may need that store to record the change it finds.
+    fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
+        self.agent(handle)
+    }
 }
 
 struct Live<H> {
@@ -176,6 +184,34 @@ impl<T: TerminalRuntime> Application<T> {
             .context("Terminal session is unavailable")
     }
 
+    /// The agent of a running session: its launched coding agent, or for a shell session,
+    /// whichever agent holds its foreground at this moment (see
+    /// `TerminalRuntime::resolve_agent`). None if the session is unknown, has exited or its
+    /// foreground cannot be resolved. Do not call it while holding a store lock.
+    pub fn live_agent(&self, id: &str) -> Option<Agent> {
+        let (launched, terminal) = {
+            let sessions = self.sessions.lock().unwrap();
+            let live = sessions.get(id)?;
+            (live.session.agent.clone(), live.terminal.clone())
+        };
+        if !self.runtime.is_running(&terminal) {
+            return None;
+        }
+        match launched {
+            Agent::Coding(_) => Some(launched),
+            Agent::Shell => self.runtime.resolve_agent(&terminal),
+        }
+    }
+
+    /// The agent a session was launched with, regardless of its current foreground.
+    pub fn launched_agent(&self, id: &str) -> Option<Agent> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|live| live.session.agent.clone())
+    }
+
     fn session_is_running(&self, id: &str) -> Result<bool> {
         Ok(self.runtime.is_running(&self.terminal(id)?))
     }
@@ -206,3 +242,5 @@ impl<T: TerminalRuntime> Application<T> {
         }
     }
 }
+
+pub mod talk;

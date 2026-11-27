@@ -113,15 +113,22 @@ impl<T: TerminalRuntime> Application<T> {
         match &record.agent {
             Agent::Coding(id) => {
                 let profile = self.agents.resolve(id)?;
+                let mut args = record.args.clone();
                 if let Some((resume, mut fresh)) =
                     restart_args(profile.resume.as_ref(), record.conversation.as_deref())
                 {
-                    fresh.extend(record.args.iter().cloned());
+                    // The saved conversation replaces any selector the launch passed,
+                    // which would conflict with it or resume the wrong one, and the fresh
+                    // start must not retry the selector that failed.
+                    if let Some(spec) = &profile.resume {
+                        args = spec.without_selectors(&args);
+                    }
+                    fresh.extend(args.iter().cloned());
                     options.args = resume;
                     options.fallback_args = Some(fresh);
                     options.initial_prompt = continuation.map(Into::into);
                 }
-                options.args.extend(record.args.iter().cloned());
+                options.args.extend(args);
             }
             // Command fixtures are never re-run, since their argv can be anything.
             Agent::Shell if !record.args.is_empty() => {
@@ -229,6 +236,9 @@ mod tests {
         fn head(&self, _: &Path) -> Result<String> {
             bail!("unused")
         }
+        fn resolve_commit(&self, _: &Path, _: &str) -> Result<String> {
+            bail!("unused")
+        }
         fn branch_exists(&self, _: &Path, _: &str) -> Result<BranchStatus> {
             bail!("unused")
         }
@@ -294,8 +304,12 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         }
     }
 
@@ -516,6 +530,37 @@ mod tests {
         );
         assert!(application.terminal("shell-tab").is_ok());
         assert_eq!(store.list()?[3].args, Vec::<OsString>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_replaces_launch_selectors_with_the_saved_conversation() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let store = Arc::new(MemorySessions::default());
+        let mut worker = record(
+            "worker",
+            worktree.path(),
+            coding("claude"),
+            &["--resume", "old", "--model", "opus", "--resume=older"],
+        );
+        worker.conversation = Some("reported".into());
+        store.save(&worker)?;
+        let (application, starts) = app(store);
+
+        application.restore_sessions_with(|_| RestoreChoice::Resume(Some("continue".into())))?;
+
+        let starts = starts.0.lock().unwrap();
+        let (_, options) = &starts[0];
+        // One selector, never two, and the fresh start does not retry the old one.
+        assert_eq!(
+            options.args,
+            os(&["--resume", "reported", "--model", "opus"])
+        );
+        assert_eq!(
+            options.fallback_args,
+            Some(os(&["--session-id", "reported", "--model", "opus"]))
+        );
+        assert_eq!(options.initial_prompt.as_deref(), Some("continue".as_ref()));
         Ok(())
     }
 

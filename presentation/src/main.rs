@@ -4,6 +4,8 @@ mod picker;
 mod preview;
 mod settings;
 mod status_bar;
+mod talk_cli;
+mod talk_dialog;
 mod terminal;
 
 use anyhow::{Context, Result};
@@ -17,11 +19,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use domain::{agent::display_name, session::Agent};
 use infrastructure::{
     agents::AgentProfiles,
+    budget::LocalWorkerBudget,
     client::{
         self,
         protocol::{
-            DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec, TaskState,
-            WorktreeRequest,
+            BudgetMode, DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec,
+            TaskState, WorktreeRequest,
         },
     },
     config, daemon,
@@ -101,6 +104,8 @@ enum Action {
         #[command(subcommand)]
         command: DagAction,
     },
+    /// Exchange messages with agents and the user.
+    Talk(talk_cli::TalkArgs),
     /// List and prune Power-managed Git worktrees.
     Worktree {
         #[command(subcommand)]
@@ -236,15 +241,15 @@ fn main() -> Result<()> {
     let cli = Cli::try_parse().unwrap_or_else(|error| {
         let mut args = std::env::args_os().skip(1);
         let command = args.next();
-        let dag_command = match command.as_deref().and_then(|arg| arg.to_str()) {
-            Some("box" | "dag") => true,
+        let command_uses_exit_one = match command.as_deref().and_then(|arg| arg.to_str()) {
+            Some("box" | "dag" | "talk") => true,
             Some("agent") => !matches!(
                 args.next().as_deref().and_then(|arg| arg.to_str()),
                 Some("codex" | "claude")
             ),
             _ => false,
         };
-        if error.use_stderr() && dag_command {
+        if error.use_stderr() && command_uses_exit_one {
             let _ = error.print();
             std::process::exit(1);
         }
@@ -255,7 +260,13 @@ fn main() -> Result<()> {
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
             finished_worker_grace(),
+            config::load_talk_policy(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load talk settings. {error:#}");
+                domain::talk::NoticePolicy::default()
+            }),
+            LocalWorkerBudget::new(settings::Settings::defaults()),
         ),
+        Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
         }) => {
@@ -304,11 +315,18 @@ fn main() -> Result<()> {
                     println!("{}", session.id);
                 }
                 SessionAction::End { id } => client::end_session(id)?,
-                SessionAction::Task { label } => client::set_task(
-                    std::env::var("POWER_SESSION").context("Set a task from a Power terminal")?,
-                    label,
-                )?,
-                SessionAction::Model { name, .. } => report_model(name)?,
+                SessionAction::Task { label } => {
+                    report_conversation();
+                    client::set_task(
+                        std::env::var("POWER_SESSION")
+                            .context("Set a task from a Power terminal")?,
+                        label,
+                    )?
+                }
+                SessionAction::Model { name, .. } => {
+                    report_conversation();
+                    report_model(name)?
+                }
             }
             Ok(())
         }
@@ -611,6 +629,12 @@ struct DispatchArgs {
     provider: String,
     #[command(flatten)]
     worktree: WorktreeArgs,
+    /// Fail instead of queueing the task when the worker budget is full.
+    #[arg(long, conflicts_with = "over_budget")]
+    no_queue: bool,
+    /// Start even when the worker budget is full. Starts an already queued task now.
+    #[arg(long)]
+    over_budget: bool,
     #[arg(last = true)]
     args: Vec<String>,
 }
@@ -689,6 +713,30 @@ fn caller_session() -> Option<String> {
     std::env::var("POWER_SESSION")
         .ok()
         .filter(|id| !id.is_empty())
+}
+
+/// Reports the conversation of an agent that exposes its ID to the commands it runs
+/// through its profile's `conversation_env`, so a restore can resume it. Best effort: a
+/// failed report leaves the command's own work to succeed or fail.
+fn report_conversation() {
+    let Some(session) = caller_session() else {
+        return;
+    };
+    for profile in configured_agents().profiles() {
+        let Some(conversation) = profile
+            .conversation_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|conversation| !conversation.is_empty())
+        else {
+            continue;
+        };
+        let _ = client::set_conversation(
+            session.clone(),
+            profile.id.as_str().to_owned(),
+            conversation,
+        );
+    }
 }
 
 fn report_model(name: Option<String>) -> Result<()> {
@@ -899,6 +947,12 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
             "attempt": attempt,
             "agent": agent,
         }),
+        DagResponse::Queued { run, task, reason } => json!({
+            "queued": true,
+            "run": run,
+            "task": task,
+            "reason": reason,
+        }),
         DagResponse::Reported { applied, reason } => json!({"applied": applied, "reason": reason}),
         DagResponse::Events { events, cursor } => json!({"events": events, "cursor": cursor}),
         _ => anyhow::bail!("Unexpected daemon response"),
@@ -912,6 +966,10 @@ fn report_arg(value: Option<String>, env: &str, flag: &str) -> Result<String> {
         .with_context(|| format!("Specify --{flag} or set {env}"))
 }
 
+const READY_BUDGET_NOTE: &str = "Dispatch every ready task. Past the worker budget \
+     (dag.max_active_workers and dag.min_available_memory in config.lua), Power queues the task \
+     and starts it when a worker reports, so don't hold tasks back or retry queued ones.";
+
 fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
     let allow_main_checkout = launch.worktree.allow_main_checkout;
     let worktree = launch.worktree.request(retry, "dispatching a task")?;
@@ -924,6 +982,13 @@ fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
         retry,
         args: launch.args,
         caller: caller_session(),
+        budget: if launch.over_budget {
+            BudgetMode::Override
+        } else if launch.no_queue {
+            BudgetMode::Refuse
+        } else {
+            BudgetMode::Queue
+        },
     })
 }
 
@@ -1055,12 +1120,16 @@ fn run_dag(command: DagAction) -> Result<()> {
         }
         DagAction::AddDep { run, task, dep } => DagRequest::AddDependency { run, task, dep },
         DagAction::Ready { run } => {
-            let tasks: Vec<_> = protocol_run(run)?
+            let (tasks, queued): (Vec<_>, Vec<_>) = protocol_run(run)?
                 .tasks
                 .into_iter()
-                .filter(|task| task.state == TaskState::Ready)
-                .collect();
-            return print_json(json!({"tasks": tasks}));
+                .filter(|task| matches!(task.state, TaskState::Ready | TaskState::Queued))
+                .partition(|task| task.state == TaskState::Ready);
+            return print_json(json!({
+                "tasks": tasks,
+                "queued": queued.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+                "budget": READY_BUDGET_NOTE,
+            }));
         }
         DagAction::Dispatch { launch, retry } => dispatch_request(launch, retry)?,
         DagAction::Retry(launch) => dispatch_request(launch, true)?,
@@ -1070,18 +1139,21 @@ fn run_dag(command: DagAction) -> Result<()> {
             run,
             task,
             attempt,
-        } => DagRequest::Report {
-            run: report_arg(run, "POWER_RUN", "run")?,
-            task: report_arg(task, "POWER_TASK", "task")?,
-            attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
-            summary,
-            status: match status {
-                ReportChoice::Success => ReportStatus::Success,
-                ReportChoice::Failed => ReportStatus::Failed,
-                ReportChoice::NeedsInput => ReportStatus::NeedsInput,
-                ReportChoice::Working => ReportStatus::Working,
-            },
-        },
+        } => {
+            report_conversation();
+            DagRequest::Report {
+                run: report_arg(run, "POWER_RUN", "run")?,
+                task: report_arg(task, "POWER_TASK", "task")?,
+                attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
+                summary,
+                status: match status {
+                    ReportChoice::Success => ReportStatus::Success,
+                    ReportChoice::Failed => ReportStatus::Failed,
+                    ReportChoice::NeedsInput => ReportStatus::NeedsInput,
+                    ReportChoice::Working => ReportStatus::Working,
+                },
+            }
+        }
         DagAction::Events(EventArgs { run, since, kinds }) => DagRequest::Events {
             run,
             since,
@@ -1107,6 +1179,7 @@ fn run_dag(command: DagAction) -> Result<()> {
                     AttemptInterrupted,
                     AttemptResumed,
                     TaskReady,
+                    QueuedDispatchFailed,
                 ];
             }
             return dag_reply(

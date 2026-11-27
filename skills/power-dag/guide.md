@@ -37,7 +37,7 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 
 ## Dispatch and monitor
 
-1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Set `PROFILE` to an installed agent profile ID, such as `claude`, `codex`, `grok`, or a profile from `config.lua`. For test fixtures, `--provider command` runs the command supplied after `--`.
+1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Set `PROFILE` to an installed agent profile ID, such as `claude`, `codex`, `grok`, `jcode`, or a profile from `config.lua`. For test fixtures, `--provider command` runs the command supplied after `--`.
 2. Dispatch each ready task with the appropriate worktree.
 
    - For edits, run `power dag dispatch "$RUN" "$TASK" --provider "$PROFILE" --branch "$BRANCH"`. Power creates a worktree for the task on that branch, which is the default when `--worktree` is omitted. Choose a distinct, unused branch name for each task. Inside Power, the new branch starts at the coordinator's current HEAD. Pass `--base` with a branch or other commit-ish to override it. For a dependent task that builds on a prerequisite's commits, pass the prerequisite's branch, for example `--base docs/setup`. Outside Power, `--base` is required when creating a worktree.
@@ -47,6 +47,8 @@ power dag add-dep "$RUN" test lint  # test depends on lint
 
    Power starts the worker in a background terminal and gives it the task instructions, completed prerequisite summaries, and reporting contract. If Power creates a worktree, the dispatch output includes its path and branch. The default location is `~/.power/<box>/<branch-slug>`, where `<branch-slug>` is the branch name with `/` replaced by `-`. Set `worktrees.root` in `config.lua` to choose a different root.
 
+   Power enforces a machine-wide worker budget, so dispatch every ready task and let Power pace them. When the budget is full, `power dag dispatch` prints `{"queued": true, "reason": ...}` instead of an attempt, the task shows as `queued` in `power dag show` and the graph, and Power starts it as soon as a worker reports or enough memory frees up. `power dag ready` lists queued task IDs under `queued`. Don't hold tasks back, poll, or re-dispatch queued ones. Pass `--no-queue` to fail instead of queueing. Only the user overrides the budget, with `--over-budget` or `s` on a queued task in the graph; never pass `--over-budget` unless they ask. A queued dispatch can fail to start in two ways. If it fails before Power records an attempt, for example because the worktree or provider is invalid, Power drops it from the queue, emits `queued_dispatch_failed` with the error as its summary, and the task returns to the state it had before it was queued: `ready` for a first dispatch, or `failed` or `interrupted` for a queued `--retry`. If it fails after the attempt is recorded, for example when Git cannot create the new worktree, the queue entry is already gone, Power emits `attempt_failed`, and the task becomes `failed`. Watch for both events, and retry with `--retry` after fixing the cause.
+
 3. Run `power dag wait "$RUN" --since "$CURSOR" --timeout 60`. Start `CURSOR` at `0` for a new run. Process the returned `events`, then save the returned `cursor` and pass it as `--since` on the next wait. A timeout returns an empty event list with the same cursor. After results, check `power dag ready "$RUN"` again and dispatch newly ready tasks.
 4. On `needs_input`, surface the worker's question to the user. They can open the worker from the graph (Ctrl+B then `d`) or the agent tree (Ctrl+B then `a`) and answer in that worker's terminal. The worker reports `working` once answered, clearing the request.
 
@@ -55,3 +57,5 @@ To set aside a run you have abandoned, run `power dag archive "$RUN"`. Archived 
 When retrying, Power reuses the task's Power-created worktree and branch by default. See the recovery reference for retry commands. To preview which Power-created worktrees can be removed, run `power worktree prune --dry-run`. Outside Power, also select a box with `--box "$BOX"` or use `--all`.
 
 Use `power dag show "$RUN"` to read each attempt's `artifacts` (`id`, `title`, `link`) in publish order, newest last. In the DAG view (Ctrl+B then `d`), the selected node's Artifacts list shows the current attempt's artifacts. Open a listed artifact or its `pwr://artifact/<id>` link in the preview pane.
+
+Send review feedback to a worker with `power talk send task:<id> "Your feedback"`. Add `--run "$RUN"` when coordinating more than one run.

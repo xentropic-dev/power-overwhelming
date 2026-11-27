@@ -181,6 +181,7 @@ impl Runtime {
                 None => defaults,
             };
             config::worktree_root(&sections)?;
+            config::worker_budget(&sections)?;
             let config = settings.map_or_else(
                 || "{}".into(),
                 |settings| sections[&settings.key].to_string(),

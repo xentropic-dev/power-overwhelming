@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use application::{SessionOptions, TerminalRuntime, agents::AgentProfileRegistry};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
-    agent::AgentProfile,
+    agent::{AgentProfile, Injection},
     session::{Agent, Geometry, Session},
+    talk::{Activity, HookState},
 };
 use ghostty_vt::{
     Terminal,
@@ -41,6 +42,10 @@ type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send 
 /// Saves a session's foreground agent, its conversation and the shell's directory.
 type ForegroundChanged =
     Arc<dyn Fn(&str, &Agent, Option<&str>, Option<&Path>) -> Result<()> + Send + Sync>;
+/// A coding agent process left a shell session's foreground.
+type ForegroundLeft = Arc<dyn Fn(&str, &Agent) + Send + Sync>;
+/// How long a request waits for its terminal to resolve the foreground process.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How often a shell session's working directory is checked for a restore.
 const CWD_INTERVAL: Duration = Duration::from_secs(3);
@@ -73,6 +78,7 @@ pub struct PtyRuntime {
     pub on_exit: ExitHandler,
     pub on_model_changed: ModelChanged,
     pub on_foreground_changed: ForegroundChanged,
+    pub on_foreground_left: ForegroundLeft,
     /// Set on daemon shutdown. Exits are then not reported and foreground state
     /// is only saved by an explicit flush, so a reboot cannot erase what a restore needs.
     pub shutting_down: Arc<AtomicBool>,
@@ -80,16 +86,26 @@ pub struct PtyRuntime {
     /// Starts each launch in its own systemd user scope, so its cgroup owns every
     /// process it starts. `None` falls back to process discovery.
     pub scopes: Option<Arc<WorkerScopes>>,
+    pub(crate) talk_wake: SyncSender<()>,
 }
 
 struct Lifecycle {
+    input: Mutex<TerminalInput>,
+    talk_wake: SyncSender<()>,
     running: AtomicBool,
     session: String,
     on_exit: ExitHandler,
     foreground: Mutex<Foreground>,
     on_model_changed: ModelChanged,
     on_foreground_changed: ForegroundChanged,
+    on_foreground_left: ForegroundLeft,
     shutting_down: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct TerminalInput {
+    activity: Activity,
+    writer: Option<SyncSender<Vec<u8>>>,
 }
 
 struct Foreground {
@@ -98,10 +114,23 @@ struct Foreground {
 }
 
 impl Lifecycle {
+    /// Output never changes the reported turn state. A repaint after a ready report only
+    /// delays delivery for providers that need output quiet.
+    fn record_output(&self) {
+        let mut input = self.input.lock().unwrap();
+        let state = &mut input.activity;
+        let now = crate::talk_adapter::now_ms();
+        state.last_output = now;
+        state.active_since = now;
+        state.revision = state.revision.wrapping_add(1);
+    }
+
     fn notify_exit(&self, detail: &str) {
-        if self.running.swap(false, Ordering::AcqRel) && !self.shutting_down.load(Ordering::Acquire)
-        {
-            (self.on_exit)(&self.session, detail);
+        if self.running.swap(false, Ordering::AcqRel) {
+            self.input.lock().unwrap().writer.take();
+            if !self.shutting_down.load(Ordering::Acquire) {
+                (self.on_exit)(&self.session, detail);
+            }
         }
     }
 
@@ -152,6 +181,66 @@ impl Handle {
 
     pub fn send(&self, command: Command) -> Result<(), mpsc::SendError<Command>> {
         self.commands.send(command)
+    }
+
+    pub(crate) fn activity(&self) -> Activity {
+        self.lifecycle.input.lock().unwrap().activity
+    }
+
+    pub(crate) fn report_turn(&self, hook: HookState, ready_only: bool) {
+        let mut input = self.lifecycle.input.lock().unwrap();
+        let now = crate::talk_adapter::now_ms();
+        let state = &mut input.activity;
+        state.ready_only |= ready_only;
+        state.hook = hook;
+        state.reported_at = now;
+        if hook == HookState::Ready {
+            state.awaiting_turn_end = false;
+        }
+        if hook == HookState::Busy {
+            state.active_since = now;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let _ = self.lifecycle.talk_wake.try_send(());
+    }
+
+    pub(crate) fn input(&self, bytes: Vec<u8>, notice: Option<Activity>) -> Result<bool> {
+        let mut input = self.lifecycle.input.lock().unwrap();
+        if notice.is_some_and(|expected| expected != input.activity)
+            || !self.is_running()
+            || self.lifecycle.shutting_down.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let Some(writer) = &input.writer else {
+            return Ok(false);
+        };
+        match writer.try_send(bytes) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) if notice.is_some() => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        let now = crate::talk_adapter::now_ms();
+        let state = &mut input.activity;
+        state.active_since = now;
+        if notice.is_some() {
+            state.last_notice = now;
+            // A notice submits a prompt, so a provider that reports turn starts is busy
+            // until it reports again. A notify-only provider reports only the turn's end.
+            if state.ready_only {
+                state.awaiting_turn_end = true;
+            } else if state.hook == HookState::Ready {
+                state.hook = HookState::Busy;
+                state.reported_at = now;
+            }
+        } else {
+            // User keystrokes may be navigation or a draft. They delay delivery until the
+            // user pauses but never make the turn busy.
+            state.last_input = now;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        let _ = self.lifecycle.talk_wake.try_send(());
+        Ok(true)
     }
 
     pub(crate) fn refresh_theme(&self) {
@@ -212,12 +301,20 @@ impl TerminalRuntime for PtyRuntime {
             None
         }
     }
+
+    /// Asks the terminal to recheck its foreground process now. The periodic check runs
+    /// every 500 ms, so a coding agent that sends at once on launch would otherwise still
+    /// look like the shell.
+    fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        handle.send(Command::ResolveForeground(reply)).ok()?;
+        answer.recv_timeout(RESOLVE_TIMEOUT).ok()
+    }
 }
 
 pub enum Command {
     RefreshTheme,
     Attach(SyncSender<Response>),
-    Input(Vec<u8>),
     Resize(Geometry),
     WorkingDirectory(SyncSender<Option<PathBuf>>),
     SetMetadata {
@@ -238,6 +335,8 @@ pub enum Command {
     Relaunched(Option<u32>),
     /// Recheck which agent owns the foreground of a shell session.
     Poll,
+    /// Recheck the foreground now and reply with the agent that owns it.
+    ResolveForeground(SyncSender<Agent>),
     OutputClosed,
     ProcessExited(String),
     /// Save pending scrollback and foreground state, then acknowledge after the attempt.
@@ -259,8 +358,25 @@ fn launch(
         .clone()
         .unwrap_or_else(|| session.worktree.clone());
     let mut conversation = None;
+    let mut ready_only = false;
+    // No process of this session runs now, so a server still listening on one of its
+    // earlier launch sockets is an orphan of a previous daemon.
+    crate::agent_socket::reclaim(&session.id, &runtime.socket);
+    let installed = crate::skill_install::LocalInstalledSkills(&session.worktree);
+    // Profiles that take no prompt argument get the initial prompt typed with their
+    // instructions instead.
+    let typed = match profile {
+        Some(profile) => crate::shell::first_message(
+            profile,
+            &options.args,
+            options.initial_prompt.as_deref(),
+            &installed,
+        )?,
+        None => None,
+    };
     let mut process = if let Some(profile) = profile {
-        let (command, id) = agent_command(profile, &session.worktree, &options.args)?;
+        let (command, id, notify_only) = agent_command(profile, &cwd, &options.args)?;
+        ready_only = notify_only;
         conversation = id;
         command
     } else if let Some((program, args)) = options.args.split_first() {
@@ -270,10 +386,12 @@ fn launch(
     } else {
         CommandBuilder::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
     };
-    if let Some(prompt) = &options.initial_prompt {
+    if let Some(prompt) = &options.initial_prompt
+        && profile.is_none_or(|profile| profile.injection != Injection::FirstMessage)
+    {
         process.arg(prompt);
     }
-    configure(&mut process, runtime, session, &options, &cwd);
+    let server = configure(&mut process, runtime, session, &options, &cwd, profile);
     let contain = |command: &mut CommandBuilder| {
         runtime
             .scopes
@@ -285,10 +403,19 @@ fn launch(
     // The fresh start never repeats the initial prompt.
     let fallback = match (profile, &options.fallback_args) {
         (Some(profile), Some(args)) => {
-            let (mut command, conversation) = agent_command(profile, &session.worktree, args)?;
-            configure(&mut command, runtime, session, &options, &cwd);
+            let (mut command, conversation, _) = agent_command(profile, &cwd, args)?;
+            // The fresh start gets its own server socket.
+            configure(
+                &mut command,
+                runtime,
+                session,
+                &options,
+                &cwd,
+                profile.into(),
+            );
             let scope = contain(&mut command)?;
-            Some((command, scope, conversation))
+            let typed = crate::shell::first_message(profile, args, None, &installed)?;
+            Some((command, scope, conversation, typed))
         }
         _ => None,
     };
@@ -297,7 +424,21 @@ fn launch(
     let mut writer = pair.master.take_writer()?;
     let process = pair.slave.spawn_command(process)?;
     let pid = process.process_id();
+    let started_at = crate::talk_adapter::now_ms();
+    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
     let lifecycle = Arc::new(Lifecycle {
+        input: Mutex::new(TerminalInput {
+            activity: Activity {
+                last_output: started_at,
+                active_since: started_at,
+                ready_only,
+                // The initial prompt (including a restore continuation) starts a turn.
+                awaiting_turn_end: ready_only && options.initial_prompt.is_some(),
+                ..Activity::default()
+            },
+            writer: Some(write_tx.clone()),
+        }),
+        talk_wake: runtime.talk_wake.clone(),
         running: AtomicBool::new(true),
         session: session.id.clone(),
         on_exit: runtime.on_exit.clone(),
@@ -307,29 +448,52 @@ fn launch(
         }),
         on_model_changed: runtime.on_model_changed.clone(),
         on_foreground_changed: runtime.on_foreground_changed.clone(),
+        on_foreground_left: runtime.on_foreground_left.clone(),
         shutting_down: runtime.shutting_down.clone(),
     });
     // A relaunch needs the slave, which also keeps the reader from seeing EOF between
     // the two processes.
     let relaunch = match fallback {
-        Some((command, scope, conversation)) => Some(Relaunch {
+        Some((command, scope, conversation, fresh_typed)) => Some(Relaunch {
             command,
             scope,
             conversation,
+            stale_server: server,
             slave: pair.slave,
             deadline: Instant::now() + RESUME_WINDOW,
+            typed: fresh_typed.as_deref().map(crate::shell::typed_message),
         }),
         None => {
             drop(pair.slave);
             None
         }
     };
+    // A resume that fails exits without reading its input, which would then reach the
+    // fresh start. Hold the message until the resume has outlived its window.
+    let mut typed = typed.as_deref().map(crate::shell::typed_message);
     if conversation.is_some() {
         lifecycle.record_foreground(&session.agent, conversation.as_deref(), None, false);
     }
 
     let (tx, rx) = mpsc::sync_channel(128);
-    let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
+    let input_ready = Arc::new(InputReady::default());
+    let typist = {
+        let input_ready = input_ready.clone();
+        let writer = write_tx.clone();
+        move |input: Vec<u8>, seen: u64| {
+            let input_ready = input_ready.clone();
+            let writer = writer.clone();
+            thread::spawn(move || {
+                input_ready.wait_beyond(seen, INPUT_READY_TIMEOUT);
+                let _ = writer.send(input);
+            });
+        }
+    };
+    if relaunch.is_none()
+        && let Some(input) = typed.take()
+    {
+        typist(input, 0);
+    }
     thread::spawn(move || {
         for bytes in write_rx {
             if writer.write_all(&bytes).is_err() {
@@ -339,19 +503,24 @@ fn launch(
     });
 
     let reader_tx = tx.clone();
+    let output_lifecycle = lifecycle.clone();
+    let reader_ready = input_ready.clone();
     thread::spawn(move || {
         let mut buffer = [0; 16 * 1024];
+        let mut tail = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count)
+                Ok(count) => {
+                    output_lifecycle.record_output();
+                    reader_ready.observe(&mut tail, &buffer[..count]);
                     if reader_tx
                         .send(Command::Output(buffer[..count].to_vec()))
-                        .is_err() =>
-                {
-                    break;
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -374,6 +543,11 @@ fn launch(
             scope,
             Some(owner),
             relaunch,
+            PendingInput {
+                held: typed,
+                ready: &input_ready,
+                send: typist,
+            },
             &waiter_stop,
             &waiter_lifecycle.shutting_down,
             |pid, conversation| {
@@ -383,9 +557,9 @@ fn launch(
                 );
                 let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
                 let _ = waiter_tx.send(Command::Relaunched(pid));
-                if conversation.is_some() {
-                    waiter_lifecycle.record_foreground(&launched, conversation, None, false);
-                }
+                // A fresh start without a preassigned ID clears the rejected one, so a
+                // later restore cannot return to it. The new ID is saved when it reports.
+                waiter_lifecycle.record_foreground(&launched, conversation, None, false);
             },
         );
         let detail = match result {
@@ -461,14 +635,16 @@ fn agent_command(
     profile: &AgentProfile,
     worktree: &Path,
     args: &[OsString],
-) -> Result<(CommandBuilder, Option<String>)> {
+) -> Result<(CommandBuilder, Option<String>, bool)> {
     let mut command = CommandBuilder::new(&profile.command);
     let installed = crate::skill_install::LocalInstalledSkills(worktree);
     command.args(crate::shell::instruction_args(profile, args, &installed)?);
+    let (callbacks, ready_only) = crate::shell::launch_callbacks(profile, args, worktree);
+    command.args(callbacks);
     let (assign, conversation) = crate::shell::assign_conversation(profile, args);
     command.args(assign);
     command.args(args);
-    Ok((command, conversation))
+    Ok((command, conversation, ready_only))
 }
 
 /// Sets the environment and directory every process in a Power terminal starts with.
@@ -478,7 +654,14 @@ fn configure(
     session: &Session,
     options: &SessionOptions,
     cwd: &Path,
-) {
+    profile: Option<&AgentProfile>,
+) -> Option<PathBuf> {
+    let (env, server) = profile
+        .map(|profile| crate::shell::profile_env(profile, &session.id, &runtime.socket))
+        .unwrap_or_default();
+    for (name, value) in env {
+        process.env(name, value);
+    }
     for (name, value) in &options.env {
         match value {
             Some(value) => process.env(name, value),
@@ -505,6 +688,7 @@ fn configure(
             process.env("PATH", path);
         }
     }
+    server
 }
 
 type Child = Box<dyn portable_pty::Child + Send + Sync>;
@@ -516,9 +700,13 @@ struct Relaunch {
     scope: Option<Scope>,
     /// Conversation the fresh start pins, if its profile can assign one.
     conversation: Option<String>,
+    /// The failed resume's server socket. Any server it started is stopped first.
+    stale_server: Option<PathBuf>,
     slave: Box<dyn portable_pty::SlavePty + Send>,
     /// An exit after this is a normal exit, not a failed resume.
     deadline: Instant,
+    /// Input typed into the fresh start once it runs.
+    typed: Option<Vec<u8>>,
 }
 
 /// Waits for the session's process and owns everything it starts until all of it
@@ -529,11 +717,15 @@ struct Relaunch {
 /// Either way, everything the process started is ended before it is reaped, so a
 /// returned status means the whole tree is gone, unless the second value names
 /// processes the fallback could not end.
+/// Input held for the first process is sent once it outlives the deadline. A fresh
+/// start gets its own input instead.
+#[allow(clippy::too_many_arguments)]
 fn wait_process(
     mut process: Child,
     scope: Option<Scope>,
     marker: Option<String>,
     mut relaunch: Option<Relaunch>,
+    mut input: PendingInput<'_, impl Fn(Vec<u8>, u64)>,
     stop: &Stop,
     shutting_down: &AtomicBool,
     relaunched: impl FnOnce(Option<u32>, Option<&str>),
@@ -579,6 +771,12 @@ fn wait_process(
             // Checked here, after the drain and at the spawn itself, with requests
             // held off until the spawn is done. An end that arrived first wins; one
             // that arrives after ends the fresh process on the next pass.
+            input.held = None;
+            if let Some(server) = &next.stale_server {
+                crate::agent_socket::stop_listeners(server);
+                let _ = std::fs::remove_file(server);
+            }
+            let seen = input.ready.count();
             let held = stop.hold();
             if *held || shutting_down.load(Ordering::Acquire) {
                 return Ok((status, ended));
@@ -592,6 +790,9 @@ fn wait_process(
                     if let Some(relaunched) = relaunched.take() {
                         relaunched(process.process_id(), next.conversation.as_deref());
                     }
+                    if let Some(typed) = next.typed {
+                        (input.send)(typed, seen);
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -603,9 +804,12 @@ fn wait_process(
         // Past the deadline, release the slave so the reader sees EOF at exit.
         if relaunch
             .as_ref()
-            .is_some_and(|next| Instant::now() >= next.deadline)
+            .is_none_or(|next| Instant::now() >= next.deadline)
         {
             relaunch = None;
+            if let Some(typed) = input.held.take() {
+                (input.send)(typed, 0);
+            }
         }
         stop.wait(Duration::from_millis(100));
     }
@@ -647,6 +851,59 @@ struct Teardown(Arc<Stop>);
 impl Drop for Teardown {
     fn drop(&mut self) {
         self.0.request();
+    }
+}
+
+/// Input to type into a session's process once it can take it.
+struct PendingInput<'a, F: Fn(Vec<u8>, u64)> {
+    /// Input for the first process, held while a failed resume could still replace it.
+    held: Option<Vec<u8>>,
+    ready: &'a InputReady,
+    /// Sends input once the [`InputReady`] count exceeds the given value.
+    send: F,
+}
+
+/// How long typed input waits for the program to enable bracketed paste. A program that
+/// never does still gets the input after this.
+const INPUT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+
+/// Counts how often the program in a terminal enabled bracketed paste. A TUI does that
+/// once it has put the terminal in raw mode. Input typed before then goes through the
+/// terminal's line discipline, which turns a carriage return (Enter) into a line feed.
+#[derive(Default)]
+struct InputReady {
+    enabled: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl InputReady {
+    /// Counts the sequences in `bytes`. `tail` carries the end of the previous read, so a
+    /// sequence split across reads still counts once.
+    fn observe(&self, tail: &mut Vec<u8>, bytes: &[u8]) {
+        tail.extend_from_slice(bytes);
+        let found = tail
+            .windows(ENABLE_BRACKETED_PASTE.len())
+            .filter(|window| *window == ENABLE_BRACKETED_PASTE)
+            .count() as u64;
+        let keep = tail.len().min(ENABLE_BRACKETED_PASTE.len() - 1);
+        tail.drain(..tail.len() - keep);
+        if found > 0 {
+            *self.enabled.lock().unwrap() += found;
+            self.changed.notify_all();
+        }
+    }
+
+    fn count(&self) -> u64 {
+        *self.enabled.lock().unwrap()
+    }
+
+    /// Waits until the count exceeds `seen`, or until `timeout` passes.
+    fn wait_beyond(&self, seen: u64, timeout: Duration) {
+        let enabled = self.enabled.lock().unwrap();
+        let _ = self
+            .changed
+            .wait_timeout_while(enabled, timeout, |enabled| *enabled <= seen);
     }
 }
 
@@ -727,6 +984,8 @@ fn terminal_actor(
     let mut clients: Vec<SyncSender<Response>> = Vec::new();
     let mut sequence = 0;
     let mut exited = false;
+    // The conversation an agent session last reported, to skip saving repeats.
+    let mut reported: Option<String> = None;
     let mut run = if launched_agent == Agent::Shell {
         None
     } else {
@@ -805,6 +1064,7 @@ fn terminal_actor(
                 command,
                 Command::Attach(_)
                     | Command::Poll
+                    | Command::ResolveForeground(_)
                     | Command::SetMetadata { .. }
                     | Command::SetConversation { .. }
             )
@@ -817,7 +1077,7 @@ fn terminal_actor(
                 profiles,
             );
             if current != run {
-                run = current;
+                let left = std::mem::replace(&mut run, current);
                 let current = run
                     .as_ref()
                     .map_or(Agent::Shell, |(_, agent)| agent.clone());
@@ -852,7 +1112,21 @@ fn terminal_actor(
                     metadata = next;
                     notify_metadata(&metadata, &mut clients);
                 }
+                if run.is_none() {
+                    let mut input = lifecycle.input.lock().unwrap();
+                    input.activity.ready_only = false;
+                    input.activity.awaiting_turn_end = false;
+                    input.activity.hook = HookState::Unknown;
+                    input.activity.revision = input.activity.revision.wrapping_add(1);
+                }
                 restore.foreground_changed(run.as_ref().map(|(_, agent)| agent), lifecycle);
+                // The process changed, so any identity derived from the old one ends. During
+                // a shutdown every process stops at once; the restore retires those.
+                if let Some((_, left)) = left
+                    && !lifecycle.shutting_down.load(Ordering::Acquire)
+                {
+                    (lifecycle.on_foreground_left)(&lifecycle.session, &left);
+                }
             }
         }
         match command {
@@ -878,11 +1152,6 @@ fn terminal_actor(
                             .is_ok())
                 {
                     clients.push(client);
-                }
-            }
-            Command::Input(bytes) => {
-                if !exited {
-                    let _ = writer.try_send(bytes);
                 }
             }
             Command::Resize(next) if next != geometry && !exited => {
@@ -975,6 +1244,9 @@ fn terminal_actor(
                     });
                 }
             }
+            Command::ResolveForeground(reply) => {
+                let _ = reply.send(lifecycle.foreground.lock().unwrap().agent.clone());
+            }
             Command::Poll => {
                 if !exited {
                     restore.poll(run.is_none(), shell_pid, lifecycle);
@@ -986,13 +1258,19 @@ fn terminal_actor(
                 conversation,
                 reply,
             } => {
-                // Only a shell session's own descendants may name its conversation.
+                // Only a session's own descendants may name its conversation: a wrapper
+                // in a shell session, or a command run by the agent of an agent session.
+                let descendant =
+                    shell_pid.is_some_and(|root| pid != root && descends_from(pid, root));
                 let accepted = !exited
-                    && launched_agent == Agent::Shell
-                    && shell_pid.is_some_and(|shell| pid != shell && descends_from(pid, shell));
-                if accepted {
+                    && descendant
+                    && (launched_agent == Agent::Shell || launched_agent == agent);
+                if accepted && launched_agent == Agent::Shell {
                     let foreground = run.as_ref().map(|(_, agent)| agent);
                     restore.set_conversation(agent, conversation, foreground, lifecycle);
+                } else if accepted && reported.as_ref() != Some(&conversation) {
+                    lifecycle.record_foreground(&agent, Some(&conversation), None, false);
+                    reported = Some(conversation);
                 }
                 let _ = reply.send(accepted);
             }
@@ -1007,6 +1285,12 @@ fn terminal_actor(
             }
             Command::Relaunched(pid) => {
                 shell_pid = pid;
+                // The fresh start never repeats the initial prompt, so no turn is running.
+                {
+                    let mut input = lifecycle.input.lock().unwrap();
+                    input.activity.awaiting_turn_end = false;
+                    input.activity.revision = input.activity.revision.wrapping_add(1);
+                }
                 if launched_agent != Agent::Shell {
                     run = pid.map(|pid| (pid, launched_agent.clone()));
                 }
@@ -1486,7 +1770,7 @@ fn requested_model(
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Option<String> {
     let short_flag = match agent.as_str() {
-        "codex" | "grok" => true,
+        "codex" | "grok" | "jcode" => true,
         "claude" => false,
         _ => return None,
     };
@@ -1602,8 +1886,10 @@ mod tests {
             command: fresh,
             scope: Some(fresh_scope),
             conversation: Some("conv-1".into()),
+            stale_server: None,
             slave: pair.slave,
             deadline: Instant::now() + window,
+            typed: Some(b"fresh input".to_vec()),
         };
         let mut reader = pair.master.try_clone_reader()?;
         let output = thread::spawn(move || {
@@ -1624,11 +1910,17 @@ mod tests {
             }
         }
         let mut reports = Vec::new();
+        let typed = Mutex::new(Vec::new());
         let (status, ended) = wait_process(
             process,
             Some(first_scope),
             None,
             Some(relaunch),
+            PendingInput {
+                held: Some(b"resume input".to_vec()),
+                ready: &InputReady::default(),
+                send: |input, _| typed.lock().unwrap().push(input),
+            },
             &stop,
             &AtomicBool::new(shutting_down),
             |pid, conversation| reports.push((pid.is_some(), conversation.map(Into::into))),
@@ -1638,6 +1930,11 @@ mod tests {
             assert!(!scope.populated(), "{} still holds processes", scope.name());
         }
         drop(pair.master);
+        let typed = typed.into_inner().unwrap();
+        let typed = typed
+            .iter()
+            .map(|input| String::from_utf8_lossy(input).into_owned());
+        reports.extend(typed.map(|input| (false, Some(input))));
         Ok((status.exit_code(), reports, output.join().unwrap(), scopes))
     }
 
@@ -1650,9 +1947,16 @@ mod tests {
             false,
             Teardown::Never,
         )?;
-        // The fresh start also exits at once, but there is no second retry.
+        // The fresh start also exits at once, but there is no second retry. It gets its own
+        // input, never the input held for the resume.
         assert_eq!(code, 3);
-        assert_eq!(reports, [(true, Some("conv-1".into()))]);
+        assert_eq!(
+            reports,
+            [
+                (true, Some("conv-1".into())),
+                (false, Some("fresh input".into()))
+            ]
+        );
         assert!(
             output.contains("resume") && output.contains("fresh"),
             "{output:?}"
@@ -1670,7 +1974,8 @@ mod tests {
             Teardown::Never,
         )?;
         assert_eq!(code, 1);
-        assert!(reports.is_empty());
+        // The resume outlived its window, so it gets the input held for it.
+        assert_eq!(reports, [(false, Some("resume input".into()))]);
         assert!(!output.contains("fresh"), "{output:?}");
         Ok(())
     }
@@ -1680,7 +1985,7 @@ mod tests {
         let (code, reports, _, _) =
             wait_with_relaunch("exit 1", "echo fresh", RESUME_WINDOW, true, Teardown::Never)?;
         assert_eq!(code, 1);
-        assert!(reports.is_empty());
+        assert!(reports.is_empty(), "{reports:?}");
         Ok(())
     }
 
@@ -1749,6 +2054,11 @@ mod tests {
             Some(scope),
             Some("POWER_SESSION=root-exit-test".into()),
             None,
+            PendingInput {
+                held: None,
+                ready: &InputReady::default(),
+                send: |_, _| {},
+            },
             &Stop::default(),
             &AtomicBool::new(false),
             |_, _| {},
@@ -1790,6 +2100,11 @@ mod tests {
             None,
             Some(marker),
             None,
+            PendingInput {
+                held: None,
+                ready: &InputReady::default(),
+                send: |_, _| {},
+            },
             &Stop::default(),
             &AtomicBool::new(false),
             |_, _| {},
@@ -1802,6 +2117,30 @@ mod tests {
             "the detached child {pid} outlived the reported exit"
         );
         Ok(())
+    }
+
+    #[test]
+    fn input_waits_for_bracketed_paste_even_when_the_sequence_spans_reads() {
+        let ready = Arc::new(InputReady::default());
+        let mut tail = Vec::new();
+        ready.observe(&mut tail, b"starting\x1b[?20");
+        assert_eq!(ready.count(), 0);
+        let waiter = {
+            let ready = ready.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                ready.wait_beyond(0, Duration::from_secs(10));
+                started.elapsed()
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        ready.observe(&mut tail, b"04h\x1b[?2004h");
+        assert_eq!(ready.count(), 2);
+        assert!(waiter.join().unwrap() < Duration::from_secs(5));
+        // A program that never enables it still gets its input after the timeout.
+        let started = Instant::now();
+        ready.wait_beyond(2, Duration::from_millis(50));
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]
@@ -1819,6 +2158,8 @@ mod tests {
     fn exits_during_shutdown_are_not_reported() {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
+            input: Mutex::default(),
+            talk_wake: mpsc::sync_channel(1).0,
             running: AtomicBool::new(true),
             session: "worker".into(),
             on_exit: {
@@ -1833,6 +2174,7 @@ mod tests {
             }),
             on_model_changed: Arc::new(|_, _, _| Ok(())),
             on_foreground_changed: Arc::new(|_, _, _, _| Ok(())),
+            on_foreground_left: Arc::new(|_, _| {}),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         // A reboot sets shutdown during the agent's exit grace period.
@@ -1996,8 +2338,12 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume: None,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         });
         assert_eq!(
             agent_for_program("/opt/agent/bin/assistant.mjs", &profiles),

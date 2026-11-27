@@ -1,3 +1,6 @@
+mod common;
+
+use common::write_config;
 use infrastructure::boxes::{Layout, SavedBox, SavedView};
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +36,7 @@ impl Fixture {
         let root = temp.path();
         let repo = root.join("repo");
         init_repo(&repo);
+        write_config(root, "");
         let mut fixture = Self {
             daemon: power(root)
                 .arg("daemon")
@@ -538,18 +542,12 @@ fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     assert!(!marker.exists());
     fixture.wait_for_state(&run_id, "duplicate", "ready");
 
-    let config = fixture
-        .temp
-        .path()
-        .join("config/power-overwhelming/config.lua");
-    fs::create_dir_all(config.parent().unwrap()).unwrap();
     let custom = fixture.temp.path().join("custom");
     fs::create_dir_all(custom.join("repo/worker-next")).unwrap();
-    fs::write(
-        &config,
-        format!("worktrees.root = {:?}\n", custom.to_str().unwrap()),
-    )
-    .unwrap();
+    write_config(
+        fixture.temp.path(),
+        &format!("worktrees.root = {:?}\n", custom.to_str().unwrap()),
+    );
     let next = fixture.spawn(&run_id, "next", "worker/next", REPORT_SUCCESS);
     assert_eq!(
         checkout(&next, "worker/next"),
@@ -558,7 +556,8 @@ fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     fixture.wait_for_state(&run_id, "next", "completed");
     assert!(first.is_dir());
 
-    fs::remove_file(&config).unwrap();
+    // Back to the default worktree root.
+    write_config(fixture.temp.path(), "");
     fs::remove_dir_all(fixture.temp.path().join("home/.power")).unwrap();
     let result = fixture.spawn(&run_id, "after-reset", "restored", REPORT_SUCCESS);
     assert_eq!(
@@ -707,4 +706,68 @@ fn prune_reports_kept_reasons_and_only_removes_managed_worktrees_in_scope() {
     assert!(!outside.exists());
     assert!(git(&other_repo, &["branch", "--list", "outside-scope"]).is_empty());
     fixture.end_session(active["agent"]["session"].as_str().unwrap());
+}
+
+#[test]
+fn a_queued_dispatch_starts_on_the_commit_its_explicit_base_named() {
+    let fixture = Fixture::new();
+    write_config(fixture.temp.path(), "dag.max_active_workers = 1\n");
+    let run = fixture.external_run("7");
+    fixture.add_task(&run, "held", &[]);
+    fixture.add_task(&run, "queued", &[]);
+    fixture.spawn(&run, "held", "worker/held", REPORT_AFTER_RELEASE);
+    let queued = fixture.spawn(
+        &run,
+        "queued",
+        "worker/queued",
+        r#"
+            git rev-parse HEAD > "${POWER_SOCKET%/*}/queued.head"
+            exec "$POWER_BIN" dag report success --summary done
+        "#,
+    );
+    assert_eq!(queued["queued"], true, "{queued}");
+    let original = git(&fixture.repo, &["rev-parse", "main"]);
+
+    // main moves on while the dispatch waits for the budget.
+    git(
+        &fixture.repo,
+        &["commit", "-q", "--allow-empty", "-m", "Later commit"],
+    );
+    assert_ne!(git(&fixture.repo, &["rev-parse", "main"]), original);
+    fs::write(fixture.temp.path().join("release"), []).unwrap();
+    fixture.wait_for_state(&run, "queued", "completed");
+    let head = fs::read_to_string(fixture.temp.path().join("queued.head")).unwrap();
+    assert_eq!(head.trim(), original);
+}
+
+#[test]
+fn an_immediate_dispatch_with_a_missing_base_records_a_failed_attempt() {
+    let fixture = Fixture::new();
+    let run = fixture.external_run("7");
+    fixture.add_task(&run, "broken", &[]);
+    let marker = fixture.temp.path().join("worker-launched");
+    let error = rejected(
+        fixture
+            .worker("dispatch", &run, "broken")
+            .args(["--worktree", "new", "--branch", "worker/broken"])
+            .args(["--base", "missing-base", "--", "/usr/bin/touch"])
+            .arg(&marker)
+            .output()
+            .unwrap(),
+        // Git's own rev-parse error.
+        "Needed a single revision",
+    );
+    assert!(!marker.exists(), "{error}");
+    assert!(git(&fixture.repo, &["branch", "--list", "worker/broken"]).is_empty());
+
+    let shown = fixture.json(&["dag", "show", &run]);
+    let task = &shown["run"]["tasks"][0];
+    assert_eq!(task["state"], "failed", "{shown}");
+    let attempts = task["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{shown}");
+    assert_eq!(attempts[0]["state"], "failed", "{shown}");
+    let events = fixture.json(&["dag", "events", &run, "--kind", "attempt_failed"]);
+    let events = events["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["attempt"], attempts[0]["id"], "{events:?}");
 }
