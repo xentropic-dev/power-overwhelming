@@ -90,6 +90,7 @@ pub enum Command {
     TerminalZoomReset,
     TerminalCopy,
     TerminalPaste,
+    TerminalSelectAll,
     PreviewPrevious,
     PreviewNext,
     PreviewClose,
@@ -350,6 +351,7 @@ const TABLE: &[Entry] = &[
     entry(S::Hints, "cancel", C::HintCancel, &["escape"], "Hide the numbers"),
     entry(S::Terminal, "copy", C::TerminalCopy, &["ctrl-shift-c"], "Copy the selection"),
     entry(S::Terminal, "paste", C::TerminalPaste, &["ctrl-shift-v"], "Paste, bracketed if the program asks"),
+    entry(S::Terminal, "select_all", C::TerminalSelectAll, &["ctrl-shift-a"], "Select the screen and scrollback"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

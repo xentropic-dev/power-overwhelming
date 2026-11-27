@@ -2,6 +2,7 @@ use super::{
     OpenLink, TerminalView,
     grid::PtyGrid,
     keys::{self, paste_for},
+    selection::{self, AUTOSCROLL_INTERVAL, Pointer, Surface},
     typing::KeyDown,
 };
 use ghostty_vt::{mouse, terminal::ScrollViewport};
@@ -43,7 +44,7 @@ impl TerminalView {
             return;
         }
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
-        let had_selection = self.selection.take().is_some();
+        let had_selection = super::selection::clear(&self.terminal);
         let had_pressed_link = self.pressed_link.take().is_some();
         if !self.send(bytes) {
             cx.notify();
@@ -91,7 +92,7 @@ impl TerminalView {
         });
         self.mouse
             .set_options_from_terminal(&self.terminal)
-            .set_any_button_pressed(self.reporting_mouse)
+            .set_any_button_pressed(self.reporting_mouse || self.reporting_middle)
             .set_size(encoder_size(&self.grid, pad));
         let mut bytes = Vec::new();
         if self.mouse.encode_to_vec(&event, &mut bytes).is_ok() {
@@ -132,9 +133,109 @@ impl TerminalView {
 
     /// Copies the selection to the clipboard.
     pub fn copy(&mut self, cx: &mut Context<Self>) {
-        if let Some(copied) = self.selected_text() {
+        if let Some(copied) = selection::text(&self.terminal) {
             cx.write_to_clipboard(ClipboardItem::new_string(copied));
         }
+    }
+
+    /// Selects the whole screen and its scrollback.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        if selection::select_all(&self.terminal) {
+            self.publish_selection(cx);
+        }
+        if self.refresh() {
+            cx.notify();
+        }
+    }
+
+    /// A finished selection goes to the clipboard with `copy_on_select`, and to the
+    /// PRIMARY selection on Linux either way, for middle-click paste.
+    fn publish_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = selection::text(&self.terminal) else {
+            return;
+        };
+        if self.settings.copy_on_select {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        cx.write_to_primary(ClipboardItem::new_string(text));
+    }
+
+    /// Pastes the PRIMARY selection on Linux; other platforms have none.
+    fn paste_primary(&mut self, cx: &mut Context<Self>) {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(text) = cx
+            .read_from_primary()
+            .and_then(|item| item.text())
+            .filter(|text| !text.is_empty())
+        {
+            let bytes = paste_for(&self.terminal, &text);
+            self.keyboard_input(bytes, cx);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let _ = cx;
+    }
+
+    fn select_pointer(&self, position: Point<Pixels>) -> Pointer {
+        let local = position - self.grid.bounds.origin;
+        Pointer {
+            cell: self.at(position),
+            x: f32::from(local.x),
+            y: f32::from(local.y),
+        }
+    }
+
+    fn surface(&self) -> Surface {
+        Surface {
+            cell_width: f32::from(self.grid.metrics.size.width),
+            cell_height: f32::from(self.grid.metrics.size.height),
+        }
+    }
+
+    /// Ends a selection gesture and copies what it selected.
+    fn finish_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        self._autoscroll = None;
+        self.select_pointer = None;
+        let pointer = self.select_pointer(position);
+        let selected = self.selector.release(&self.terminal, Some(pointer));
+        if selected {
+            self.publish_selection(cx);
+        }
+        self.refresh();
+        cx.notify();
+        selected
+    }
+
+    /// While a drag is held past the top or bottom edge, scrolls one row every
+    /// `AUTOSCROLL_INTERVAL` (herdr-app `src/terminal.rs`, Apache-2.0).
+    fn start_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self._autoscroll = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_INTERVAL).await;
+                let keep = view
+                    .update(cx, |view, cx| {
+                        if !view.selector.selecting {
+                            return false;
+                        }
+                        if let Some(position) = view.select_pointer {
+                            let pointer = view.select_pointer(position);
+                            let surface = view.surface();
+                            if view
+                                .selector
+                                .autoscroll(&mut view.terminal, pointer, surface)
+                            {
+                                view.refresh();
+                                cx.notify();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Types the clipboard's text in as a paste, bracketed if the program asked for it.
@@ -204,9 +305,32 @@ impl TerminalView {
             return;
         }
         self.pressed_link = link;
-        self.selection = Some((cell, cell));
-        self.dragging = true;
+        self.press_cell = Some(cell);
+        self.select_pointer = Some(event.position);
+        let pointer = self.select_pointer(event.position);
+        self.selector
+            .press(&self.terminal, pointer, event.modifiers.shift);
+        self.start_autoscroll(cx);
+        self.refresh();
         cx.notify();
+    }
+
+    /// Whether a button press is held, so moves count wherever the pointer goes.
+    pub(super) fn pointer_held(&self) -> bool {
+        self.reporting_mouse || self.reporting_middle || self.selector.selecting
+    }
+
+    /// Moves over the terminal while no button is held. Held moves come through the
+    /// window's capture phase instead, so they keep arriving past the terminal's edges.
+    pub(super) fn hover_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.pointer_held() {
+            self.mouse_move(event, window, cx);
+        }
     }
 
     pub(super) fn mouse_move(
@@ -216,23 +340,28 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         let mut changed = self.set_pointer(Some(event.position));
-        if self.reporting_mouse {
+        if self.reporting_mouse || self.reporting_middle {
+            let button = if self.reporting_mouse {
+                mouse::Button::Left
+            } else {
+                mouse::Button::Middle
+            };
             self.mouse_input(
                 event.position,
                 event.modifiers,
                 mouse::Action::Motion,
-                mouse::Button::Left,
+                button,
                 cx,
             );
-        } else if self.dragging
-            && let Some((anchor, previous)) = self.selection
-        {
-            let cell = self.at(event.position);
-            if previous != cell {
-                self.pressed_link = None;
-                self.selection = Some((anchor, cell));
+        } else if self.selector.selecting {
+            self.select_pointer = Some(event.position);
+            let pointer = self.select_pointer(event.position);
+            let surface = self.surface();
+            self.selector.drag(&self.terminal, pointer, surface);
+            if self.selector.dragged(&self.terminal) && self.pressed_link.take().is_some() {
                 changed = true;
             }
+            changed |= self.refresh();
         }
         if changed {
             cx.notify();
@@ -256,21 +385,18 @@ impl TerminalView {
                 cx,
             );
             self.reporting_mouse = false;
-        } else if self.dragging {
-            let cell = self.at(event.position);
-            if self.selection == Some((cell, cell)) {
-                self.selection = None;
-                if let Some(pressed) = pressed
-                    && self
-                        .clickable_link_at(event.position, event.modifiers)
-                        .is_some_and(|link| *link == pressed)
-                {
-                    cx.emit(OpenLink(pressed.to_string()));
-                }
+        } else if self.selector.selecting {
+            let selected = self.finish_selection(event.position, cx);
+            if !selected
+                && let Some(pressed) = pressed
+                && self
+                    .clickable_link_at(event.position, event.modifiers)
+                    .is_some_and(|link| *link == pressed)
+            {
+                cx.emit(OpenLink(pressed.to_string()));
             }
-            self.dragging = false;
-            cx.notify();
         }
+        self.press_cell = None;
     }
 
     pub(super) fn mouse_up_out(
@@ -290,9 +416,54 @@ impl TerminalView {
             );
             self.reporting_mouse = false;
         }
-        self.dragging = false;
+        if self.selector.selecting {
+            self.finish_selection(event.position, cx);
+        }
+        self.press_cell = None;
         if changed {
             cx.notify();
+        }
+    }
+
+    /// Middle-click reports to a program tracking the mouse, and otherwise pastes the
+    /// PRIMARY selection on Linux.
+    pub(super) fn middle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus.focus(window);
+        if !event.modifiers.shift && self.terminal.is_mouse_tracking().unwrap_or(false) {
+            // Latch the route so the release goes to the program too, wherever it lands.
+            self.reporting_middle = true;
+            self.mouse_input(
+                event.position,
+                event.modifiers,
+                mouse::Action::Press,
+                mouse::Button::Middle,
+                cx,
+            );
+        } else {
+            self.paste_primary(cx);
+        }
+    }
+
+    /// Sends the release paired with a reported middle press, inside the terminal or out.
+    pub(super) fn middle_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.reporting_middle) {
+            self.mouse_input(
+                event.position,
+                event.modifiers,
+                mouse::Action::Release,
+                mouse::Button::Middle,
+                cx,
+            );
         }
     }
 
@@ -324,8 +495,14 @@ impl TerminalView {
                 return;
             }
             self.terminal.scroll_viewport(ScrollViewport::Delta(amount));
-            self.selection = None;
             self.pressed_link = None;
+            if self.selector.selecting
+                && let Some(position) = self.select_pointer
+            {
+                let pointer = self.select_pointer(position);
+                let surface = self.surface();
+                self.selector.drag(&self.terminal, pointer, surface);
+            }
             self.refresh();
             cx.notify();
         }
@@ -333,6 +510,18 @@ impl TerminalView {
 }
 
 pub(super) fn register_mouse_exit(pointer_owner: WeakEntity<TerminalView>, window: &mut Window) {
+    // While a button is held, follow the pointer anywhere in the window, as herdr-app
+    // does, so a drag past the terminal's edges keeps selecting and autoscrolling.
+    let mover = pointer_owner.clone();
+    window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+        if phase == DispatchPhase::Capture {
+            let _ = mover.update(cx, |view, cx| {
+                if view.pointer_held() {
+                    view.mouse_move(event, window, cx);
+                }
+            });
+        }
+    });
     window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
         if phase == DispatchPhase::Bubble {
             let _ = pointer_owner.update(cx, |view, cx| {
