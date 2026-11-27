@@ -17,7 +17,8 @@ pub(super) struct CellPosition {
 }
 
 pub(super) struct Cell {
-    /// The cell's grapheme, or a space when it has none.
+    /// The cell's grapheme, or a space when it has none. Concealed (SGR 8) cells keep theirs,
+    /// which selection copies; drawing hides them.
     pub(super) text: String,
     pub(super) fg: Hsla,
     pub(super) bg: Option<Hsla>,
@@ -77,8 +78,7 @@ pub(super) fn frame(
             let mut grapheme = String::new();
             cell.graphemes_utf8(&mut grapheme)?;
             let style = cell.style()?;
-            if grapheme.is_empty() || style.invisible {
-                grapheme.clear();
+            if grapheme.is_empty() {
                 grapheme.push(' ');
             }
             offsets.push(text.len());
@@ -190,5 +190,25 @@ mod tests {
         assert_eq!(second.as_ref(), "pwr://artifact/two");
         assert!(Arc::ptr_eq(second, cells[28].link.as_ref().unwrap()));
         assert!(cells[30..36].iter().all(|cell| cell.link.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod conceal_tests {
+    use super::{RenderState, Terminal, frame};
+    use ghostty_vt::terminal::Options;
+
+    #[test]
+    fn concealed_cells_keep_their_graphemes() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(b"a\x1b[8mSECRET\x1b[0mz");
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap();
+        let text: String = frame.rows[0]
+            .cells
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(text.starts_with("aSECRETz"));
+        assert!(frame.rows[0].cells[1].style.invisible);
     }
 }

@@ -2,7 +2,7 @@ use super::{
     TerminalView, cell_metrics,
     frame::CellPosition,
     input::register_mouse_exit,
-    runs::{RowOp, RunCell, Shaping, row_ops},
+    runs::{FAINT_OPACITY, RowOp, RunCell, Shaping, row_ops},
 };
 use gpui::{prelude::*, *};
 use infrastructure::theme::blend;
@@ -20,6 +20,7 @@ impl Render for TerminalView {
         let scheme = self.scheme;
         let colors = &scheme.colors;
         let (_, background, cursor_color) = scheme.terminal_ink(&self.terminal);
+        let background_color = Hsla::from(rgb(background));
         let selection_background = Hsla::from(rgba(scheme.selection_background));
         let terminal_font = self.font.font.clone();
         let hovered_link = self.hovered_link().cloned();
@@ -92,10 +93,15 @@ impl Render for TerminalView {
                                             {
                                                 fg = rgba(color).into();
                                             }
-                                            if cell.style.faint {
-                                                fg = fg.opacity(0.6);
-                                            }
-                                            (RunCell { cell, fg }, selected)
+                                            let fade = cell.style.faint.then(|| {
+                                                fg = fg.opacity(FAINT_OPACITY);
+                                                if selected {
+                                                    selection_background
+                                                } else {
+                                                    cell.bg.unwrap_or(background_color)
+                                                }
+                                            });
+                                            (RunCell { cell, fg, fade }, selected)
                                         })
                                         .unzip();
                                     let shaping = Shaping {
@@ -155,7 +161,9 @@ impl Render for TerminalView {
                             }
                             for (row, line) in frame.rows.iter().enumerate() {
                                 for (column, cell) in line.cells.iter().enumerate() {
-                                    if let Some(link) = &cell.link {
+                                    if let Some(link) =
+                                        cell.link.as_ref().filter(|_| link_underline(cell))
+                                    {
                                         let origin = metrics.cell_origin(grid, row, column);
                                         let underline = Bounds::new(
                                             origin + point(px(0.), metrics.underline),
@@ -171,6 +179,7 @@ impl Render for TerminalView {
                                     if let RowOp::Text { column, .. } = op {
                                         let origin = metrics.cell_origin(grid, row, *column);
                                         op.paint(origin + baseline, window);
+                                        op.paint_fade(origin, cell_size, window);
                                     }
                                 }
                             }
@@ -237,5 +246,30 @@ impl Render for TerminalView {
                     )
                 },
             )
+    }
+}
+
+/// Whether a link cell gets the link's own underline: not when the cell has an underline of its
+/// own, whose style (dotted, dashed, double) a solid line would fill in.
+pub(super) fn link_underline(cell: &super::frame::Cell) -> bool {
+    cell.style.underline == ghostty_vt::style::Underline::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_underline;
+    use ghostty_vt::{Terminal, render::RenderState, terminal::Options};
+
+    #[test]
+    fn link_underline_yields_to_the_cells_own_underline() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(
+            b"\x1b]8;;https://example.com\x1b\\a\x1b[4:4mb\x1b[4:5mc\x1b[21md\x1b[4:1me\x1b]8;;\x1b\\",
+        );
+        let frame =
+            super::super::frame::frame(&mut RenderState::new().unwrap(), &terminal, 0).unwrap();
+        let cells = &frame.rows[0].cells;
+        let drawn: Vec<_> = cells[..5].iter().map(link_underline).collect();
+        assert_eq!(drawn, [true, false, false, false, false]);
     }
 }
