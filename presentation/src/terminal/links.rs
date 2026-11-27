@@ -147,9 +147,9 @@ impl TerminalView {
 
     pub(super) fn pressed_span(&self) -> Option<(CellPosition, CellPosition)> {
         let pressed = self.pressed_link.as_ref()?;
-        let (start, end) = self.selection?;
+        let start = self.press_cell?;
         let link = self.link_at(start)?;
-        if start == end && pressed == link {
+        if pressed == link {
             self.frame.link_span(start)
         } else {
             None

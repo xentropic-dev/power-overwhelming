@@ -3065,6 +3065,7 @@ impl Workspace {
             tab.view.update(cx, |view, cx| match command {
                 Command::TerminalCopy if !event.is_held => view.copy(cx),
                 Command::TerminalPaste => view.paste(cx),
+                Command::TerminalSelectAll if !event.is_held => view.select_all(cx),
                 _ => {}
             });
             return;
