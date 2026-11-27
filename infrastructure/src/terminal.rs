@@ -592,6 +592,17 @@ fn configure(
     let (env, server) = profile
         .map(|profile| crate::shell::profile_env(profile, &session.id, &runtime.socket))
         .unwrap_or_default();
+    // A conversation ID the daemon inherited (say, from the jcode that started it) is
+    // not this session's. Left in place, the launched process would report it, and a
+    // restore would resume a conversation that belongs to someone else.
+    for name in runtime
+        .profiles
+        .profiles()
+        .iter()
+        .filter_map(|profile| profile.conversation_env.as_deref())
+    {
+        process.env_remove(name);
+    }
     for (name, value) in env {
         process.env(name, value);
     }
