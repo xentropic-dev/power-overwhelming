@@ -97,8 +97,10 @@ fn setup(root: &Path) {
     std::fs::write(
         &agent,
         format!(
-            "#!/bin/sh\nif [ ! -f {marker} ]; then\n  : > {marker}\n  power session task 'Saved task'\n  power session model reported-model\nfi\n# With its input redirected, the agent stays until it is killed.\nread finish || sleep 30\n",
-            marker = root.join("reported").display()
+            "#!/bin/sh\ncase \"$*\" in *--resume*) [ ! -f {fail} ] || exit 1;; esac\nif [ -f {fail} ]; then : > {fresh}; fi\nif [ ! -f {marker} ]; then\n  : > {marker}\n  power session task 'Saved task'\n  power session model reported-model\nfi\n# With its input redirected, the agent stays until it is killed.\nread finish || sleep 30\n",
+            marker = root.join("reported").display(),
+            fail = root.join("fail-claude").display(),
+            fresh = root.join("claude-fresh").display(),
         ),
     )
     .unwrap();
@@ -416,6 +418,132 @@ fn a_fresh_start_after_a_failed_resume_drops_the_old_labels() {
     std::fs::remove_file(root.join("fail-resume")).unwrap();
     let _daemon = Daemon::start(root);
     wait_for(&root.join("codex-resumed"));
+    assert_eq!(
+        metadata_now(&socket, &session),
+        json!({"task":null, "model":null})
+    );
+}
+
+/// Waits until the live labels of `session` are `wanted`.
+fn labels_become(socket: &Path, session: &Value, wanted: Value) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let now = metadata_now(socket, session);
+        if now == wanted {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Labels stayed {now}, not {wanted}"
+        );
+    }
+}
+
+fn launch(socket: &Path, agent: &str) -> (Value, BufReader<UnixStream>) {
+    let launched = event(&mut request(
+        socket,
+        json!({"request":"launch", "worktree":socket.parent().unwrap(), "agent":agent}),
+    ));
+    let session = launched["session"]["id"].clone();
+    let attached = request(socket, json!({"request":"subscribe", "session":session}));
+    (session, attached)
+}
+
+#[test]
+fn a_managed_resume_of_the_last_conversation_shows_no_saved_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    let (codex, mut attached) = launch(&socket, "codex");
+    metadata_until(
+        &mut attached,
+        json!({"task":"Codex task", "model":"codex-model"}),
+    );
+    // Positive control: a managed agent resumed by its pinned ID keeps its labels.
+    let (claude, mut attached) = launch(&socket, "claude");
+    metadata_until(
+        &mut attached,
+        json!({"task":"Saved task", "model":"reported-model"}),
+    );
+    daemon.terminate();
+
+    // `resume --last` succeeds, but may open another conversation, such as one a
+    // sibling tab in this worktree used last.
+    let daemon = Daemon::start(root);
+    wait_for(&root.join("codex-resumed"));
+    labels_become(
+        &socket,
+        &claude,
+        json!({"task":"Saved task", "model":"reported-model"}),
+    );
+    assert_eq!(
+        metadata_now(&socket, &codex),
+        json!({"task":null, "model":null})
+    );
+    daemon.terminate();
+
+    // The record dropped them as well.
+    std::fs::remove_file(root.join("codex-resumed")).unwrap();
+    let _daemon = Daemon::start(root);
+    wait_for(&root.join("codex-resumed"));
+    labels_become(
+        &socket,
+        &claude,
+        json!({"task":"Saved task", "model":"reported-model"}),
+    );
+    assert_eq!(
+        metadata_now(&socket, &codex),
+        json!({"task":null, "model":null})
+    );
+}
+
+#[test]
+fn a_shell_fallback_that_reuses_the_failed_id_drops_the_old_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    let (session, _attached) = start_agent(&socket);
+    std::fs::write(root.join("fail-claude"), "").unwrap();
+    daemon.terminate();
+
+    // `--resume <id>` fails, and the hook starts `--session-id <id>`, a new conversation
+    // under the same ID that reports nothing.
+    let daemon = Daemon::start(root);
+    wait_for(&root.join("claude-fresh"));
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "The fresh agent was never seen");
+        let message = event(&mut attached);
+        if message["event"] == "agent" && message["agent"] == "claude" {
+            break;
+        }
+    }
+    labels_become(&socket, &session, json!({"task":null, "model":null}));
+    // Still none after the restored shell's grace period would have run out.
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        metadata_now(&socket, &session),
+        json!({"task":null, "model":null})
+    );
+    daemon.terminate();
+
+    // The record dropped them, so a later resume that succeeds shows none.
+    std::fs::remove_file(root.join("fail-claude")).unwrap();
+    let _daemon = Daemon::start(root);
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "The resumed agent was never seen"
+        );
+        let message = event(&mut attached);
+        assert_ne!(message["event"], "metadata", "{message}");
+        if message["event"] == "agent" && message["agent"] == "claude" {
+            break;
+        }
+    }
     assert_eq!(
         metadata_now(&socket, &session),
         json!({"task":null, "model":null})

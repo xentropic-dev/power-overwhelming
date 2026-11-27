@@ -631,6 +631,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             session,
             agent,
             conversation,
+            fresh,
         } => {
             ensure!(
                 !agent.is_empty()
@@ -647,6 +648,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                     pid: wire::peer_pid(socket)?,
                     agent: Agent::Coding(agent.into()),
                     conversation,
+                    fresh,
                     reply: send,
                 })?;
             ensure!(

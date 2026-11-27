@@ -187,12 +187,41 @@ impl<T: TerminalRuntime> Application<T> {
                 }
             }
         }
-        // Labels belong to the agent that reported them: the agent session itself, or the
-        // agent a shell resumes. A shell with nothing to resume has none to show.
-        if matches!(record.agent, Agent::Coding(_)) || options.resume.is_some() {
+        // Labels belong to the conversation that reported them. Only a resume pinned to
+        // that conversation's ID continues it. `--last`, `--continue`, no resume at all,
+        // or a fresh start may open any other conversation, so the labels are dropped,
+        // from the record too, so no later restore brings them back either.
+        if self.pinned(record) {
             options.labels = record.labels.clone();
+        } else if record.labels != crate::Labels::default()
+            && let Err(error) = self
+                .records
+                .update_labels(&record.id, &crate::Labels::default())
+        {
+            eprintln!("Could not clear labels of session {}. {error:#}", record.id);
         }
         Ok(Plan::Launch(Box::new(options)))
+    }
+}
+
+impl<R: TerminalRuntime> Application<R> {
+    /// Whether restoring `record` resumes the very conversation that saved its labels.
+    fn pinned(&self, record: &SessionRecord) -> bool {
+        let agent = match &record.agent {
+            Agent::Coding(id) => id,
+            Agent::Shell => match &record.foreground {
+                Agent::Coding(id) if record.args.is_empty() => id,
+                _ => return false,
+            },
+        };
+        record.conversation.is_some()
+            && self
+                .agents
+                .resolve(agent)
+                .ok()
+                .and_then(|profile| profile.resume.as_ref())
+                // Only an `{id}` argument selects the saved conversation itself.
+                .is_some_and(|resume| resume.resume.iter().any(|arg| arg.contains("{id}")))
     }
 }
 
@@ -356,7 +385,13 @@ mod tests {
             resume_last: vec!["resume".into(), "--last".into()],
             ..Resume::default()
         };
+        // A custom profile whose resume never names the conversation.
+        let last = Resume {
+            resume: vec!["resume".into(), "--last".into()],
+            ..Resume::default()
+        };
         let profiles = vec![
+            profile("last", Some(last)),
             profile("claude", Some(claude)),
             profile("codex", Some(codex)),
             profile("plain", None),
@@ -746,55 +781,106 @@ mod tests {
     }
 
     #[test]
-    fn reported_labels_survive_a_restore() -> Result<()> {
+    fn saved_labels_return_only_with_a_resume_pinned_to_their_conversation() -> Result<()> {
         let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
         let store = Arc::new(MemorySessions::default());
-        let (application, _) = app(store.clone());
-        let agent = application.start_session(StartSession {
-            worktree: worktree.path().into(),
-            agent: coding("claude"),
-        })?;
-        let shell = application.start_session(StartSession {
-            worktree: worktree.path().into(),
-            agent: Agent::Shell,
-        })?;
-        let reported = |task: &str, model: Option<&str>| Labels {
-            task: Some(task.into()),
-            model: model.map(Into::into),
+        let saved = Labels {
+            task: Some("Task".into()),
+            model: Some("model".into()),
             model_reported: true,
         };
-        application.record_labels(&agent.id, &reported("Fix the build", Some("opus")))?;
-        application.record_foreground(
-            &shell.id,
-            &coding("claude"),
-            None,
-            None,
-            Some(&reported("Review", None)),
-        )?;
-        let bare = application.start_session(StartSession {
-            worktree: worktree.path().into(),
-            agent: Agent::Shell,
-        })?;
-        application.record_labels(&bare.id, &reported("Stale", Some("old")))?;
-
-        let (restored, starts) = app(store);
-        restored.restore_sessions()?;
+        // (id, launched agent, foreground agent, conversation, whether the labels return)
+        let cases = [
+            (
+                "managed-pinned",
+                coding("claude"),
+                coding("claude"),
+                Some("c"),
+                true,
+            ),
+            (
+                "managed-unknown",
+                coding("claude"),
+                coding("claude"),
+                None,
+                false,
+            ),
+            (
+                "managed-last",
+                coding("codex"),
+                coding("codex"),
+                Some("c"),
+                false,
+            ),
+            (
+                "managed-custom-last",
+                coding("last"),
+                coding("last"),
+                Some("c"),
+                false,
+            ),
+            (
+                "managed-no-resume",
+                coding("plain"),
+                coding("plain"),
+                Some("c"),
+                false,
+            ),
+            (
+                "shell-pinned",
+                Agent::Shell,
+                coding("claude"),
+                Some("c"),
+                true,
+            ),
+            ("shell-unknown", Agent::Shell, coding("claude"), None, false),
+            (
+                "shell-last",
+                Agent::Shell,
+                coding("codex"),
+                Some("c"),
+                false,
+            ),
+            (
+                "shell-custom-last",
+                Agent::Shell,
+                coding("last"),
+                Some("c"),
+                false,
+            ),
+            (
+                "shell-no-resume",
+                Agent::Shell,
+                coding("plain"),
+                Some("c"),
+                false,
+            ),
+            ("shell-bare", Agent::Shell, Agent::Shell, Some("c"), false),
+        ];
+        for (id, agent, foreground, conversation, _) in &cases {
+            let mut record = record(id, root, agent.clone(), &[]);
+            record.foreground = foreground.clone();
+            record.conversation = conversation.map(Into::into);
+            record.labels = saved.clone();
+            store.save(&record)?;
+        }
+        let (application, starts) = app(store.clone());
+        application.restore_sessions()?;
 
         let starts = starts.0.lock().unwrap();
-        let labels: Vec<_> = starts
-            .iter()
-            .map(|(session, options)| (session.id.clone(), options.labels.clone()))
-            .collect();
-        let saved = reported;
-        assert_eq!(
-            labels,
-            [
-                (agent.id, saved("Fix the build", Some("opus"))),
-                (shell.id, saved("Review", None)),
-                // A shell with no agent to resume has no labels to show.
-                (bare.id, Labels::default()),
-            ]
-        );
+        for (id, .., kept) in &cases {
+            let expected = if *kept {
+                saved.clone()
+            } else {
+                Labels::default()
+            };
+            let (_, options) = starts.iter().find(|(s, _)| s.id == *id).unwrap();
+            assert_eq!(options.labels, expected, "{id}");
+            // The record drops them too, so no later restore brings them back.
+            let record = store.list()?.into_iter().find(|r| r.id == *id).unwrap();
+            assert_eq!(record.labels, expected, "{id}");
+        }
         Ok(())
     }
 }

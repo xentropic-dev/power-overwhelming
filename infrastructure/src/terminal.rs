@@ -377,6 +377,8 @@ pub enum Command {
         pid: u32,
         agent: Agent,
         conversation: Option<String>,
+        /// The agent starts fresh in place of a failed resume.
+        fresh: bool,
         reply: SyncSender<bool>,
     },
     Output(Vec<u8>),
@@ -1534,6 +1536,7 @@ fn terminal_actor(
                 pid,
                 agent,
                 conversation,
+                fresh,
                 reply,
             } => {
                 // Only a session's own descendants may name its conversation: a wrapper
@@ -1544,6 +1547,9 @@ fn terminal_actor(
                     && descendant
                     && (launched_agent == Agent::Shell || launched_agent == agent);
                 if accepted && launched_agent == Agent::Shell {
+                    if fresh {
+                        restore.fresh_start(lifecycle);
+                    }
                     restore.started(
                         pid,
                         Identity {
@@ -1864,6 +1870,21 @@ impl RestoreState {
         self.restored
             .take_if(|restored| restored.identity == *identity)
             .map(|restored| restored.labels)
+    }
+
+    /// A restored shell's fallback started a new conversation in place of the failed
+    /// resume. Its labels belonged to the failed conversation, so they go, even if the
+    /// new one reuses its ID.
+    fn fresh_start(&mut self, lifecycle: &Lifecycle) {
+        // The failed resume may already have claimed them before it exited.
+        if let Some(restored) = self.restored.take()
+            && self.saved.identity == restored.identity
+        {
+            self.owner_pid = None;
+            self.clear_at = None;
+            self.saved.labels = Labels::default();
+            self.save(lifecycle, false);
+        }
     }
 
     /// Makes the agent `pid` the owner of the saved state, with its current labels.

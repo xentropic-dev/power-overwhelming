@@ -112,6 +112,10 @@ pub enum Request {
         agent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<String>,
+        /// Whether the agent starts fresh in place of a failed resume, so it owns none
+        /// of the labels saved for a conversation, even one with the same ID.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fresh: bool,
     },
     Launch {
         worktree: PathBuf,
@@ -1568,6 +1572,7 @@ mod profile_tests {
             session: "session".into(),
             agent: "claude".into(),
             conversation: Some("conversation".into()),
+            fresh: false,
         };
         let mut line = Vec::new();
         send(&mut line, &request)?;
@@ -1583,7 +1588,7 @@ mod profile_tests {
         let decoded = receive::<Request>(&mut line.as_slice())?;
         assert!(matches!(
             decoded,
-            Some(Request::SetConversation { session, agent, conversation })
+            Some(Request::SetConversation { session, agent, conversation, fresh: false })
                 if session == "session" && agent == "claude"
                     && conversation.as_deref() == Some("conversation")
         ));

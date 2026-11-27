@@ -102,7 +102,7 @@ impl Shell {
     function __power_resume_fallback {
         [ $((SECONDS - __power_resume_started)) -lt 5 ] || return 1
         printf '\033[2m── could not resume, started a new conversation ──\033[0m\n'
-        "$@"
+        POWER_RESUME_FRESH=1 "$@"
     }
     function __power_resume_once {
         local power_resume_command="$__power_resume_command" __power_resume_started=$SECONDS
@@ -157,6 +157,7 @@ fi
     function __power_resume_fallback
         test (math (date +%s) - $__power_resume_started) -lt 5; or return 1
         printf '\033[2m── could not resume, started a new conversation ──\033[0m\n'
+        set -lx POWER_RESUME_FRESH 1
         eval (string escape -- $argv)
     end
     function __power_resume_once
@@ -655,12 +656,19 @@ fn launch_instructions(profile: &AgentProfile, installed: &dyn InstalledSkills) 
     Ok(instructions)
 }
 
+/// Marks an agent wrapper call as the fresh start that replaces a failed resume.
+const FRESH_ENV: &str = "POWER_RESUME_FRESH";
+
 /// Replaces this process with the real agent binary, adding Power's instructions and
 /// model callback.
 pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     let program = find_program(&profile.command)
         .with_context(|| format!("{}: command not found", profile.command))?;
     let mut command = std::process::Command::new(&program);
+    // Set by a restored shell's fallback: this start replaces a failed resume, so it is
+    // a new conversation even when it reuses the failed one's ID.
+    let fresh = std::env::var_os(FRESH_ENV).is_some();
+    command.env_remove(FRESH_ENV);
     let cwd = std::env::current_dir()?;
     // A wrapper that replaces itself cannot type a first message, so a profile using
     // `Injection::FirstMessage` starts here without Power's instructions.
@@ -698,6 +706,7 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
                 session.to_string_lossy().into_owned(),
                 profile.id.as_str().to_owned(),
                 conversation,
+                fresh,
             );
         }
     }

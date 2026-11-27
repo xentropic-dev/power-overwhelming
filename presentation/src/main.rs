@@ -868,6 +868,7 @@ fn report_conversation() {
             session.clone(),
             profile.id.as_str().to_owned(),
             Some(conversation),
+            false,
         );
         // An agent without a model callback, like jcode, records its model in its
         // session, so each report also refreshes the model shown in the bar.

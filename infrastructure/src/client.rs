@@ -96,11 +96,13 @@ pub fn set_conversation(
     session: String,
     agent: String,
     conversation: Option<String>,
+    fresh: bool,
 ) -> Result<()> {
     expect_ok(&Request::SetConversation {
         session,
         agent,
         conversation,
+        fresh,
     })
 }
 
