@@ -447,23 +447,7 @@ impl Picker {
                 .into_iter()
                 .collect();
         }
-        let mut rows: Vec<Row> = self
-            .rows
-            .iter()
-            .filter(|row| {
-                query.split_whitespace().all(|word| {
-                    row.label.to_lowercase().contains(word)
-                        || row.detail.to_lowercase().contains(word)
-                        || matches!(row.choice, Choice::ColorScheme(scheme) if scheme.aliases.iter().any(|alias| alias.to_lowercase().contains(word)))
-                })
-            })
-            .cloned()
-            .collect();
-        if matches!(self.kind, Kind::Runs { .. }) {
-            // Run IDs are UUIDs, so short queries match them by accident. Prefer title matches.
-            rows.sort_by_key(|row| !title_matches(&row.label, &query));
-        }
-        rows
+        fuzzy_rows(&self.rows, &self.query)
     }
 
     /// The run under the selection in the run picker.
@@ -1394,18 +1378,74 @@ mod tests {
     }
 }
 
-fn title_matches(title: &str, query: &str) -> bool {
-    let title = title.to_lowercase();
-    query.split_whitespace().all(|word| title.contains(word))
+/// Fuzzy-filters rows with nucleo (fzf syntax, smart case). Rows whose label matches on its own
+/// rank first, so run titles beat accidental hits inside UUIDs or details. Ties keep list order.
+fn fuzzy_rows(rows: &[Row], query: &str) -> Vec<Row> {
+    let query = query.trim();
+    if query.is_empty() {
+        return rows.to_vec();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buffer = Vec::new();
+    let mut ranked: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let label = pattern.score(Utf32Str::new(row.label.trim(), &mut buffer), &mut matcher);
+            let rank = match label {
+                Some(score) => (true, score),
+                None => {
+                    let mut text = format!("{} {}", row.label, row.detail);
+                    if let Choice::ColorScheme(scheme) = &row.choice {
+                        for alias in scheme.aliases.iter() {
+                            text.push(' ');
+                            text.push_str(alias);
+                        }
+                    }
+                    (
+                        false,
+                        pattern.score(Utf32Str::new(&text, &mut buffer), &mut matcher)?,
+                    )
+                }
+            };
+            Some((Reverse(rank), index, row))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, index, _)| (rank, index));
+    ranked.into_iter().map(|(_, _, row)| row.clone()).collect()
 }
 
 #[cfg(test)]
-mod run_search_tests {
-    use super::title_matches;
+mod fuzzy_row_tests {
+    use super::{Choice, Row, fuzzy_rows};
+
+    fn row(label: &str, detail: &str) -> Row {
+        Row {
+            label: label.into(),
+            detail: detail.into(),
+            choice: Choice::NewBox,
+        }
+    }
+
+    fn labels(rows: &[Row], query: &str) -> Vec<String> {
+        fuzzy_rows(rows, query)
+            .into_iter()
+            .map(|row| row.label)
+            .collect()
+    }
 
     #[test]
-    fn title_matches_need_every_word_in_the_title() {
-        assert!(title_matches("Acceptance 2", "acceptance 2"));
-        assert!(!title_matches("Acceptance 1", "acceptance 2"));
+    fn matches_partial_and_scattered_words() {
+        let rows = [row("Acceptance tests", ""), row("Refactor picker", "")];
+        assert_eq!(labels(&rows, "accep"), ["Acceptance tests"]);
+        assert_eq!(labels(&rows, "rfpk"), ["Refactor picker"]);
+        assert_eq!(labels(&rows, "acc tst"), ["Acceptance tests"]);
+    }
+
+    #[test]
+    fn label_matches_beat_detail_matches() {
+        let rows = [row("Other", "acceptance"), row("Acceptance 2", "")];
+        assert_eq!(labels(&rows, "acceptance"), ["Acceptance 2", "Other"]);
     }
 }
