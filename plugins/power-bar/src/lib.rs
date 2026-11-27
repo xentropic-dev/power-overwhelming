@@ -193,11 +193,13 @@ impl Config {
                 fields.insert(name.into(), value);
             }
         }
-        fields.extend(
-            custom
-                .into_iter()
-                .map(|field| (format!("custom.{}", field.name), field.value)),
-        );
+        fields.extend(custom.into_iter().map(|field| {
+            let name = match field.name.as_str() {
+                "@dag.progress" => "dag.progress".into(),
+                name => format!("custom.{name}"),
+            };
+            (name, field.value)
+        }));
         fields.extend(
             self.params
                 .iter()
@@ -282,7 +284,7 @@ impl Template {
                                 overflow = Overflow::Path;
                             }
                         }
-                        "agent.task" | "agent.model" | "time" | "theme.name" => {}
+                        "agent.task" | "agent.model" | "dag.progress" | "time" | "theme.name" => {}
                         value if value.strip_prefix("custom.").is_some_and(custom_name) => {}
                         _ => return Err(format!("Unknown Power-bar field {field:?}")),
                     }

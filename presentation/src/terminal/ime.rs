@@ -77,7 +77,7 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         match self.typing.commit(text) {
-            Some(bytes) => self.input(bytes, cx),
+            Some(bytes) => self.keyboard_input(bytes, cx),
             None => cx.notify(),
         }
     }

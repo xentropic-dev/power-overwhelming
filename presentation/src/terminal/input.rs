@@ -43,21 +43,27 @@ impl TerminalView {
             return;
         }
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
-        self.selection = None;
-        self.pressed_link = None;
-        self.send(bytes);
-        self.refresh();
-        cx.notify();
+        let had_selection = self.selection.take().is_some();
+        let had_pressed_link = self.pressed_link.take().is_some();
+        if !self.send(bytes) {
+            cx.notify();
+        }
+        if self.refresh() || had_selection || had_pressed_link {
+            cx.notify();
+        }
     }
 
-    /// Writes bytes to the program without touching the view: reports it asked for.
-    pub(super) fn send(&mut self, bytes: Vec<u8>) {
+    /// Writes bytes to the program without touching the view: reports it asked for. False
+    /// when sending failed and the status changed.
+    pub(super) fn send(&mut self, bytes: Vec<u8>) -> bool {
         if bytes.is_empty() || self.exited {
-            return;
+            return true;
         }
         if let Err(error) = self.commands.try_send(TerminalControl::Input(bytes)) {
             self.status = Some(format!("Could not send input. {error}"));
+            return false;
         }
+        true
     }
 
     fn mouse_input(
@@ -112,7 +118,7 @@ impl TerminalView {
         if composing && self.typing.marked().is_none() {
             cx.notify();
         }
-        self.input(bytes, cx);
+        self.keyboard_input(bytes, cx);
     }
 
     /// Releases reach programs that asked the Kitty protocol to report them, for keys whose
@@ -135,7 +141,7 @@ impl TerminalView {
     pub fn paste(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let bytes = paste_for(&self.terminal, &text);
-            self.input(bytes, cx);
+            self.keyboard_input(bytes, cx);
         }
     }
 
@@ -146,6 +152,13 @@ impl TerminalView {
         if let Some(bytes) = self.typing.set_focused(&self.terminal, focused) {
             self.send(bytes);
         }
+    }
+
+    pub(super) fn keyboard_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if !bytes.is_empty() {
+            self.typed_at = Some(std::time::Instant::now());
+        }
+        self.input(bytes, cx);
     }
 
     pub(super) fn hover(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {

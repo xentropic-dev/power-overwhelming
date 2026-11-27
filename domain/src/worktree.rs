@@ -27,7 +27,13 @@ pub enum WorktreeCreator {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorktreeRequest {
-    Existing(PathBuf),
+    /// An existing worktree of the box's repository. The repository's main checkout is
+    /// refused unless `allow_main_checkout` is set, so agents don't edit where coordinators
+    /// and the user work.
+    Existing {
+        path: PathBuf,
+        allow_main_checkout: bool,
+    },
     RetryManaged,
     New {
         branch: String,

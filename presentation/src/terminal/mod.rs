@@ -1,3 +1,6 @@
+//! Output redraw scheduling adapted from herdr-app `src/terminal.rs` (Apache-2.0).
+
+pub(crate) mod bench;
 mod frame;
 mod grid;
 mod ime;
@@ -15,7 +18,7 @@ pub(crate) use self::metrics::has_family;
 use self::metrics::preload_font_files;
 pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
-use self::frame::{CellPosition, Frame, frame};
+use self::frame::{CellPosition, Frame};
 use self::grid::PtyGrid;
 pub use self::typing::InputHold;
 use self::typing::Typing;
@@ -28,7 +31,13 @@ use infrastructure::{
     client::{self, SessionMetadata, TerminalControl, TerminalEvent},
     theme::Scheme,
 };
-use std::{path::PathBuf, sync::Arc, thread};
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 /// JetBrains Mono, shipped so the terminal's default font resolves on every machine. A family
 /// GPUI can't find resolves to its UI fallback (Noto Sans and the like) with default features,
@@ -92,6 +101,15 @@ impl EventEmitter<AgentChanged> for TerminalView {}
 pub struct BarContextChanged;
 impl EventEmitter<BarContextChanged> for TerminalView {}
 
+/// All terminals with pending output share one GPUI timer.
+#[derive(Default)]
+struct OutputClock(Vec<WeakEntity<TerminalView>>);
+impl Global for OutputClock {}
+
+const OUTPUT_TURN: Duration = Duration::from_millis(6);
+const OUTPUT_INTERVAL: Duration = Duration::from_millis(33);
+const TYPING_INTERVAL: Duration = Duration::from_millis(200);
+
 pub struct TerminalView {
     pub session: Session,
     pub focus: FocusHandle,
@@ -102,7 +120,9 @@ pub struct TerminalView {
     grid: PtyGrid,
     terminal: Terminal,
     renderer: RenderState,
-    frame: Arc<Frame>,
+    frame: Rc<Frame>,
+    typed_at: Option<Instant>,
+    paint_revision: u64,
     selection: Option<(CellPosition, CellPosition)>,
     pointer: Option<Point<Pixels>>,
     pressed_link: Option<Arc<str>>,
@@ -152,27 +172,26 @@ impl TerminalView {
         });
         let follow = cx.spawn_in(window, async move |view, cx| {
             while let Ok(first) = rx.recv().await {
+                let deadline = Instant::now() + OUTPUT_TURN;
+                let queued = std::iter::from_fn(|| {
+                    if Instant::now() < deadline {
+                        rx.try_recv().ok()
+                    } else {
+                        None
+                    }
+                });
                 if view
                     .update_in(cx, |view, _, cx| {
-                        let agent = view.session.agent.clone();
-                        let metadata = view.metadata.clone();
-                        view.apply(first);
-                        for _ in 0..127 {
-                            let Ok(event) = rx.try_recv() else { break };
-                            view.apply(event);
-                        }
-                        if view.session.agent != agent {
-                            cx.emit(AgentChanged(view.session.agent.clone()));
-                        }
-                        if view.session.agent != agent || view.metadata != metadata {
-                            cx.emit(BarContextChanged);
-                        }
-                        view.refresh();
-                        cx.notify();
+                        view.ingest(std::iter::once(first).chain(queued), cx);
                     })
                     .is_err()
                 {
                     break;
+                }
+                if !rx.is_empty() {
+                    // A ready receiver can otherwise keep GPUI from running the
+                    // redraw timer or delivering keystrokes during a large cat.
+                    cx.foreground_executor().spawn(async {}).await;
                 }
             }
         });
@@ -196,7 +215,9 @@ impl TerminalView {
             grid: PtyGrid::default(),
             terminal,
             renderer: RenderState::new().expect("allocate render state"),
-            frame: Arc::default(),
+            frame: Rc::default(),
+            typed_at: None,
+            paint_revision: 0,
             selection: None,
             pointer: None,
             pressed_link: None,
@@ -216,6 +237,7 @@ impl TerminalView {
 
     pub fn set_scheme(&mut self, scheme: &'static Scheme, cx: &mut Context<Self>) {
         self.scheme = scheme;
+        self.paint_revision += 1;
         if let Err(error) = scheme.apply_to(&mut self.terminal) {
             self.status = Some(format!("Could not apply color scheme. {error:#}"));
         }
@@ -229,6 +251,7 @@ impl TerminalView {
         if settings == self.settings {
             return;
         }
+        self.paint_revision += 1;
         self.font = terminal_font(&settings, cx);
         self.settings = settings;
         if !self.exited {
@@ -247,12 +270,47 @@ impl TerminalView {
         }
     }
 
+    fn ingest(&mut self, batch: impl Iterator<Item = TerminalEvent>, cx: &mut Context<Self>) {
+        let agent = self.session.agent.clone();
+        let metadata = self.metadata.clone();
+        let status = self.status.clone();
+        let exited = self.exited;
+        let selection = self.selection;
+        let mut output = false;
+        let mut refresh_now = false;
+        for event in batch {
+            match event {
+                TerminalEvent::Output(_) => output = true,
+                TerminalEvent::Snapshot { .. } | TerminalEvent::Geometry(_) => refresh_now = true,
+                _ => {}
+            }
+            self.apply(event);
+        }
+        if self.session.agent != agent {
+            cx.emit(AgentChanged(self.session.agent.clone()));
+        }
+        if self.session.agent != agent || self.metadata != metadata {
+            cx.emit(BarContextChanged);
+        }
+        let overlay_changed =
+            self.exited != exited || self.status != status || self.selection != selection;
+        if refresh_now || overlay_changed {
+            if self.refresh() || overlay_changed {
+                cx.notify();
+            }
+        } else if output {
+            self.redraw_output(cx);
+        }
+    }
+
     fn apply(&mut self, response: TerminalEvent) {
         let result = (|| -> Result<()> {
             match response {
                 TerminalEvent::Snapshot { data, exited } => {
                     let mut terminal = snapshot::Decoder::from_slice(&data).decode()?;
                     self.scheme.apply_to(&mut terminal)?;
+                    self.renderer = RenderState::new()?;
+                    self.frame = Rc::default();
                     let previous = std::mem::replace(&mut self.terminal, terminal);
                     if let Some(bytes) = self.typing.installed(&previous, &self.terminal) {
                         self.send(bytes);
@@ -291,11 +349,51 @@ impl TerminalView {
         }
     }
 
-    fn refresh(&mut self) {
-        let foreground = self.scheme.terminal_ink(&self.terminal).0;
-        match frame(&mut self.renderer, &self.terminal, foreground) {
-            Ok(frame) => self.frame = Arc::new(frame),
-            Err(error) => self.status = Some(error.to_string()),
+    fn refresh(&mut self) -> bool {
+        match self.frame.update(&mut self.renderer, &self.terminal) {
+            Ok(Some(frame)) => {
+                self.frame = Rc::new(frame);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                let message = error.to_string();
+                if self.status.as_ref() == Some(&message) {
+                    return false;
+                }
+                self.status = Some(message);
+                true
+            }
+        }
+    }
+
+    fn redraw_output(&mut self, cx: &mut Context<Self>) {
+        if self.typed_at.is_some_and(|t| t.elapsed() < TYPING_INTERVAL) {
+            if self.refresh() {
+                cx.notify();
+            }
+            return;
+        }
+        let me = cx.weak_entity();
+        let pending = &mut cx.default_global::<OutputClock>().0;
+        if pending.contains(&me) {
+            return;
+        }
+        pending.push(me);
+        if pending.len() == 1 {
+            cx.spawn(async |_, cx| {
+                cx.background_executor().timer(OUTPUT_INTERVAL).await;
+                let _ = cx.update(|cx| {
+                    for view in std::mem::take(&mut cx.default_global::<OutputClock>().0) {
+                        let _ = view.update(cx, |view, cx| {
+                            if view.refresh() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            })
+            .detach();
         }
     }
 
