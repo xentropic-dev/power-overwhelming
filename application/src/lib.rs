@@ -1,8 +1,10 @@
 pub mod agents;
 mod commands;
 pub mod dag;
+pub mod overview;
 mod queries;
 mod restore;
+mod scheduler;
 mod sessions;
 pub mod skill_install;
 pub mod skills;
@@ -11,6 +13,8 @@ pub use commands::{
     ArtifactPublished, Labels, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
 };
 pub use queries::ResolveArtifact;
+pub use restore::{RestoreChoice, RestoredSession};
+pub use scheduler::{Job, Scheduler};
 pub use sessions::{MemorySessions, SessionRecord, SessionStore};
 
 use anyhow::{Context, Result};
@@ -53,8 +57,12 @@ pub trait Workspace: Send + Sync {
     fn open_worktree(&self, directory: &Path) -> Result<PathBuf>;
     fn list_worktrees(&self, directory: &Path) -> Result<Vec<PathBuf>>;
     fn validate_box_worktree(&self, repository: &Path, worktree: &Path) -> Result<PathBuf>;
+    /// The canonical path of the repository's main checkout, if it has one.
+    fn main_checkout(&self, repository: &Path) -> Result<Option<PathBuf>>;
     /// The full commit ID at the worktree's HEAD.
     fn head(&self, worktree: &Path) -> Result<String>;
+    /// The full commit ID that a commit-ish such as a branch name names in the repository.
+    fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String>;
     /// Looks up a local branch and reports where it is checked out, if anywhere.
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus>;
     /// Creates a new branch and checks it out at `path`, starting at the given commit-ish.
@@ -71,6 +79,8 @@ pub trait Workspace: Send + Sync {
     }
     fn worktree_status(&self, path: &Path) -> Result<WorktreeStatus>;
     fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()>;
+    /// Whether a worktree directory is still present on disk.
+    fn worktree_exists(&self, path: &Path) -> bool;
     fn open_artifact_file(&self, path: &Path) -> Result<PathBuf>;
 }
 
@@ -111,12 +121,27 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Self::Handle>;
     fn is_running(&self, handle: &Self::Handle) -> bool;
     fn end(&self, handle: Self::Handle) -> Result<()>;
+    /// Pauses (`true`) or resumes every process the session owns, and nothing else.
+    fn pause(&self, _handle: &Self::Handle, _paused: bool) -> Result<()> {
+        anyhow::bail!("This terminal cannot pause its processes")
+    }
     /// The agent currently in the foreground, which can differ from the launched one
     /// when a shell starts an agent.
     fn agent(&self, handle: &Self::Handle) -> Option<Agent>;
     /// Model reported or requested for the given foreground agent, when known.
     fn model(&self, _handle: &Self::Handle, _agent: &Agent) -> Option<String> {
         None
+    }
+    /// Ends whatever an earlier daemon left running for the session `id`, before it
+    /// is restored or forgotten. An error means some of it may still run.
+    fn reclaim(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Rechecks the foreground process now, rather than trusting the last periodic check.
+    /// None when the terminal cannot answer. Never call it while holding a store lock: the
+    /// terminal may need that store to record the change it finds.
+    fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
+        self.agent(handle)
     }
 }
 
@@ -155,6 +180,42 @@ impl<T: TerminalRuntime> Application<T> {
         }
     }
 
+    /// Ends whatever still runs of session `id` outside a live terminal, such as what
+    /// an earlier daemon or an incomplete teardown left. An error means some of it may
+    /// still run.
+    pub fn reclaim(&self, id: &str) -> Result<()> {
+        self.runtime.reclaim(id)
+    }
+
+    /// Forgets a session whose processes are gone, without ending anything.
+    pub fn forget_session(&self, id: &str) -> Result<()> {
+        self.sessions.lock().unwrap().remove(id);
+        self.records.remove(id)
+    }
+
+    /// Whether a durable record of session `id` remains.
+    pub fn has_record(&self, id: &str) -> Result<bool> {
+        Ok(self.records.list()?.iter().any(|record| record.id == id))
+    }
+
+    /// Drops session `id`'s terminal handle once its process has exited, keeping
+    /// the durable record, so the session no longer looks live while what it left is
+    /// reclaimed. A handle that still runs, such as a relaunch, stays.
+    pub fn retire_terminal(&self, id: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions
+            .get(id)
+            .is_some_and(|live| !self.runtime.is_running(&live.terminal))
+        {
+            sessions.remove(id);
+        }
+    }
+
+    /// Whether a live terminal runs session `id`.
+    pub fn terminal_running(&self, id: &str) -> bool {
+        self.session_is_running(id).unwrap_or(false)
+    }
+
     pub fn terminal(&self, id: &str) -> Result<T::Handle> {
         self.sessions
             .lock()
@@ -162,6 +223,34 @@ impl<T: TerminalRuntime> Application<T> {
             .get(id)
             .map(|live| live.terminal.clone())
             .context("Terminal session is unavailable")
+    }
+
+    /// The agent of a running session: its launched coding agent, or for a shell session,
+    /// whichever agent holds its foreground at this moment (see
+    /// `TerminalRuntime::resolve_agent`). None if the session is unknown, has exited or its
+    /// foreground cannot be resolved. Do not call it while holding a store lock.
+    pub fn live_agent(&self, id: &str) -> Option<Agent> {
+        let (launched, terminal) = {
+            let sessions = self.sessions.lock().unwrap();
+            let live = sessions.get(id)?;
+            (live.session.agent.clone(), live.terminal.clone())
+        };
+        if !self.runtime.is_running(&terminal) {
+            return None;
+        }
+        match launched {
+            Agent::Coding(_) => Some(launched),
+            Agent::Shell => self.runtime.resolve_agent(&terminal),
+        }
+    }
+
+    /// The agent a session was launched with, regardless of its current foreground.
+    pub fn launched_agent(&self, id: &str) -> Option<Agent> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|live| live.session.agent.clone())
     }
 
     fn session_is_running(&self, id: &str) -> Result<bool> {
@@ -194,3 +283,5 @@ impl<T: TerminalRuntime> Application<T> {
         }
     }
 }
+
+pub mod talk;

@@ -6,6 +6,32 @@ use domain::{
 };
 use std::ffi::OsString;
 
+/// A session that `restore_sessions_with` relaunched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoredSession {
+    pub id: String,
+    /// Whether the resumed agent received a continuation prompt.
+    pub prompted: bool,
+}
+
+/// What `restore_sessions_deferring` did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Restore {
+    pub restored: Vec<RestoredSession>,
+    /// Sessions left unrestored because what an earlier daemon left of them still runs.
+    pub deferred: Vec<String>,
+}
+
+/// What the caller of `restore_sessions_with` wants for one saved session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreChoice {
+    /// Relaunch it. A coding agent that resumes its conversation also receives this
+    /// continuation prompt, passed the way a launch passes the initial prompt.
+    Resume(Option<String>),
+    /// Forget the record without relaunching. The reason is logged.
+    Forget(&'static str),
+}
+
 /// What to do with one saved session on daemon start.
 enum Plan {
     Launch(Box<SessionOptions>),
@@ -18,9 +44,58 @@ impl<T: TerminalRuntime> Application<T> {
     /// One failing record does not stop the others. A failed record is kept so a later
     /// restart can retry it, or the user can close its tab to forget it.
     pub fn restore_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .restore_sessions_with(|_| RestoreChoice::Resume(None))?
+            .into_iter()
+            .map(|restored| restored.id)
+            .collect())
+    }
+
+    /// Restores like `restore_sessions`, asking `choose` about each session ID first.
+    /// A forgotten session is never relaunched. A fresh fallback start never receives
+    /// the continuation prompt.
+    pub fn restore_sessions_with(
+        &self,
+        choose: impl Fn(&str) -> RestoreChoice,
+    ) -> Result<Vec<RestoredSession>> {
+        Ok(self.restore_sessions_deferring(choose)?.restored)
+    }
+
+    /// Restores like `restore_sessions_with`, and also returns the sessions whose
+    /// earlier processes could not all be ended. Those keep their records and are
+    /// neither relaunched nor forgotten, so a replacement never runs beside them. A
+    /// later `reclaim` that succeeds lets them go.
+    pub fn restore_sessions_deferring(
+        &self,
+        choose: impl Fn(&str) -> RestoreChoice,
+    ) -> Result<Restore> {
         let mut restored = Vec::new();
+        let mut deferred = Vec::new();
         for record in self.records.list()? {
-            let options = match self.restore_plan(&record) {
+            // Anything an earlier daemon left of the session ends first, whether it
+            // is relaunched or forgotten, so a finished worker's teardown that the
+            // restart interrupted still completes.
+            let reclaimed = self.runtime.reclaim(&record.id);
+            if let Err(error) = &reclaimed {
+                eprintln!(
+                    "Could not end what an earlier daemon left of session {}. {error:#}",
+                    record.id
+                );
+            }
+            if reclaimed.is_err() {
+                // The record is how a later start or retry finds what still runs.
+                eprintln!(
+                    "Keeping session {} unrestored until what still runs of it ends.",
+                    record.id
+                );
+                deferred.push(record.id);
+                continue;
+            }
+            let plan = match choose(&record.id) {
+                RestoreChoice::Resume(continuation) => self.restore_plan(&record, continuation),
+                RestoreChoice::Forget(reason) => Ok(Plan::Drop(reason)),
+            };
+            let options = match plan {
                 Ok(Plan::Launch(options)) => options,
                 Ok(Plan::Drop(reason)) => {
                     eprintln!("Not restoring session {}: {reason}.", record.id);
@@ -39,15 +114,19 @@ impl<T: TerminalRuntime> Application<T> {
                 worktree: record.worktree.clone(),
                 agent: record.agent.clone(),
             };
+            let prompted = options.initial_prompt.is_some();
             match self.launch(session, *options) {
-                Ok(_) => restored.push(record.id),
+                Ok(_) => restored.push(RestoredSession {
+                    id: record.id,
+                    prompted,
+                }),
                 Err(error) => eprintln!("Could not restore session {}. {error:#}", record.id),
             }
         }
-        Ok(restored)
+        Ok(Restore { restored, deferred })
     }
 
-    fn restore_plan(&self, record: &SessionRecord) -> Result<Plan> {
+    fn restore_plan(&self, record: &SessionRecord, continuation: Option<String>) -> Result<Plan> {
         if !record.worktree.is_dir() {
             return Ok(Plan::Drop("its worktree no longer exists"));
         }
@@ -58,14 +137,22 @@ impl<T: TerminalRuntime> Application<T> {
         match &record.agent {
             Agent::Coding(id) => {
                 let profile = self.agents.resolve(id)?;
+                let mut args = record.args.clone();
                 if let Some((resume, mut fresh)) =
                     restart_args(profile.resume.as_ref(), record.conversation.as_deref())
                 {
-                    fresh.extend(record.args.iter().cloned());
+                    // The saved conversation replaces any selector the launch passed,
+                    // which would conflict with it or resume the wrong one, and the fresh
+                    // start must not retry the selector that failed.
+                    if let Some(spec) = &profile.resume {
+                        args = spec.without_selectors(&args);
+                    }
+                    fresh.extend(args.iter().cloned());
                     options.args = resume;
                     options.fallback_args = Some(fresh);
+                    options.initial_prompt = continuation.map(Into::into);
                 }
-                options.args.extend(record.args.iter().cloned());
+                options.args.extend(args);
             }
             // Command fixtures are never re-run, since their argv can be anything.
             Agent::Shell if !record.args.is_empty() => {
@@ -123,6 +210,7 @@ fn restart_args(
 
 #[cfg(test)]
 mod tests {
+    use super::RestoreChoice;
     use crate::{
         Application, ArtifactStore, BranchStatus, CreatedWorktree, Labels, MemorySessions,
         RecentArtifact, ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession,
@@ -172,7 +260,13 @@ mod tests {
         fn validate_box_worktree(&self, _: &Path, _: &Path) -> Result<PathBuf> {
             bail!("unused")
         }
+        fn main_checkout(&self, _: &Path) -> Result<Option<PathBuf>> {
+            bail!("unused")
+        }
         fn head(&self, _: &Path) -> Result<String> {
+            bail!("unused")
+        }
+        fn resolve_commit(&self, _: &Path, _: &str) -> Result<String> {
             bail!("unused")
         }
         fn branch_exists(&self, _: &Path, _: &str) -> Result<BranchStatus> {
@@ -186,6 +280,9 @@ mod tests {
         }
         fn remove_worktree(&self, _: &Path, _: bool) -> Result<()> {
             bail!("unused")
+        }
+        fn worktree_exists(&self, _: &Path) -> bool {
+            true
         }
         fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
             bail!("unused")
@@ -237,8 +334,12 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         }
     }
 
@@ -461,6 +562,116 @@ mod tests {
         );
         assert!(application.terminal("shell-tab").is_ok());
         assert_eq!(store.list()?[3].args, Vec::<OsString>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_replaces_launch_selectors_with_the_saved_conversation() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let store = Arc::new(MemorySessions::default());
+        let mut worker = record(
+            "worker",
+            worktree.path(),
+            coding("claude"),
+            &["--resume", "old", "--model", "opus", "--resume=older"],
+        );
+        worker.conversation = Some("reported".into());
+        store.save(&worker)?;
+        let (application, starts) = app(store);
+
+        application.restore_sessions_with(|_| RestoreChoice::Resume(Some("continue".into())))?;
+
+        let starts = starts.0.lock().unwrap();
+        let (_, options) = &starts[0];
+        // One selector, never two, and the fresh start does not retry the old one.
+        assert_eq!(
+            options.args,
+            os(&["--resume", "reported", "--model", "opus"])
+        );
+        assert_eq!(
+            options.fallback_args,
+            Some(os(&["--session-id", "reported", "--model", "opus"]))
+        );
+        assert_eq!(options.initial_prompt.as_deref(), Some("continue".as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn restore_passes_a_continuation_prompt_only_to_resumed_coding_agents() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        let mut worker = record("worker", root, coding("claude"), &["--model", "opus"]);
+        worker.conversation = Some("conv".into());
+        let idle = record("idle", root, coding("claude"), &[]);
+        // Without resume arguments the agent starts fresh, so a nudge means nothing.
+        let fresh = record("fresh", root, coding("plain"), &[]);
+        let mut shell = record("shell", root, Agent::Shell, &[]);
+        shell.foreground = coding("claude");
+        for record in [&worker, &idle, &fresh, &shell] {
+            store.save(record)?;
+        }
+        let (application, starts) = app(store.clone());
+
+        let restored = application.restore_sessions_with(|id| {
+            RestoreChoice::Resume((id != "idle").then(|| format!("continue {id}")))
+        })?;
+
+        let prompted: Vec<_> = restored
+            .iter()
+            .map(|session| (session.id.as_str(), session.prompted))
+            .collect();
+        assert_eq!(
+            prompted,
+            [
+                ("worker", true),
+                ("idle", false),
+                ("fresh", false),
+                ("shell", false)
+            ]
+        );
+        let starts = starts.0.lock().unwrap();
+        let (_, options) = &starts[0];
+        assert_eq!(options.args, os(&["--resume", "conv", "--model", "opus"]));
+        assert_eq!(
+            options.initial_prompt.as_deref(),
+            Some("continue worker".as_ref())
+        );
+        assert!(
+            starts[1..]
+                .iter()
+                .all(|(_, options)| options.initial_prompt.is_none())
+        );
+        assert!(
+            !format!("{:?}", store.list()?).contains("continue"),
+            "the continuation prompt must never be persisted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_forgets_sessions_the_caller_rejects_without_launching_them() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        for id in ["finished", "active"] {
+            store.save(&record(id, root, coding("claude"), &[]))?;
+        }
+        let (application, starts) = app(store.clone());
+
+        let restored = application.restore_sessions_with(|id| match id {
+            "finished" => RestoreChoice::Forget("its attempt finished"),
+            _ => RestoreChoice::Resume(None),
+        })?;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "active");
+        let starts = starts.0.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].0.id, "active");
+        let kept: Vec<_> = store.list()?.into_iter().map(|record| record.id).collect();
+        assert_eq!(kept, ["active"]);
+        assert!(application.terminal("finished").is_err());
         Ok(())
     }
 

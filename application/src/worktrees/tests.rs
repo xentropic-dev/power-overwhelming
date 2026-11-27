@@ -28,10 +28,17 @@ impl Workspace for WorktreeWorkspace {
     fn validate_box_worktree(&self, _: &Path, _: &Path) -> Result<PathBuf> {
         bail!("Unexpected worktree validation")
     }
+    fn main_checkout(&self, _: &Path) -> Result<Option<PathBuf>> {
+        bail!("Unexpected main checkout lookup")
+    }
 
     fn head(&self, path: &Path) -> Result<String> {
         ensure!(path == Path::new("/view-source"), "Wrong source worktree");
         Ok("view-head".into())
+    }
+
+    fn resolve_commit(&self, _: &Path, commitish: &str) -> Result<String> {
+        Ok(commitish.into())
     }
 
     fn branch_exists(&self, repository: &Path, _: &str) -> Result<BranchStatus> {
@@ -88,6 +95,16 @@ impl Workspace for WorktreeWorkspace {
         state.removals.push((path.into(), delete_branch));
         state.statuses.remove(path);
         Ok(())
+    }
+
+    fn worktree_exists(&self, path: &Path) -> bool {
+        !self
+            .0
+            .lock()
+            .unwrap()
+            .removals
+            .iter()
+            .any(|(removed, _)| removed == path)
     }
 
     fn open_artifact_file(&self, _: &Path) -> Result<PathBuf> {
@@ -160,7 +177,7 @@ fn creates_from_the_view_head_and_records_ownership() -> Result<()> {
     fs::create_dir_all(root.0.join("test-repo/feature-branch"))?;
     let before = now();
 
-    let path = dag.create_view_worktree("2", &view.id, "feature/branch")?;
+    let path = dag.create_view_worktree("2", &view.id, "feature/branch", None)?;
 
     let requested = root.0.join("test-repo/feature-branch-2");
     assert_eq!(
@@ -189,6 +206,35 @@ fn creates_from_the_view_head_and_records_ownership() -> Result<()> {
 }
 
 #[test]
+fn creates_at_a_requested_path() -> Result<()> {
+    let workspace = WorktreeWorkspace::default();
+    let (dag, view) = fixture(workspace.clone())?;
+    let root = TempRoot::new()?;
+    let dag = dag.with_worktree_root(FixedRoot(root.0.clone()));
+    let requested = root.0.join("elsewhere/mine");
+
+    dag.create_view_worktree("box-id", &view.id, "mine", Some(&requested))?;
+    assert_eq!(
+        workspace.0.lock().unwrap().created,
+        std::slice::from_ref(&requested)
+    );
+
+    fs::create_dir_all(&requested)?;
+    let error = dag
+        .create_view_worktree("box-id", &view.id, "other", Some(&requested))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("{} already exists", requested.display())
+    );
+    let error = dag
+        .create_view_worktree("box-id", &view.id, "other", Some(Path::new("relative")))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Worktree path relative must be absolute");
+    Ok(())
+}
+
+#[test]
 fn rejects_a_branch_that_already_exists() -> Result<()> {
     let workspace = WorktreeWorkspace::default();
     let (dag, view) = fixture(workspace.clone())?;
@@ -202,7 +248,7 @@ fn rejects_a_branch_that_already_exists() -> Result<()> {
     ] {
         workspace.0.lock().unwrap().branch = Some(BranchStatus::Exists { checked_out_at });
         let error = dag
-            .create_view_worktree("box-id", &view.id, "feature")
+            .create_view_worktree("box-id", &view.id, "feature", None)
             .unwrap_err();
         assert_eq!(error.to_string(), expected);
     }
@@ -219,7 +265,7 @@ fn reports_git_creation_errors_without_recording_ownership() -> Result<()> {
     let dag = dag.with_worktree_root(FixedRoot("/managed".into()));
 
     let error = dag
-        .create_view_worktree("box-id", &view.id, "invalid name")
+        .create_view_worktree("box-id", &view.id, "invalid name", None)
         .unwrap_err();
 
     assert_eq!(error.to_string(), "fatal: invalid branch name");
@@ -262,6 +308,8 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 label: "fixture".into(),
             },
             created_at: 0,
+            archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         })?;
         db.insert_tasks(&worktree.branch, &[spec("work", &[])])?;
@@ -282,6 +330,8 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 detail: None,
                 started_at: 0,
                 ended_at: None,
+                paused: false,
+                stalled: false,
                 artifacts: Vec::new(),
             },
         )
@@ -343,7 +393,7 @@ fn lists_and_prunes_only_owned_worktrees_in_scope() -> Result<()> {
         (dirty.clone(), PruneVerdict::Keep(KeepReason::Dirty)),
         (unmerged.clone(), PruneVerdict::Keep(KeepReason::Unmerged)),
         (live.clone(), PruneVerdict::Keep(KeepReason::InUse)),
-        (open.clone(), PruneVerdict::Keep(KeepReason::InUse)),
+        (open.clone(), PruneVerdict::Keep(KeepReason::OpenAttempt)),
         (removable.clone(), PruneVerdict::Remove),
     ];
     assert_eq!(dag.prune(Some("box-id"), true, true)?, expected);
@@ -392,5 +442,117 @@ fn retains_ownership_when_git_refuses_to_remove_a_worktree() -> Result<()> {
         workspace.0.lock().unwrap().removals,
         [(removed.path, false)]
     );
+    Ok(())
+}
+
+fn add_agent(
+    dag: &TestDag,
+    id: &str,
+    worktree: &Path,
+    session: Option<&str>,
+    state: AgentState,
+) -> Result<()> {
+    dag.store.write(|db| {
+        db.insert_agent(&ManagedAgent {
+            id: id.into(),
+            box_id: "box-id".into(),
+            worktree: worktree.into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: session.map(str::to_owned),
+            run: None,
+            task: None,
+            attempt: None,
+            state,
+            paused: false,
+            status: domain::dag::AgentStatus::derive(state, false, None),
+            label: id.into(),
+            created_at: 0,
+        })
+    })
+}
+
+fn agent_state(dag: &TestDag, id: &str) -> Result<AgentState> {
+    dag.store.read(|db| db.agent(id)).map(|agent| agent.state)
+}
+
+#[test]
+fn removing_a_worktree_retires_the_agents_left_in_it() -> Result<()> {
+    let removed = record("box-id", "removed");
+    let other = record("box-id", "other");
+    let workspace = WorktreeWorkspace::default();
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .insert(removed.path.clone(), CLEAN_MERGED);
+    let (dag, _) = fixture(workspace.clone())?;
+    record_owners(&dag, &[&removed])?;
+    // The terminal has stopped, but the exit has not been recorded yet.
+    let stale = start_shell(&dag.application, &removed.path)?;
+    dag.application
+        .terminal(&stale.id)?
+        .store(false, Ordering::Release);
+    add_agent(
+        &dag,
+        "with-session",
+        &removed.path,
+        Some(&stale.id),
+        AgentState::Running,
+    )?;
+    add_agent(
+        &dag,
+        "orphan",
+        &removed.path,
+        Some("gone"),
+        AgentState::Running,
+    )?;
+    add_agent(&dag, "no-session", &removed.path, None, AgentState::Running)?;
+    add_agent(&dag, "elsewhere", &other.path, None, AgentState::Running)?;
+
+    assert_eq!(
+        dag.prune(None, false, false)?,
+        [(removed.clone(), PruneVerdict::Remove)]
+    );
+
+    assert!(dag.application.session(&stale.id).is_err());
+    assert_eq!(agent_state(&dag, "orphan")?, AgentState::Exited);
+    assert_eq!(agent_state(&dag, "no-session")?, AgentState::Exited);
+    assert_eq!(agent_state(&dag, "elsewhere")?, AgentState::Running);
+    // The session's exit report marks this one, as for any other exit.
+    assert_eq!(agent_state(&dag, "with-session")?, AgentState::Running);
+    dag.session_exited(&stale.id, "ended", true)?;
+    assert_eq!(agent_state(&dag, "with-session")?, AgentState::Exited);
+    Ok(())
+}
+
+#[test]
+fn keeps_a_worktree_whose_agent_has_an_open_attempt_elsewhere() -> Result<()> {
+    let worktree = record("box-id", "agent-home");
+    let attempt_path = record("box-id", "attempt-path");
+    let workspace = WorktreeWorkspace::default();
+    workspace
+        .0
+        .lock()
+        .unwrap()
+        .statuses
+        .insert(worktree.path.clone(), CLEAN_MERGED);
+    let (dag, _) = fixture(workspace.clone())?;
+    record_owners(&dag, &[&worktree])?;
+    // The attempt records a different path, but its agent works in this worktree.
+    add_attempt(&dag, &attempt_path, AttemptState::Active)?;
+    add_agent(&dag, "agent", &worktree.path, None, AgentState::Running)?;
+    let expected = [(
+        worktree.clone(),
+        PruneVerdict::Keep(KeepReason::OpenAttempt),
+    )];
+
+    assert_eq!(dag.prune(None, true, false)?, expected);
+    assert_eq!(dag.prune(None, false, false)?, expected);
+
+    assert!(workspace.0.lock().unwrap().removals.is_empty());
+    assert_eq!(agent_state(&dag, "agent")?, AgentState::Running);
     Ok(())
 }

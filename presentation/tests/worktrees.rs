@@ -1,3 +1,6 @@
+mod common;
+
+use common::write_config;
 use infrastructure::boxes::{Layout, SavedBox, SavedView};
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +36,7 @@ impl Fixture {
         let root = temp.path();
         let repo = root.join("repo");
         init_repo(&repo);
+        write_config(root, "");
         let mut fixture = Self {
             daemon: power(root)
                 .arg("daemon")
@@ -165,7 +169,23 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &test_slice(self.temp.path())])
+            .stderr(Stdio::null())
+            .status();
     }
+}
+
+/// The systemd slice for this fixture's worker scopes, apart from the live daemon's.
+fn test_slice(root: &Path) -> String {
+    let name: String = root
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("app-powertest{name}.slice")
 }
 
 fn power(root: &Path) -> Command {
@@ -177,6 +197,7 @@ fn power(root: &Path) -> Command {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root.join("home"))
         .env("SHELL", "/bin/sh")
+        .env("POWER_WORKER_SLICE", test_slice(root))
         .env_remove("POWER_SESSION")
         .env_remove("POWER_BOX")
         .env_remove("POWER_RUN")
@@ -418,6 +439,71 @@ fn dispatches_from_a_view_and_an_explicit_base_and_records_creators() {
 }
 
 #[test]
+fn workers_default_to_a_new_worktree_and_need_an_opt_in_for_the_main_checkout() {
+    let fixture = Fixture::new();
+    let run_id = fixture.external_run("7");
+    for task in ["default", "main"] {
+        fixture.add_task(&run_id, task, &[]);
+    }
+    let created = parse(
+        fixture
+            .worker("dispatch", &run_id, "default")
+            .args(["--branch", "worker/default", "--base", "main"])
+            .args(["--", "/bin/sh", "-ec", REPORT_SUCCESS]),
+    );
+    assert_eq!(
+        checkout(&created, "worker/default"),
+        fixture.default_root().join("repo/worker-default")
+    );
+    fixture.wait_for_state(&run_id, "default", "completed");
+
+    let main = fixture.repo.canonicalize().unwrap();
+    let dispatch = || fixture.worker("dispatch", &run_id, "main");
+    rejected(
+        dispatch().args(["--", "/bin/true"]).output().unwrap(),
+        "Specify --branch <name>",
+    );
+    let error = rejected(
+        dispatch()
+            .arg("--worktree")
+            .arg(&main)
+            .args(["--", "/bin/true"])
+            .output()
+            .unwrap(),
+        "is the repository's main checkout",
+    );
+    assert!(error.contains("--allow-main-checkout"), "{error}");
+    rejected(
+        dispatch()
+            .args(["--branch", "x", "--allow-main-checkout"])
+            .output()
+            .unwrap(),
+        "--worktree",
+    );
+    fixture.wait_for_state(&run_id, "main", "ready");
+    let reused = parse(
+        dispatch()
+            .arg("--worktree")
+            .arg(&main)
+            .arg("--allow-main-checkout")
+            .args(["--", "/bin/sh", "-ec", REPORT_SUCCESS]),
+    );
+    assert_eq!(reused["attempt"]["worktree"], main.to_str().unwrap());
+    fixture.wait_for_state(&run_id, "main", "completed");
+
+    let start = || {
+        let mut command = fixture.command();
+        command.args(["agent", "start", "--box", "7", "--provider", "codex"]);
+        command
+    };
+    rejected(start().output().unwrap(), "Specify --branch <name>");
+    rejected(
+        start().arg("--worktree").arg(&main).output().unwrap(),
+        "is the repository's main checkout",
+    );
+}
+
+#[test]
 fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     let fixture = Fixture::new();
     let run_id = fixture.external_run("7");
@@ -456,18 +542,12 @@ fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     assert!(!marker.exists());
     fixture.wait_for_state(&run_id, "duplicate", "ready");
 
-    let config = fixture
-        .temp
-        .path()
-        .join("config/power-overwhelming/config.lua");
-    fs::create_dir_all(config.parent().unwrap()).unwrap();
     let custom = fixture.temp.path().join("custom");
     fs::create_dir_all(custom.join("repo/worker-next")).unwrap();
-    fs::write(
-        &config,
-        format!("worktrees.root = {:?}\n", custom.to_str().unwrap()),
-    )
-    .unwrap();
+    write_config(
+        fixture.temp.path(),
+        &format!("worktrees.root = {:?}\n", custom.to_str().unwrap()),
+    );
     let next = fixture.spawn(&run_id, "next", "worker/next", REPORT_SUCCESS);
     assert_eq!(
         checkout(&next, "worker/next"),
@@ -476,7 +556,8 @@ fn checks_creation_inputs_and_reads_config_again_for_the_next_dispatch() {
     fixture.wait_for_state(&run_id, "next", "completed");
     assert!(first.is_dir());
 
-    fs::remove_file(&config).unwrap();
+    // Back to the default worktree root.
+    write_config(fixture.temp.path(), "");
     fs::remove_dir_all(fixture.temp.path().join("home/.power")).unwrap();
     let result = fixture.spawn(&run_id, "after-reset", "restored", REPORT_SUCCESS);
     assert_eq!(
@@ -601,7 +682,7 @@ fn prune_reports_kept_reasons_and_only_removes_managed_worktrees_in_scope() {
     );
     assert!(plan.contains("uncommitted or untracked changes"), "{plan}");
     assert!(
-        plan.contains("in use by a live session or active attempt"),
+        plan.contains("an attempt there is still active or waiting for input"),
         "{plan}"
     );
     assert!(merged.is_dir());
@@ -625,4 +706,68 @@ fn prune_reports_kept_reasons_and_only_removes_managed_worktrees_in_scope() {
     assert!(!outside.exists());
     assert!(git(&other_repo, &["branch", "--list", "outside-scope"]).is_empty());
     fixture.end_session(active["agent"]["session"].as_str().unwrap());
+}
+
+#[test]
+fn a_queued_dispatch_starts_on_the_commit_its_explicit_base_named() {
+    let fixture = Fixture::new();
+    write_config(fixture.temp.path(), "dag.max_active_workers = 1\n");
+    let run = fixture.external_run("7");
+    fixture.add_task(&run, "held", &[]);
+    fixture.add_task(&run, "queued", &[]);
+    fixture.spawn(&run, "held", "worker/held", REPORT_AFTER_RELEASE);
+    let queued = fixture.spawn(
+        &run,
+        "queued",
+        "worker/queued",
+        r#"
+            git rev-parse HEAD > "${POWER_SOCKET%/*}/queued.head"
+            exec "$POWER_BIN" dag report success --summary done
+        "#,
+    );
+    assert_eq!(queued["queued"], true, "{queued}");
+    let original = git(&fixture.repo, &["rev-parse", "main"]);
+
+    // main moves on while the dispatch waits for the budget.
+    git(
+        &fixture.repo,
+        &["commit", "-q", "--allow-empty", "-m", "Later commit"],
+    );
+    assert_ne!(git(&fixture.repo, &["rev-parse", "main"]), original);
+    fs::write(fixture.temp.path().join("release"), []).unwrap();
+    fixture.wait_for_state(&run, "queued", "completed");
+    let head = fs::read_to_string(fixture.temp.path().join("queued.head")).unwrap();
+    assert_eq!(head.trim(), original);
+}
+
+#[test]
+fn an_immediate_dispatch_with_a_missing_base_records_a_failed_attempt() {
+    let fixture = Fixture::new();
+    let run = fixture.external_run("7");
+    fixture.add_task(&run, "broken", &[]);
+    let marker = fixture.temp.path().join("worker-launched");
+    let error = rejected(
+        fixture
+            .worker("dispatch", &run, "broken")
+            .args(["--worktree", "new", "--branch", "worker/broken"])
+            .args(["--base", "missing-base", "--", "/usr/bin/touch"])
+            .arg(&marker)
+            .output()
+            .unwrap(),
+        // Git's own rev-parse error.
+        "Needed a single revision",
+    );
+    assert!(!marker.exists(), "{error}");
+    assert!(git(&fixture.repo, &["branch", "--list", "worker/broken"]).is_empty());
+
+    let shown = fixture.json(&["dag", "show", &run]);
+    let task = &shown["run"]["tasks"][0];
+    assert_eq!(task["state"], "failed", "{shown}");
+    let attempts = task["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "{shown}");
+    assert_eq!(attempts[0]["state"], "failed", "{shown}");
+    let events = fixture.json(&["dag", "events", &run, "--kind", "attempt_failed"]);
+    let events = events["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["attempt"], attempts[0]["id"], "{events:?}");
 }

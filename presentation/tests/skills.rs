@@ -5,6 +5,7 @@ use std::{
 };
 
 const DAG_GUIDE: &str = include_str!("../../skills/power-dag/guide.md");
+const TALK_GUIDE: &str = include_str!("../../skills/power-talk/guide.md");
 const ARTIFACTS_GUIDE: &str = include_str!("../../skills/power-artifacts/guide.md");
 const WORKER_CONTRACT: &str = include_str!("../../skills/power-dag/references/worker-contract.md");
 const RECOVERY: &str = include_str!("../../skills/power-dag/references/recovery.md");
@@ -70,7 +71,8 @@ fn lists_skills_and_descriptions() {
         .lines()
         .map(|line| line.split_once('\t').unwrap())
         .collect();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[2].0, "power-talk");
     assert_eq!(entries[0].0, "power-artifacts");
     assert!(entries[0].1.contains("localhost preview"));
     assert_eq!(entries[1].0, "power-dag");
@@ -80,6 +82,7 @@ fn lists_skills_and_descriptions() {
 #[test]
 fn get_and_show_print_the_kernel_by_default() {
     assert_eq!(stdout(&["skills", "get", "power-dag"]), DAG_GUIDE);
+    assert_eq!(stdout(&["skills", "get", "power-talk"]), TALK_GUIDE);
     assert_eq!(stdout(&["skills", "show", "power-dag"]), DAG_GUIDE);
     assert_eq!(
         stdout(&["skills", "get", "power-artifacts"]),

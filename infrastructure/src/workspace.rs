@@ -50,6 +50,13 @@ fn power_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".power"))
 }
 
+/// The common Git directory of a box. Desktop entries use the common Git directory, and
+/// registry entries may name the checkout itself.
+fn box_repository(repository: &Path) -> Result<PathBuf> {
+    let repository = repository.canonicalize().context("Open box repository")?;
+    Ok(Checkout::discover(&repository).map_or(repository, |checkout| checkout.repository))
+}
+
 pub struct Checkout {
     pub repository: PathBuf,
     pub worktree: PathBuf,
@@ -163,11 +170,7 @@ impl Workspace for LocalWorkspace {
 
     fn validate_box_worktree(&self, repository: &Path, worktree: &Path) -> Result<PathBuf> {
         let worktree = self.open_worktree(worktree)?;
-        let repository = repository.canonicalize().context("Open box repository")?;
-        // Desktop entries use the common Git directory. Also accept registry
-        // entries that name the checkout itself.
-        let repository =
-            Checkout::discover(&repository).map_or(repository, |checkout| checkout.repository);
+        let repository = box_repository(repository)?;
         let listed =
             repository_worktrees(&repository).context("List worktrees in the box repository")?;
         ensure!(
@@ -185,8 +188,27 @@ impl Workspace for LocalWorkspace {
         Ok(worktree)
     }
 
+    fn main_checkout(&self, repository: &Path) -> Result<Option<PathBuf>> {
+        let repository = box_repository(repository)?;
+        let mut bare = git();
+        bare.arg("--git-dir")
+            .arg(&repository)
+            .args(["rev-parse", "--is-bare-repository"]);
+        if git_line(&git_output(bare)?) == OsStr::new("true") {
+            return Ok(None);
+        }
+        // Git lists the main worktree first.
+        let listed =
+            repository_worktrees(&repository).context("List worktrees in the box repository")?;
+        Ok(listed.first().and_then(|path| path.canonicalize().ok()))
+    }
+
     fn head(&self, worktree: &Path) -> Result<String> {
         resolve_commit(worktree, "HEAD")
+    }
+
+    fn resolve_commit(&self, repository: &Path, commitish: &str) -> Result<String> {
+        resolve_commit(repository, commitish)
     }
 
     fn branch_exists(&self, repository: &Path, branch: &str) -> Result<BranchStatus> {
@@ -290,6 +312,11 @@ impl Workspace for LocalWorkspace {
             dirty,
             merged_into_default,
         })
+    }
+
+    fn worktree_exists(&self, path: &Path) -> bool {
+        // Only a definite absence counts. A permission or I/O error keeps the agent.
+        !matches!(path.try_exists(), Ok(false))
     }
 
     fn remove_worktree(&self, path: &Path, delete_branch: bool) -> Result<()> {

@@ -86,7 +86,7 @@ pub enum ClipboardWrite {
 /// The `terminal` table: font, grid and behaviour of terminal views.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalSettings {
-    /// A font family name; unset picks JetBrains Mono when installed, else `monospace`.
+    /// A font family name; unset, or one GPUI can't find, picks JetBrains Mono (bundled).
     pub font_family: Option<String>,
     /// In logical pixels, 6–72.
     pub font_size: f32,
@@ -229,12 +229,14 @@ impl Settings {
             (APPEARANCE.to_owned(), json!({})),
             (TERMINAL.to_owned(), terminal_defaults()),
             (AGENTS_SECTION.to_owned(), json!({})),
+            (infrastructure::config::TALK_SECTION.to_owned(), json!({})),
         ]
         .into()
     }
 
     /// Resolves the desktop sections of an evaluated config over their defaults.
     pub fn from_sections(config: &Sections) -> Result<Self> {
+        infrastructure::config::talk_policy(config)?;
         Ok(Self {
             keymap: Keymap::from_sections(config).context("Read keys from config.lua")?,
             previews: match config.get(PREVIEWS) {
