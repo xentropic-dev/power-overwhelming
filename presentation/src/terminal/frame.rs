@@ -1,4 +1,5 @@
-//! Row damage and reuse adapted from herdr-app `src/vt.rs` (Apache-2.0).
+//! Row damage and reuse adapted from herdr-app `src/vt.rs`
+//! (https://github.com/ogulcancelik/herdr-app), licensed under Apache-2.0.
 
 use super::links::{candidate, links};
 use super::paint::RowDrawing;
@@ -7,7 +8,7 @@ use ghostty_vt::{
     Terminal,
     render::{CellIterator, Colors, Dirty, RenderState, RowId, RowIteration, RowIterator},
     screen::CellWide,
-    style::Style,
+    style::{Style, StyleColor, Underline},
     terminal::{Point as VtPoint, PointCoordinate},
 };
 use gpui::{Hsla, rgb};
@@ -20,12 +21,15 @@ pub(super) struct CellPosition {
 }
 
 pub(super) struct Cell {
-    /// The cell's grapheme, or a space when it has none.
+    /// The cell's grapheme, or a space when it has none. Concealed (SGR 8) cells keep theirs,
+    /// which selection copies; drawing hides them.
     pub(super) text: String,
     pub(super) fg: Hsla,
     pub(super) bg: Option<Hsla>,
     /// The cell's SGR attributes, as Ghostty stores them; `fg` and `bg` are already resolved.
     pub(super) style: Style,
+    /// The underline's own color (SGR 58), resolved; `None` follows the text.
+    pub(super) underline_color: Option<Hsla>,
     pub(super) wide: CellWide,
     pub(super) link: Option<Arc<str>>,
 }
@@ -95,8 +99,6 @@ impl Frame {
             .map(|row| (row.id, row))
             .collect();
         let mut rows = Vec::with_capacity(height);
-        let fg = colors.foreground;
-        let foreground = rgba_color(fg.r, fg.g, fg.b);
         while let Some(row) = source.next() {
             let id = row.id()?;
             if !full
@@ -111,7 +113,7 @@ impl Frame {
                     terminal,
                     rows.len() as u32,
                     id,
-                    foreground,
+                    &colors,
                 )?));
             }
         }
@@ -132,8 +134,18 @@ fn read_row<'s>(
     terminal: &Terminal,
     y: u32,
     id: RowId,
-    foreground: Hsla,
+    colors: &Colors,
 ) -> Result<Row> {
+    let foreground = rgba_color(
+        colors.foreground.r,
+        colors.foreground.g,
+        colors.foreground.b,
+    );
+    let default_background = rgba_color(
+        colors.background.r,
+        colors.background.g,
+        colors.background.b,
+    );
     super::bench::count(&super::bench::DECODED_ROWS);
     let wrapped = row.raw_row()?.is_wrap_continuation()?;
     let mut osc_link: Option<Arc<str>> = None;
@@ -174,13 +186,29 @@ fn read_row<'s>(
         if cells.is_empty() {
             continues_osc = wrapped && osc_link.is_some();
         }
+        let style = cell.style()?;
+        let mut fg = cell
+            .fg_color()?
+            .map_or(foreground, |c| rgba_color(c.r, c.g, c.b));
+        let mut bg = cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b));
+        if style.inverse {
+            (fg, bg) = (bg.unwrap_or(default_background), Some(fg));
+        }
+        let underline_color = match style.underline_color {
+            _ if style.underline == Underline::None => None,
+            StyleColor::None => None,
+            StyleColor::Palette(index) => {
+                let c = colors.palette[usize::from(index.0)];
+                Some(rgba_color(c.r, c.g, c.b))
+            }
+            StyleColor::Rgb(c) => Some(rgba_color(c.r, c.g, c.b)),
+        };
         cells.push(Cell {
             text: grapheme,
-            fg: cell
-                .fg_color()?
-                .map_or(foreground, |c| rgba_color(c.r, c.g, c.b)),
-            bg: cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b)),
-            style: cell.style()?,
+            fg,
+            bg,
+            style,
+            underline_color,
             wide: raw.wide()?,
             link: osc_link.clone(),
         });
@@ -361,5 +389,28 @@ mod tests {
         assert_eq!(second.as_ref(), "pwr://artifact/two");
         assert!(Arc::ptr_eq(second, cells[28].link.as_ref().unwrap()));
         assert!(cells[30..36].iter().all(|cell| cell.link.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod conceal_tests {
+    use super::{Frame, RenderState, Terminal};
+    use ghostty_vt::terminal::Options;
+
+    #[test]
+    fn concealed_cells_keep_their_graphemes() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(b"a\x1b[8mSECRET\x1b[0mz");
+        let frame = Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap();
+        let text: String = frame.rows[0]
+            .cells
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(text.starts_with("aSECRETz"));
+        assert!(frame.rows[0].cells[1].style.invisible);
     }
 }

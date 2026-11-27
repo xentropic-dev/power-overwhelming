@@ -5,7 +5,7 @@ use super::{
     frame::{CellPosition, Row},
     ime::Preedit,
     input::register_mouse_exit,
-    runs::{RowOp, RunCell, Shaping, row_ops},
+    runs::{FAINT_OPACITY, RowOp, RunCell, Shaping, row_ops},
 };
 use gpui::{prelude::*, *};
 use infrastructure::theme::{Scheme, blend};
@@ -72,16 +72,23 @@ impl Row {
             .iter()
             .enumerate()
             .map(|(column, cell)| {
-                let fg = if highlights.selected.contains(&column)
-                    && let Some(color) = scheme.selection_foreground
-                {
+                let selected = highlights.selected.contains(&column);
+                let mut fg = if selected && let Some(color) = scheme.selection_foreground {
                     rgba(color).into()
                 } else if cell.link.is_some() {
                     rgb(highlights.link_color(column, scheme, background)).into()
                 } else {
                     cell.fg
                 };
-                RunCell { cell, fg }
+                let fade = cell.style.faint.then(|| {
+                    fg = fg.opacity(FAINT_OPACITY);
+                    if selected {
+                        rgba(scheme.selection_background).into()
+                    } else {
+                        cell.bg.unwrap_or_else(|| rgb(background).into())
+                    }
+                });
+                RunCell { cell, fg, fade }
             })
             .collect();
         row_ops(&styled, shaping, |text, size, runs| {
@@ -157,6 +164,7 @@ impl Render for TerminalView {
         let pressed = self.pressed_span();
         let selection = self.selection_range().filter(|_| pressed.is_none());
         let ligatures = self.settings.ligatures;
+        let bold_weight = FontWeight(f32::from(self.settings.font_weight_bold));
         let revision = self.paint_revision;
         let hovering = hovered.is_some();
         div()
@@ -213,6 +221,7 @@ impl Render for TerminalView {
                                         font_size,
                                         cell_width: cell_size.width,
                                         ligatures,
+                                        bold_weight,
                                         cursor,
                                     };
                                     line.draw_with(
@@ -266,13 +275,27 @@ impl Render for TerminalView {
                             for (row, line) in frame.rows.iter().enumerate() {
                                 let highlights = &rows[row].highlights;
                                 for link in &line.links {
-                                    let mut underline = span(row, link.start, link.end);
-                                    underline.origin.y += metrics.underline;
-                                    underline.size.height = metrics.underline_thickness;
-                                    window.paint_quad(fill(
-                                        underline,
-                                        rgb(highlights.link_color(link.start, scheme, background)),
-                                    ));
+                                    // Cells with an underline of their own keep its style.
+                                    let mut column = link.start;
+                                    while column < link.end {
+                                        if !link_underline(&line.cells[column]) {
+                                            column += 1;
+                                            continue;
+                                        }
+                                        let from = column;
+                                        while column < link.end
+                                            && link_underline(&line.cells[column])
+                                        {
+                                            column += 1;
+                                        }
+                                        let mut underline = span(row, from, column);
+                                        underline.origin.y += metrics.underline;
+                                        underline.size.height = metrics.underline_thickness;
+                                        window.paint_quad(fill(
+                                            underline,
+                                            rgb(highlights.link_color(from, scheme, background)),
+                                        ));
+                                    }
                                 }
                             }
                             let baseline = point(metrics.glyph_x, metrics.baseline);
@@ -281,6 +304,15 @@ impl Render for TerminalView {
                                     if let RowOp::Text { column, .. } = op {
                                         let origin = metrics.cell_origin(grid, row, *column);
                                         op.paint(origin + baseline, window);
+                                        op.paint_fade(origin, cell_size, window);
+                                    }
+                                }
+                            }
+                            for (row, drawing) in rows.iter().enumerate() {
+                                for op in &drawing.ops {
+                                    if let RowOp::Decoration { from, .. } = op {
+                                        let origin = metrics.cell_origin(grid, row, *from);
+                                        op.paint_decoration(origin, &metrics, window);
                                     }
                                 }
                             }
@@ -345,11 +377,32 @@ impl Render for TerminalView {
     }
 }
 
+/// Whether a link cell gets the link's own underline: not when the cell has an underline of its
+/// own, whose style (dotted, dashed, double) a solid line would fill in.
+pub(super) fn link_underline(cell: &super::frame::Cell) -> bool {
+    cell.style.underline == ghostty_vt::style::Underline::None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CellMetrics, Highlights, Rc};
+    use super::{CellMetrics, Highlights, Rc, link_underline};
     use crate::terminal::frame::Frame;
     use ghostty_vt::{Terminal, render::RenderState, terminal::Options};
+
+    #[test]
+    fn link_underline_yields_to_the_cells_own_underline() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(
+            b"\x1b]8;;https://example.com\x1b\\a\x1b[4:4mb\x1b[4:5mc\x1b[21md\x1b[4:1me\x1b]8;;\x1b\\",
+        );
+        let frame = Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap();
+        let cells = &frame.rows[0].cells;
+        let drawn: Vec<_> = cells[..5].iter().map(link_underline).collect();
+        assert_eq!(drawn, [true, false, false, false, false]);
+    }
 
     #[test]
     fn cached_ops_follow_cursor_highlights_metrics_and_settings_revision() {

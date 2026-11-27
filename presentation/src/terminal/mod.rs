@@ -43,14 +43,22 @@ use std::{
 /// GPUI can't find resolves to its UI fallback (Noto Sans and the like) with default features,
 /// which are proportional and join `ffi` whatever `terminal.ligatures` says.
 pub(crate) const BUNDLED_FONT: &[u8] =
-    include_bytes!("../../assets/fonts/JetBrainsMono-Variable.ttf");
+    include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+/// The real bold and italic faces: GPUI doesn't apply variable-font axes, so a variable font
+/// would draw bold and italic text exactly like regular.
+const BUNDLED_FONTS: [&[u8]; 4] = [
+    BUNDLED_FONT,
+    include_bytes!("../../assets/fonts/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../../assets/fonts/JetBrainsMono-Italic.ttf"),
+    include_bytes!("../../assets/fonts/JetBrainsMono-BoldItalic.ttf"),
+];
 const BUNDLED_FAMILY: &str = "JetBrains Mono";
 
 /// Adds the bundled font to GPUI's text system; call once before any terminal is drawn.
 pub fn load_bundled_fonts(cx: &App) {
     if let Err(error) = cx
         .text_system()
-        .add_fonts(vec![std::borrow::Cow::Borrowed(BUNDLED_FONT)])
+        .add_fonts(BUNDLED_FONTS.map(std::borrow::Cow::Borrowed).to_vec())
     {
         eprintln!("Could not load the bundled terminal font. {error:#}");
     }
@@ -405,5 +413,28 @@ impl TerminalView {
 
     fn at(&self, position: Point<Pixels>) -> CellPosition {
         self.grid.at(position)
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::BUNDLED_FONTS;
+
+    /// Bold and italic text must reach real faces: a variable font's axes aren't applied by
+    /// GPUI, so the four bundled files must be distinct static faces.
+    #[test]
+    fn bundled_fonts_carry_real_bold_and_italic_faces() {
+        let faces: Vec<_> = BUNDLED_FONTS
+            .iter()
+            .map(|data| {
+                let face = ttf_parser::Face::parse(data, 0).unwrap();
+                assert!(!face.is_variable());
+                (face.is_bold(), face.is_italic())
+            })
+            .collect();
+        assert_eq!(
+            faces,
+            [(false, false), (true, false), (false, true), (true, true)]
+        );
     }
 }
