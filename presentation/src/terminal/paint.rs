@@ -173,7 +173,7 @@ impl Render for TerminalView {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(background))
+            .bg(Hsla::from(rgb(background)).opacity(self.settings.opacity))
             .when(hovering, |terminal| terminal.cursor_pointer())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))

@@ -1,5 +1,6 @@
 //! Row damage and reuse adapted from herdr-app `src/vt.rs`
-//! (https://github.com/ogulcancelik/herdr-app), licensed under Apache-2.0.
+//! (https://github.com/ogulcancelik/herdr-app), licensed under Apache-2.0. Minimum
+//! contrast is adapted from the same file.
 
 use super::links::{candidate, links};
 use super::paint::RowDrawing;
@@ -53,15 +54,27 @@ pub(super) struct Frame {
     pub(super) ime_cursor: Option<CellPosition>,
     pub(super) colors: Option<Colors>,
     cols: u16,
+    minimum_contrast: f32,
 }
 
 impl Frame {
     /// None means the last frame still describes the viewport. Only acknowledge
     /// Ghostty's damage after every row and its links have been captured.
+    #[cfg(test)]
     pub(super) fn update(
         &self,
         renderer: &mut RenderState,
         terminal: &Terminal,
+    ) -> Result<Option<Self>> {
+        self.update_with(renderer, terminal, 1.)
+    }
+
+    /// Like `update`, raising text below `minimum_contrast` (a WCAG ratio, 1 disables it).
+    pub(super) fn update_with(
+        &self,
+        renderer: &mut RenderState,
+        terminal: &Terminal,
+        minimum_contrast: f32,
     ) -> Result<Option<Self>> {
         let state = renderer.update(terminal)?;
         let vt_cursor = state.cursor()?;
@@ -74,8 +87,10 @@ impl Frame {
         let dirty = state.dirty()?;
         let cols = state.cols()?;
         let height = usize::from(state.rows()?);
-        let full =
-            dirty == Dirty::Full || self.colors.as_ref() != Some(&colors) || self.cols != cols;
+        let full = dirty == Dirty::Full
+            || self.colors.as_ref() != Some(&colors)
+            || self.cols != cols
+            || self.minimum_contrast != minimum_contrast;
         if !full && dirty == Dirty::Clean && self.rows.len() == height {
             if self.cursor == cursor && self.ime_cursor == ime_cursor {
                 return Ok(None);
@@ -86,6 +101,7 @@ impl Frame {
                 ime_cursor,
                 colors: Some(colors),
                 cols,
+                minimum_contrast,
             }));
         }
 
@@ -114,6 +130,7 @@ impl Frame {
                     rows.len() as u32,
                     id,
                     &colors,
+                    minimum_contrast,
                 )?));
             }
         }
@@ -124,6 +141,7 @@ impl Frame {
             ime_cursor,
             colors: Some(colors),
             cols,
+            minimum_contrast,
         }))
     }
 }
@@ -135,12 +153,8 @@ fn read_row<'s>(
     y: u32,
     id: RowId,
     colors: &Colors,
+    minimum_contrast: f32,
 ) -> Result<Row> {
-    let foreground = rgba_color(
-        colors.foreground.r,
-        colors.foreground.g,
-        colors.foreground.b,
-    );
     let default_background = rgba_color(
         colors.background.r,
         colors.background.g,
@@ -187,12 +201,21 @@ fn read_row<'s>(
             continues_osc = wrapped && osc_link.is_some();
         }
         let style = cell.style()?;
-        let mut fg = cell
-            .fg_color()?
-            .map_or(foreground, |c| rgba_color(c.r, c.g, c.b));
-        let mut bg = cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b));
+        let fg_rgb = cell.fg_color()?.unwrap_or(colors.foreground);
+        let bg_color = cell.bg_color()?;
+        let mut fg = rgba_color(fg_rgb.r, fg_rgb.g, fg_rgb.b);
+        let mut bg = bg_color.map(|c| rgba_color(c.r, c.g, c.b));
+        let (mut ink, mut paper) = (fg_rgb, bg_color.unwrap_or(colors.background));
         if style.inverse {
             (fg, bg) = (bg.unwrap_or(default_background), Some(fg));
+            (ink, paper) = (paper, ink);
+        }
+        if minimum_contrast > 1. && !preserves_graphics_color(&grapheme) {
+            let ink = packed_rgb(ink.r, ink.g, ink.b);
+            let readable = readable(ink, packed_rgb(paper.r, paper.g, paper.b), minimum_contrast);
+            if readable != ink {
+                fg = rgb(readable).into();
+            }
         }
         let underline_color = match style.underline_color {
             _ if style.underline == Underline::None => None,
@@ -249,13 +272,119 @@ fn read_row<'s>(
     })
 }
 
+fn packed_rgb(r: u8, g: u8, b: u8) -> u32 {
+    u32::from_be_bytes([0, r, g, b])
+}
+
+/// Box drawing, blocks, braille, powerline and legacy computing sprites keep their authored
+/// colors even when that color has low contrast.
+fn preserves_graphics_color(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| {
+        ('\u{2500}'..='\u{259f}').contains(&c)
+            || ('\u{2800}'..='\u{28ff}').contains(&c)
+            || ('\u{e0b0}'..='\u{e0d7}').contains(&c)
+            || c == '\u{23fa}'
+            || ('\u{1fb00}'..='\u{1fbff}').contains(&c)
+            || ('\u{1cc00}'..='\u{1cebf}').contains(&c)
+    })
+}
+
+/// `foreground`, or near-white / near-black when it would vanish into `background`.
+fn readable(foreground: u32, background: u32, minimum: f32) -> u32 {
+    if contrast(foreground, background) >= minimum {
+        return foreground;
+    }
+    let (light, dark) = (0xf2f2f4, 0x1b1b1e);
+    if contrast(light, background) >= contrast(dark, background) {
+        light
+    } else {
+        dark
+    }
+}
+
+fn contrast(a: u32, b: u32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn luminance(color: u32) -> f32 {
+    let [_, r, g, b] = color.to_be_bytes();
+    let linear = |value: u8| {
+        let value = f32::from(value) / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
 fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
     rgb(u32::from_be_bytes([0, r, g, b])).into()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, RenderState, Terminal};
+    use super::{Frame, RenderState, Terminal, contrast, preserves_graphics_color, readable};
+    use gpui::{Hsla, rgb};
+
+    #[test]
+    fn minimum_contrast_replaces_low_contrast_text_but_keeps_graphics_colors() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(b"\x1b[48;2;0;0;0m\x1b[38;2;16;16;16mA\xe2\xa0\x81");
+        let frame = Frame::default()
+            .update_with(&mut RenderState::new().unwrap(), &terminal, 4.5)
+            .unwrap()
+            .unwrap();
+        let cells = &frame.rows[0].cells;
+        assert_eq!(cells[0].fg, Hsla::from(rgb(0xf2f2f4)));
+        assert_eq!(cells[1].fg, Hsla::from(rgb(0x101010)));
+    }
+
+    #[test]
+    fn contrast_ratio_one_leaves_program_colors_unchanged() {
+        assert_eq!(readable(0x101010, 0x000000, 1.), 0x101010);
+    }
+
+    #[test]
+    fn minimum_contrast_selects_a_dark_fallback_on_light_backgrounds() {
+        assert_eq!(readable(0xffffff, 0xffffff, 4.5), 0x1b1b1e);
+        assert!(contrast(readable(0xffffff, 0xffffff, 4.5), 0xffffff) >= 4.5);
+    }
+
+    #[test]
+    fn minimum_contrast_exempts_sprite_and_powerline_ranges() {
+        for glyph in ["─", "▅", "⠁", "\u{e0b0}", "⏺", "🬀", "\u{1cc00}"] {
+            assert!(preserves_graphics_color(glyph), "{glyph}");
+        }
+        assert!(!preserves_graphics_color("A"));
+    }
+
+    fn low_contrast_cell(glyph: &str) -> Hsla {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(format!("\x1b[48;2;0;0;0m\x1b[38;2;16;16;16m{glyph}").as_bytes());
+        let frame = Frame::default()
+            .update_with(&mut RenderState::new().unwrap(), &terminal, 4.5)
+            .unwrap()
+            .unwrap();
+        frame.rows[0].cells[0].fg
+    }
+
+    #[test]
+    fn minimum_contrast_keeps_extended_powerline_colors() {
+        for glyph in ["\u{e0c0}", "\u{e0d7}"] {
+            assert_eq!(low_contrast_cell(glyph), Hsla::from(rgb(0x101010)));
+        }
+    }
+
+    #[test]
+    fn minimum_contrast_keeps_graphics_colors_with_combining_marks() {
+        assert_eq!(
+            low_contrast_cell("\u{2500}\u{0301}"),
+            Hsla::from(rgb(0x101010))
+        );
+    }
     use ghostty_vt::terminal::Options;
     use std::sync::Arc;
 
