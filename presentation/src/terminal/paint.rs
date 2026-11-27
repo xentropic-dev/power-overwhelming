@@ -22,8 +22,9 @@ impl Render for TerminalView {
         let colors = &scheme.colors;
         let (foreground, background, cursor_color) = scheme.terminal_ink(&self.terminal);
         let preedit = self
-            .marked
-            .clone()
+            .typing
+            .marked()
+            .map(str::to_owned)
             .zip(self.frame.ime_cursor)
             .map(|(text, at)| Preedit {
                 text,

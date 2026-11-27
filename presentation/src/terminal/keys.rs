@@ -5,6 +5,7 @@
 //! The key description is adapted from herdr-app `src/terminal.rs` (`key_bytes`,
 //! `control_alias_bytes`, `map_key`; herdr-app 3e6d564), licensed under Apache-2.0.
 
+use super::typing::KeyId;
 use ghostty_vt::{
     Terminal, focus,
     key::{self, Key},
@@ -138,6 +139,20 @@ fn map_key(name: &str) -> Option<Mapped> {
         shifted,
         unshifted: Some(base),
     })
+}
+
+/// The key a GPUI key name stands for, whatever modifiers changed the name.
+pub(super) fn key_id(name: &str) -> KeyId {
+    match map_key(name) {
+        Some(mapped) if mapped.key != Key::Unidentified => KeyId::Physical(mapped.key),
+        _ => KeyId::Named(name.to_owned()),
+    }
+}
+
+/// Whether the key types a character (letters, digits, punctuation, space, keypad
+/// operators), as opposed to a named key such as Escape or an arrow.
+pub(super) fn types_text(name: &str) -> bool {
+    map_key(name).is_some_and(|mapped| mapped.unshifted.is_some())
 }
 
 fn letter(c: char) -> Key {
@@ -389,7 +404,6 @@ mod tests {
         assert_eq!(press(&t, "ctrl-c", None), "\x03");
         assert_eq!(press(&t, "enter", None), "\r");
         assert_eq!(press(&t, "space", Some(" ")), " ");
-        assert_eq!(press(&t, "alt-x", Some("x")), "\x1bx");
         assert_eq!(press(&t, "ctrl-[", None), "\x1b");
         assert_eq!(press(&t, "ctrl-i", None), "\t");
         assert_eq!(press(&t, "ctrl-m", None), "\r");
@@ -399,6 +413,22 @@ mod tests {
         assert_eq!(press(&t, "f12", None), "\x1b[24~");
         assert_eq!(press(&t, "shift-f5", None), "\x1b[15;2~");
         assert_eq!(press(&t, "ctrl-up", None), "\x1b[1;5A");
+    }
+
+    #[test]
+    fn alt_prefixes_escape_unless_it_typed_the_text() {
+        let t = terminal("");
+        // Linux Alt is Meta. On macOS Option is spent on whatever it typed, so the encoder
+        // sends the text alone.
+        let expected = if cfg!(target_os = "macos") {
+            "x"
+        } else {
+            "\x1bx"
+        };
+        assert_eq!(press(&t, "alt-x", Some("x")), expected);
+        // A character Option or AltGr produced types as itself everywhere.
+        assert_eq!(press(&t, "alt-x", Some("≈")), "≈");
+        assert_eq!(press(&t, "alt-e", Some("€")), "€");
     }
 
     #[test]

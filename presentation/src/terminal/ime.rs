@@ -1,7 +1,8 @@
 //! Input methods (Pinyin, Japanese, Korean, dead keys, AltGr compose) type into the terminal
 //! here. What they are composing shows underlined at the cursor; the finished text goes to the
 //! program as it is. Keys the terminal encodes itself never reach this handler, because
-//! `key_down` stops their propagation.
+//! `key_down` stops their propagation. While Power reads the keyboard (link hints, a pending
+//! prefix), input-method text is dropped, as those keys are; see `typing::InputHold`.
 //!
 //! Adapted from herdr-app `src/terminal.rs` (`impl EntityInputHandler for TerminalView` and the
 //! marked-text painting in `paint_grid`; herdr-app 3e6d564), licensed under Apache-2.0.
@@ -13,8 +14,8 @@ use unicode_width::UnicodeWidthStr;
 
 impl TerminalView {
     fn marked_len(&self) -> usize {
-        self.marked
-            .as_deref()
+        self.typing
+            .marked()
             .map_or(0, |marked| marked.encode_utf16().count())
     }
 }
@@ -39,12 +40,7 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let units: Vec<u16> = self
-            .marked
-            .as_deref()
-            .unwrap_or("")
-            .encode_utf16()
-            .collect();
+        let units: Vec<u16> = self.typing.marked().unwrap_or("").encode_utf16().collect();
         let range = range.start.min(units.len())..range.end.min(units.len());
         *adjusted = Some(range.clone());
         Some(String::from_utf16_lossy(&units[range]))
@@ -64,14 +60,11 @@ impl EntityInputHandler for TerminalView {
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked
-            .as_ref()
-            .filter(|marked| !marked.is_empty())
-            .map(|_| 0..self.marked_len())
+        self.typing.marked().map(|_| 0..self.marked_len())
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        if self.marked.take().is_some() {
+        if self.typing.unmark() {
             cx.notify();
         }
     }
@@ -83,11 +76,9 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked = None;
-        if text.is_empty() {
-            cx.notify();
-        } else {
-            self.input(text.as_bytes().to_vec(), cx);
+        match self.typing.commit(text) {
+            Some(bytes) => self.input(bytes, cx),
+            None => cx.notify(),
         }
     }
 
@@ -99,7 +90,7 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked = (!text.is_empty()).then(|| text.to_owned());
+        self.typing.mark(text);
         cx.notify();
     }
 
@@ -113,7 +104,7 @@ impl EntityInputHandler for TerminalView {
     ) -> Option<Bounds<Pixels>> {
         let cursor = self.frame.ime_cursor?;
         let metrics = self.grid.metrics;
-        let before = utf16_prefix(self.marked.as_deref().unwrap_or(""), range.start);
+        let before = utf16_prefix(self.typing.marked().unwrap_or(""), range.start);
         let origin = metrics.cell_origin(self.grid.bounds.origin, cursor.row, cursor.column)
             + point(metrics.size.width * before.width() as f32, px(0.));
         Some(Bounds::new(origin, metrics.size))

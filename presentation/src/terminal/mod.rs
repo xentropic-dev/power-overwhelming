@@ -8,6 +8,7 @@ mod metrics;
 mod paint;
 mod runs;
 mod selection;
+mod typing;
 
 #[cfg(test)]
 pub(crate) use self::metrics::has_family;
@@ -16,16 +17,18 @@ pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
 use self::frame::{CellPosition, Frame, frame};
 use self::grid::PtyGrid;
+pub use self::typing::InputHold;
+use self::typing::Typing;
 use crate::settings::TerminalSettings;
 use anyhow::{Result, bail};
 use domain::session::{Agent, Session};
-use ghostty_vt::{Terminal, key, mouse, render::RenderState, snapshot, terminal::Options};
+use ghostty_vt::{Terminal, mouse, render::RenderState, snapshot, terminal::Options};
 use gpui::*;
 use infrastructure::{
     client::{self, SessionMetadata, TerminalControl, TerminalEvent},
     theme::Scheme,
 };
-use std::{collections::HashSet, path::PathBuf, sync::Arc, thread};
+use std::{path::PathBuf, sync::Arc, thread};
 
 /// JetBrains Mono, shipped so the terminal's default font resolves on every machine. A family
 /// GPUI can't find resolves to its UI fallback (Noto Sans and the like) with default features,
@@ -110,14 +113,9 @@ pub struct TerminalView {
     reporting_mouse: bool,
     exited: bool,
     status: Option<String>,
-    encoder: key::Encoder,
     mouse: mouse::Encoder,
-    /// Keys whose press went to the program, so their releases go too.
-    pressed_keys: HashSet<String>,
-    /// Whether the program was last told it has focus, as focus reporting sees it.
-    focused: bool,
-    /// What an input method is composing, shown at the cursor until it commits.
-    marked: Option<String>,
+    /// Keys, input methods and focus as the program hears them.
+    typing: Typing,
     commands: async_channel::Sender<TerminalControl>,
     _follow: Task<()>,
     _focus_changes: [Subscription; 3],
@@ -128,6 +126,7 @@ impl TerminalView {
         session: Session,
         scheme: &'static Scheme,
         settings: TerminalSettings,
+        hold: InputHold,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -207,11 +206,8 @@ impl TerminalView {
             reporting_mouse: false,
             exited: false,
             status: None,
-            encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
-            pressed_keys: HashSet::new(),
-            focused: false,
-            marked: None,
+            typing: Typing::new(hold),
             commands,
             _follow: follow,
             _focus_changes: focus_changes,
@@ -257,7 +253,10 @@ impl TerminalView {
                 TerminalEvent::Snapshot { data, exited } => {
                     let mut terminal = snapshot::Decoder::from_slice(&data).decode()?;
                     self.scheme.apply_to(&mut terminal)?;
-                    self.terminal = terminal;
+                    let previous = std::mem::replace(&mut self.terminal, terminal);
+                    if let Some(bytes) = self.typing.installed(&previous, &self.terminal) {
+                        self.send(bytes);
+                    }
                     self.exited = exited;
                     self.status = None;
                     self.selection = None;

@@ -10,7 +10,9 @@ use crate::{
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
-    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView, load_bundled_fonts},
+    terminal::{
+        AgentChanged, BarContextChanged, InputHold, OpenLink, TerminalView, load_bundled_fonts,
+    },
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
@@ -176,6 +178,8 @@ struct Workspace {
     preview_focus: FocusHandle,
     /// The terminal showing numbered link hints, if any.
     hinting: Option<Entity<TerminalView>>,
+    /// Set while a prefix is pending or hints are up, so terminals drop input-method text.
+    input_hold: InputHold,
     _bar_config: Subscription,
 }
 
@@ -287,6 +291,7 @@ impl Workspace {
             launching: false,
             focus,
             prefix: None,
+            input_hold: InputHold::default(),
             picker: None,
             dag: None,
             dag_refresh,
@@ -583,10 +588,23 @@ impl Workspace {
             cx.notify();
         });
         self.hinting = Some(tab.view.clone());
+        self.sync_input_hold();
+    }
+
+    fn set_prefix(&mut self, prefix: Option<Prefix>) {
+        self.prefix = prefix;
+        self.sync_input_hold();
+    }
+
+    /// Power reads the keyboard while a prefix is pending or hints are up.
+    fn sync_input_hold(&self) {
+        self.input_hold
+            .set(self.prefix.is_some() || self.hinting.is_some());
     }
 
     fn end_hints(&mut self, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
         let view = self.hinting.take()?;
+        self.sync_input_hold();
         view.update(cx, |view, cx| {
             view.clear_hints();
             cx.notify();
@@ -1030,7 +1048,8 @@ impl Workspace {
         };
         let scheme = cx.global::<DesktopScheme>().0;
         let settings = self.zoomed_terminal_settings();
-        let view = cx.new(|cx| TerminalView::new(session, scheme, settings, window, cx));
+        let hold = self.input_hold.clone();
+        let view = cx.new(|cx| TerminalView::new(session, scheme, settings, hold, window, cx));
         let links = cx.subscribe_in(&view, window, |app, source, link: &OpenLink, window, cx| {
             let id = source.read(cx).session.id.clone();
             app.resolve(id, link.0.clone(), false, window, cx);
@@ -1254,7 +1273,7 @@ impl Workspace {
         let id = self.next_id();
         let focus = cx.focus_handle();
         focus.focus(window);
-        self.prefix = None;
+        self.set_prefix(None);
         self.dag = None;
         self.picker = Some(Picker::new(id, kind, focus, rows));
         cx.notify();
@@ -2258,12 +2277,12 @@ impl Workspace {
         };
         if let Some(incoming) = incoming {
             if !event.is_held && self.prefix == Some(incoming) {
-                self.prefix = None;
+                self.set_prefix(None);
                 cx.notify();
                 return;
             }
             if !event.is_held {
-                self.prefix = Some(incoming);
+                self.set_prefix(Some(incoming));
                 cx.notify();
             }
             cx.stop_propagation();
@@ -2292,9 +2311,10 @@ impl Workspace {
             return;
         }
 
-        let Some(prefix) = self.prefix.take() else {
+        let Some(prefix) = self.prefix else {
             return;
         };
+        self.set_prefix(None);
         cx.stop_propagation();
         cx.notify();
         if event.is_held {

@@ -1,9 +1,10 @@
 use super::{
     OpenLink, TerminalView,
     grid::PtyGrid,
-    keys::{self, KeyEncoder, focus_report, paste_for},
+    keys::{self, paste_for},
+    typing::KeyDown,
 };
-use ghostty_vt::{key, mouse, terminal::ScrollViewport};
+use ghostty_vt::{mouse, terminal::ScrollViewport};
 use gpui::*;
 use infrastructure::client::TerminalControl;
 
@@ -50,7 +51,7 @@ impl TerminalView {
     }
 
     /// Writes bytes to the program without touching the view: reports it asked for.
-    fn send(&mut self, bytes: Vec<u8>) {
+    pub(super) fn send(&mut self, bytes: Vec<u8>) {
         if bytes.is_empty() || self.exited {
             return;
         }
@@ -98,38 +99,27 @@ impl TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let action = if event.is_held {
-            key::Action::Repeat
-        } else {
-            key::Action::Press
-        };
-        let Some(bytes) = (KeyEncoder {
-            encoder: &mut self.encoder,
-            terminal: &self.terminal,
-        })
-        .key(&event.keystroke, action) else {
+        let composing = self.typing.marked().is_some();
+        let KeyDown::Send(bytes) =
+            self.typing
+                .key_down(&self.terminal, &event.keystroke, event.is_held)
+        else {
             return;
         };
         // Handled here, so the platform doesn't also type the key's text through the input
         // method handler.
         cx.stop_propagation();
-        self.pressed_keys.insert(event.keystroke.key.clone());
+        if composing && self.typing.marked().is_none() {
+            cx.notify();
+        }
         self.input(bytes, cx);
     }
 
     /// Releases reach programs that asked the Kitty protocol to report them, for keys whose
     /// press this terminal sent; a press the app took as a shortcut releases nothing.
     pub(super) fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.pressed_keys.remove(&event.keystroke.key) {
-            return;
-        }
-        cx.stop_propagation();
-        if let Some(bytes) = (KeyEncoder {
-            encoder: &mut self.encoder,
-            terminal: &self.terminal,
-        })
-        .key(&event.keystroke, key::Action::Release)
-        {
+        if let Some(bytes) = self.typing.key_up(&self.terminal, &event.keystroke) {
+            cx.stop_propagation();
             self.send(bytes);
         }
     }
@@ -153,16 +143,7 @@ impl TerminalView {
     /// counts as focused while its window is active and it holds keyboard focus.
     pub(super) fn sync_focus(&mut self, window: &Window) {
         let focused = window.is_window_active() && self.focus.is_focused(window);
-        if focused == self.focused {
-            return;
-        }
-        self.focused = focused;
-        if !focused {
-            // Keys held as focus leaves never deliver their releases here.
-            self.pressed_keys.clear();
-            self.marked = None;
-        }
-        if let Some(bytes) = focus_report(&self.terminal, focused) {
+        if let Some(bytes) = self.typing.set_focused(&self.terminal, focused) {
             self.send(bytes);
         }
     }
