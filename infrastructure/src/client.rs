@@ -462,6 +462,47 @@ pub fn start_queued(run: String, task: String) -> Result<()> {
     }
 }
 
+/// Pauses a run's workers and stops dispatching from it.
+pub fn pause_run(run: String) -> Result<Run> {
+    match dag(DagRequest::PauseRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Resumes a paused run.
+pub fn resume_run(run: String) -> Result<Run> {
+    match dag(DagRequest::ResumeRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Stops one agent through the daemon's guarded use case, which ends only the agent's
+/// own session and refuses an agent sharing a shell session.
+pub fn stop_agent(agent: String) -> Result<ManagedAgent> {
+    match dag(DagRequest::StopAgent { agent }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses or resumes one agent's process tree.
+pub fn set_agent_paused(agent: String, paused: bool) -> Result<ManagedAgent> {
+    match dag(DagRequest::SetAgentPaused { agent, paused }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses every running agent except `keep` and the caller's own session.
+pub fn pause_all_except(keep: Vec<String>, caller: Option<String>) -> Result<Vec<ManagedAgent>> {
+    match dag(DagRequest::PauseAllExcept { keep, caller }, DAG_TIMEOUT)? {
+        DagResponse::Agents { agents } => Ok(agents.into_iter().map(Into::into).collect()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
 pub fn unarchive_run(run: String) -> Result<Run> {
     match dag(DagRequest::UnarchiveRun { run }, DAG_TIMEOUT)? {
         DagResponse::Run { run } => Ok(run.into()),

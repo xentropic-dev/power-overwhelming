@@ -1577,6 +1577,348 @@ fn agent_end_interrupts_a_working_worker() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("No agent no-such-agent"));
 }
 
+/// The process's state letter from `/proc/<pid>/stat`, such as `S` or `T`.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+fn wait_for_states(pids: &[u32], stopped: bool) {
+    poll(&format!("{pids:?} to be stopped: {stopped}"), || {
+        pids.iter()
+            .all(|pid| process_state(*pid).is_some_and(|state| (state == 'T') == stopped))
+            .then_some(())
+    });
+}
+
+fn ticks(fixture: &Fixture, name: &str) -> usize {
+    fs::read_to_string(fixture.root().join(format!("{name}.ticks")))
+        .map_or(0, |ticks| ticks.lines().count())
+}
+
+fn agent_status(fixture: &Fixture, agent: &str) -> Value {
+    json!(
+        fixture
+            .agents()
+            .into_iter()
+            .find(|listed| listed.id == agent)
+            .unwrap()
+            .status
+    )
+}
+
+/// Pauses, resumes and stops a parent and child worker, and checks that an
+/// unrelated process is never touched, even by `--all-except`.
+fn pause_resume_and_stop(fixture: &Fixture) {
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "pause-me");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "pause-me",
+        &fixture.worktrees[0],
+        false,
+        &["pausable", "pause-go", "pause-pids"],
+    ));
+    let pids = read_pids(&fixture.root().join("pause-pids"), 2);
+    let mut bystander = Command::new("sleep").arg("600").spawn().unwrap();
+    let bystander_pid = bystander.id();
+
+    assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+    wait_for_states(&pids, true);
+    assert_eq!(agent_status(fixture, &agent.id), "paused");
+    assert_eq!(
+        task(&fixture.show(&run), "pause-me").state,
+        TaskState::Paused
+    );
+    let frozen = ticks(fixture, "pause-pids");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        ticks(fixture, "pause-pids"),
+        frozen,
+        "a paused worker kept running"
+    );
+
+    assert_success(&fixture.command(&["agent", "resume", &agent.id]));
+    wait_for_states(&pids, false);
+    assert_eq!(agent_status(fixture, &agent.id), "working");
+    poll("both processes to tick again", || {
+        let ticks = fs::read_to_string(fixture.root().join("pause-pids.ticks")).unwrap();
+        let after: Vec<_> = ticks.lines().skip(frozen).collect();
+        (after.contains(&"parent") && after.contains(&"child")).then_some(())
+    });
+
+    // A second real worker, named as the exemption, keeps running while every other
+    // agent pauses. The bystander outside Power is never touched.
+    fixture.add_task(&run, "exempt");
+    let (_, exempt) = dispatched(fixture.dispatch(
+        &run,
+        "exempt",
+        &fixture.worktrees[1],
+        false,
+        &["pausable", "exempt-go", "exempt-pids"],
+    ));
+    let exempt_pids = read_pids(&fixture.root().join("exempt-pids"), 2);
+    assert_success(&fixture.command(&["agent", "pause", "--all-except", &exempt.id]));
+    wait_for_states(&pids, true);
+    let ticked = ticks(fixture, "exempt-pids");
+    poll("the exempt worker to keep ticking", || {
+        (ticks(fixture, "exempt-pids") > ticked + 2).then_some(())
+    });
+    assert!(
+        exempt_pids
+            .iter()
+            .all(|pid| process_state(*pid) != Some('T'))
+    );
+    assert_eq!(agent_status(fixture, &exempt.id), "working");
+    assert_ne!(process_state(bystander_pid), Some('T'));
+    fixture.release("exempt-go");
+    fixture.wait_for_state(&run, "exempt", TaskState::Completed);
+
+    // Stop ends the paused tree cleanly and leaves the attempt retryable.
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    let interrupted = fixture.wait_for_state(&run, "pause-me", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert_eq!(interrupted.attempts[0].state, AttemptState::Interrupted);
+    wait_for_exit_after(fixture, &agent.id, &pids);
+    assert!(process_running(bystander_pid));
+    bystander.kill().unwrap();
+    bystander.wait().unwrap();
+
+    let (retried, _) = dispatched(fixture.dispatch(
+        &run,
+        "pause-me",
+        &fixture.worktrees[0],
+        true,
+        &["success", "retry-go", "Retried"],
+    ));
+    assert_eq!(retried.number, 2);
+    fixture.release("retry-go");
+    fixture.wait_for_state(&run, "pause-me", TaskState::Completed);
+}
+
+#[test]
+fn pause_resume_and_stop_act_on_the_whole_worker_tree_only() {
+    pause_resume_and_stop(&with_grace("0.5"));
+}
+
+#[test]
+fn without_cgroups_pause_resume_and_stop_act_on_the_whole_worker_tree_only() {
+    pause_resume_and_stop(&Fixture::with_configure_env(
+        |root| write_config(root, "dag.end_finished_workers_after = 0.5\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    ));
+}
+
+#[test]
+fn a_paused_run_pauses_its_workers_and_dispatches_nothing_until_it_resumes() {
+    let fixture = Fixture::with_configure(|root| {
+        write_config(root, "dag.max_active_workers = 1\n");
+    });
+    let run = fixture.create_run().id;
+    for id in ["working", "queued", "later"] {
+        fixture.add_task(&run, id);
+    }
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "working",
+        &fixture.worktrees[0],
+        false,
+        &["pausable", "run-go", "run-pids"],
+    ));
+    let pids = read_pids(&fixture.root().join("run-pids"), 2);
+    // Queued for the budget before the pause.
+    let queued = json_output(fixture.dispatch(
+        &run,
+        "queued",
+        &fixture.worktrees[1],
+        false,
+        &["success", "queued-go", "Started after the resume"],
+    ));
+    assert_eq!(queued["queued"], true, "{queued}");
+
+    let paused = fixture.json(&["dag", "pause", &run]);
+    assert!(paused["run"]["paused_at"].is_u64(), "{paused}");
+    wait_for_states(&pids, true);
+    assert_eq!(agent_status(&fixture, &agent.id), "paused");
+    let refused = fixture.dispatch(
+        &run,
+        "later",
+        &fixture.worktrees[1],
+        false,
+        &["success", "x", "y"],
+    );
+    assert_rejected(&refused);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("paused"));
+
+    // Stopping the paused worker frees the budget, but the paused run starts nothing.
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    fixture.wait_for_state(&run, "working", TaskState::Interrupted);
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(task(&fixture.show(&run), "queued").state, TaskState::Queued);
+    assert!(!fixture.root().join("queued-go.started").exists());
+
+    let resumed = fixture.json(&["dag", "resume", &run]);
+    assert!(resumed["run"].get("paused_at").is_none(), "{resumed}");
+    fixture.wait_for_worker("queued-go");
+    fixture.release("queued-go");
+    fixture.wait_for_state(&run, "queued", TaskState::Completed);
+}
+
+#[test]
+fn dag_resume_continues_a_live_paused_worker() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "live");
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "live",
+        &fixture.worktrees[0],
+        false,
+        &["pausable", "live-go", "live-pids"],
+    ));
+    let pids = read_pids(&fixture.root().join("live-pids"), 2);
+    let paused = fixture.json(&["dag", "pause", &run]);
+    assert!(paused["run"]["paused_at"].is_u64(), "{paused}");
+    wait_for_states(&pids, true);
+    let frozen = ticks(&fixture, "live-pids");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(ticks(&fixture, "live-pids"), frozen, "a paused worker ran");
+
+    let resumed = fixture.json(&["dag", "resume", &run]);
+    assert!(resumed["run"].get("paused_at").is_none(), "{resumed}");
+    // Both the parent and its child leave T and tick again.
+    wait_for_states(&pids, false);
+    poll("both processes to tick after the resume", || {
+        let ticks = fs::read_to_string(fixture.root().join("live-pids.ticks")).unwrap();
+        let after: Vec<_> = ticks.lines().skip(frozen).collect();
+        (after.contains(&"parent") && after.contains(&"child")).then_some(())
+    });
+    assert_eq!(agent_status(&fixture, &agent.id), "working");
+    fixture.release("live-go");
+    fixture.wait_for_state(&run, "live", TaskState::Completed);
+}
+
+#[test]
+fn a_stopped_worker_that_ignores_sigterm_never_reports_success() {
+    let one_worker = |root: &Path| write_config(root, "dag.max_active_workers = 1\n");
+    for fixture in [
+        Fixture::with_configure(one_worker),
+        Fixture::with_configure_env(one_worker, &[("POWER_WORKER_CGROUPS", "0")]),
+    ] {
+        let run = fixture.create_run().id;
+        fixture.add_task(&run, "stubborn");
+        fixture.add_task(&run, "other");
+        let (attempt, agent) = dispatched(fixture.dispatch(
+            &run,
+            "stubborn",
+            &fixture.worktrees[0],
+            false,
+            &["term-ignoring", "stubborn-go", "stubborn-pid"],
+        ));
+        let pids = read_pids(&fixture.root().join("stubborn-pid"), 1);
+        assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+        wait_for_states(&pids, true);
+        // Released while frozen, so the worker reports as soon as the stop wakes it,
+        // inside the teardown grace, since it ignores SIGTERM.
+        fixture.release("stubborn-go");
+        assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+        let reported = fixture.root().join("stubborn-pid.reported");
+        poll("the stubborn worker to report", || {
+            reported.is_file().then_some(())
+        });
+        let reply = fs::read_to_string(fixture.root().join("stubborn-pid.report")).unwrap();
+        assert!(!reply.contains("\"applied\":true"), "{reply}");
+
+        // During the teardown the attempt keeps its slot and cannot be retried.
+        let retried = fixture.dispatch(
+            &run,
+            "stubborn",
+            &fixture.worktrees[0],
+            true,
+            &["success", "retry-go", "Retried after the exit"],
+        );
+        assert_rejected(&retried);
+        let other = json_output(fixture.dispatch(
+            &run,
+            "other",
+            &fixture.worktrees[1],
+            false,
+            &["success", "other-go", "Started after the exit"],
+        ));
+        assert_eq!(other["queued"], true, "{other}");
+        assert!(
+            pids.iter().all(|pid| process_running(*pid)),
+            "the teardown ended before its checks"
+        );
+        let held = task(&fixture.show(&run), "stubborn").attempts[0].state;
+        assert_eq!(held, AttemptState::Active);
+        assert!(!fixture.root().join("other-go.started").exists());
+        assert!(!fixture.root().join("retry-go.started").exists());
+
+        wait_for_exit_after(&fixture, &agent.id, &pids);
+        let interrupted = fixture.wait_for_state(&run, "stubborn", TaskState::Interrupted);
+        assert_eq!(interrupted.attempts[0].id, attempt.id);
+        let stopped = &interrupted.attempts[0];
+        assert_eq!(stopped.state, AttemptState::Interrupted);
+        assert!(stopped.summary.is_none(), "{stopped:?}");
+
+        // Once the exit is confirmed, the slot is free and the retry starts in the
+        // same worktree.
+        fixture.wait_for_worker("other-go");
+        fixture.release("other-go");
+        fixture.wait_for_state(&run, "other", TaskState::Completed);
+        let (retry, _) = dispatched(fixture.dispatch(
+            &run,
+            "stubborn",
+            &fixture.worktrees[0],
+            true,
+            &["success", "retry-go", "Retried after the exit"],
+        ));
+        assert_eq!(retry.number, 2);
+        assert_eq!(retry.worktree, interrupted.attempts[0].worktree);
+        fixture.release("retry-go");
+        fixture.wait_for_state(&run, "stubborn", TaskState::Completed);
+    }
+}
+
+#[test]
+fn stop_ends_a_paused_worker_with_sigterm_and_never_lets_it_report() {
+    for fixture in [
+        Fixture::new(),
+        Fixture::with_configure_env(|_| {}, &[("POWER_WORKER_CGROUPS", "0")]),
+    ] {
+        let run = fixture.create_run().id;
+        fixture.add_task(&run, "stop-me");
+        let (attempt, agent) = dispatched(fixture.dispatch(
+            &run,
+            "stop-me",
+            &fixture.worktrees[0],
+            false,
+            &["termable", "term-go", "term-pid"],
+        ));
+        let pids = read_pids(&fixture.root().join("term-pid"), 1);
+        assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+        wait_for_states(&pids, true);
+        // On an ordinary resume the worker would see this marker and report success.
+        fixture.release("term-go");
+        assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+        let interrupted = fixture.wait_for_state(&run, "stop-me", TaskState::Interrupted);
+        assert_eq!(interrupted.attempts[0].id, attempt.id);
+        assert_eq!(interrupted.attempts[0].state, AttemptState::Interrupted);
+        wait_for_exit_after(&fixture, &agent.id, &pids);
+        assert!(
+            fixture.root().join("term-pid.term").exists(),
+            "the paused worker did not run its SIGTERM handler"
+        );
+        // Long enough for a resumed worker to have reported.
+        thread::sleep(Duration::from_millis(500));
+        let shown = fixture.show(&run);
+        let attempt = &task(&shown, "stop-me").attempts[0];
+        assert_eq!(attempt.state, AttemptState::Interrupted);
+        assert!(attempt.summary.is_none(), "{attempt:?}");
+    }
+}
+
 /// Whether the process runs. A zombie has exited.
 fn process_running(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -2398,4 +2740,79 @@ fn without_cgroups_a_missing_program_fails_the_dispatch() {
     assert!(!output.status.success(), "a missing program was dispatched");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("doesn't exist"), "{stderr}");
+}
+
+#[test]
+fn a_repeated_stop_keeps_the_first_stops_fence() {
+    let fixture = Fixture::with_configure_env(|_| {}, &[("POWER_WORKER_CGROUPS", "0")]);
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "twice");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "twice",
+        &fixture.worktrees[0],
+        false,
+        &["term-ignoring", "twice-go", "twice-pid"],
+    ));
+    let pids = read_pids(&fixture.root().join("twice-pid"), 1);
+    assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+    wait_for_states(&pids, true);
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    // The second stop arrives while the first teardown still runs.
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    fixture.release("twice-go");
+    let reported = fixture.root().join("twice-pid.reported");
+    poll("the stubborn worker to report", || {
+        reported.is_file().then_some(())
+    });
+    let reply = fs::read_to_string(fixture.root().join("twice-pid.report")).unwrap();
+    assert!(reply.contains("\"applied\":false"), "{reply}");
+    wait_for_exit_after(&fixture, &agent.id, &pids);
+    let interrupted = fixture.wait_for_state(&run, "twice", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert!(interrupted.attempts[0].summary.is_none());
+}
+
+#[test]
+fn a_daemon_crash_during_a_stop_holds_the_retry_until_the_old_tree_is_gone() {
+    let mut fixture = Fixture::with_configure_env(
+        |root| write_config(root, "dag.max_active_workers = 1\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    );
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "crash");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "crash",
+        &fixture.worktrees[0],
+        false,
+        &["term-ignoring", "crash-go", "crash-pid"],
+    ));
+    let pids = read_pids(&fixture.root().join("crash-pid"), 1);
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    assert!(pids.iter().all(|pid| process_running(*pid)));
+    // SIGKILL before the teardown confirms the exit.
+    fixture.restart();
+    // The restart reclaims the stopped tree before the attempt or its slot is freed.
+    let interrupted = fixture.wait_for_state(&run, "crash", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert!(
+        pids.iter().all(|pid| !process_running(*pid)),
+        "the attempt was released while the old tree still ran"
+    );
+    fixture.release("crash-go");
+    let (retry, _) = dispatched(fixture.dispatch(
+        &run,
+        "crash",
+        &fixture.worktrees[0],
+        true,
+        &["success", "crash-retry", "Retried after the crash"],
+    ));
+    assert_eq!(retry.number, 2);
+    fixture.release("crash-retry");
+    fixture.wait_for_state(&run, "crash", TaskState::Completed);
+    assert!(
+        !fixture.root().join("crash-pid.reported").exists(),
+        "the stopped worker outlived the restart"
+    );
 }

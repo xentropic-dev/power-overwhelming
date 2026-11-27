@@ -40,16 +40,8 @@ pub(crate) enum TreeSignal {
     /// Ends every process at once.
     Kill,
     /// Pauses every process.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pausing a session comes with #79")
-    )]
     Stop,
     /// Resumes paused processes.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "resuming a session comes with #79")
-    )]
     Continue,
 }
 

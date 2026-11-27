@@ -188,6 +188,12 @@ impl Handle {
         self.commands.send(command)
     }
 
+    /// Pauses or resumes every process the session owns. The thread that owns them
+    /// applies it, to a relaunched process too.
+    pub fn set_paused(&self, paused: bool) {
+        self.stop.set_paused(paused);
+    }
+
     pub(crate) fn activity(&self) -> Activity {
         self.lifecycle.input.lock().unwrap().activity
     }
@@ -281,6 +287,11 @@ impl TerminalRuntime for PtyRuntime {
                 anyhow::bail!("Terminal session has already ended")
             }
         }
+    }
+
+    fn pause(&self, handle: &Self::Handle, paused: bool) -> Result<()> {
+        handle.set_paused(paused);
+        Ok(())
     }
 
     /// Ends what any earlier launch of `session` left, whichever backend started it:
@@ -815,11 +826,33 @@ fn wait_process(
     };
     let mut relaunched = Some(relaunched);
     let mut owner = own(&process, scope);
+    // Whether the owned tree was last paused. A relaunch starts unpaused.
+    let mut paused = false;
     loop {
+        let wanted = stop.paused();
+        if wanted != paused && !stop.requested() {
+            if let Some(owner) = owner.as_mut() {
+                let sent = if wanted {
+                    owner.pause(marker.as_deref())
+                } else {
+                    owner.resume(marker.as_deref())
+                };
+                let action = if wanted { "Paused" } else { "Resumed" };
+                eprintln!("{action} {sent} processes of a worker.");
+            }
+            paused = wanted;
+        }
         if stop.requested() {
             // Cancel the fresh start before signalling, so an exit caused by the
             // teardown is never mistaken for a failed resume.
             drop(relaunch.take());
+            // A paused tree is never resumed first, which would let it run ordinary
+            // work, or report, before it is asked to end. Each backend sends every
+            // process SIGTERM and only then SIGCONT, so a stopped process wakes with
+            // the end already pending and runs only its handler.
+            if paused && let Some(owner) = owner.as_mut() {
+                owner.end_paused(marker.as_deref());
+            }
             let ended = owner
                 .as_mut()
                 .map_or(Ok(()), |owner| owner.terminate(END_GRACE));
@@ -875,6 +908,7 @@ fn wait_process(
                 Ok(child) => {
                     process = child;
                     owner = own(&process, next.scope);
+                    paused = false;
                     if let Some(relaunched) = relaunched.take() {
                         relaunched(process.process_id(), next.conversation.as_deref());
                     }
@@ -899,7 +933,7 @@ fn wait_process(
                 (input.send)(typed, 0);
             }
         }
-        stop.wait(Duration::from_millis(100));
+        stop.wait(Duration::from_millis(100), paused);
     }
 }
 

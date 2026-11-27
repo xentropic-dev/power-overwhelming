@@ -120,6 +120,10 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Self::Handle>;
     fn is_running(&self, handle: &Self::Handle) -> bool;
     fn end(&self, handle: Self::Handle) -> Result<()>;
+    /// Pauses (`true`) or resumes every process the session owns, and nothing else.
+    fn pause(&self, _handle: &Self::Handle, _paused: bool) -> Result<()> {
+        anyhow::bail!("This terminal cannot pause its processes")
+    }
     /// The agent currently in the foreground, which can differ from the launched one
     /// when a shell starts an agent.
     fn agent(&self, handle: &Self::Handle) -> Option<Agent>;
@@ -186,6 +190,11 @@ impl<T: TerminalRuntime> Application<T> {
     pub fn forget_session(&self, id: &str) -> Result<()> {
         self.sessions.lock().unwrap().remove(id);
         self.records.remove(id)
+    }
+
+    /// Whether a durable record of session `id` remains.
+    pub fn has_record(&self, id: &str) -> Result<bool> {
+        Ok(self.records.list()?.iter().any(|record| record.id == id))
     }
 
     /// Drops session `id`'s terminal handle once its process has exited, keeping

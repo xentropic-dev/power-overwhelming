@@ -416,16 +416,30 @@ fn main() -> Result<()> {
                 }
                 print_json(json!({"agents": agents}))
             }
-            AgentAction::End { id, box_sel } => {
+            AgentAction::Pause { ids, all_except } => {
+                client::ensure_daemon()?;
+                if all_except {
+                    let request = DagRequest::PauseAllExcept {
+                        keep: ids,
+                        caller: caller_session(),
+                    };
+                    return dag_reply(request, Duration::from_secs(30));
+                }
+                set_paused(ids, true)
+            }
+            AgentAction::Resume { ids } => {
+                client::ensure_daemon()?;
+                set_paused(ids, false)
+            }
+            AgentAction::End { id, box_sel } | AgentAction::Stop { id, box_sel } => {
                 client::ensure_daemon()?;
                 let agent = protocol_agents(box_sel, true)?
                     .into_iter()
                     .find(|agent| agent.id == id)
                     .with_context(|| format!("No agent {id} in this box."))?;
-                let session = agent
-                    .session
-                    .with_context(|| format!("Agent {id} has no terminal session."))?;
-                client::end_session(session)
+                // The daemon ends only the agent's own session, and refuses an agent
+                // that shares a shell session with the shell's other jobs.
+                client::stop_agent(agent.id).map(drop)
             }
             AgentAction::Start {
                 box_sel,
@@ -525,6 +539,27 @@ enum AgentAction {
         #[arg(long, conflicts_with = "box_sel")]
         all_boxes: bool,
     },
+    /// Pause an agent's whole process tree (SIGSTOP). Only its own processes are touched.
+    Pause {
+        /// Agents to pause. With --all-except, the agents to leave running.
+        #[arg(required_unless_present = "all_except")]
+        ids: Vec<String>,
+        /// Pause every running agent except the ones named, and the caller's own.
+        #[arg(long)]
+        all_except: bool,
+    },
+    /// Resume a paused agent's process tree.
+    Resume {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Stop an agent cleanly: end its terminal session and interrupt its open attempt,
+    /// which can then be dispatched again with --retry.
+    Stop {
+        id: String,
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+    },
     /// End an agent's terminal session, interrupting any attempt it still has open.
     End {
         id: String,
@@ -592,6 +627,14 @@ enum DagAction {
     },
     /// Return an archived run to default listings.
     Unarchive {
+        run: String,
+    },
+    /// Pause every active worker of a run and stop dispatching from it.
+    Pause {
+        run: String,
+    },
+    /// Resume a paused run's workers and let it dispatch again.
+    Resume {
         run: String,
     },
     AddTask {
@@ -959,6 +1002,7 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
             json!({"link": domain::link::dag_uri(&run.id), "run": run})
         }
         DagResponse::Run { run } => json!({"run": run}),
+        DagResponse::Agents { agents } => json!({"agents": agents}),
         DagResponse::Runs { runs } => {
             let links: serde_json::Map<String, Value> = runs
                 .iter()
@@ -1110,6 +1154,8 @@ fn run_dag(command: DagAction) -> Result<()> {
         DagAction::Show { run } => DagRequest::GetRun { run },
         DagAction::Archive { run, force } => DagRequest::ArchiveRun { run, force },
         DagAction::Unarchive { run } => DagRequest::UnarchiveRun { run },
+        DagAction::Pause { run } => DagRequest::PauseRun { run },
+        DagAction::Resume { run } => DagRequest::ResumeRun { run },
         DagAction::AddTask {
             run,
             id,
@@ -1234,6 +1280,21 @@ fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
         DagResponse::Boxes { boxes } => Ok(boxes),
         _ => anyhow::bail!("Unexpected daemon response"),
     }
+}
+
+/// Pauses or resumes each agent and prints them.
+fn set_paused(ids: Vec<String>, paused: bool) -> Result<()> {
+    let mut agents = Vec::new();
+    for agent in ids {
+        match client::dag(
+            DagRequest::SetAgentPaused { agent, paused },
+            Duration::from_secs(10),
+        )? {
+            DagResponse::Agent { agent } => agents.push(agent),
+            _ => anyhow::bail!("Unexpected daemon response"),
+        }
+    }
+    print_json(json!({"agents": agents}))
 }
 
 fn protocol_agents(

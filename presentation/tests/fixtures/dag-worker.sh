@@ -89,6 +89,40 @@ case "$1" in
         report success "$3"
         exec sleep 600
         ;;
+    pausable)
+        # A parent and its child that each append a tick every tenth of a second,
+        # so a pause shows as no new ticks, until the marker reports success.
+        tick() { while :; do echo "$1" >> "$fixture_dir/$2.ticks"; sleep 0.1; done; }
+        tick child "$3" &
+        child=$!
+        printf '%s %s\n' "$$" "$child" > "$fixture_dir/$3.tmp"
+        mv "$fixture_dir/$3.tmp" "$fixture_dir/$3"
+        until test -f "$fixture_dir/$2"; do echo parent >> "$fixture_dir/$3.ticks"; sleep 0.1; done
+        report success "Ran to the end"
+        kill "$child"
+        ;;
+    termable)
+        # Records its PID, then reports success once the marker exists. A SIGTERM
+        # writes "$3.term" and exits without reporting, so a stop that ends it
+        # gracefully leaves its attempt interrupted.
+        trap 'echo term > "$fixture_dir/$3.term"; exit 0' TERM
+        printf '%s\n' "$$" > "$fixture_dir/$3.tmp"
+        mv "$fixture_dir/$3.tmp" "$fixture_dir/$3"
+        # `wait` returns at once for a trapped signal, so the handler runs promptly.
+        until test -f "$fixture_dir/$2"; do sleep 0.1 & wait $! || true; done
+        report success "Ran on after a stop"
+        ;;
+    term-ignoring)
+        # Ignores SIGTERM and reports success as soon as the marker exists, the way a
+        # worker that defers or ignores the end of a stop reports during the teardown.
+        trap '' TERM
+        printf '%s\n' "$$" > "$fixture_dir/$3.tmp"
+        mv "$fixture_dir/$3.tmp" "$fixture_dir/$3"
+        until test -f "$fixture_dir/$2"; do sleep 0.05; done
+        "$POWER_BIN" dag report success --summary "Reported after stop" > "$fixture_dir/$3.report" 2>&1 || true
+        : > "$fixture_dir/$3.reported"
+        exec sleep 600
+        ;;
     graced)
         # Reports success, then marks each tenth of a second it still runs.
         wait_for_marker "$2"

@@ -204,6 +204,7 @@ mod tests {
             task: None,
             attempt: None,
             state: infrastructure::client::AgentState::Running,
+            paused: false,
             status: infrastructure::client::AgentStatus::Idle,
             label: id.into(),
             created_at: 0,

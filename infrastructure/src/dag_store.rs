@@ -13,7 +13,7 @@ use domain::{
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::IntoDeserializer};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -83,6 +83,7 @@ impl SqliteDagStore {
                       AND creator_box IS NOT NULL AND creator_session IS NOT NULL)
                  )
              );
+             CREATE TABLE IF NOT EXISTS stopping_sessions (session TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS queued_dispatches (
                  id TEXT NOT NULL UNIQUE,
                  run_id TEXT NOT NULL, task_id TEXT NOT NULL, provider TEXT NOT NULL,
@@ -120,6 +121,25 @@ impl SqliteDagStore {
             // registration of that session, after a restart, still coordinates the run.
             db.execute("ALTER TABLE runs ADD COLUMN coordinator_session TEXT", [])?;
         }
+        let has_paused: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name = 'paused')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_paused {
+            db.execute(
+                "ALTER TABLE agents ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let has_paused_at: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name = 'paused_at')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_paused_at {
+            db.execute("ALTER TABLE runs ADD COLUMN paused_at INTEGER", [])?;
+        }
         talk::migrate(&db)?;
         Ok(Self(Arc::new(Mutex::new(db)), Arc::new(Condvar::new())))
     }
@@ -146,7 +166,7 @@ impl DagDb<'_> {
     fn require_run(&self, id: &str) -> Result<Run> {
         self.0
             .query_row(
-                "SELECT id, box_id, title, coordinator, created_at, archived_at FROM runs WHERE id = ?1",
+                "SELECT id, box_id, title, coordinator, created_at, archived_at, paused_at FROM runs WHERE id = ?1",
                 [id],
                 run_from_row,
             )
@@ -194,11 +214,15 @@ impl DagDb<'_> {
             self.0,
             "SELECT a.id, a.number, a.agent, g.session, g.worktree, g.provider,
                     a.state, a.summary, a.blocker, a.detail, a.started_at, a.ended_at,
-                    g.model, a.task_id
+                    g.model, a.task_id, g.paused
              FROM attempts a JOIN agents g ON g.id = a.agent
              WHERE a.run_id = ?1 ORDER BY a.number",
             [&run.id],
-            |row| Ok((row.get(13)?, attempt_from_row(row)?)),
+            |row| {
+                let mut attempt = attempt_from_row(row)?;
+                attempt.paused = row.get(14)?;
+                Ok((row.get(13)?, attempt))
+            },
         )? {
             attempts.entry(task).or_default().push(attempt);
         }
@@ -304,7 +328,7 @@ impl DagReader for DagDb<'_> {
     fn list_runs(&self, box_id: Option<&str>) -> Result<Vec<Run>> {
         let mut runs = rows(
             self.0,
-            "SELECT id, box_id, title, coordinator, created_at, archived_at FROM runs
+            "SELECT id, box_id, title, coordinator, created_at, archived_at, paused_at FROM runs
              WHERE (?1 IS NULL OR box_id = ?1) ORDER BY rowid",
             [box_id],
             run_from_row,
@@ -404,6 +428,16 @@ impl DagReader for DagDb<'_> {
             },
         )
         .map_err(Into::into)
+    }
+
+    fn stopping_sessions(&self) -> Result<BTreeSet<String>> {
+        Ok(
+            rows(self.0, "SELECT session FROM stopping_sessions", [], |row| {
+                row.get(0)
+            })?
+            .into_iter()
+            .collect(),
+        )
     }
 
     fn latest_seq(&self) -> Result<u64> {
@@ -507,14 +541,58 @@ impl DagTransaction for DagDb<'_> {
     }
 
     fn set_agent_exited(&self, id: &str) -> Result<()> {
-        self.0
-            .execute("UPDATE agents SET state = 'exited' WHERE id = ?1", [id])?;
+        self.0.execute(
+            "UPDATE agents SET state = 'exited', paused = 0 WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    fn set_agent_paused(&self, id: &str, paused: bool) -> Result<()> {
+        self.0.execute(
+            "UPDATE agents SET paused = ?2 WHERE id = ?1",
+            params![id, paused],
+        )?;
+        Ok(())
+    }
+
+    fn insert_stopping(&self, session: &str) -> Result<bool> {
+        Ok(self.0.execute(
+            "INSERT OR IGNORE INTO stopping_sessions (session) VALUES (?1)",
+            [session],
+        )? > 0)
+    }
+
+    fn remove_stopping(&self, session: &str) -> Result<bool> {
+        Ok(self.0.execute(
+            "DELETE FROM stopping_sessions WHERE session = ?1",
+            [session],
+        )? > 0)
+    }
+
+    fn set_run_paused(&self, id: &str, paused_at: Option<u64>) -> Result<()> {
+        self.0.execute(
+            "UPDATE runs SET paused_at = ?2 WHERE id = ?1",
+            params![id, paused_at],
+        )?;
+        Ok(())
+    }
+
+    fn adopt_coordinated_runs(&self, session: &str, agent: &str) -> Result<()> {
+        let coordinator = serde_json::to_string(&wire::Coordinator::from(Coordinator::Agent {
+            agent: agent.into(),
+        }))?;
+        self.0.execute(
+            "UPDATE runs SET coordinator = ?2
+             WHERE coordinator_session = ?1 AND json_extract(coordinator, '$.kind') = 'agent'",
+            params![session, coordinator],
+        )?;
         Ok(())
     }
 
     fn retire_agent(&self, id: &str) -> Result<()> {
         self.0.execute(
-            "UPDATE agents SET state = 'exited', session = NULL WHERE id = ?1",
+            "UPDATE agents SET state = 'exited', paused = 0, session = NULL WHERE id = ?1",
             [id],
         )?;
         Ok(())
@@ -657,11 +735,12 @@ fn worktree_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedWorktree> {
 
 const AGENT_SELECT: &str =
     "SELECT a.id, a.box_id, a.worktree, a.provider, a.parent, a.session, p.run_id, p.task_id,
-            p.id, a.state, a.label, a.created_at, a.model, p.state
+            p.id, a.state, a.label, a.created_at, a.model, p.state, a.paused
      FROM agents a LEFT JOIN attempts p ON p.agent = a.id";
 
 fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedAgent> {
     let state = enum_column::<wire::AgentState>(row, 9)?.into();
+    let paused: bool = row.get(14)?;
     let attempt_state = row
         .get::<_, Option<String>>(13)?
         .map(|_| enum_column::<wire::AttemptState>(row, 13).map(Into::into))
@@ -677,7 +756,8 @@ fn agent_from_row(row: &Row<'_>) -> rusqlite::Result<ManagedAgent> {
         task: row.get(7)?,
         attempt: row.get(8)?,
         state,
-        status: AgentStatus::derive(state, attempt_state),
+        paused,
+        status: AgentStatus::derive(state, paused, attempt_state),
         label: row.get(10)?,
         created_at: row.get(11)?,
         model: row.get(12)?,
@@ -694,6 +774,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<Run> {
             .into(),
         created_at: row.get(4)?,
         archived_at: row.get(5)?,
+        paused_at: row.get(6)?,
         tasks: Vec::new(),
     })
 }
@@ -713,6 +794,7 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
         started_at: row.get(10)?,
         ended_at: row.get(11)?,
         model: row.get(12)?,
+        paused: false,
         artifacts: Vec::new(),
     })
 }
@@ -837,6 +919,69 @@ mod tests {
     }
 
     #[test]
+    fn a_coordinator_that_registers_again_coordinates_its_runs_and_pauses_persist() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store =
+            SqliteDagStore::initialize(Connection::open(directory.path().join("dag.sqlite3"))?)?;
+        let agent = |id: &str| ManagedAgent {
+            id: id.into(),
+            box_id: "box".into(),
+            worktree: "/worktree".into(),
+            provider: Provider::Agent("claude".into()),
+            model: None,
+            parent: None,
+            session: Some("session".into()),
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            paused: false,
+            status: AgentStatus::Idle,
+            label: id.into(),
+            created_at: 1,
+        };
+        let run = Run {
+            id: "run".into(),
+            box_id: "box".into(),
+            title: "Run".into(),
+            coordinator: Coordinator::Agent {
+                agent: "before".into(),
+            },
+            created_at: 1,
+            archived_at: None,
+            paused_at: None,
+            tasks: Vec::new(),
+        };
+        store.write(|db| {
+            db.insert_agent(&agent("before"))?;
+            db.insert_run(&run)?;
+            // A restart retires the old identity, and the session registers anew.
+            db.retire_agent("before")?;
+            db.insert_agent(&agent("after"))?;
+            db.adopt_coordinated_runs("session", "after")?;
+            db.set_agent_paused("after", true)?;
+            db.set_run_paused("run", Some(7))
+        })?;
+        store.read(|db| {
+            let run = db.run("run")?;
+            assert_eq!(
+                run.coordinator,
+                Coordinator::Agent {
+                    agent: "after".into()
+                }
+            );
+            assert_eq!(run.paused_at, Some(7));
+            let after = db.agent("after")?;
+            assert!(after.paused);
+            assert_eq!(after.status, AgentStatus::Paused);
+            Ok(())
+        })?;
+        store.write(|db| db.set_agent_exited("after"))?;
+        assert!(!store.read(|db| db.agent("after"))?.paused);
+        Ok(())
+    }
+
+    #[test]
     fn finds_agents_by_exact_worktree() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let store =
@@ -853,6 +998,7 @@ mod tests {
             task: None,
             attempt: None,
             state: AgentState::Running,
+            paused: false,
             status: AgentStatus::Idle,
             label: id.into(),
             created_at: 1,

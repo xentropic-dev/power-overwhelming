@@ -454,6 +454,7 @@ pub enum AgentState {
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Working,
+    Paused,
     NeedsInput,
     Done,
     Failed,
@@ -481,6 +482,9 @@ pub struct ManagedAgent {
     pub task: Option<String>,
     pub attempt: Option<String>,
     pub state: AgentState,
+    /// Whether its processes are paused.
+    #[serde(default)]
+    pub paused: bool,
     #[serde(default)]
     pub status: AgentStatus,
     /// Short label, the task title for DAG workers.
@@ -507,6 +511,8 @@ pub enum TaskState {
     /// Dispatched while the worker budget was full. Power starts it when capacity frees up.
     Queued,
     Working,
+    /// Its attempt is open and its worker is paused.
+    Paused,
     NeedsInput,
     Completed,
     Failed,
@@ -543,6 +549,9 @@ pub struct Attempt {
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Whether the attempt's worker is paused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
     /// Artifacts published from the attempt's session, in publish order, newest last.
     #[serde(default)]
     pub artifacts: Vec<AttemptArtifact>,
@@ -595,6 +604,9 @@ pub struct Run {
     /// Unix seconds, while the run is archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<u64>,
+    /// Unix seconds, while the run is paused and dispatches nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<u64>,
     /// Derived by the daemon from the task states, or `archived` while archived.
     #[serde(default)]
     pub status: RunStatus,
@@ -642,6 +654,9 @@ pub enum RunEventKind {
     StaleReport,
     RunArchived,
     RunUnarchived,
+    /// The run's workers were paused, and it dispatches nothing until it resumes.
+    RunPaused,
+    RunResumed,
     /// A dispatch waits for the worker budget. The summary says which limit held it.
     TaskQueued,
     /// A queued dispatch could not be started. The summary has the error.
@@ -903,6 +918,28 @@ pub enum DagRequest {
     UnarchiveRun {
         run: String,
     },
+    /// Pauses every running worker of the run and stops dispatching from it.
+    PauseRun {
+        run: String,
+    },
+    /// Resumes the run's paused workers and lets it dispatch again.
+    ResumeRun {
+        run: String,
+    },
+    /// Pauses or resumes one agent's whole process tree.
+    SetAgentPaused {
+        agent: String,
+        paused: bool,
+    },
+    /// Ends an agent's own terminal session, interrupting its open attempt.
+    StopAgent {
+        agent: String,
+    },
+    /// Pauses every running agent except `keep` and the caller's own session.
+    PauseAllExcept {
+        keep: Vec<String>,
+        caller: Option<String>,
+    },
     /// Adds tasks atomically. References may point at tasks in this batch or already in the
     /// run. Unknown references, duplicate IDs, and cycles reject the whole batch.
     AddTasks {
@@ -1098,6 +1135,7 @@ mod dag_dto {
     enum_dto!(AgentState { Running, Exited });
     enum_dto!(AgentStatus {
         Working,
+        Paused,
         NeedsInput,
         Done,
         Failed,
@@ -1110,6 +1148,7 @@ mod dag_dto {
         Ready,
         Queued,
         Working,
+        Paused,
         NeedsInput,
         Completed,
         Failed,
@@ -1143,6 +1182,8 @@ mod dag_dto {
         StaleReport,
         RunArchived,
         RunUnarchived,
+        RunPaused,
+        RunResumed,
         TaskQueued,
         QueuedDispatchFailed,
     });
@@ -1167,6 +1208,7 @@ mod dag_dto {
         task,
         attempt,
         state,
+        paused,
         status,
         label,
         created_at,
@@ -1185,6 +1227,7 @@ mod dag_dto {
         detail,
         started_at,
         ended_at,
+        paused,
     } lists { artifacts });
     impl From<dag::AttemptArtifact> for AttemptArtifact {
         fn from(value: dag::AttemptArtifact) -> Self {
@@ -1226,6 +1269,7 @@ mod dag_dto {
                 coordinator: value.coordinator.into(),
                 created_at: value.created_at,
                 archived_at: value.archived_at,
+                paused_at: value.paused_at,
                 tasks: value.tasks.into_iter().map(Into::into).collect(),
             }
         }
@@ -1240,6 +1284,7 @@ mod dag_dto {
                 coordinator: value.coordinator.into(),
                 created_at: value.created_at,
                 archived_at: value.archived_at,
+                paused_at: value.paused_at,
                 tasks: value.tasks.into_iter().map(Into::into).collect(),
             }
         }

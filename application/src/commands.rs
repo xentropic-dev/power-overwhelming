@@ -128,6 +128,16 @@ impl<T: TerminalRuntime> Application<T> {
         self.runtime.end(terminal.clone())
     }
 
+    /// Pauses or resumes every process of a running session.
+    pub fn set_session_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let terminal = self.terminal(id)?;
+        ensure!(
+            self.runtime.is_running(&terminal),
+            "Terminal session has exited"
+        );
+        self.runtime.pause(&terminal, paused)
+    }
+
     /// Ends a session and forgets it, so it is not restored after a restart. The
     /// session ends even when forgetting its record fails, and a retry forgets the
     /// record of a session whose terminal is already gone.
@@ -142,6 +152,16 @@ impl<T: TerminalRuntime> Application<T> {
             .context("Could not forget the ended session");
         // A record that could not be forgotten is what a retry must fix.
         forgotten.and(ended)
+    }
+
+    /// Starts ending a session's processes and keeps its record, so a restart can
+    /// still find and reclaim what runs of it until its exit is confirmed. Returns
+    /// false when no live terminal holds the session any more.
+    pub fn stop_session(&self, id: &str) -> Result<bool> {
+        let Some(live) = self.sessions.lock().unwrap().remove(id) else {
+            return Ok(false);
+        };
+        self.runtime.end(live.terminal).map(|()| true)
     }
 
     /// Saves the foreground state a restore resumes from.
