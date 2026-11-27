@@ -252,12 +252,7 @@ pub fn conversation_model(agent: &AgentId, conversation: &str) -> Option<String>
     {
         return None;
     }
-    let home = std::env::var_os("JCODE_HOME")
-        .filter(|home| !home.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".jcode"))
-        })?;
+    let home = jcode_home()?;
     jcode_session_model(&home.join("sessions"), conversation)
 }
 
@@ -294,6 +289,22 @@ fn jcode_session_model(sessions: &std::path::Path, id: &str) -> Option<String> {
     }
     let snapshot = std::fs::read(sessions.join(format!("{id}.json"))).ok()?;
     model(&serde_json::from_slice::<serde_json::Value>(&snapshot).ok()?["model"])
+}
+
+/// The model of the jcode TUI running as `pid`. jcode names each client's session in
+/// `$JCODE_HOME/client_sessions/<pid>`, so this works however the TUI was started.
+pub(crate) fn jcode_process_model(pid: u32) -> Option<String> {
+    let home = jcode_home()?;
+    let session =
+        std::fs::read_to_string(home.join("client_sessions").join(pid.to_string())).ok()?;
+    conversation_model(&AgentId::from("jcode"), session.trim())
+}
+
+fn jcode_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("JCODE_HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".jcode")))
 }
 
 #[cfg(test)]
