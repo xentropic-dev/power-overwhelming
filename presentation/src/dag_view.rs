@@ -800,6 +800,20 @@ fn details(
                 .child(task.title.clone()),
         )
         .child(div().text_xs().text_color(rgb(color)).child(state))
+        .when(!task.instructions.trim().is_empty(), |panel| {
+            // Refreshes with the run, so an edited task shows its new instructions.
+            panel.child(
+                div()
+                    .mt_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.muted))
+                            .child("Instructions"),
+                    )
+                    .child(div().text_sm().child(task.instructions.clone())),
+            )
+        })
         .when(fields.is_empty(), |panel| {
             panel.child(
                 div()

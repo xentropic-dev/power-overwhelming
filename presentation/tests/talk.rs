@@ -1325,3 +1325,82 @@ fn peers_message_agents_and_runs_in_other_boxes_and_coordinators_keep_the_log() 
     });
     assert_eq!(log(&coordinator).len(), 20);
 }
+
+#[test]
+fn edit_task_tells_the_running_worker_without_a_restart() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    fs::write(path.join("read-a"), []).unwrap();
+    let run = &fixture.run.id;
+    let edited = json(
+        power(path, Some(&fixture.coordinator))
+            .args([
+                "dag",
+                "edit-task",
+                run,
+                "a",
+                "--title",
+                "Use plan B",
+                "--instructions",
+                "Switch to plan B and keep going.",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(edited["run"], run.as_str());
+    assert_eq!(edited["task"]["title"], "Use plan B");
+    assert_eq!(edited["task"]["state"], "working");
+    let delivery = &edited["delivery"];
+    assert_eq!(delivery["status"], "sent", "{edited}");
+    assert_eq!(delivery["agent"], fixture.a.id.as_str());
+    assert_eq!(delivery["attempt"].as_str(), fixture.a.attempt.as_deref());
+    let message = field(delivery, "message");
+
+    let inbox = poll("edited instructions in the worker inbox", || {
+        let inbox = file(path, "inbox-a");
+        inbox.contains("plan B and keep going").then_some(inbox)
+    });
+    for expected in [
+        message,
+        "replace your earlier instructions",
+        "Task: a — Use plan B",
+        &fixture.coordinator.id,
+    ] {
+        assert!(inbox.contains(expected), "{inbox}");
+    }
+    // The worker kept running: one start, one attempt, and no notice for task b.
+    assert_eq!(file(path, "ready-a").lines().count(), 1);
+    assert_eq!(notice_count(path, "b"), 0);
+    let shown = json(
+        power(path, None)
+            .args(["dag", "show", run])
+            .output()
+            .unwrap(),
+    );
+    let task = shown["run"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "a")
+        .unwrap();
+    assert_eq!(task["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(task["instructions"], "Switch to plan B and keep going.");
+    let events = json(
+        power(path, None)
+            .args([
+                "dag",
+                "events",
+                run,
+                "--since",
+                "0",
+                "--kind",
+                "task_edited",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let events = events["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["task"], "a");
+    assert_eq!(events[0]["attempt"].as_str(), fixture.a.attempt.as_deref());
+}

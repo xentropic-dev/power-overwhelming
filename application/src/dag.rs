@@ -6,8 +6,8 @@ use domain::{
     dag::{
         AgentState, AgentStatus, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo,
         BudgetLimit, Coordinator, ManagedAgent, Provider, ReportStatus, ReportTransition, Run,
-        RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState, WorkerBudget, WorkerLoad,
-        can_dispatch, report_transition, validate_batch,
+        RunEvent, RunEventKind, RunStatus, Task, TaskEdit, TaskSpec, TaskState, WorkerBudget,
+        WorkerLoad, can_dispatch, report_transition, task_edit, valid_task_text, validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
@@ -68,6 +68,7 @@ pub trait DagTransaction: DagReader {
     fn set_run_archived(&self, id: &str, archived_at: Option<u64>) -> Result<()>;
     fn insert_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<()>;
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()>;
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()>;
     fn update_attempt(&self, attempt: &Attempt) -> Result<()>;
     fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()>;
@@ -222,6 +223,51 @@ pub struct DispatchResult {
 pub struct ReportResult {
     pub applied: bool,
     pub reason: Option<String>,
+}
+
+/// Delivers a corrected task to the worker on its current attempt. The talk use case
+/// implements it, so the message is durable and reaches the worker when it is idle.
+pub trait TaskMessenger {
+    /// Sends `body` to `agent` within `run`, as `caller`. Returns the message ID.
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String>;
+}
+
+pub struct EditTask {
+    pub run: String,
+    pub task: String,
+    pub title: Option<String>,
+    pub instructions: Option<String>,
+    /// The coordinator's session, which sends the message to a running worker.
+    pub caller: Option<String>,
+}
+
+/// The message sent to the running worker, or why it could not be sent. The stored edit
+/// stands either way.
+pub enum EditDelivery {
+    /// Nothing is running. The next dispatch or retry uses the edit.
+    None,
+    Sent {
+        agent: String,
+        attempt: String,
+        message: String,
+    },
+    Failed {
+        agent: String,
+        attempt: String,
+        error: String,
+    },
+}
+
+pub struct TaskEdited {
+    pub run: Run,
+    pub task: Task,
+    pub delivery: EditDelivery,
 }
 
 pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> {
@@ -628,6 +674,90 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 }
             }
             Ok(run)
+        })
+    }
+
+    /// Corrects a task's title or instructions. The stored copy changes in every open
+    /// state, so the next dispatch or retry uses it, and a running worker is sent the new
+    /// instructions through `messenger`. A completed task is refused.
+    pub fn edit_task(
+        &self,
+        command: EditTask,
+        messenger: &dyn TaskMessenger,
+    ) -> Result<TaskEdited> {
+        ensure!(
+            command.title.is_some() || command.instructions.is_some(),
+            "Specify --title, --instructions or --instructions-file"
+        );
+        if let Some(title) = &command.title {
+            ensure!(valid_task_text(title), "Task title is empty");
+        }
+        if let Some(instructions) = &command.instructions {
+            ensure!(valid_task_text(instructions), "Task instructions are empty");
+        }
+        let (run, notify) = self.write(|db| {
+            let before = load_run(db, &command.run)?;
+            let task = find_task(&before, &command.task)?;
+            let edit = task_edit(task.state);
+            ensure!(
+                edit != TaskEdit::Refused,
+                "Task {:?} is completed. Add a new task instead",
+                task.id
+            );
+            let title = command.title.as_deref().unwrap_or(&task.title);
+            let instructions = command
+                .instructions
+                .as_deref()
+                .unwrap_or(&task.instructions);
+            db.update_task(&before.id, &task.id, title, instructions)?;
+            let notify = match edit {
+                TaskEdit::StoreAndNotify => task
+                    .current_attempt
+                    .as_deref()
+                    .and_then(|id| task.attempts.iter().find(|attempt| attempt.id == id))
+                    .map(|attempt| (attempt.agent.clone(), attempt.id.clone())),
+                _ => None,
+            };
+            let changed = [
+                command.title.as_ref().map(|_| "title"),
+                command.instructions.as_ref().map(|_| "instructions"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ");
+            db.event(
+                &before.id,
+                RunEventKind::TaskEdited,
+                Some(&task.id),
+                notify.as_ref().map(|(_, attempt)| attempt.as_str()),
+                Some(&format!("Updated {changed}")),
+            )?;
+            Ok((load_run(db, &command.run)?, notify))
+        })?;
+        let task = find_task(&run, &command.task)?.clone();
+        let delivery = match notify {
+            None => EditDelivery::None,
+            Some((agent, attempt)) => {
+                let body = edit_message(&run, &task);
+                match messenger.send_to_worker(command.caller, &run.id, &agent, body) {
+                    Ok(message) => EditDelivery::Sent {
+                        agent,
+                        attempt,
+                        message,
+                    },
+                    Err(error) => EditDelivery::Failed {
+                        agent,
+                        attempt,
+                        error: format!("{error:#}"),
+                    },
+                }
+            }
+        };
+        Ok(TaskEdited {
+            run,
+            task,
+            delivery,
         })
     }
 
@@ -1690,6 +1820,26 @@ fn worker_prompt(
         "Full worker contract: `power skills get power-dag --reference worker-contract`.\n",
     ));
     prompt
+}
+
+/// Talk bodies are limited, so instructions that do not fit are left for `dag show`.
+const EDIT_MESSAGE_LIMIT: usize = 15 * 1024;
+
+fn edit_message(run: &Run, task: &Task) -> String {
+    let header = format!(
+        "The coordinator edited your task {} in run {}. These instructions replace your \
+         earlier instructions for this task. Follow them from now on.\n\nTask: {} — {}\n",
+        task.id, run.id, task.id, task.title,
+    );
+    if header.len() + task.instructions.len() <= EDIT_MESSAGE_LIMIT {
+        format!("{header}\nInstructions:\n{}", task.instructions)
+    } else {
+        format!(
+            "{header}\nThe new instructions are too long for a message. Read them with \
+             `power dag show {}` (task {}).",
+            run.id, task.id
+        )
+    }
 }
 
 fn task_specs(run: &Run) -> Vec<TaskSpec> {

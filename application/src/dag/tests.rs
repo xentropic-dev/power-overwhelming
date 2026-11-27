@@ -386,6 +386,22 @@ impl DagTransaction for MemoryDb {
         Ok(())
     }
 
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()> {
+        let mut records = self.0.borrow_mut();
+        let entry = records
+            .runs
+            .iter_mut()
+            .find(|entry| entry.id == run)
+            .context("Unknown run")?
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .context("Unknown task")?;
+        entry.title = title.into();
+        entry.instructions = instructions.into();
+        Ok(())
+    }
+
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()> {
         self.0
             .borrow_mut()
@@ -2362,5 +2378,230 @@ fn a_queued_explicit_base_starts_on_the_commit_it_named_when_queued() -> Result<
         (branch.as_str(), base.as_str()),
         ("feature/queued", "commit-1")
     );
+    Ok(())
+}
+
+/// Caller, run, agent and body of one message.
+type SentEdit = (Option<String>, String, String, String);
+
+#[derive(Default)]
+struct FakeMessenger {
+    sent: Mutex<Vec<SentEdit>>,
+    fail: bool,
+}
+
+impl TaskMessenger for FakeMessenger {
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String> {
+        if self.fail {
+            bail!("Talk target is gone");
+        }
+        let mut sent = self.sent.lock().unwrap();
+        sent.push((caller, run.into(), agent.into(), body));
+        Ok(format!("message-{}", sent.len()))
+    }
+}
+
+fn edit(run: &str, task: &str, title: Option<&str>, instructions: Option<&str>) -> EditTask {
+    EditTask {
+        run: run.into(),
+        task: task.into(),
+        title: title.map(str::to_owned),
+        instructions: instructions.map(str::to_owned),
+        caller: Some("coordinator-session".into()),
+    }
+}
+
+fn edit_events(dag: &TestDag, run: &str) -> Result<Vec<RunEvent>> {
+    Ok(dag
+        .events(
+            EventScope::Run(run, &[RunEventKind::TaskEdited]),
+            0,
+            Duration::ZERO,
+        )?
+        .events)
+}
+
+fn agent_dispatch(run: &str, task: &str, retry: bool) -> Dispatch {
+    Dispatch {
+        task: task.into(),
+        provider: Provider::Agent("codex".into()),
+        args: Vec::new(),
+        ..command(run, retry)
+    }
+}
+
+#[test]
+fn editing_a_waiting_or_ready_task_updates_the_next_dispatch_without_a_message() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("later", &["work"])])?;
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(
+        edit(&run, "later", None, Some("Use the new plan")),
+        &messenger,
+    )?;
+    assert_eq!(edited.task.state, TaskState::Waiting);
+    assert_eq!(edited.task.instructions, "Use the new plan");
+    assert_eq!(edited.task.title, "later");
+    assert!(matches!(edited.delivery, EditDelivery::None));
+    let edited = dag.edit_task(edit(&run, "work", Some("Renamed"), None), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::Ready);
+    assert_eq!(edited.task.title, "Renamed");
+    assert_eq!(edited.task.instructions, "Implement work");
+    assert!(messenger.sent.lock().unwrap().is_empty());
+
+    let events = edit_events(&dag, &run)?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].task.as_deref(), Some("later"));
+    assert_eq!(events[0].attempt, None);
+    assert_eq!(events[0].summary.as_deref(), Some("Updated instructions"));
+    assert_eq!(events[1].summary.as_deref(), Some("Updated title"));
+
+    dag.start(agent_dispatch(&run, "work", false))?;
+    let prompt = last_worker_prompt(&dag);
+    assert!(prompt.contains("Task: work — Renamed\n"), "{prompt}");
+    Ok(())
+}
+
+#[test]
+fn editing_a_running_task_messages_its_current_attempt() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(
+        edit(&run, "work", Some("Fix it"), Some("Do it the new way")),
+        &messenger,
+    )?;
+    assert_eq!(edited.task.state, TaskState::Working);
+    let EditDelivery::Sent {
+        agent,
+        attempt,
+        message,
+    } = &edited.delivery
+    else {
+        panic!("Expected a sent message");
+    };
+    assert_eq!(agent, &started.agent.id);
+    assert_eq!(attempt, &started.attempt.id);
+    assert_eq!(message, "message-1");
+    {
+        let sent = messenger.sent.lock().unwrap();
+        let (caller, to_run, to_agent, body) = &sent[0];
+        assert_eq!(caller.as_deref(), Some("coordinator-session"));
+        assert_eq!((to_run, to_agent), (&run, &started.agent.id));
+        assert!(body.contains("replace your earlier instructions"), "{body}");
+        assert!(body.contains("Task: work — Fix it"), "{body}");
+        assert!(body.ends_with("Instructions:\nDo it the new way"), "{body}");
+    }
+    let events = edit_events(&dag, &run)?;
+    assert_eq!(
+        events[0].attempt.as_deref(),
+        Some(started.attempt.id.as_str())
+    );
+    assert_eq!(
+        events[0].summary.as_deref(),
+        Some("Updated title and instructions")
+    );
+
+    // A worker waiting on input is still running, so it is told as well.
+    dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::NeedsInput,
+        "Which way?",
+    )?;
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Second fix")), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::NeedsInput);
+    assert!(matches!(edited.delivery, EditDelivery::Sent { .. }));
+    assert_eq!(messenger.sent.lock().unwrap().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_failed_delivery_keeps_the_stored_edit() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let messenger = FakeMessenger {
+        fail: true,
+        ..FakeMessenger::default()
+    };
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Kept")), &messenger)?;
+    assert!(
+        matches!(&edited.delivery, EditDelivery::Failed { error, .. } if error.contains("gone"))
+    );
+    assert_eq!(dag.run(&run)?.tasks[0].instructions, "Kept");
+    Ok(())
+}
+
+#[test]
+fn editing_a_failed_or_interrupted_task_updates_the_retry_without_a_message() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("failing", &[])])?;
+    let interrupted = dag.start(command(&run, false))?;
+    dag.session_exited(interrupted.agent.session.as_deref().unwrap(), "exited")?;
+    let failing = dag.start(Dispatch {
+        task: "failing".into(),
+        ..command(&run, false)
+    })?;
+    dag.report(
+        &run,
+        "failing",
+        &failing.attempt.id,
+        ReportStatus::Failed,
+        "broken",
+    )?;
+    let messenger = FakeMessenger::default();
+    for (task, state) in [
+        ("work", TaskState::Interrupted),
+        ("failing", TaskState::Failed),
+    ] {
+        let edited = dag.edit_task(edit(&run, task, None, Some("Retry this way")), &messenger)?;
+        assert_eq!(edited.task.state, state);
+        assert!(matches!(edited.delivery, EditDelivery::None));
+    }
+    assert!(messenger.sent.lock().unwrap().is_empty());
+    dag.start(agent_dispatch(&run, "failing", true))?;
+    let prompt = last_worker_prompt(&dag);
+    assert!(
+        prompt.contains("Instructions:\nRetry this way\n"),
+        "{prompt}"
+    );
+    Ok(())
+}
+
+#[test]
+fn edits_refuse_completed_tasks_unknown_targets_and_empty_text() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let messenger = FakeMessenger::default();
+    let before = dag.latest_seq()?;
+    let error = |command| {
+        dag.edit_task(command, &messenger)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap()
+    };
+    assert!(error(edit(&run, "work", Some("New"), None)).contains("Add a new task instead"));
+    assert!(error(edit(&run, "missing", Some("New"), None)).contains("Unknown task"));
+    assert!(error(edit("nope", "work", Some("New"), None)).contains("Unknown run"));
+    assert!(error(edit(&run, "work", Some("  "), None)).contains("title is empty"));
+    assert!(error(edit(&run, "work", None, Some(""))).contains("instructions are empty"));
+    assert!(error(edit(&run, "work", None, None)).contains("Specify --title"));
+    assert_eq!(dag.latest_seq()?, before);
+    assert_eq!(dag.run(&run)?.tasks[0].title, "work");
+    assert!(messenger.sent.lock().unwrap().is_empty());
     Ok(())
 }
