@@ -16,8 +16,9 @@ use crate::{
     status_bar::{ConfigChanged, StatusBar},
     talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{
-        AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, TerminalView,
-        column_width, link_action, load_bundled_fonts, terminal_font_family,
+        AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, TerminalBell,
+        TerminalNotification, TerminalTitleChanged, TerminalView, column_width, link_action,
+        load_bundled_fonts, terminal_font_family,
     },
 };
 use anyhow::{Context as _, Result, ensure};
@@ -220,6 +221,9 @@ struct TerminalTab {
     _links: Subscription,
     _agent: Subscription,
     _bar_context: Subscription,
+    _title: Subscription,
+    _bell: Subscription,
+    _notification: Subscription,
 }
 
 struct PreviewTab {
@@ -238,6 +242,9 @@ struct Workspace {
     box_icons: HashMap<String, Arc<RenderImage>>,
     sessions: HashMap<String, Session>,
     terminals: HashMap<String, TerminalTab>,
+    terminal_titles: HashMap<String, String>,
+    terminal_notice: Option<String>,
+    terminal_notice_generation: u64,
     tab_scroll: ScrollHandle,
     launching: bool,
     focus: FocusHandle,
@@ -249,6 +256,7 @@ struct Workspace {
     talk_refresh: async_channel::Sender<()>,
     dag_progress: Option<(String, String)>,
     attention: HashMap<String, HashSet<String>>,
+    terminal_bells: HashSet<String>,
     previews: Vec<PreviewTab>,
     active_previews: HashMap<String, u64>,
     next_id: u64,
@@ -394,6 +402,9 @@ impl Workspace {
             box_icons: HashMap::new(),
             sessions: HashMap::new(),
             terminals: HashMap::new(),
+            terminal_titles: HashMap::new(),
+            terminal_notice: None,
+            terminal_notice_generation: 0,
             tab_scroll: ScrollHandle::new(),
             launching: false,
             focus,
@@ -408,6 +419,7 @@ impl Workspace {
             talk_refresh,
             dag_progress: None,
             attention: HashMap::new(),
+            terminal_bells: HashSet::new(),
             previews: Vec::new(),
             active_previews: HashMap::new(),
             next_id: 0,
@@ -679,6 +691,11 @@ impl Workspace {
         self.layout.onboarded = true;
         self.save();
         self.open_initial_view(window, cx);
+    }
+
+    /// Names the window after the selected terminal's title, or the app when it has none.
+    fn sync_window_title(&self, window: &mut Window) {
+        window.set_window_title(&window_title(&self.layout, &self.terminal_titles));
     }
 
     fn active_view(&self) -> Option<String> {
@@ -1400,6 +1417,61 @@ impl Workspace {
                 app.sync_status_bar(cx);
             }
         });
+        let title = cx.subscribe_in(
+            &view,
+            window,
+            |app, source, changed: &TerminalTitleChanged, window, cx| {
+                let id = source.read(cx).session.id.clone();
+                if changed.0.is_empty() {
+                    app.terminal_titles.remove(&id);
+                } else {
+                    app.terminal_titles.insert(id.clone(), changed.0.clone());
+                }
+                app.sync_window_title(window);
+                cx.notify();
+            },
+        );
+        let bell = cx.subscribe(&view, |app, source, _: &TerminalBell, cx| {
+            let id = source.read(cx).session.id.clone();
+            app.terminal_bells.insert(id);
+            cx.notify();
+        });
+        let notification = cx.subscribe(&view, |app, _, note: &TerminalNotification, cx| {
+            let (title, body) = (note.title.clone(), note.body.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    let title = if title.is_empty() {
+                        "Power Overwhelming"
+                    } else {
+                        &title
+                    };
+                    if let Err(error) = infrastructure::notify::desktop_notification(title, &body) {
+                        eprintln!("Could not show desktop notification. {error:#}");
+                    }
+                })
+                .detach();
+            let message = if note.title.is_empty() {
+                note.body.clone()
+            } else if note.body.is_empty() {
+                note.title.clone()
+            } else {
+                format!("{}: {}", note.title, note.body)
+            };
+            app.terminal_notice_generation = app.terminal_notice_generation.wrapping_add(1);
+            let generation = app.terminal_notice_generation;
+            app.terminal_notice = Some(message);
+            cx.spawn(async move |app, cx| {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let _ = app.update(cx, |app, cx| {
+                    if app.terminal_notice_generation == generation {
+                        app.terminal_notice = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+        });
         self.terminals.insert(
             id.to_owned(),
             TerminalTab {
@@ -1408,6 +1480,9 @@ impl Workspace {
                 _links: links,
                 _agent: agent,
                 _bar_context: bar_context,
+                _title: title,
+                _bell: bell,
+                _notification: notification,
             },
         );
     }
@@ -1416,6 +1491,7 @@ impl Workspace {
         if self.hinting.is_some() {
             self.end_hints(cx);
         }
+        self.sync_window_title(window);
         if let Some(talk) = &self.talk {
             talk.focus(window);
         } else if let Some(dag) = &self.dag {
@@ -1438,6 +1514,8 @@ impl Workspace {
             if let Some(tab) = self.terminals.get(&id) {
                 tab.view.read(cx).focus.focus(window);
             }
+            // Every route to a terminal (its tab, its box, a closed neighbour) lands here.
+            acknowledge_bell(&self.layout, &mut self.terminal_bells);
         } else {
             self.focus.focus(window);
         }
@@ -1556,6 +1634,7 @@ impl Workspace {
         if self.layout.active_box.is_some() {
             self.restore_focus(window, cx);
         } else {
+            self.sync_window_title(window);
             self.sync_status_bar(cx);
             self.pick_boxes(window, cx);
         }
@@ -1565,9 +1644,16 @@ impl Workspace {
         let Some(id) = self.layout.active_box.clone() else {
             return;
         };
-        let entry = self.box_mut(&id).unwrap();
-        if entry.views.iter().any(|view| view.session == session) {
-            entry.select_view(session);
+        let selected = {
+            let entry = self.box_mut(&id).unwrap();
+            if entry.views.iter().any(|view| view.session == session) {
+                entry.select_view(session);
+                entry.active_view.clone()
+            } else {
+                None
+            }
+        };
+        if selected.is_some() {
             self.picker = None;
             self.dag = None;
             self.save();
@@ -3125,6 +3211,9 @@ impl Workspace {
     }
 
     fn tab_label(&self, index: usize, view: &SavedView) -> String {
+        if let Some(title) = self.terminal_titles.get(&view.session) {
+            return format!("{} {}", index + 1, title);
+        }
         let agent = self
             .sessions
             .get(&view.session)
@@ -3440,7 +3529,11 @@ impl Render for Workspace {
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
             let active = self.layout.active_box.as_ref() == Some(&entry.id);
-            let needs_input = self.attention.contains_key(&entry.id);
+            let needs_input = self.attention.contains_key(&entry.id)
+                || entry
+                    .views
+                    .iter()
+                    .any(|view| self.terminal_bells.contains(&view.session));
             let id = entry.id.clone();
             div()
                 .id(("box", usize::from(digit)))
@@ -3492,7 +3585,8 @@ impl Render for Workspace {
                 let needs_input = self
                     .attention
                     .values()
-                    .any(|sessions| sessions.contains(&id));
+                    .any(|sessions| sessions.contains(&id))
+                    || self.terminal_bells.contains(&id);
                 unstyled_button(("terminal-tab", index), self.tab_label(index, view))
                     .hover(move |tab| {
                         tab.bg(rgb(if needs_input {
@@ -3684,6 +3778,16 @@ impl Render for Workspace {
                                 .child(error)
                         }),
                     )
+                    .when_some(self.terminal_notice.clone(), |main, notice| {
+                        main.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(colors.raised))
+                                .text_color(rgb(colors.foreground))
+                                .child(notice),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
@@ -3722,12 +3826,100 @@ fn random_seed() -> u64 {
         .finish()
 }
 
+fn window_title(layout: &Layout, titles: &HashMap<String, String>) -> String {
+    let title = layout
+        .boxes
+        .iter()
+        .find(|entry| Some(&entry.id) == layout.active_box.as_ref())
+        .and_then(|entry| entry.active_view.as_ref())
+        .and_then(|session| titles.get(session));
+    match title {
+        Some(title) => format!("{title} — Power Overwhelming"),
+        None => "Power Overwhelming".to_owned(),
+    }
+}
+
+/// The selected terminal has been seen, so its bell no longer needs attention.
+fn acknowledge_bell(layout: &Layout, bells: &mut HashSet<String>) {
+    if let Some(session) = layout
+        .boxes
+        .iter()
+        .find(|entry| Some(&entry.id) == layout.active_box.as_ref())
+        .and_then(|entry| entry.active_view.as_ref())
+    {
+        bells.remove(session);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AgentStatus, Coordinator, EndWorker, LinkAction, ManagedAgent, Run, Task, empty_message,
         end_worker_step, link_action, running_progress,
     };
+    use super::{acknowledge_bell, window_title};
+    use infrastructure::boxes::{Layout, SavedBox, SavedView};
+    use std::collections::{HashMap, HashSet};
+
+    fn saved_box(id: &str, sessions: &[&str], active: &str) -> SavedBox {
+        SavedBox {
+            id: id.into(),
+            repository: "/repo".into(),
+            checkout: "/repo".into(),
+            shortcut: Some(1),
+            views: sessions
+                .iter()
+                .map(|session| SavedView {
+                    session: (*session).into(),
+                    worktree: "/repo".into(),
+                })
+                .collect(),
+            active_view: Some(active.into()),
+            previous_view: None,
+        }
+    }
+
+    #[test]
+    fn the_window_title_follows_the_selected_terminal() {
+        let mut layout = Layout {
+            boxes: vec![saved_box("one", &["alpha", "beta"], "alpha")],
+            active_box: Some("one".into()),
+            ..Layout::default()
+        };
+        let titles = HashMap::from([
+            ("alpha".to_owned(), "Alpha".to_owned()),
+            ("beta".to_owned(), "Beta".to_owned()),
+        ]);
+        assert_eq!(window_title(&layout, &titles), "Alpha — Power Overwhelming");
+        layout.boxes[0].active_view = Some("beta".into());
+        assert_eq!(window_title(&layout, &titles), "Beta — Power Overwhelming");
+        // Back to the named first tab with no new title output.
+        layout.boxes[0].active_view = Some("alpha".into());
+        assert_eq!(window_title(&layout, &titles), "Alpha — Power Overwhelming");
+        layout.boxes[0].active_view = None;
+        assert_eq!(window_title(&layout, &titles), "Power Overwhelming");
+        layout.active_box = None;
+        assert_eq!(window_title(&layout, &titles), "Power Overwhelming");
+    }
+
+    #[test]
+    fn visiting_a_ringing_terminal_through_its_box_clears_the_bell() {
+        let mut layout = Layout {
+            boxes: vec![
+                saved_box("one", &["alpha"], "alpha"),
+                saved_box("two", &["beta", "gamma"], "gamma"),
+            ],
+            active_box: Some("one".into()),
+            ..Layout::default()
+        };
+        let mut bells = HashSet::from(["gamma".to_owned(), "beta".to_owned()]);
+        acknowledge_bell(&layout, &mut bells);
+        assert_eq!(bells.len(), 2);
+        // Opening box two restores its saved terminal without going through its tab.
+        layout.active_box = Some("two".into());
+        acknowledge_bell(&layout, &mut bells);
+        assert_eq!(bells, HashSet::from(["beta".to_owned()]));
+    }
     use domain::dag::{AgentState, Provider, TaskState};
 
     #[test]
