@@ -276,14 +276,17 @@ fn needs_ligatures(text: &str, font: &Font) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::frame::{Frame, frame};
+    use crate::terminal::frame::Frame;
     use ghostty_vt::{Terminal, render::RenderState, terminal::Options};
     use gpui::{ShapedGlyph, ShapedRun, font, px, rgb};
 
     fn screen(output: &[u8]) -> Frame {
         let mut terminal = Terminal::new(Options::default()).unwrap();
         terminal.vt_write(output);
-        frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap()
+        Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap()
     }
 
     fn cells(frame: &Frame, row: usize) -> Vec<RunCell<'_>> {
