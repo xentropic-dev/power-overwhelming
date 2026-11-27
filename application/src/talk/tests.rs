@@ -52,6 +52,7 @@ impl TalkReader for Db {
                 coordinator: Coordinator::External {
                     label: "pane".into(),
                 },
+                coordinator_session: None,
             }],
         })
     }

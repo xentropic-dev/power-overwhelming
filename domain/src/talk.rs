@@ -158,6 +158,8 @@ pub struct RunRef {
     pub id: String,
     pub box_id: String,
     pub coordinator: Coordinator,
+    /// The session the coordinating agent held when it created the run, if any.
+    pub coordinator_session: Option<String>,
 }
 
 #[derive(Default)]
@@ -178,7 +180,6 @@ pub enum AddressError {
     Unknown(String),
     Ambiguous(String),
     Exited(String),
-    OtherBox(String),
     ExternalCoordinator(String),
     EmptyRun(String),
 }
@@ -189,7 +190,6 @@ impl fmt::Display for AddressError {
             Self::Unknown(target) => write!(f, "Unknown talk target {target:?}"),
             Self::Ambiguous(target) => write!(f, "Talk target {target:?} is ambiguous"),
             Self::Exited(target) => write!(f, "Talk target {target:?} has exited or ended"),
-            Self::OtherBox(target) => write!(f, "Talk target {target:?} is in another box"),
             Self::ExternalCoordinator(label) => {
                 write!(
                     f,
@@ -242,20 +242,11 @@ pub fn resolve(
     target: &Target,
     directory: &Directory,
 ) -> Result<Vec<Recipient>, AddressError> {
-    let check_box = |target: &str, box_id: &str| {
-        if ctx.agent.is_some_and(|sender| sender.box_id != box_id) {
-            return Err(AddressError::OtherBox(target.into()));
-        }
-        Ok(())
-    };
     let find_run = |id: Option<&str>, alias: &str| {
-        let run = directory.run(id.ok_or_else(|| AddressError::Unknown(alias.into()))?)?;
-        check_box(alias, &run.box_id)?;
-        Ok(run)
+        directory.run(id.ok_or_else(|| AddressError::Unknown(alias.into()))?)
     };
     let sender_run = ctx.agent.and_then(|agent| agent.run.as_deref());
     let one = |agent: &ManagedAgent, address: &str| {
-        check_box(address, &agent.box_id)?;
         if agent.status == AgentStatus::Exited || agent.session.is_none() {
             return Err(AddressError::Exited(address.into()));
         }
@@ -327,26 +318,6 @@ pub fn resolve(
             Ok(recipients)
         }
     }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct TrustError(pub String);
-
-impl fmt::Display for TrustError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        AddressError::OtherBox(self.0.clone()).fmt(f)
-    }
-}
-
-impl Error for TrustError {}
-
-pub fn authorize(sender: &Sender, recipient: &Recipient) -> Result<(), TrustError> {
-    if let (Sender::Agent(sender), Recipient::Agent { id, box_id }) = (sender, recipient)
-        && sender.box_id != *box_id
-    {
-        return Err(TrustError(id.clone()));
-    }
-    Ok(())
 }
 
 /// Returns the first timestamp at which sending would be allowed.

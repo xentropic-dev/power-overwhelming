@@ -121,7 +121,10 @@ impl Sandbox {
         let mut boxes = Vec::new();
         for (id, names) in [
             (BOX, &["coordinator", "a", "b"][..]),
-            (REMOTE_BOX, &["remote"][..]),
+            (
+                REMOTE_BOX,
+                &["remote", "remote-coordinator", "remote-worker"][..],
+            ),
         ] {
             let checkout = path.join(id);
             fs::create_dir(&checkout).unwrap();
@@ -591,7 +594,7 @@ fn rejects_bad_targets_and_rate_limits_without_queueing() {
         ("task:missing", "Unknown"),
         ("fixture-", "ambiguous"),
         ("fixture-a", "exited"),
-        ("elsewhere", "another box"),
+        ("elsewhere", "exited"),
     ] {
         let result = fixture.talk(Some(&fixture.a), &["send", to, "rejected"]);
         assert_eq!(result.status.code(), Some(1), "{result:?}");
@@ -1215,4 +1218,110 @@ fn a_turn_end_reported_while_the_daemon_still_restores_clears_the_hold() {
             .any(|row| row["id"] == id.as_str() && row["delivery"]["notified_at"].is_u64())
             .then_some(())
     });
+}
+
+#[test]
+fn peers_message_agents_and_runs_in_other_boxes_and_coordinators_keep_the_log() {
+    let mut sandbox = Sandbox::new();
+    let path = sandbox.root.path().to_owned();
+    let sender = sandbox.launch("a", BOX);
+    let coordinator = sandbox.launch_profile("restorable", "remote-coordinator", REMOTE_BOX);
+    let run: Run = serde_json::from_value(
+        json(
+            power(&path, Some(&coordinator))
+                .args(["dag", "create", "--title", "Remote"])
+                .output()
+                .unwrap(),
+        )["run"]
+            .take(),
+    )
+    .unwrap();
+    assert_eq!(run.box_id, REMOTE_BOX);
+    json(
+        power(&path, None)
+            .args([
+                "dag",
+                "add-task",
+                &run.id,
+                "--id",
+                "remote-worker",
+                "--title",
+                "w",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let output = power(&path, Some(&coordinator))
+        .args([
+            "dag",
+            "dispatch",
+            &run.id,
+            "remote-worker",
+            "--provider",
+            "command",
+            "--worktree",
+        ])
+        .arg(path.join("remote-worker"))
+        .arg("--")
+        .arg(path.join("worker.sh"))
+        .output()
+        .unwrap();
+    let worker: ManagedAgent = serde_json::from_value(json(output)["agent"].take()).unwrap();
+    poll("remote worker startup", || {
+        path.join("ready-remote-worker").exists().then_some(())
+    });
+
+    let direct = messages(talk(
+        &path,
+        Some(&sender),
+        &["send", &worker.id, "by id", "--json"],
+    ));
+    let broadcast = messages(talk(
+        &path,
+        Some(&sender),
+        &["send", "--run", &run.id, "by run", "--json"],
+    ));
+    assert_eq!(broadcast.len(), 1);
+    for sent in [&direct[0], &broadcast[0]] {
+        assert_eq!(sent["box_id"], REMOTE_BOX);
+        assert_eq!(sent["run"], run.id.as_str());
+    }
+    poll("remote notice", || {
+        (notice_count(&path, "remote-worker") > 0).then_some(())
+    });
+    let printed = success(talk(&path, Some(&worker), &["inbox"]));
+    for expected in [&sender.id, BOX, "Not from the user.", "by id", "by run"] {
+        assert!(printed.contains(expected), "{printed}");
+    }
+
+    for _ in 0..18 {
+        success(talk(&path, Some(&sender), &["send", &worker.id, "rate"]));
+    }
+    let result = talk(&path, Some(&sender), &["send", &worker.id, "21st"]);
+    assert_eq!(result.status.code(), Some(1), "{result:?}");
+
+    let log = |coordinator: &ManagedAgent| {
+        messages(talk(
+            &path,
+            Some(coordinator),
+            &["log", "--run", &run.id, "--json"],
+        ))
+    };
+    assert_eq!(log(&coordinator).len(), 20);
+    drop(sandbox.daemon.take());
+    fs::remove_file(path.join("ready-remote-coordinator")).unwrap();
+    // A restart can register the coordinator's session under a new agent ID. The run still
+    // names the old one, so the log must be granted by the recorded session.
+    let db = rusqlite::Connection::open(path.join("state/dag.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE runs SET coordinator = '{\"kind\":\"agent\",\"agent\":\"gone\"}' WHERE id = ?1",
+        [&run.id],
+    )
+    .unwrap();
+    drop(db);
+    sandbox.daemon = Some(start(&path));
+    poll("restored coordinator", || {
+        path.join("ready-remote-coordinator").exists().then_some(())
+    });
+    assert_eq!(log(&coordinator).len(), 20);
 }

@@ -5,7 +5,8 @@ use application::dag::{
 };
 use domain::{
     dag::{
-        AgentStatus, Attempt, ManagedAgent, Run, RunEvent, RunEventKind, Task, TaskSpec, TaskState,
+        AgentStatus, Attempt, Coordinator, ManagedAgent, Run, RunEvent, RunEventKind, Task,
+        TaskSpec, TaskState,
     },
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest},
 };
@@ -107,6 +108,17 @@ impl SqliteDagStore {
         )?;
         if !has_archived_at {
             db.execute("ALTER TABLE runs ADD COLUMN archived_at INTEGER", [])?;
+        }
+        let has_coordinator_session: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs')
+                 WHERE name = 'coordinator_session')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_coordinator_session {
+            // The session the coordinating agent held when it created the run. A later
+            // registration of that session, after a restart, still coordinates the run.
+            db.execute("ALTER TABLE runs ADD COLUMN coordinator_session TEXT", [])?;
         }
         talk::migrate(&db)?;
         Ok(Self(Arc::new(Mutex::new(db)), Arc::new(Condvar::new())))
@@ -518,8 +530,9 @@ impl DagTransaction for DagDb<'_> {
 
     fn insert_run(&self, run: &Run) -> Result<()> {
         self.0.execute(
-            "INSERT INTO runs (id, box_id, title, coordinator, created_at, archived_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run.id, run.box_id, run.title, serde_json::to_string(&wire::Coordinator::from(run.coordinator.clone()))?, run.created_at, run.archived_at],
+            "INSERT INTO runs (id, box_id, title, coordinator, created_at, archived_at, coordinator_session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT session FROM agents WHERE id = ?7))",
+            params![run.id, run.box_id, run.title, serde_json::to_string(&wire::Coordinator::from(run.coordinator.clone()))?, run.created_at, run.archived_at, match &run.coordinator { Coordinator::Agent { agent } => Some(agent.as_str()), Coordinator::External { .. } => None }],
         )?;
         Ok(())
     }

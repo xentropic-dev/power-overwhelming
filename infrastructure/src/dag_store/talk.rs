@@ -34,6 +34,16 @@ pub(super) fn migrate(db: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS talk_events_box ON talk_events(box_id, seq);",
     )?;
+    let has_sender_box: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('talk_messages')
+             WHERE name = 'sender_box')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_sender_box {
+        // `box_id` is the recipient's box. A peer may write from another one.
+        db.execute("ALTER TABLE talk_messages ADD COLUMN sender_box TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -74,15 +84,17 @@ struct TalkDb<'a>(&'a Connection);
 const COLUMNS: &str =
     "id, box_id, sender_kind, sender_agent, sender_provider, sender_role, sender_run,
      recipient_agent, body, thread, reply_to, broadcast, run, created_at, queued_at,
-     notified_at, reminded_at, read_at, urgent";
+     notified_at, reminded_at, read_at, urgent, sender_box";
 
-/// Reads sender and recipient from columns 1–7 of COLUMNS or QUEUED_COLUMNS.
-fn parties(row: &Row<'_>) -> rusqlite::Result<(String, Sender, Recipient)> {
+/// Reads sender and recipient from columns 1–7 of COLUMNS or QUEUED_COLUMNS, and the
+/// sender's box from column `sender_box`. Rows written before it existed share one box.
+fn parties(row: &Row<'_>, sender_box: usize) -> rusqlite::Result<(String, Sender, Recipient)> {
     let box_id: String = row.get(1)?;
+    let sender_box: Option<String> = row.get(sender_box)?;
     let sender = match row.get::<_, String>(2)?.as_str() {
         "agent" => Sender::Agent(AgentRef {
             id: row.get(3)?,
-            box_id: box_id.clone(),
+            box_id: sender_box.unwrap_or_else(|| box_id.clone()),
             provider: row.get(4)?,
             role: row.get(5)?,
             run: row.get(6)?,
@@ -104,10 +116,10 @@ fn parties(row: &Row<'_>) -> rusqlite::Result<(String, Sender, Recipient)> {
 
 const QUEUED_COLUMNS: &str =
     "id, box_id, sender_kind, sender_agent, sender_provider, sender_role, sender_run,
-     recipient_agent, queued_at, notified_at, reminded_at, read_at, urgent";
+     recipient_agent, queued_at, notified_at, reminded_at, read_at, urgent, sender_box";
 
 fn queued_from_row(row: &Row<'_>) -> rusqlite::Result<Queued> {
-    let (_, sender, recipient) = parties(row)?;
+    let (_, sender, recipient) = parties(row, 13)?;
     Ok(Queued {
         id: MessageId(row.get(0)?),
         sender,
@@ -123,7 +135,7 @@ fn queued_from_row(row: &Row<'_>) -> rusqlite::Result<Queued> {
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
-    let (box_id, sender, recipient) = parties(row)?;
+    let (box_id, sender, recipient) = parties(row, 19)?;
     Ok(Message {
         id: MessageId(row.get(0)?),
         box_id,
@@ -175,14 +187,18 @@ impl TalkReader for TalkDb<'_> {
     fn directory(&self) -> Result<Directory> {
         let runs = self
             .0
-            .prepare("SELECT id, box_id, title, coordinator, created_at, archived_at FROM runs")?
-            .query_map([], run_from_row)?
-            .map(|run| {
-                let run = run?;
+            .prepare(
+                "SELECT id, box_id, title, coordinator, created_at, archived_at,
+                        coordinator_session FROM runs",
+            )?
+            .query_map([], |row| Ok((run_from_row(row)?, row.get(6)?)))?
+            .map(|row| {
+                let (run, coordinator_session) = row?;
                 Ok(RunRef {
                     id: run.id,
                     box_id: run.box_id,
                     coordinator: run.coordinator,
+                    coordinator_session,
                 })
             })
             .collect::<rusqlite::Result<_>>()?;
@@ -378,7 +394,7 @@ impl TalkTransaction for TalkDb<'_> {
         self.0.execute(
             &format!(
                 "INSERT INTO talk_messages({COLUMNS}) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
             )"
             ),
             params![
@@ -400,7 +416,8 @@ impl TalkTransaction for TalkDb<'_> {
                 message.delivery.notified_at,
                 message.delivery.reminded_at,
                 message.delivery.read_at,
-                message.urgent
+                message.urgent,
+                agent.map(|a| &a.box_id)
             ],
         )?;
         self.event(&message.id, "talk_message")

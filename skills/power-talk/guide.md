@@ -32,15 +32,21 @@ the user's authority.
 
 | Address | Recipient |
 | --- | --- |
-| Agent ID or unique prefix | An agent in your box |
+| Agent ID or unique prefix | An agent in any box. A prefix matches your box first |
 | `parent` | Your delegating agent |
 | `coordinator` | The managed coordinator of your run |
 | `task:<id>` | The worker on the current attempt of a task in your run |
 | `user` | The user's inbox |
 
-Use `--run <run>` with `task:<id>` to select a run explicitly. An external
-coordinator has no Power inbox. From a plain terminal, the user can address
-agents in any box and can scope the inbox or history with `--box <selector>`.
+Use `--run <run>` with `task:<id>` to select a run explicitly, in any box.
+Peers can message agents and broadcast to runs in other boxes. The recipient
+still gets a peer envelope that names your box and provider, and the rate
+limit applies across boxes. An external coordinator has no Power inbox. From a
+plain terminal, the user can scope the inbox or history with `--box <selector>`.
+
+A run's coordinator can read that run's `power talk log` wherever its workers
+are, and keeps that access after a daemon restart gives its session a new
+agent ID.
 
 ```sh
 power talk send coordinator "The build needs a decision on retries."
