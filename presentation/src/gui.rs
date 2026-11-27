@@ -2215,6 +2215,11 @@ impl Workspace {
         };
         match choice {
             Choice::NewBox => self.pick_repository(window, cx),
+            Choice::Command(command) => {
+                self.picker = None;
+                self.restore_focus(window, cx);
+                self.run_command(command, window, cx);
+            }
             Choice::Link(link) => {
                 self.picker = None;
                 self.restore_focus(window, cx);
@@ -2816,11 +2821,8 @@ impl Workspace {
             Prefix::Box => Scope::Box,
             Prefix::View => Scope::Tab,
         };
-        let command = self.keymap.command(scope, stroke);
-        match command {
-            Some(Command::Help) => return self.open_help(window, cx),
-            Some(Command::Quit) => return window.remove_window(),
-            _ => {}
+        if let Some(command) = self.keymap.command(scope, stroke) {
+            return self.run_command(command, window, cx);
         }
         if self.registry.is_none() {
             return;
@@ -2829,53 +2831,96 @@ impl Workspace {
         let digit = (!mods.control && !mods.alt && !mods.platform)
             .then(|| shortcut_digit(key))
             .flatten();
+        match (prefix, digit) {
+            (Prefix::Box, Some(digit)) => {
+                if let Some(entry) = self
+                    .layout
+                    .boxes
+                    .iter()
+                    .find(|entry| entry.shortcut == Some(digit))
+                {
+                    self.activate_box(entry.id.clone(), window, cx);
+                }
+            }
+            (Prefix::View, Some(_)) => self.navigate_tabs(key, window, cx),
+            _ => {}
+        }
+    }
+
+    /// Runs a box or tab command, from its key or from the command palette, and records it
+    /// as recently run. Other commands are ignored.
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(command, Command::Help | Command::Quit) && self.registry.is_none() {
+            return;
+        }
+        let name = self
+            .keymap
+            .palette_entries()
+            .into_iter()
+            .find(|entry| entry.command == command)
+            .map(|entry| entry.name);
+        if let Some(name) = name
+            && self.layout.remember_command(&name)
+        {
+            self.save();
+        }
         match command {
-            Some(Command::BoxNew) => self.pick_repository(window, cx),
-            Some(Command::BoxPick) => self.pick_boxes(window, cx),
-            Some(Command::BoxRuns) => self.pick_runs(window, cx),
-            Some(Command::BoxAgents) => self.pick_agents(window, cx),
-            Some(Command::BoxTalk) => {
+            Command::Help => self.open_help(window, cx),
+            Command::Quit => window.remove_window(),
+            Command::Palette => self.open_palette(window, cx),
+            Command::BoxNew => self.pick_repository(window, cx),
+            Command::BoxPick => self.pick_boxes(window, cx),
+            Command::BoxRuns => self.pick_runs(window, cx),
+            Command::BoxAgents => self.pick_agents(window, cx),
+            Command::BoxTalk => {
                 if let Some(box_id) = self.layout.active_box.clone() {
                     self.open_talk(box_id, TalkTarget::User, window, cx);
                 }
             }
-            Some(Command::Reload) => {
+            Command::Reload => {
                 self.status_bar.update(cx, StatusBar::reload);
             }
-            Some(Command::BoxDetach) => self.detach_box(window, cx),
-            Some(Command::BoxColorScheme) => self.pick_color_scheme(false, window, cx),
-            Some(Command::BoxSetup) => self.open_setup(false, window, cx),
-            Some(Command::TabNew) => self.launch_in_active_worktree(window, cx),
-            Some(Command::TabWorktree) => self.new_worktree(window, cx),
-            Some(Command::TabPick) => self.pick_tabs(window, cx),
-            Some(Command::TabRecover) => self.pick_sessions(window, cx),
-            Some(Command::TabEnd) => self.end_active_tab(window, cx),
-            Some(Command::TabDetach) => self.detach_active_tab(window, cx),
-            Some(Command::TabPaths) => self.open_status_actions(window, cx),
-            Some(Command::TabNext) => self.navigate_tabs("n", window, cx),
-            Some(Command::TabPrevious) => self.navigate_tabs("p", window, cx),
-            Some(Command::TabLast) => self.navigate_tabs("l", window, cx),
-            Some(Command::TabOpenLink) => self.start_hints(cx),
-            Some(Command::TabPreview) => self.focus_preview(window, cx),
-            Some(Command::TerminalZoomIn) => self.zoom_terminals(Some(1.), cx),
-            Some(Command::TerminalZoomOut) => self.zoom_terminals(Some(-1.), cx),
-            Some(Command::TerminalZoomReset) => self.zoom_terminals(None, cx),
-            Some(_) => {}
-            None => match (prefix, digit) {
-                (Prefix::Box, Some(digit)) => {
-                    if let Some(entry) = self
-                        .layout
-                        .boxes
-                        .iter()
-                        .find(|entry| entry.shortcut == Some(digit))
-                    {
-                        self.activate_box(entry.id.clone(), window, cx);
-                    }
-                }
-                (Prefix::View, Some(_)) => self.navigate_tabs(key, window, cx),
-                _ => {}
-            },
+            Command::BoxDetach => self.detach_box(window, cx),
+            Command::BoxColorScheme => self.pick_color_scheme(false, window, cx),
+            Command::BoxSetup => self.open_setup(false, window, cx),
+            Command::TabNew => self.launch_in_active_worktree(window, cx),
+            Command::TabWorktree => self.new_worktree(window, cx),
+            Command::TabPick => self.pick_tabs(window, cx),
+            Command::TabRecover => self.pick_sessions(window, cx),
+            Command::TabEnd => self.end_active_tab(window, cx),
+            Command::TabDetach => self.detach_active_tab(window, cx),
+            Command::TabPaths => self.open_status_actions(window, cx),
+            Command::TabNext => self.navigate_tabs("n", window, cx),
+            Command::TabPrevious => self.navigate_tabs("p", window, cx),
+            Command::TabLast => self.navigate_tabs("l", window, cx),
+            Command::TabOpenLink => self.start_hints(cx),
+            Command::TabPreview => self.focus_preview(window, cx),
+            Command::TerminalZoomIn => self.zoom_terminals(Some(1.), cx),
+            Command::TerminalZoomOut => self.zoom_terminals(Some(-1.), cx),
+            Command::TerminalZoomReset => self.zoom_terminals(None, cx),
+            _ => {}
         }
+    }
+
+    /// Opens the command palette over every box and tab command, recent ones first.
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.keymap.palette_entries();
+        let recent = self
+            .layout
+            .recent_commands
+            .iter()
+            .filter_map(|name| entries.iter().find(|entry| &entry.name == name))
+            .map(|entry| entry.command)
+            .collect();
+        let rows = entries
+            .iter()
+            .map(|entry| Row {
+                label: entry.description.to_owned(),
+                detail: self.keymap.binding(entry.scope, entry.command),
+                choice: Choice::Command(entry.command),
+            })
+            .collect();
+        self.open_picker(Kind::Commands { recent }, rows, window, cx);
     }
 
     /// Closes the task graph and opens an artifact link in the box's preview pane, focused,

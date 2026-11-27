@@ -571,6 +571,16 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .collect())
     }
 
+    /// Every registered box with the sessions open as its tabs.
+    pub fn registered_boxes(&self) -> Result<Vec<RegisteredBox>> {
+        self.registry.boxes()
+    }
+
+    /// Every live session this daemon hosts.
+    pub fn list_sessions(&self) -> Vec<domain::session::Session> {
+        self.application.list_sessions()
+    }
+
     pub fn select_box(&self, selector: &str) -> Result<String> {
         Ok(select_box(&self.registry.boxes()?, selector)?
             .info

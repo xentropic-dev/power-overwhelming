@@ -1,4 +1,7 @@
-use crate::{gui::agent_tree::AgentTree, keymap::Shortcut};
+use crate::{
+    gui::agent_tree::AgentTree,
+    keymap::{Command, Shortcut},
+};
 use domain::{session::Session, talk::AgentTalkSummary};
 use gpui::{prelude::*, *};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
@@ -20,6 +23,8 @@ use std::{
 };
 
 const MAX_COMPLETIONS: usize = 50;
+/// Score added to recently run commands so they rank near the top among good matches.
+const RECENT_BONUS: u32 = 24;
 /// How deep and how wide the recursive directory search goes below the query's parent.
 const WALK_DEPTH: usize = 6;
 const WALK_LIMIT: usize = 30_000;
@@ -72,6 +77,11 @@ pub enum Kind {
     ColorSchemes {
         first_run: bool,
     },
+    /// The command palette. Rows are box and tab commands in table order; `recent` lists the
+    /// most recently run, newest first.
+    Commands {
+        recent: Vec<Command>,
+    },
 }
 
 #[derive(Clone)]
@@ -90,6 +100,7 @@ pub enum Choice {
     Setup(bool),
     ColorScheme(&'static Scheme),
     Link(String),
+    Command(Command),
 }
 
 #[derive(Clone)]
@@ -155,6 +166,8 @@ pub struct Picker {
     walk_request: Option<(PathBuf, usize)>,
     completions: Vec<Completion>,
     help_matches: Vec<usize>,
+    /// Palette rows in display order, each with whether it was run recently.
+    command_order: Vec<(usize, bool)>,
     matcher: Matcher,
 }
 
@@ -181,6 +194,7 @@ impl Kind {
             } => "Shell integration",
             Self::ColorSchemes { first_run: true } => "Choose a color scheme",
             Self::ColorSchemes { first_run: false } => "Color schemes",
+            Self::Commands { .. } => "Commands",
         }
     }
 
@@ -197,6 +211,7 @@ impl Kind {
             Self::Help(_) => Some("Search shortcuts"),
             Self::Links => Some("Search links"),
             Self::ColorSchemes { .. } => Some("Search color schemes"),
+            Self::Commands { .. } => Some("Run a command…"),
             Self::End { .. } | Self::Setup { .. } | Self::StatusActions(_) | Self::RunLink => None,
         }
     }
@@ -212,6 +227,11 @@ impl Picker {
             Config::DEFAULT.match_paths()
         } else {
             Config::DEFAULT
+        };
+        let matcher = Matcher::new(matcher_config);
+        let command_order = match &kind {
+            Kind::Commands { recent } => order_commands(&rows, recent, ""),
+            _ => Vec::new(),
         };
         Self {
             id,
@@ -237,7 +257,8 @@ impl Picker {
             walk_request: None,
             completions: Vec::new(),
             help_matches,
-            matcher: Matcher::new(matcher_config),
+            command_order,
+            matcher,
         }
     }
 
@@ -529,6 +550,23 @@ impl Picker {
                 })
                 .collect();
         }
+        if let Kind::Commands { .. } = &self.kind {
+            return self
+                .command_order
+                .iter()
+                .map(|&(index, recent)| {
+                    let mut row = self.rows[index].clone();
+                    if recent {
+                        row.detail = if row.detail.is_empty() {
+                            "Recent".to_owned()
+                        } else {
+                            format!("Recent · {}", row.detail)
+                        };
+                    }
+                    row
+                })
+                .collect();
+        }
         if self.completes_paths() && !self.query.is_empty() {
             return self
                 .completions
@@ -547,23 +585,7 @@ impl Picker {
                 .into_iter()
                 .collect();
         }
-        let mut rows: Vec<Row> = self
-            .rows
-            .iter()
-            .filter(|row| {
-                query.split_whitespace().all(|word| {
-                    row.label.to_lowercase().contains(word)
-                        || row.detail.to_lowercase().contains(word)
-                        || matches!(row.choice, Choice::ColorScheme(scheme) if scheme.aliases.iter().any(|alias| alias.to_lowercase().contains(word)))
-                })
-            })
-            .cloned()
-            .collect();
-        if matches!(self.kind, Kind::Runs { .. }) {
-            // Run IDs are UUIDs, so short queries match them by accident. Prefer title matches.
-            rows.sort_by_key(|row| !title_matches(&row.label, &query));
-        }
-        rows
+        fuzzy_rows(&self.rows, &self.query)
     }
 
     /// The run under the selection in the run picker.
@@ -746,6 +768,9 @@ impl Picker {
                 self.selected = tree.search(&self.query, &mut self.matcher);
                 self.scroll.scroll_to_item(self.selected);
             }
+            Kind::Commands { recent } => {
+                self.command_order = order_commands(&self.rows, recent, &self.query);
+            }
             _ => self.refresh_completions(),
         }
     }
@@ -879,6 +904,12 @@ impl Picker {
             let rows = std::mem::take(&mut visible);
             let selected = self.selected;
             let select = select.clone();
+            let query = self.query.clone();
+            let matched = HighlightStyle {
+                color: Some(rgb(colors.accent).into()),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            };
             let height = px(30. * rows.len().min(10) as f32);
             uniform_list("scheme-options", rows.len(), move |range, _, _| {
                 range
@@ -898,7 +929,15 @@ impl Picker {
                             .cursor_pointer()
                             .when(index == selected, |row| row.bg(rgb(colors.raised)))
                             .hover(|row| row.bg(rgb(colors.raised)))
-                            .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+                            .child(
+                                div().flex_1().min_w_0().truncate().child(
+                                    StyledText::new(row.label.clone()).with_highlights(
+                                        fuzzy_highlights(&query, &row.label)
+                                            .into_iter()
+                                            .map(|range| (range, matched)),
+                                    ),
+                                ),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -934,11 +973,19 @@ impl Picker {
         });
         let rows = visible.into_iter().enumerate().map(|(index, row)| {
             let select = select.clone();
-            let highlights = completing
-                .then(|| self.completions.get(index))
-                .flatten()
-                .map(|completion| completion.highlights.clone())
-                .unwrap_or_default();
+            let highlights = if completing {
+                self.completions
+                    .get(index)
+                    .map(|completion| completion.highlights.clone())
+                    .unwrap_or_default()
+            } else {
+                fuzzy_highlights(&self.query, &row.label)
+            };
+            let detail_highlights = if completing {
+                Vec::new()
+            } else {
+                fuzzy_highlights(&self.query, &row.detail)
+            };
             let matched = HighlightStyle {
                 color: Some(rgb(colors.accent).into()),
                 font_weight: Some(FontWeight::BOLD),
@@ -961,7 +1008,9 @@ impl Picker {
                             .text_xs()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(row.detail),
+                            .child(StyledText::new(row.detail).with_highlights(
+                                detail_highlights.into_iter().map(|range| (range, matched)),
+                            )),
                     )
                 })
                 .on_click(move |_, window, cx| select(index, window, cx))
@@ -1178,6 +1227,42 @@ fn search_shortcuts(shortcuts: &[Shortcut], query: &str, matcher: &mut Matcher) 
         .collect();
     matches.sort_by_key(|&(_, score)| Reverse(score));
     matches.into_iter().map(|(index, _)| index).collect()
+}
+
+/// Orders command palette rows. With an empty query the recent commands come first, newest
+/// first, then the rest in table order. Otherwise rows are ranked like every other picker
+/// (see [`fuzzy_rank`]), with a small bonus for recent commands among rows matched the same
+/// way. Returns row indices, each with whether its command is recent.
+fn order_commands(rows: &[Row], recent: &[Command], query: &str) -> Vec<(usize, bool)> {
+    let is_recent =
+        |row: &Row| matches!(row.choice, Choice::Command(command) if recent.contains(&command));
+    if query.trim().is_empty() {
+        let first: Vec<usize> = recent
+            .iter()
+            .filter_map(|command| {
+                rows.iter().position(
+                    |row| matches!(row.choice, Choice::Command(other) if other == *command),
+                )
+            })
+            .collect();
+        let rest = (0..rows.len()).filter(|index| !first.contains(index));
+        return first
+            .iter()
+            .map(|&index| (index, true))
+            .chain(rest.map(|index| (index, false)))
+            .collect();
+    }
+    let mut matches = fuzzy_rank(rows, query);
+    for (index, (_, score)) in &mut matches {
+        if is_recent(&rows[*index]) {
+            *score += RECENT_BONUS;
+        }
+    }
+    matches.sort_by_key(|&(index, rank)| (Reverse(rank), index));
+    matches
+        .into_iter()
+        .map(|(index, _)| (index, is_recent(&rows[index])))
+        .collect()
 }
 
 fn directory_row(label: String, path: &Path, query: &str) -> Row {
@@ -1453,9 +1538,10 @@ pub fn worktree_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        Entry, Rank, Run, Shortcut, display_path, path_match, run_detail, search_shortcuts, walk,
-        worktree_target,
+        Choice, Entry, Rank, Row, Run, Shortcut, display_path, order_commands, path_match,
+        run_detail, search_shortcuts, walk, worktree_target,
     };
+    use crate::keymap::{Command, Keymap};
     use infrastructure::client::Coordinator;
 
     #[test]
@@ -1548,6 +1634,111 @@ mod tests {
         assert!(search("zzz").is_empty());
     }
 
+    fn palette_rows(keymap: &Keymap) -> Vec<Row> {
+        keymap
+            .palette_entries()
+            .into_iter()
+            .map(|entry| Row {
+                label: entry.description.to_owned(),
+                detail: keymap.binding(entry.scope, entry.command),
+                choice: Choice::Command(entry.command),
+            })
+            .collect()
+    }
+
+    fn ordered(rows: &[Row], recent: &[Command], query: &str) -> Vec<(Command, bool)> {
+        order_commands(rows, recent, query)
+            .into_iter()
+            .map(|(index, recent)| match rows[index].choice {
+                Choice::Command(command) => (command, recent),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn palette_lists_recent_commands_first_then_table_order() {
+        let keymap = Keymap::default();
+        let rows = palette_rows(&keymap);
+        let table: Vec<_> = ordered(&rows, &[], "")
+            .into_iter()
+            .map(|(command, recent)| {
+                assert!(!recent);
+                command
+            })
+            .collect();
+        assert_eq!(
+            table[..3],
+            [Command::BoxNew, Command::BoxPick, Command::BoxDetach]
+        );
+        assert_eq!(table.len(), rows.len());
+        let recent = [Command::TabNext, Command::BoxRuns, Command::Reload];
+        let order = ordered(&rows, &recent, "");
+        assert_eq!(
+            order[..4],
+            [
+                (Command::TabNext, true),
+                (Command::BoxRuns, true),
+                (Command::Reload, true),
+                (Command::BoxNew, false),
+            ]
+        );
+        assert_eq!(order.len(), rows.len());
+        assert_eq!(
+            order
+                .iter()
+                .filter(|(command, _)| *command == Command::BoxRuns)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn palette_filters_fuzzily_and_boosts_recent_commands() {
+        let keymap = Keymap::default();
+        let rows = palette_rows(&keymap);
+        let order = ordered(&rows, &[], "colsch");
+        assert_eq!(order.first(), Some(&(Command::BoxColorScheme, false)));
+        assert!(ordered(&rows, &[], "zzzzqx").is_empty());
+        // "tab" matches many commands; a recent one moves up among them.
+        let plain = ordered(&rows, &[], "new tab");
+        assert_eq!(plain.first(), Some(&(Command::TabNew, false)));
+        let worktree = plain
+            .iter()
+            .position(|(command, _)| *command == Command::TabWorktree)
+            .unwrap();
+        let boosted = ordered(&rows, &[Command::TabWorktree], "new tab");
+        let boosted_at = boosted
+            .iter()
+            .position(|(command, _)| *command == Command::TabWorktree)
+            .unwrap();
+        assert!(
+            boosted_at < worktree || worktree == 0,
+            "{plain:?} {boosted:?}"
+        );
+        assert!(boosted[boosted_at].1);
+    }
+
+    #[test]
+    fn palette_ranks_like_other_pickers() {
+        let keymap = Keymap::default();
+        let rows = palette_rows(&keymap);
+        // Label matches beat matches that need the binding, even for a recent command.
+        let order = ordered(&rows, &[Command::BoxNew], "reload");
+        assert_eq!(order.first(), Some(&(Command::Reload, false)));
+        // A binding-only query still finds the command.
+        let order = ordered(&rows, &[], "ctrl+b then p");
+        assert!(
+            order
+                .iter()
+                .all(|(command, _)| *command != Command::Palette)
+        );
+        assert!(!order.is_empty());
+        // fzf syntax: an exact-prefix atom.
+        let order = ordered(&rows, &[], "^quit");
+        assert_eq!(order, [(Command::Quit, false)]);
+    }
+
     #[test]
     fn path_match_prefers_the_final_component() {
         let rank = |query, relative| matches(query, relative).unwrap().0;
@@ -1607,18 +1798,111 @@ mod tests {
     }
 }
 
-fn title_matches(title: &str, query: &str) -> bool {
-    let title = title.to_lowercase();
-    query.split_whitespace().all(|word| title.contains(word))
+/// Fuzzy-filters rows with nucleo (fzf syntax, smart case). Rows whose label matches on its own
+/// rank first, so run titles beat accidental hits inside UUIDs or details. Ties keep list order.
+fn fuzzy_rows(rows: &[Row], query: &str) -> Vec<Row> {
+    if query.trim().is_empty() {
+        return rows.to_vec();
+    }
+    let mut ranked = fuzzy_rank(rows, query);
+    ranked.sort_by_key(|&(index, rank)| (Reverse(rank), index));
+    ranked
+        .into_iter()
+        .map(|(index, _)| rows[index].clone())
+        .collect()
+}
+
+/// The rows that the fuzzy `query` matches, in list order, each with its rank: whether the
+/// label matches on its own, then the nucleo score. Higher ranks sort first.
+fn fuzzy_rank(rows: &[Row], query: &str) -> Vec<(usize, (bool, u32))> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buffer = Vec::new();
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let label = pattern.score(Utf32Str::new(row.label.trim(), &mut buffer), &mut matcher);
+            let rank = match label {
+                Some(score) => (true, score),
+                None => {
+                    let mut text = format!("{} {}", row.label, row.detail);
+                    if let Choice::ColorScheme(scheme) = &row.choice {
+                        for alias in scheme.aliases.iter() {
+                            text.push(' ');
+                            text.push_str(alias);
+                        }
+                    }
+                    (
+                        false,
+                        pattern.score(Utf32Str::new(&text, &mut buffer), &mut matcher)?,
+                    )
+                }
+            };
+            Some((index, rank))
+        })
+        .collect()
+}
+
+/// Byte ranges of `text` that the fuzzy `query` matches, for highlighting. Empty when it doesn't match.
+fn fuzzy_highlights(query: &str, text: &str) -> Vec<Range<usize>> {
+    let query = query.trim();
+    if query.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut indices = Vec::new();
+    let mut buffer = Vec::new();
+    match pattern.indices(Utf32Str::new(text, &mut buffer), &mut matcher, &mut indices) {
+        Some(_) => byte_ranges(text, indices),
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]
-mod run_search_tests {
-    use super::title_matches;
+mod fuzzy_row_tests {
+    use super::{Choice, Row, fuzzy_rows};
+
+    fn row(label: &str, detail: &str) -> Row {
+        Row {
+            label: label.into(),
+            detail: detail.into(),
+            choice: Choice::NewBox,
+        }
+    }
+
+    fn labels(rows: &[Row], query: &str) -> Vec<String> {
+        fuzzy_rows(rows, query)
+            .into_iter()
+            .map(|row| row.label)
+            .collect()
+    }
 
     #[test]
-    fn title_matches_need_every_word_in_the_title() {
-        assert!(title_matches("Acceptance 2", "acceptance 2"));
-        assert!(!title_matches("Acceptance 1", "acceptance 2"));
+    fn matches_partial_and_scattered_words() {
+        let rows = [row("Acceptance tests", ""), row("Refactor picker", "")];
+        assert_eq!(labels(&rows, "accep"), ["Acceptance tests"]);
+        assert_eq!(labels(&rows, "rfpk"), ["Refactor picker"]);
+        assert_eq!(labels(&rows, "acc tst"), ["Acceptance tests"]);
+    }
+
+    #[test]
+    fn highlights_cover_the_matched_characters() {
+        assert_eq!(
+            super::fuzzy_highlights("acc", "Acceptance"),
+            [std::ops::Range { start: 0, end: 3 }]
+        );
+        assert_eq!(super::fuzzy_highlights("rfp", "Refactor picker").len(), 3);
+        assert!(super::fuzzy_highlights("zzz", "Acceptance").is_empty());
+    }
+
+    #[test]
+    fn label_matches_beat_detail_matches() {
+        let rows = [row("Other", "acceptance"), row("Acceptance 2", "")];
+        assert_eq!(labels(&rows, "acceptance"), ["Acceptance 2", "Other"]);
     }
 }

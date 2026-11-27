@@ -864,7 +864,12 @@ fn report_model(name: Option<String>) -> Result<()> {
         .map(str::trim)
         .find(|name| !name.is_empty());
     if let (Some(session), Some(name)) = (caller_session(), name) {
-        client::set_model(session, name.to_owned())?;
+        client::set_model(session.clone(), name.to_owned())?;
+        let windows = infrastructure::usage::claude_status_line_windows(&payload);
+        if !windows.is_empty() {
+            // Best effort: the model report above is what the status line is for.
+            let _ = client::set_usage(session, name, &windows);
+        }
     }
     Ok(())
 }

@@ -303,6 +303,7 @@ impl Fixture {
             active_box: Some(BOX_ID.into()),
             onboarded: true,
             color_scheme: None,
+            recent_commands: Vec::new(),
         };
         fs::write(
             state.join("boxes.json"),
@@ -3104,4 +3105,107 @@ fn restart_check_names_the_daemon_on_the_callers_socket() {
     let elsewhere = restart_check(other.path(), &[]);
     assert!(elsewhere.status.success(), "{elsewhere:?}");
     assert!(elsewhere.stdout.is_empty(), "{elsewhere:?}");
+}
+
+#[test]
+fn overview_counts_runs_workers_terminals_and_attached_tabs() {
+    let fixture = Fixture::new();
+    let overview = || -> Value {
+        let mut reply = fixture.request(json!({"request": "overview"}));
+        let mut line = String::new();
+        reply.read_line(&mut line).unwrap();
+        let mut response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["event"], "overview", "{response}");
+        response["overview"].take()
+    };
+    let empty = overview();
+    assert_eq!(empty["runs"], json!([]));
+    assert_eq!(
+        empty["totals"],
+        json!({"agents_working": 0, "terminals": 0, "attached": 0})
+    );
+    assert!(empty["system"]["mem_total"].as_u64().unwrap() > 0);
+
+    let run = fixture.create_run().id;
+    json_output(fixture.apply(
+        &run,
+        json!([
+            {"id": "alpha", "title": "First"},
+            {"id": "beta", "title": "Second", "deps": ["alpha"]},
+            {"id": "gamma", "title": "Third", "deps": ["beta"]}
+        ]),
+    ));
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "alpha",
+        &fixture.worktrees[0],
+        false,
+        &["success", "alpha-go", "Alpha result", "alpha-exit"],
+    ));
+    let session = agent.session.clone().unwrap();
+
+    let working = overview();
+    let runs = working["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["run"], run.as_str());
+    assert_eq!(runs[0]["box_id"], BOX_ID);
+    assert_eq!(runs[0]["title"], "Fixture run");
+    assert_eq!(
+        (
+            &runs[0]["completed"],
+            &runs[0]["total"],
+            &runs[0]["workers"]
+        ),
+        (&json!(0), &json!(3), &json!(1))
+    );
+    assert_eq!(runs[0]["status"], "active");
+    // Nothing has succeeded yet, so there is no estimate.
+    assert_eq!(runs[0].get("eta_secs"), None);
+    assert_eq!(
+        working["totals"],
+        json!({"agents_working": 1, "terminals": 1, "attached": 0})
+    );
+    assert_eq!(
+        working["boxes"],
+        json!([{
+            "id": BOX_ID,
+            "name": "box-repo",
+            "terminals": 1,
+            "attached": 0,
+            "agents_working": 1,
+            "runs_active": 1
+        }])
+    );
+    // Command workers have no provider usage.
+    assert_eq!(working["usage"], json!([]));
+
+    fixture.release("alpha-go");
+    fixture.wait_for_state(&run, "alpha", TaskState::Completed);
+    // The worker's session is still open, now as a tab in the box.
+    let state = fixture.root().join("state/boxes.json");
+    let mut layout: Layout = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    layout.boxes[0]
+        .views
+        .push(infrastructure::boxes::SavedView {
+            session: session.clone(),
+            worktree: fixture.worktrees[0].clone(),
+        });
+    fs::write(&state, serde_json::to_vec(&layout).unwrap()).unwrap();
+
+    let done = overview();
+    let runs = done["runs"].as_array().unwrap();
+    assert_eq!(
+        (&runs[0]["completed"], &runs[0]["workers"]),
+        (&json!(1), &json!(0))
+    );
+    // Two dependent tasks remain, one after the other, each as long as the first.
+    assert!(runs[0]["eta_secs"].is_u64(), "{done}");
+    assert_eq!(
+        done["totals"],
+        json!({"agents_working": 0, "terminals": 1, "attached": 1})
+    );
+    assert_eq!(done["boxes"][0]["terminals"], 1);
+    assert_eq!(done["boxes"][0]["attached"], 1);
+    assert_eq!(done["boxes"][0]["agents_working"], 0);
+    fixture.release("alpha-exit");
 }
