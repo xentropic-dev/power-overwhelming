@@ -1,6 +1,6 @@
 use crate::{
-    Application, BranchStatus, RestoreChoice, Scheduler, SessionOptions, StartSession,
-    TerminalRuntime, WorktreeRoot,
+    Application, BranchStatus, RestoreChoice, Scheduler, SessionOptions, SessionRecord,
+    StartSession, TerminalRuntime, WorktreeRoot,
 };
 use anyhow::{Context, Result, bail, ensure};
 use domain::{
@@ -294,6 +294,22 @@ struct FinishedCleanup {
     teardown: Arc<dyn Scheduler>,
     /// Forgets each ended session's record afterwards.
     persistence: Arc<dyn Scheduler>,
+}
+
+/// What `admit_restored` decided.
+struct Admission {
+    /// Attempts left to restore and reconcile as before.
+    admitted: BTreeMap<String, OpenAttempt>,
+    /// Restored workers over the budget, by session.
+    over: BTreeMap<String, OverBudget>,
+}
+
+/// A restored worker over the budget.
+struct OverBudget {
+    open: OpenAttempt,
+    record: SessionRecord,
+    /// The limit it was over.
+    reason: String,
 }
 
 struct DispatchWorktree {
@@ -1138,6 +1154,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         budget: Option<&WorkerBudget>,
     ) -> Result<DispatchOutcome> {
         let mut created_path = None;
+        // A retry Power queues later keeps the dispatch's worktree mode.
+        let explicit = matches!(command.worktree, WorktreeRequest::Existing { .. });
         let result = self.worker_transaction(|db, launched| {
             let run = load_run(db, &command.run)?;
             let task = find_task(&run, &command.task)?;
@@ -1321,7 +1339,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 }
                 success => success,
             };
-            let attempt = insert_dispatch_attempt(db, &agent, target, start.as_ref().err())?;
+            let attempt =
+                insert_dispatch_attempt(db, &agent, target, explicit, start.as_ref().err())?;
             if let Some(ownership) = ownership {
                 db.insert_worktree(&ownership)?;
             }
@@ -1690,8 +1709,24 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         }
     }
 
-    /// Records that nothing of `session` runs any more.
+    /// Records that nothing of `session` runs any more. A worker held over the budget
+    /// at a restart has its task queued now.
     fn reclaimed(&self, session: &str) -> Result<()> {
+        let held = self.store.read(|db| {
+            Ok(db
+                .open_attempts(Some(session))?
+                .into_iter()
+                .find(|open| open.attempt.detail.as_deref() == Some(BUDGET_HOLD_DETAIL)))
+        })?;
+        if let Some(open) = held
+            && let Some(record) = self.application.session_record(session)?
+        {
+            self.requeue_over_budget(&OverBudget {
+                open,
+                record,
+                reason: BUDGET_HOLD_REASON.into(),
+            })?;
+        }
         let finished = self.write(|db| {
             let stopping = db.stopping_sessions()?.contains(session);
             let Some(agent) = db.session_agent(session)? else {
@@ -1721,12 +1756,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         B: 'static,
         I: 'static,
     {
+        // Open attempts in dispatch order, which breaks ties in the budget's ordering.
         let (open, finished, stopping): (
-            BTreeMap<String, OpenAttempt>,
+            Vec<(String, OpenAttempt)>,
             BTreeSet<String>,
             BTreeSet<String>,
         ) = self.store.read(|db| {
-            let open: BTreeMap<_, _> = db
+            let open: Vec<_> = db
                 .open_attempts(None)?
                 .into_iter()
                 .filter_map(|open| Some((open.attempt.session.clone()?, open)))
@@ -1737,19 +1773,24 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 .into_iter()
                 .filter(|agent| agent.attempt.is_some())
                 .filter_map(|agent| agent.session)
-                .filter(|session| !open.contains_key(session))
+                .filter(|session| !open.iter().any(|(open, _)| open == session))
                 .collect();
             Ok((open, finished, db.stopping_sessions()?))
         })?;
-        let (open, queued) = self.admit_restored(open, &stopping)?;
-        let active: BTreeMap<String, OpenAttempt> = open
+        let Admission { admitted, over } = self.admit_restored(open, &stopping)?;
+        let active: BTreeMap<String, OpenAttempt> = admitted
             .into_iter()
             .filter(|(_, open)| open.attempt.state == AttemptState::Active)
             .collect();
+        // Restore asks about a session only after ending what an earlier daemon left of
+        // it, so an over-budget task is queued only once nothing of it runs.
         let restore = self.application.restore_sessions_deferring(|session| {
             if stopping.contains(session) {
                 RestoreChoice::Forget("it was stopped")
-            } else if queued.contains(session) {
+            } else if let Some(over) = over.get(session) {
+                if let Err(error) = self.requeue_over_budget(over) {
+                    eprintln!("Could not queue the task of session {session}. {error:#}");
+                }
                 RestoreChoice::Forget("the worker budget is full, so its task was queued")
             } else if finished.contains(session) {
                 RestoreChoice::Forget("its DAG attempt already finished")
@@ -1758,6 +1799,15 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             }
         })?;
         let (restored, mut deferred) = (restore.restored, restore.deferred);
+        let held: Vec<&OverBudget> = deferred
+            .iter()
+            .filter_map(|session| over.get(session))
+            .collect();
+        self.hold_over_budget(&held)?;
+        let held: Vec<String> = held
+            .iter()
+            .filter_map(|over| over.open.attempt.session.clone())
+            .collect();
         // A stopped session that is not deferred has nothing left running, so its
         // attempt ends. A fenced session with no record left is reclaimed by ID, so
         // a lost record never hides what still runs. The fence lifts only once the
@@ -1796,7 +1846,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .filter_map(|session| active.get(&session.id))
             .collect();
         let restored: Vec<_> = restored.into_iter().map(|session| session.id).collect();
-        self.reconcile_with(&restored, &deferred, &resumed)?;
+        self.reconcile_with(&restored, &deferred, &held, &resumed)?;
         self.reapply_pauses(&restored)?;
         for session in deferred {
             self.schedule_reclaim(session);
@@ -1807,41 +1857,66 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(restored)
     }
 
-    /// Holds restored workers to the worker budget. Workers waiting on input count first
-    /// and always come back, so their requests stay visible. Active workers follow, most
-    /// recently started first, while the budget has room. Each one past the budget has
-    /// its attempt interrupted and its task queued for a retry in the same worktree, so
-    /// it starts through the dispatch queue's claim path once capacity frees up. Returns
-    /// the attempts left to restore and the sessions whose task was queued.
+    /// Holds restored workers to the worker budget, without writing anything. Stopped
+    /// sessions are never relaunched but stay fenced, so they take their slots first.
+    /// Workers waiting on input are admitted next, then active workers, each group most
+    /// recently started first, with ties broken by dispatch order, while
+    /// `WorkerBudget::limit` has room under both the worker counts and the memory floor.
+    /// Every other worker is over the budget. Its task is queued only once restore has
+    /// ended what still runs of it, so a retry never starts beside it. Command workers
+    /// are never relaunched or replayed, and sessions without a record cannot be
+    /// relaunched, so the reconcile interrupts both and they take no slot.
     fn admit_restored(
         &self,
-        open: BTreeMap<String, OpenAttempt>,
+        open: Vec<(String, OpenAttempt)>,
         stopping: &BTreeSet<String>,
-    ) -> Result<(BTreeMap<String, OpenAttempt>, BTreeSet<String>)> {
+    ) -> Result<Admission> {
         let Some(budget) = self.worker_budget()? else {
-            return Ok((open, BTreeSet::new()));
+            return Ok(Admission {
+                admitted: open.into_iter().collect(),
+                over: BTreeMap::new(),
+            });
         };
         let memory = self
             .budget
             .as_ref()
             .and_then(|(_, memory)| budget.min_available_memory.and(memory.available_memory()));
-        // A command worker is never relaunched, so the reconcile interrupts it and it
-        // takes no slot.
-        let (commands, open): (Vec<_>, Vec<_>) = open
+        // One snapshot of the session records, indexed by ID.
+        let mut records: BTreeMap<String, SessionRecord> = self
+            .application
+            .records
+            .list()?
             .into_iter()
-            .partition(|(_, open)| open.attempt.provider == Provider::Command);
-        let (mut admitted, mut candidates): (Vec<_>, Vec<_>) =
-            open.into_iter().partition(|(session, open)| {
-                stopping.contains(session) || open.attempt.state != AttemptState::Active
-            });
-        candidates.sort_by(|(_, a), (_, b)| {
-            b.attempt
-                .started_at
-                .cmp(&a.attempt.started_at)
-                .then_with(|| b.attempt.id.cmp(&a.attempt.id))
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let mut admitted = Vec::new();
+        let mut candidates = Vec::new();
+        for (order, (session, open)) in open.into_iter().enumerate() {
+            if stopping.contains(&session) {
+                admitted.push((session, open));
+            } else if open.attempt.provider == Provider::Command || !records.contains_key(&session)
+            {
+                // Takes no slot. Kept out of the load below.
+                candidates.push((false, order, session, open));
+            } else {
+                candidates.push((true, order, session, open));
+            }
+        }
+        let (launchable, passthrough): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(|(launch, ..)| *launch);
+        let mut launchable: Vec<_> = launchable
+            .into_iter()
+            .map(|(_, order, session, open)| (order, session, open))
+            .collect();
+        launchable.sort_by(|(a_order, _, a), (b_order, _, b)| {
+            let waiting = |open: &OpenAttempt| open.attempt.state == AttemptState::NeedsInput;
+            waiting(b)
+                .cmp(&waiting(a))
+                .then_with(|| b.attempt.started_at.cmp(&a.attempt.started_at))
+                .then_with(|| b_order.cmp(a_order))
         });
-        let mut over = Vec::new();
-        for (session, candidate) in candidates {
+        let mut over = BTreeMap::new();
+        for (_, session, candidate) in launchable {
             let load = WorkerLoad {
                 total: admitted.len(),
                 run: admitted
@@ -1856,81 +1931,131 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             };
             match budget.limit(load) {
                 None => admitted.push((session, candidate)),
-                Some(limit) => over.push((session, candidate, limit)),
+                Some(limit) => {
+                    let record = records.remove(&session).expect("checked above");
+                    over.insert(
+                        session,
+                        OverBudget {
+                            open: candidate,
+                            record,
+                            reason: limit.to_string(),
+                        },
+                    );
+                }
             }
         }
-        let mut queued = BTreeSet::new();
-        for (session, candidate, limit) in over {
-            let Some(record) = self.application.session_record(&session)? else {
-                // Nothing to relaunch from. The reconcile interrupts the attempt.
-                admitted.push((session, candidate));
-                continue;
-            };
-            let args = record
-                .args
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
-            let entry = QueuedDispatch {
-                id: self.new_id(),
-                run: candidate.run.clone(),
-                task: candidate.task.clone(),
-                provider: candidate.attempt.provider.clone(),
-                worktree: WorktreeRequest::Existing {
-                    path: candidate.attempt.worktree.clone(),
+        Ok(Admission {
+            admitted: admitted
+                .into_iter()
+                .chain(
+                    passthrough
+                        .into_iter()
+                        .map(|(_, _, session, open)| (session, open)),
+                )
+                .collect(),
+            over,
+        })
+    }
+
+    /// Queues a retry of an over-budget restored worker, whose processes are known to be
+    /// gone, and interrupts its attempt. The retry keeps the dispatch's provider, args and
+    /// worktree mode. Returns whether the task was queued.
+    fn requeue_over_budget(&self, over: &OverBudget) -> Result<bool> {
+        let OverBudget {
+            open,
+            record,
+            reason,
+        } = over;
+        let args = record
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let id = self.new_id();
+        let detail = match (&open.attempt.state, &open.attempt.blocker) {
+            (AttemptState::NeedsInput, Some(blocker)) => {
+                format!("{BUDGET_RESTART_DETAIL}. It was waiting on input: {blocker}")
+            }
+            _ => BUDGET_RESTART_DETAIL.to_owned(),
+        };
+        self.write(|db| {
+            let worktree = if open.attempt.explicit_worktree
+                || !db
+                    .find_worktree_by_path(&open.attempt.worktree)?
+                    .is_some_and(|worktree| worktree.box_id == open.box_id)
+            {
+                WorktreeRequest::Existing {
+                    path: open.attempt.worktree.clone(),
                     // The dispatch already chose this worktree.
                     allow_main_checkout: true,
-                },
+                }
+            } else {
+                WorktreeRequest::RetryManaged
+            };
+            if db.queued_dispatch(&open.run, &open.task)?.is_some() {
+                return Ok(false);
+            }
+            // The attempt as stored now, so a report since the snapshot wins.
+            let Some(mut attempt) = db
+                .open_attempts(open.attempt.session.as_deref())?
+                .into_iter()
+                .map(|open| open.attempt)
+                .find(|attempt| attempt.id == open.attempt.id)
+            else {
+                return Ok(false);
+            };
+            if !attempt.interrupt(&detail, now()) {
+                return Ok(false);
+            }
+            db.update_attempt(&attempt)?;
+            db.event(
+                &open.run,
+                RunEventKind::AttemptInterrupted,
+                Some(&open.task),
+                Some(&attempt.id),
+                Some(&detail),
+            )?;
+            db.insert_queued(&QueuedDispatch {
+                id,
+                run: open.run.clone(),
+                task: open.task.clone(),
+                provider: attempt.provider.clone(),
+                worktree,
                 retry: true,
                 args,
                 caller: None,
                 queued_at: now(),
-            };
-            let reason = limit.to_string();
-            let requeued = self.write(|db| {
-                let managed = db
-                    .find_worktree_by_path(&candidate.attempt.worktree)?
-                    .is_some_and(|worktree| worktree.box_id == candidate.box_id);
-                let entry = QueuedDispatch {
-                    worktree: if managed {
-                        WorktreeRequest::RetryManaged
-                    } else {
-                        entry.worktree.clone()
-                    },
-                    ..entry.clone()
-                };
-                if db.queued_dispatch(&entry.run, &entry.task)?.is_some() {
-                    return Ok(false);
-                }
-                let mut attempt = candidate.attempt.clone();
-                if !attempt.interrupt(BUDGET_RESTART_DETAIL, now()) {
-                    return Ok(false);
-                }
-                db.update_attempt(&attempt)?;
-                db.event(
-                    &entry.run,
-                    RunEventKind::AttemptInterrupted,
-                    Some(&entry.task),
-                    Some(&attempt.id),
-                    Some(BUDGET_RESTART_DETAIL),
-                )?;
-                db.insert_queued(&entry)?;
-                db.event(
-                    &entry.run,
-                    RunEventKind::TaskQueued,
-                    Some(&entry.task),
-                    None,
-                    Some(&reason),
-                )?;
-                Ok(true)
             })?;
-            if requeued {
-                queued.insert(session);
-            } else {
-                admitted.push((session, candidate));
+            db.event(
+                &open.run,
+                RunEventKind::TaskQueued,
+                Some(&open.task),
+                None,
+                Some(reason),
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Marks the attempts of over-budget workers whose earlier processes could not be
+    /// ended. Each stays open and counts toward the budget, and its task is queued once
+    /// a reclaim confirms the processes are gone.
+    fn hold_over_budget(&self, held: &[&OverBudget]) -> Result<()> {
+        self.write(|db| {
+            for over in held {
+                let mut attempt = over.open.attempt.clone();
+                attempt.detail = Some(BUDGET_HOLD_DETAIL.into());
+                db.update_attempt(&attempt)?;
+                eprintln!(
+                    "Holding task {} of run {} until what still runs of session {} ends. {}",
+                    over.open.task,
+                    over.open.run,
+                    attempt.session.as_deref().unwrap_or_default(),
+                    over.reason
+                );
             }
-        }
-        Ok((admitted.into_iter().chain(commands).collect(), queued))
+            Ok(())
+        })
     }
 
     /// A restored session starts running again, so an agent that was paused before
@@ -1989,16 +2114,19 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Reconciles like `reconcile`, and records `AttemptResumed` for each attempt in
     /// `resumed`, whose worker was told to continue.
     fn reconcile_restored(&self, restored: &[String], resumed: &[&OpenAttempt]) -> Result<()> {
-        self.reconcile_with(restored, &[], resumed)
+        self.reconcile_with(restored, &[], &[], resumed)
     }
 
     /// Reconciles like `reconcile_restored`. An agent of a session in `running`, whose
     /// earlier processes could not be ended, stays running until a reclaim ends them,
-    /// though its open attempt is interrupted since no daemon follows it.
+    /// though its open attempt is interrupted since no daemon follows it. One in `held`
+    /// also keeps its open attempt, which counts toward the budget until the reclaim
+    /// queues its task.
     fn reconcile_with(
         &self,
         restored: &[String],
         running: &[String],
+        held: &[String],
         resumed: &[&OpenAttempt],
     ) -> Result<()> {
         let restored_ids = restored;
@@ -2018,7 +2146,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             // a reclaim confirms its tree is gone.
             let stopping = db.stopping_sessions()?;
             interrupt(db, None, RESTART_DETAIL, &|session| {
-                restored(session) || session.is_some_and(|session| stopping.contains(session))
+                restored(session)
+                    || session.is_some_and(|session| {
+                        stopping.contains(session) || held.iter().any(|id| id == session)
+                    })
             })?;
             for open in resumed {
                 db.event(
@@ -2394,6 +2525,7 @@ fn insert_dispatch_attempt(
     db: &dyn DagTransaction,
     agent: &ManagedAgent,
     target: WorkerAttempt,
+    explicit_worktree: bool,
     error: Option<&anyhow::Error>,
 ) -> Result<Attempt> {
     let attempt = Attempt {
@@ -2417,6 +2549,7 @@ fn insert_dispatch_attempt(
         paused: false,
         stalled: false,
         artifacts: Vec::new(),
+        explicit_worktree,
     };
     db.insert_agent(agent)?;
     db.insert_attempt(&target.run, &target.task, &attempt)?;
@@ -2476,6 +2609,11 @@ const STOP_DETAIL: &str = "stopped by Power";
 const RESTART_DETAIL: &str = "daemon restarted; session unavailable";
 const RESUME_DETAIL: &str = "daemon restarted; session resumed and told to continue";
 const BUDGET_RESTART_DETAIL: &str = "daemon restarted over the worker budget; task queued to retry";
+/// The detail of an over-budget restored attempt whose earlier processes still run.
+const BUDGET_HOLD_DETAIL: &str = "daemon restarted over the worker budget; the task is queued to \
+     retry once what still runs of this worker ends";
+const BUDGET_HOLD_REASON: &str =
+    "the daemon restarted over the worker budget and the previous worker has now ended";
 
 /// What a worker whose session was resumed after a daemon restart is told.
 fn continuation_prompt(open: &OpenAttempt) -> String {

@@ -3712,24 +3712,35 @@ fn an_attempt_that_reports_while_it_is_sampled_is_not_flagged_stalled() -> Resul
     Ok(())
 }
 
-#[test]
-fn restore_brings_back_the_budgets_worth_of_workers_and_queues_the_rest() -> Result<()> {
-    let application = application();
+/// A DAG whose worker budget allows `max` workers, with `memory` GiB free, and a run
+/// with `tasks` dispatched to coding-agent workers in `worktree`, in order.
+fn budget_restart(
+    workspace: FakeWorkspace,
+    max: usize,
+    min_memory: Option<u64>,
+    memory_gib: u64,
+    tasks: &[&str],
+) -> Result<(TestDag, String, BTreeMap<String, DispatchResult>)> {
+    let application = application_with_workspace(workspace);
     let caller = application.start_session(StartSession {
         worktree: "/worktree".into(),
         agent: Agent::Coding("claude".into()),
     })?;
     let memory = FakeMemory::default();
-    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    memory
+        .0
+        .store(memory_gib * domain::dag::GIB, Ordering::Relaxed);
     let dag = TestDag::new(
         application,
         MemoryStore::default(),
         FakeRegistry(vec![caller.id.clone()]),
         FakeIcons::default(),
     )
+    .with_worktree_root(FakeWorktreeRoot)
     .with_worker_budget(
         FixedBudget(WorkerBudget {
-            max_active_workers: Some(2),
+            max_active_workers: Some(max),
+            min_available_memory: min_memory.map(|gib| gib * domain::dag::GIB),
             ..WorkerBudget::default()
         }),
         memory,
@@ -3742,83 +3753,225 @@ fn restore_brings_back_the_budgets_worth_of_workers_and_queues_the_rest() -> Res
         "Restart".into(),
         None,
     )?;
-    let tasks = ["a", "b", "c", "d", "blocked"];
-    dag.add_tasks(&run.id, &tasks.map(|id| spec(id, &[])))?;
+    dag.add_tasks(
+        &run.id,
+        &tasks.iter().map(|id| spec(id, &[])).collect::<Vec<_>>(),
+    )?;
     let mut attempts = BTreeMap::new();
     for task in tasks {
         let started = dag.start(Dispatch {
-            task: task.into(),
+            task: (*task).into(),
             provider: Provider::Agent("claude".into()),
-            args: Vec::new(),
+            args: vec!["--model".into(), "opus".into()],
             caller: Some(caller.id.clone()),
             budget: BudgetMode::Override,
             ..command(&run.id, false)
         })?;
-        attempts.insert(task, started);
+        attempts.insert((*task).to_owned(), started);
     }
-    dag.report(
-        &run.id,
-        "blocked",
-        &attempts["blocked"].attempt.id,
-        ReportStatus::NeedsInput,
-        "question",
-    )?;
+    Ok((dag, run.id, attempts))
+}
+
+/// Points every saved session at a real directory, so restore can relaunch it.
+fn restorable(dag: &TestDag) -> Result<tempfile::TempDir> {
     let worktree = tempfile::tempdir()?;
     for mut record in dag.application.records.list()? {
         record.worktree = worktree.path().into();
         dag.application.records.save(&record)?;
     }
+    Ok(worktree)
+}
+
+fn tasks_in(run: &Run, state: TaskState) -> Vec<String> {
+    run.tasks
+        .iter()
+        .filter(|task| task.state == state)
+        .map(|task| task.id.clone())
+        .collect()
+}
+
+fn session_of(result: &DispatchResult) -> String {
+    result.agent.session.clone().unwrap()
+}
+
+#[test]
+fn restore_admits_waiting_workers_under_the_budget_and_queues_the_overflow_visibly() -> Result<()> {
+    let (dag, run, attempts) =
+        budget_restart(FakeWorkspace::default(), 2, None, 64, &["a", "b", "c"])?;
+    for task in ["a", "b", "c"] {
+        dag.report(
+            &run,
+            task,
+            &attempts[task].attempt.id,
+            ReportStatus::NeedsInput,
+            &format!("question {task}"),
+        )?;
+    }
+    let _worktree = restorable(&dag)?;
 
     let restored = dag.restore()?;
 
-    // The worker waiting on input counts and stays, so one active worker fits.
-    let snapshot = dag.run(&run.id)?;
-    let in_state = |state: TaskState| {
-        snapshot
-            .tasks
-            .iter()
-            .filter(|task| task.state == state)
-            .map(|task| task.id.clone())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(in_state(TaskState::NeedsInput), ["blocked"]);
-    let working = in_state(TaskState::Working);
-    assert_eq!(working.len(), 1, "{working:?}");
-    let queued = in_state(TaskState::Queued);
-    assert_eq!(queued.len(), 3, "{queued:?}");
-    assert!(restored.contains(&attempts["blocked"].agent.session.clone().unwrap()));
-    assert!(restored.contains(&attempts[working[0].as_str()].agent.session.clone().unwrap()));
-    for task in &queued {
-        let session = attempts[task.as_str()].agent.session.clone().unwrap();
-        assert!(
-            !restored.contains(&session),
-            "{task} was restored over budget"
-        );
-        let attempt = find_task(&snapshot, task)?.attempts.last().unwrap().clone();
-        assert_eq!(attempt.state, AttemptState::Interrupted);
-    }
+    // Most recent first, so the earliest dispatch is the one over the budget.
+    let snapshot = dag.run(&run)?;
+    assert_eq!(tasks_in(&snapshot, TaskState::NeedsInput), ["b", "c"]);
+    assert_eq!(tasks_in(&snapshot, TaskState::Queued), ["a"]);
+    assert!(!restored.contains(&session_of(&attempts["a"])));
+    let interrupted = find_task(&snapshot, "a")?.attempts.last().unwrap().clone();
+    assert_eq!(interrupted.state, AttemptState::Interrupted);
+    // The overflowed question stays on record.
+    assert!(
+        interrupted
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("question a")),
+        "{interrupted:?}"
+    );
+    let queued = dag.store.read(|db| db.queued_dispatches())?;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].args, ["--model", "opus"]);
     assert_eq!(dag.start_queued()?, 0, "A queued task started over budget");
+    Ok(())
+}
 
-    // A report frees a slot, and the queue starts a retry in the same worktree.
-    let working_attempt = attempts[working[0].as_str()].attempt.id.clone();
+#[test]
+fn restore_below_the_memory_floor_queues_waiting_workers_too() -> Result<()> {
+    let (dag, run, attempts) =
+        budget_restart(FakeWorkspace::default(), 4, Some(8), 1, &["a", "b"])?;
     dag.report(
-        &run.id,
-        &working[0],
-        &working_attempt,
+        &run,
+        "a",
+        &attempts["a"].attempt.id,
+        ReportStatus::NeedsInput,
+        "question",
+    )?;
+    let _worktree = restorable(&dag)?;
+
+    let restored = dag.restore()?;
+
+    for task in ["a", "b"] {
+        assert!(
+            !restored.contains(&session_of(&attempts[task])),
+            "{restored:?}"
+        );
+    }
+    assert_eq!(tasks_in(&dag.run(&run)?, TaskState::Queued), ["a", "b"]);
+    Ok(())
+}
+
+#[test]
+fn an_over_budget_worker_that_still_runs_keeps_its_slot_until_a_reclaim_ends_it() -> Result<()> {
+    let (dag, run, attempts) = budget_restart(FakeWorkspace::default(), 1, None, 64, &["a", "b"])?;
+    dag.add_tasks(&run, &[spec("c", &[])])?;
+    let _worktree = restorable(&dag)?;
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(true, Ordering::Release);
+
+    dag.restore()?;
+
+    // The older worker is over the budget, but what ran of it could not be ended, so its
+    // attempt stays open and nothing retries it.
+    let snapshot = dag.run(&run)?;
+    let held = find_task(&snapshot, "a")?.attempts.last().unwrap().clone();
+    assert_eq!(held.state, AttemptState::Active);
+    assert_eq!(held.detail.as_deref(), Some(BUDGET_HOLD_DETAIL));
+    assert!(dag.store.read(|db| db.queued_dispatches())?.is_empty());
+    // The other worker's attempt ended, which frees its slot, yet the held worker still
+    // counts, so new work queues and nothing starts.
+    assert_eq!(
+        find_task(&snapshot, "b")?.attempts.last().unwrap().state,
+        AttemptState::Interrupted
+    );
+    let outcome = dag.dispatch(Dispatch {
+        task: "c".into(),
+        ..command(&run, false)
+    })?;
+    assert!(matches!(outcome, DispatchOutcome::Queued { .. }));
+    assert_eq!(dag.start_queued()?, 0);
+    assert_eq!(find_task(&dag.run(&run)?, "a")?.attempts.len(), 1);
+
+    // Once a reclaim ends it, its task queues to retry and one worker starts.
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(false, Ordering::Release);
+    dag.reclaimed(&session_of(&attempts["a"]))?;
+    let snapshot = dag.run(&run)?;
+    assert_eq!(
+        find_task(&snapshot, "a")?.attempts.last().unwrap().state,
+        AttemptState::Interrupted
+    );
+    assert_eq!(tasks_in(&snapshot, TaskState::Queued), ["a", "c"]);
+    assert_eq!(dag.start_queued()?, 1);
+    Ok(())
+}
+
+#[test]
+fn a_queued_restart_retry_keeps_an_explicit_worktree_whose_branch_changed() -> Result<()> {
+    let workspace = FakeWorkspace::default();
+    let (dag, run, _) = budget_restart(workspace.clone(), 1, None, 64, &[])?;
+    dag.add_tasks(&run, &[spec("setup", &[]), spec("a", &[]), spec("b", &[])])?;
+    // A Power-managed worktree that a later dispatch names with --worktree.
+    let created = dag.start(Dispatch {
+        task: "setup".into(),
+        ..new_worktree(&run, "feature", Some("main"))
+    })?;
+    dag.report(
+        &run,
+        "setup",
+        &created.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let managed = created.worktree.clone();
+    let mut started = BTreeMap::new();
+    for task in ["a", "b"] {
+        let result = dag.start(Dispatch {
+            task: task.into(),
+            provider: Provider::Agent("claude".into()),
+            args: Vec::new(),
+            budget: BudgetMode::Override,
+            worktree: WorktreeRequest::Existing {
+                path: managed.clone(),
+                allow_main_checkout: false,
+            },
+            ..command(&run, false)
+        })?;
+        assert!(result.attempt.explicit_worktree);
+        started.insert(task, result);
+    }
+    // The worktree now has another branch checked out, so Power no longer owns it.
+    {
+        let mut git = workspace.0.lock().unwrap();
+        git.branches.insert("feature".into(), None);
+        git.branches.insert("other".into(), Some(managed.clone()));
+    }
+    let _worktree = restorable(&dag)?;
+
+    dag.restore()?;
+    let queued = dag.store.read(|db| db.queued_dispatches())?;
+    assert_eq!(queued.len(), 1);
+    assert!(
+        matches!(&queued[0].worktree, WorktreeRequest::Existing { path, .. } if path == &managed),
+        "{:?}",
+        queued[0].worktree
+    );
+    dag.report(
+        &run,
+        "b",
+        &started["b"].attempt.id,
         ReportStatus::Success,
         "done",
     )?;
     assert_eq!(dag.start_queued()?, 1);
-    let snapshot = dag.run(&run.id)?;
-    let started: Vec<_> = snapshot
-        .tasks
-        .iter()
-        .filter(|task| task.state == TaskState::Working)
-        .collect();
-    assert_eq!(started.len(), 1);
-    let retry = started[0].attempts.last().unwrap();
+    let retry = find_task(&dag.run(&run)?, "a")?
+        .attempts
+        .last()
+        .unwrap()
+        .clone();
     assert_eq!(retry.number, 2);
-    assert_eq!(retry.worktree, Path::new("/worktree"));
-    assert_eq!(retry.provider, Provider::Agent("claude".into()));
+    assert_eq!(retry.worktree, managed);
+    assert!(retry.explicit_worktree);
     Ok(())
 }

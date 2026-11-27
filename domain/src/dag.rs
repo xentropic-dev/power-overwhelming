@@ -236,6 +236,9 @@ pub struct Attempt {
     /// Artifacts published from the attempt's session, in publish order, newest last.
     /// Derived from the artifact store when a run is read; never persisted with the run.
     pub artifacts: Vec<AttemptArtifact>,
+    /// Whether the dispatch named an existing worktree with `--worktree`, rather than
+    /// creating or reusing a Power-managed one. A retry Power starts keeps that mode.
+    pub explicit_worktree: bool,
 }
 
 /// An artifact published from an attempt's session.
@@ -837,6 +840,7 @@ mod tests {
             ended_at: None,
             paused,
             stalled: false,
+            explicit_worktree: false,
             artifacts: Vec::new(),
         };
         let run_with = |state, paused| {

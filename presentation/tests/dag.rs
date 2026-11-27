@@ -2626,6 +2626,75 @@ fn worker_budget_queues_past_max_active_workers_and_starts_on_report() {
 }
 
 #[test]
+fn a_restart_never_replays_command_workers_and_drains_the_queue_within_the_budget() {
+    // Power never replays a command's argv, so command workers that a restart ended are
+    // interrupted, not relaunched or requeued. The queue then refills the budget, and
+    // drains as the new workers report.
+    let mut fixture = Fixture::with_configure(|root| {
+        write_config(root, "dag.max_active_workers = 2\n");
+    });
+    let run = fixture.create_run();
+    for id in ["one", "two", "three", "four", "five"] {
+        fixture.add_task(&run.id, id);
+    }
+    let worktree = fixture.worktrees[0].clone();
+    for id in ["one", "two"] {
+        dispatched(fixture.dispatch(
+            &run.id,
+            id,
+            &worktree,
+            false,
+            &["success", &format!("{id}.go"), id],
+        ));
+        fixture.wait_for_worker(&format!("{id}.go"));
+    }
+    for id in ["three", "four", "five"] {
+        let queued = json_output(fixture.dispatch(
+            &run.id,
+            id,
+            &worktree,
+            false,
+            &["success", &format!("{id}.go"), id],
+        ));
+        assert_eq!(queued["queued"], true, "{queued}");
+    }
+
+    fixture.restart();
+
+    for id in ["one", "two"] {
+        let task = fixture.wait_for_state(&run.id, id, TaskState::Interrupted);
+        assert_eq!(task.attempts.len(), 1, "{id} was replayed");
+    }
+    fixture.wait_for_state(&run.id, "three", TaskState::Working);
+    fixture.wait_for_state(&run.id, "four", TaskState::Working);
+    fixture.wait_for_worker("three.go");
+    fixture.wait_for_worker("four.go");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        task(&fixture.show(&run.id), "five").state,
+        TaskState::Queued,
+        "a queued task started over the budget after the restart"
+    );
+    // The released markers of the ended workers must not start anything again.
+    for id in ["one", "two"] {
+        fixture.release(&format!("{id}.go"));
+    }
+
+    fixture.release("three.go");
+    fixture.wait_for_state(&run.id, "three", TaskState::Completed);
+    fixture.wait_for_state(&run.id, "five", TaskState::Working);
+    for id in ["four", "five"] {
+        fixture.release(&format!("{id}.go"));
+        fixture.wait_for_state(&run.id, id, TaskState::Completed);
+    }
+    for id in ["one", "two"] {
+        let task = task(&fixture.show(&run.id), id).clone();
+        assert_eq!(task.state, TaskState::Interrupted);
+        assert_eq!(task.attempts.len(), 1, "{id} was replayed");
+    }
+}
+
+#[test]
 fn a_persisted_queued_worker_that_reports_at_once_starts_after_the_socket_listens() {
     let mut fixture = Fixture::with_configure(|root| {
         write_config(root, "dag.max_active_workers = 1\n");

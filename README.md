@@ -221,7 +221,7 @@ dag = {
 
 The defaults are 4 workers and 4 GiB.
 
-A daemon restart holds restored workers to the same budget. Workers waiting on input come back first and count. Active workers follow, most recently started first, while the budget has room. Each one past it has its attempt interrupted and its task queued to retry in the same worktree, so it starts like any queued dispatch once a worker reports. Command workers are never relaunched, so they take no slot.
+A daemon restart holds restored workers to the same budget, including its memory floor. Stopped workers that still run keep their slots. Workers waiting on input are admitted next, then active workers, each most recently started first, while the budget has room. Each worker past it has its attempt interrupted, with any question it was waiting on kept in the attempt's detail, and its task queued to retry with the same provider, arguments and worktree, so it starts like any queued dispatch once a worker reports. A worker whose earlier processes could not be ended keeps its open attempt and its slot, and its task is queued only after a reclaim confirms they are gone. Command workers are never relaunched or replayed, since their command can be anything: the restart interrupts them, frees their slots, and the queue starts waiting tasks in their place.
 
 `power dag create` and `power dag show` return the run and a `pwr://dag/<run-id>` link. Coordinators share that link verbatim on its own line when they create or reopen a run. Click the link or open it with Ctrl+S then `o` to see the live graph.
 

@@ -750,6 +750,9 @@ pub struct Attempt {
     /// Artifacts published from the attempt's session, in publish order, newest last.
     #[serde(default)]
     pub artifacts: Vec<AttemptArtifact>,
+    /// Whether the dispatch named an existing worktree with `--worktree`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explicit_worktree: bool,
 }
 
 /// An artifact published from an attempt's session.
@@ -1427,6 +1430,7 @@ mod dag_dto {
         ended_at,
         paused,
         stalled,
+        explicit_worktree,
     } lists { artifacts });
     impl From<dag::AttemptArtifact> for AttemptArtifact {
         fn from(value: dag::AttemptArtifact) -> Self {
