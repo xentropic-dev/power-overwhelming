@@ -7,7 +7,7 @@ mod workspace_talk;
 
 use self::{agent_tree::AgentTree, dag_view::DagView};
 use crate::{
-    keymap::{Command, Keymap, Scope},
+    keymap::{Command, Keymap, PluginCommandId, Scope},
     picker::{Choice, Kind, Picker, Row, worktree_target},
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
@@ -33,7 +33,10 @@ use infrastructure::{
     client::{
         self, Attempt, ManagedAgent, ManagedWorktree, Run, Task, WorktreeCreator, WorktreeScope,
     },
-    plugins::ActiveView,
+    plugins::{
+        ActiveView,
+        panel::{PanelPlugins, PanelUpdate},
+    },
     shell::{self, Shell},
     theme::{self, Colors, Scheme},
     workspace::{
@@ -276,6 +279,8 @@ struct Workspace {
     hinting: Option<Entity<TerminalView>>,
     /// Set while a prefix is pending or hints are up, so terminals drop input-method text.
     input_hold: InputHold,
+    /// Panel plugins: their commands are in the keymap and they draw panels.
+    panels: PanelPlugins,
     _bar_config: Subscription,
 }
 
@@ -354,8 +359,16 @@ impl Workspace {
         Self::watch_box_icons(window, cx);
         let dag_refresh = Self::watch_dag(window, cx);
         let talk_refresh = Self::watch_talk(window, cx);
-        let status_bar =
-            cx.new(|cx| StatusBar::new(window, cx, Settings::defaults(), Settings::from_sections));
+        let panels = Self::watch_panels(window, cx);
+        let status_bar = cx.new(|cx| {
+            StatusBar::new(
+                window,
+                cx,
+                Settings::defaults(),
+                Settings::from_sections,
+                panels.clone(),
+            )
+        });
         let bar_config = cx.subscribe_in(
             &status_bar,
             window,
@@ -415,6 +428,7 @@ impl Workspace {
             hinting: None,
             main_checkouts: HashMap::new(),
             config_error: None,
+            panels,
             _bar_config: bar_config,
         }
     }
@@ -809,6 +823,50 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Starts the panel plugin host and handles the effects of plugin commands.
+    fn watch_panels(window: &mut Window, cx: &mut Context<Self>) -> PanelPlugins {
+        let (panels, updates) = PanelPlugins::start(infrastructure::config::directory());
+        cx.spawn_in(window, async move |app, cx| {
+            while let Ok(update) = updates.recv().await {
+                if app
+                    .update_in(cx, |this, window, cx| match update {
+                        PanelUpdate::OpenPanel {
+                            panel_id,
+                            refresh_ms,
+                        } => this.open_panel(panel_id, refresh_ms, window, cx),
+                        // Panels draw in the panel view, which renders them on request.
+                        PanelUpdate::Panel { .. } => {}
+                        PanelUpdate::Error(error) => this.show_error(error, cx),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        panels
+    }
+
+    /// Runs a plugin command. Its effect arrives through `watch_panels`.
+    fn invoke_plugin(&mut self, id: PluginCommandId) {
+        if let Some(entry) = self.keymap.plugin(id) {
+            self.panels.invoke(entry.name.clone());
+        }
+    }
+
+    /// Opens a panel a plugin asked for. The panel view that draws it hooks in here.
+    fn open_panel(
+        &mut self,
+        panel_id: String,
+        refresh_ms: Option<u32>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = (panel_id, refresh_ms);
+        cx.notify();
     }
 
     /// Reloads a box's icon whenever an agent sets or resets it.
@@ -2898,6 +2956,7 @@ impl Workspace {
             Command::TerminalZoomIn => self.zoom_terminals(Some(1.), cx),
             Command::TerminalZoomOut => self.zoom_terminals(Some(-1.), cx),
             Command::TerminalZoomReset => self.zoom_terminals(None, cx),
+            Command::Plugin(id) => self.invoke_plugin(id),
             _ => {}
         }
     }

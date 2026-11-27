@@ -20,6 +20,8 @@ use std::{
 pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
+/// The key bindings section. Each scope is a table of command names to keys.
+pub const KEYS_SECTION: &str = "keys";
 pub const TALK_SECTION: &str = "talk";
 pub(crate) const WORKTREES_SECTION: &str = "worktrees";
 pub(crate) const DAG_SECTION: &str = "dag";

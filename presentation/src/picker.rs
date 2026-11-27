@@ -1026,7 +1026,7 @@ impl Picker {
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .child(div().min_w_0().child(shortcut.description))
+                    .child(div().min_w_0().child(shortcut.description.clone()))
                     .child(
                         div()
                             .min_w_0()
@@ -1613,15 +1613,15 @@ mod tests {
     fn shortcut_search_matches_command_names_and_bindings() {
         let shortcuts = [
             Shortcut {
-                description: "Next tab",
+                description: "Next tab".into(),
                 binding: "Ctrl+A then n/j".into(),
             },
             Shortcut {
-                description: "Focus the preview pane",
+                description: "Focus the preview pane".into(),
                 binding: "Ctrl+S then v".into(),
             },
             Shortcut {
-                description: "Reload page",
+                description: "Reload page".into(),
                 binding: "In the preview pane: !".into(),
             },
         ];
