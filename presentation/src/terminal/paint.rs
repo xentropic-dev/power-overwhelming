@@ -2,7 +2,7 @@ use super::{
     TerminalView, cell_metrics,
     frame::CellPosition,
     input::register_mouse_exit,
-    runs::{RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
+    runs::{EMOJI_FAMILY, RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
 };
 use gpui::{prelude::*, *};
 use infrastructure::theme::blend;
@@ -69,6 +69,8 @@ impl Render for TerminalView {
                             let grid = metrics.snap(bounds.origin);
                             let text_system = window.text_system().clone();
                             let symbols = text_system.resolve_font(&font(SYMBOLS_FAMILY));
+                            let emoji_font =
+                                super::installed(EMOJI_FAMILY).then(|| font(EMOJI_FAMILY));
                             let primary = text_system.resolve_font(&terminal_font);
                             let has_glyph =
                                 |c: char| text_system.advance(primary, font_size, c).is_ok();
@@ -104,6 +106,7 @@ impl Render for TerminalView {
                                         cell_width: cell_size.width,
                                         cell_height: cell_size.height,
                                         symbols,
+                                        emoji: emoji_font.as_ref(),
                                         has_glyph: &has_glyph,
                                         ligatures,
                                         cursor: frame
