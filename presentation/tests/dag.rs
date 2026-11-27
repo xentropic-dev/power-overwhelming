@@ -1130,6 +1130,77 @@ done
 }
 
 #[test]
+fn planned_provider_and_model_apply_when_dispatch_names_no_provider() {
+    let fixture = Fixture::with_configure(|root| {
+        let program = root.join("codex");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+# Power may add its own arguments, such as a turn hook, around the planned model.
+while [ "$#" -gt 1 ] && [ "$1" != "--model" ]; do shift; done
+test "$1" = "--model"
+test "$2" = "planned-model"
+"$POWER_BIN" dag report success --summary "Ran the plan"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            format!(
+                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
+                program.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    });
+    let run = fixture.create_run().id;
+    assert_success(&fixture.apply(
+        &run,
+        json!([
+            {"id": "planned", "title": "Planned", "provider": "codex", "model": "planned-model"},
+            {"id": "later", "title": "Later", "deps": ["planned"], "provider": "codex", "model": "first"},
+            {"id": "open", "title": "Unplanned"},
+        ]),
+    ));
+    let shown = fixture.json(&["dag", "show", &run]);
+    let tasks = shown["run"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks[0]["provider"], "codex");
+    assert_eq!(tasks[0]["model"], "planned-model");
+    assert_eq!(tasks[2]["provider"], Value::Null);
+    assert_eq!(tasks[2]["model"], Value::Null);
+
+    let replanned = fixture.json(&["dag", "plan", &run, "later", "--model", "second"]);
+    assert_eq!(replanned["run"]["tasks"][1]["provider"], "codex");
+    assert_eq!(replanned["run"]["tasks"][1]["model"], "second");
+    let cleared = fixture.json(&["dag", "plan", &run, "later", "--clear"]);
+    assert_eq!(cleared["run"]["tasks"][1]["model"], Value::Null);
+    assert_eq!(fixture.events(&run, 0, &["task_planned"]).events.len(), 2);
+
+    let worktree = fixture.worktrees[0].to_str().unwrap();
+    let unplanned = output(power(fixture.root()).args([
+        "dag",
+        "dispatch",
+        &run,
+        "open",
+        "--worktree",
+        worktree,
+    ]));
+    assert!(!unplanned.status.success());
+    assert!(String::from_utf8_lossy(&unplanned.stderr).contains("--provider"));
+
+    let (attempt, agent) =
+        dispatched(fixture.command(&["dag", "dispatch", &run, "planned", "--worktree", worktree]));
+    assert_eq!(attempt.provider, Provider::Agent("codex".into()));
+    assert_eq!(attempt.model.as_deref(), Some("planned-model"));
+    assert_eq!(agent.model, attempt.model);
+    fixture.wait_for_state(&run, "planned", TaskState::Completed);
+}
+
+#[test]
 fn background_workers_unlock_dependent_task_only_after_both_succeed() {
     let fixture = Fixture::new();
     let boxes: Vec<BoxInfo> =

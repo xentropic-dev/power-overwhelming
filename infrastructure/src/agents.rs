@@ -239,3 +239,99 @@ fn resume(assign: &[&str], resume: &[&str], resume_last: &[&str], conflicts: &[&
         conflicts: strings(conflicts),
     }
 }
+
+/// The model a conversation currently uses, read from the agent's own session record.
+/// jcode has no model callback and usually starts without `--model`, but every entry it
+/// appends to `$JCODE_HOME/sessions/<id>.journal.jsonl` carries the session's current
+/// model in `meta.model`, and the snapshot `<id>.json` carries it in `model`.
+pub fn conversation_model(agent: &AgentId, conversation: &str) -> Option<String> {
+    if agent.as_str() != "jcode"
+        || conversation.is_empty()
+        || conversation.contains(['/', '\\'])
+        || conversation.starts_with('.')
+    {
+        return None;
+    }
+    let home = jcode_home()?;
+    jcode_session_model(&home.join("sessions"), conversation)
+}
+
+fn jcode_session_model(sessions: &std::path::Path, id: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+
+    let model = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && crate::terminal::valid_metadata(model))
+            .map(str::to_owned)
+    };
+    if let Ok(mut journal) = std::fs::File::open(sessions.join(format!("{id}.journal.jsonl"))) {
+        let len = journal.metadata().ok()?.len();
+        let start = len.saturating_sub(TAIL);
+        let mut tail = Vec::new();
+        if journal.seek(SeekFrom::Start(start)).is_ok() && journal.read_to_end(&mut tail).is_ok() {
+            // A tail that starts mid-file may start mid-line.
+            let lines: Vec<&[u8]> = tail
+                .split(|&byte| byte == b'\n')
+                .skip(usize::from(start > 0))
+                .collect();
+            let found = lines
+                .into_iter()
+                .rev()
+                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+                .find_map(|entry| model(&entry["meta"]["model"]));
+            if found.is_some() {
+                return found;
+            }
+        }
+    }
+    let snapshot = std::fs::read(sessions.join(format!("{id}.json"))).ok()?;
+    model(&serde_json::from_slice::<serde_json::Value>(&snapshot).ok()?["model"])
+}
+
+/// The model of the jcode TUI running as `pid`. jcode names each client's session in
+/// `$JCODE_HOME/client_sessions/<pid>`, so this works however the TUI was started.
+pub(crate) fn jcode_process_model(pid: u32) -> Option<String> {
+    let home = jcode_home()?;
+    let session =
+        std::fs::read_to_string(home.join("client_sessions").join(pid.to_string())).ok()?;
+    conversation_model(&AgentId::from("jcode"), session.trim())
+}
+
+fn jcode_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("JCODE_HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".jcode")))
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn jcode_model_comes_from_the_latest_journal_entry() {
+        let dir = std::env::temp_dir().join(format!("power-jcode-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s1.json"), r#"{"model":"old-snapshot"}"#).unwrap();
+        std::fs::write(
+            dir.join("s1.journal.jsonl"),
+            "{\"meta\":{\"model\":\"first\"}}\n{\"meta\":{\"model\":\"gpt-5.5\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(jcode_session_model(&dir, "s1").as_deref(), Some("gpt-5.5"));
+
+        std::fs::write(dir.join("s2.json"), r#"{"model":"claude-opus-4-6"}"#).unwrap();
+        assert_eq!(
+            jcode_session_model(&dir, "s2").as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(jcode_session_model(&dir, "missing"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(conversation_model(&"claude".into(), "s1"), None);
+        assert_eq!(conversation_model(&"jcode".into(), "../x"), None);
+    }
+}

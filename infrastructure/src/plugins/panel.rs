@@ -39,7 +39,10 @@ pub use bindings::power::panel::types::{
 use bindings::power::panel::types::{Command as WitCommand, CommandScope as WitScope};
 
 /// Components that ship with Power, by name. The dashboard joins this list.
-const BUNDLED: &[(&str, &[u8])] = &[];
+const BUNDLED: &[(&str, &[u8])] = &[(
+    "dashboard",
+    include_bytes!("../../../plugins/dashboard/dashboard.wasm"),
+)];
 
 const MAX_COMMANDS: usize = 32;
 const MAX_KEYS: usize = 8;

@@ -2,10 +2,12 @@
 pub(crate) mod agent_tree;
 #[path = "dag_view.rs"]
 mod dag_view;
+#[path = "panel_view.rs"]
+mod panel_view;
 #[path = "workspace_talk.rs"]
 mod workspace_talk;
 
-use self::{agent_tree::AgentTree, dag_view::DagView};
+use self::{agent_tree::AgentTree, dag_view::DagView, panel_view::PanelView};
 use crate::{
     keymap::{Command, Keymap, PluginCommandId, Scope},
     picker::{Choice, Kind, Picker, Row, worktree_target},
@@ -14,7 +16,8 @@ use crate::{
     status_bar::{ConfigChanged, StatusBar},
     talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{
-        AgentChanged, BarContextChanged, InputHold, OpenLink, TerminalView, load_bundled_fonts,
+        AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, TerminalView,
+        column_width, link_action, load_bundled_fonts, terminal_font_family,
     },
 };
 use anyhow::{Context as _, Result, ensure};
@@ -22,7 +25,6 @@ use application::{ResolveArtifact, StartSession, WorktreeRoot, agents::AgentProf
 use domain::{
     artifact::{ResolvedArtifact, Target},
     dag::{AgentStatus, Coordinator, RunStatus, TaskState},
-    link::dag_run_id,
     session::{Agent, Session},
 };
 use gpui::{prelude::*, *};
@@ -212,16 +214,6 @@ impl DagWorktrees {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum LinkAction<'a> {
-    OpenDag(&'a str),
-    ResolveArtifact,
-}
-
-fn link_action(target: &str) -> LinkAction<'_> {
-    dag_run_id(target).map_or(LinkAction::ResolveArtifact, LinkAction::OpenDag)
-}
-
 struct TerminalTab {
     view: Entity<TerminalView>,
     closing: bool,
@@ -281,6 +273,10 @@ struct Workspace {
     input_hold: InputHold,
     /// Panel plugins: their commands are in the keymap and they draw panels.
     panels: PanelPlugins,
+    /// The open plugin panel, such as the dashboard.
+    panel: Option<PanelView>,
+    /// The plugin command whose effect is pending, so its panel knows its opening key.
+    panel_opener: Option<Command>,
     _bar_config: Subscription,
 }
 
@@ -405,6 +401,8 @@ impl Workspace {
             input_hold: InputHold::default(),
             picker: None,
             dag: None,
+            panel: None,
+            panel_opener: None,
             dag_refresh,
             talk: None,
             talk_refresh,
@@ -836,9 +834,21 @@ impl Workspace {
                             panel_id,
                             refresh_ms,
                         } => this.open_panel(panel_id, refresh_ms, window, cx),
-                        // Panels draw in the panel view, which renders them on request.
-                        PanelUpdate::Panel { .. } => {}
-                        PanelUpdate::Error(error) => this.show_error(error, cx),
+                        PanelUpdate::Panel { panel_id, panel } => {
+                            if let Some(view) =
+                                this.panel.as_mut().filter(|view| view.panel_id == panel_id)
+                            {
+                                view.show(panel);
+                                cx.notify();
+                            }
+                        }
+                        PanelUpdate::Error(error) => match &mut this.panel {
+                            Some(view) => {
+                                view.error = Some(error);
+                                cx.notify();
+                            }
+                            None => this.show_error(error, cx),
+                        },
                     })
                     .is_err()
                 {
@@ -853,20 +863,123 @@ impl Workspace {
     /// Runs a plugin command. Its effect arrives through `watch_panels`.
     fn invoke_plugin(&mut self, id: PluginCommandId) {
         if let Some(entry) = self.keymap.plugin(id) {
+            self.panel_opener = Some(Command::Plugin(id));
             self.panels.invoke(entry.name.clone());
         }
     }
 
-    /// Opens a panel a plugin asked for. The panel view that draws it hooks in here.
+    /// Opens a panel a plugin asked for and keeps it fresh while it stays open.
     fn open_panel(
         &mut self,
         panel_id: String,
         refresh_ms: Option<u32>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let _ = (panel_id, refresh_ms);
+        let opener = self.panel_opener.take();
+        if self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.panel_id == panel_id)
+        {
+            return;
+        }
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        self.picker = None;
+        self.dag = None;
+        let id = self.next_id();
+        self.panel = Some(PanelView::new(
+            id,
+            panel_id,
+            refresh_ms.map(|ms| Duration::from_millis(ms.into())),
+            opener,
+            focus,
+        ));
+        self.poll_panel(id, window, cx);
         cx.notify();
+    }
+
+    /// Reads the overview off the UI thread and asks the plugin to redraw the panel, every
+    /// refresh interval until panel `id` closes.
+    fn poll_panel(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let overview = cx
+                    .background_executor()
+                    .spawn(async { client::overview() })
+                    .await;
+                let refresh = this.update_in(cx, |this, window, cx| {
+                    let columns = this.panel_columns(window, cx);
+                    let scheme = cx.global::<DesktopScheme>().0;
+                    let panel = this.panel.as_mut().filter(|panel| panel.id == id)?;
+                    match overview {
+                        Ok(overview) => {
+                            this.panels
+                                .render(panel.panel_id.clone(), &overview, columns, scheme)
+                        }
+                        Err(error) => {
+                            panel.error = Some(format!("Could not read the overview. {error:#}"));
+                            cx.notify();
+                        }
+                    }
+                    Some(panel.refresh)
+                });
+                let Ok(Some(refresh)) = refresh else {
+                    break;
+                };
+                cx.background_executor().timer(refresh).await;
+            }
+        })
+        .detach();
+    }
+
+    /// The monospace cell width panels lay out in.
+    fn panel_cell(window: &Window, cx: &App) -> Pixels {
+        column_width(
+            window.text_system(),
+            &font(terminal_font_family(cx)),
+            px(panel_view::TEXT_SIZE),
+            window.scale_factor(),
+        )
+    }
+
+    fn panel_columns(&self, window: &Window, cx: &App) -> u32 {
+        PanelView::columns(window.viewport_size().width, Self::panel_cell(window, cx))
+    }
+
+    fn close_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.take().is_some() {
+            self.restore_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Keys while a panel is open. Prefixed commands fall through to the usual handling;
+    /// the one that opened the panel closes it again.
+    fn panel_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stroke = &event.keystroke;
+        if self.prefix.is_some() || self.keymap.command(Scope::Prefix, stroke).is_some() {
+            return false;
+        }
+        cx.stop_propagation();
+        let Some(panel) = &mut self.panel else {
+            return true;
+        };
+        match self.keymap.command(Scope::Panel, stroke) {
+            Some(Command::PanelClose) if !event.is_held => self.close_panel(window, cx),
+            Some(command @ (Command::PanelUp | Command::PanelDown)) => {
+                panel.step(command == Command::PanelUp);
+                cx.notify();
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Reloads a box's icon whenever an agent sets or resets it.
@@ -1307,6 +1420,8 @@ impl Workspace {
             talk.focus(window);
         } else if let Some(dag) = &self.dag {
             dag.focus.focus(window);
+        } else if let Some(panel) = &self.panel {
+            panel.focus.focus(window);
         } else if let Some(picker) = &self.picker {
             picker.focus.focus(window);
         } else if let Some(id) = self
@@ -2616,6 +2731,9 @@ impl Workspace {
             self.talk_key(event, window, cx);
             return;
         }
+        if self.panel.is_some() && self.panel_key(event, window, cx) {
+            return;
+        }
         if let Some(dag) = &mut self.dag {
             cx.stop_propagation();
             if dag.picking_artifact {
@@ -2922,6 +3040,13 @@ impl Workspace {
         {
             self.save();
         }
+        if let Some(panel) = &self.panel {
+            let toggle = panel.opener == Some(command);
+            self.close_panel(window, cx);
+            if toggle {
+                return;
+            }
+        }
         match command {
             Command::Help => self.open_help(window, cx),
             Command::Quit => window.remove_window(),
@@ -3017,6 +3142,7 @@ impl Workspace {
     ) {
         match link_action(&target) {
             LinkAction::OpenDag(run) => self.open_dag_link(run.to_owned(), window, cx),
+            LinkAction::OpenBrowser => cx.open_url(&target),
             LinkAction::ResolveArtifact => {
                 if let Some(box_id) = self.layout.active_box.clone() {
                     self.resolve_in(box_id, session, target, focus_preview, window, cx);
@@ -3431,6 +3557,14 @@ impl Render for Workspace {
                     });
                 })
             });
+        let panel = self.panel.as_ref().map(|panel| {
+            panel.render(
+                colors,
+                &self.keymap,
+                terminal_font_family(cx),
+                Self::panel_cell(window, cx),
+            )
+        });
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
@@ -3460,6 +3594,14 @@ impl Render for Workspace {
             .id("workspace")
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::key_down))
+            // Modifier events follow focus, even when the pointer is over the terminal.
+            .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, _, cx| {
+                if let Some(tab) = this.active_view().and_then(|id| this.terminals.get(&id))
+                    && tab.view.read(cx).pointer_over_link()
+                {
+                    tab.view.update(cx, |_, cx| cx.notify());
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -3563,6 +3705,7 @@ impl Render for Workspace {
             )
             .children(modal)
             .children(graph)
+            .children(panel)
             .children(
                 self.talk
                     .as_ref()
@@ -3678,6 +3821,8 @@ mod tests {
                 title: id.into(),
                 instructions: String::new(),
                 deps: Vec::new(),
+                provider: None,
+                model: None,
                 state,
                 queued_at: None,
                 current_attempt: None,
@@ -3695,18 +3840,31 @@ mod tests {
     }
 
     #[test]
-    fn dag_links_open_runs_directly() {
+    fn terminal_link_destinations_use_their_existing_routes_and_open_web_urls_in_a_browser() {
         assert_eq!(
             link_action("pwr://dag/Run-123"),
             LinkAction::OpenDag("Run-123")
         );
         for target in [
             "pwr://artifact/abc",
+            "power://artifact/abc",
             "pwr://dag/",
             "pwr://dag/a/b",
             "./report.html",
+            "file:///tmp/report.html",
+            "http://localhost:3000/",
+            "https://127.1/",
+            "http://[::1]:80/",
         ] {
             assert_eq!(link_action(target), LinkAction::ResolveArtifact);
+        }
+        for target in [
+            "https://example.com/",
+            "HTTP://example.com/report.html",
+            "http://localhost.example.com/",
+            "https://[2001:db8::1]:8443/view",
+        ] {
+            assert_eq!(link_action(target), LinkAction::OpenBrowser);
         }
     }
 }

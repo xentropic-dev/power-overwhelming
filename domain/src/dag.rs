@@ -15,6 +15,10 @@ pub struct TaskSpec {
     pub title: String,
     pub instructions: String,
     pub deps: Vec<String>,
+    /// Planned provider for dispatches that do not name one.
+    pub provider: Option<Provider>,
+    /// Planned model, passed to the planned provider when dispatch args do not choose one.
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +275,10 @@ pub struct Task {
     pub title: String,
     pub instructions: String,
     pub deps: Vec<String>,
+    /// Planned provider, chosen by the coordinator before dispatch.
+    pub provider: Option<Provider>,
+    /// Planned model. An attempt records the model it actually ran.
+    pub model: Option<String>,
     /// Derived by the daemon from persisted attempts and prerequisite states.
     pub state: TaskState,
     /// Unix seconds, while a dispatch of the task waits for the worker budget.
@@ -301,6 +309,8 @@ pub enum RunEventKind {
     RunCreated,
     TaskAdded,
     TaskReady,
+    /// The task's planned provider or model changed.
+    TaskPlanned,
     AttemptStarted,
     AgentModelChanged,
     AttemptSucceeded,
@@ -807,6 +817,8 @@ mod tests {
                 title: "a".into(),
                 instructions: String::new(),
                 deps: Vec::new(),
+                provider: None,
+                model: None,
                 state: TaskState::Waiting,
                 queued_at: Some(5),
                 current_attempt: None,
@@ -853,6 +865,8 @@ mod tests {
                     title: "a".into(),
                     instructions: String::new(),
                     deps: Vec::new(),
+                    provider: None,
+                    model: None,
                     state: TaskState::Waiting,
                     queued_at: None,
                     current_attempt: None,
@@ -884,6 +898,8 @@ mod tests {
             title: id.into(),
             instructions: String::new(),
             deps: deps.iter().map(|dep| (*dep).into()).collect(),
+            provider: None,
+            model: None,
         }
     }
 

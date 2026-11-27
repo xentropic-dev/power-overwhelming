@@ -13,7 +13,7 @@
 //! `keys.box["dashboard.open"]`. Users rebind them exactly like built-in commands.
 
 use anyhow::{Context as _, Result, bail};
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
@@ -79,7 +79,11 @@ pub enum Command {
     DagArtifact,
     DagStartNow,
     DagClose,
+    PanelUp,
+    PanelDown,
+    PanelClose,
     TabOpenLink,
+    TerminalOpenLink,
     TabPreview,
     TerminalZoomIn,
     TerminalZoomOut,
@@ -99,6 +103,17 @@ pub enum Command {
     PreviewExit,
     HintSearch,
     HintCancel,
+}
+
+impl Command {
+    pub(crate) fn terminal_link(modifiers: Modifiers, requires_control: bool) -> Option<Self> {
+        (!modifiers.shift && (!requires_control || terminal_link_modifier(modifiers)))
+            .then_some(Self::TerminalOpenLink)
+    }
+}
+
+pub(crate) fn terminal_link_modifier(modifiers: Modifiers) -> bool {
+    modifiers.control && !modifiers.shift && !modifiers.alt && !modifiers.platform
 }
 
 /// Where a key press is interpreted.
@@ -122,6 +137,8 @@ pub enum Scope {
     Runs,
     /// On the task graph.
     Dag,
+    /// In a plugin panel, such as the dashboard.
+    Panel,
     /// While the preview pane has focus.
     Preview,
     /// While links on screen show number hints. Digits 1–9 always open a hint.
@@ -142,6 +159,7 @@ impl Scope {
             Self::Talk => "talk",
             Self::Runs => "runs",
             Self::Dag => "dag",
+            Self::Panel => "panel",
             Self::Preview => "preview",
             Self::Hints => "hints",
             Self::Terminal => "terminal",
@@ -314,6 +332,9 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
     entry(S::Dag, "start_now", C::DagStartNow, &["s"], "Start the selected queued task now, over the worker budget"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
+    entry(S::Panel, "up", C::PanelUp, &["k", "up"], "Scroll the panel up"),
+    entry(S::Panel, "down", C::PanelDown, &["j", "down"], "Scroll the panel down"),
+    entry(S::Panel, "close", C::PanelClose, &["escape"], "Close the panel"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
     entry(S::Preview, "close", C::PreviewClose, &["escape", "x"], "Close preview"),
@@ -721,6 +742,7 @@ impl Keymap {
                 Scope::Talk => format!("In talk: {keys}"),
                 Scope::Runs => format!("In the run picker: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
+                Scope::Panel => format!("In panels such as the dashboard: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
                 Scope::Terminal => format!("In the terminal: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
@@ -746,6 +768,23 @@ mod tests {
 
     fn stroke(text: &str) -> Keystroke {
         Keystroke::parse(text).unwrap()
+    }
+
+    #[test]
+    fn terminal_link_click_preserves_selection_and_preview_gestures() {
+        for (modifiers, browser, preview) in [
+            (Modifiers::default(), None, Some(C::TerminalOpenLink)),
+            (
+                stroke("ctrl-a").modifiers,
+                Some(C::TerminalOpenLink),
+                Some(C::TerminalOpenLink),
+            ),
+            (stroke("shift-a").modifiers, None, None),
+            (stroke("ctrl-shift-a").modifiers, None, None),
+        ] {
+            assert_eq!(Command::terminal_link(modifiers, true), browser);
+            assert_eq!(Command::terminal_link(modifiers, false), preview);
+        }
     }
 
     #[test]

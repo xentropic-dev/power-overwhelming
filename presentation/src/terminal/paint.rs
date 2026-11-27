@@ -5,6 +5,7 @@ use super::{
     frame::{CellPosition, Row},
     ime::Preedit,
     input::register_mouse_exit,
+    links::{LinkAction, link_action},
     runs::{FAINT_OPACITY, RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
     sprites,
 };
@@ -165,7 +166,7 @@ impl Render for TerminalView {
         let selection_background = Hsla::from(rgba(scheme.selection_background));
         let terminal_font = self.font.font.clone();
         let block_font = terminal_font.clone();
-        let hovered = self.hovered_span();
+        let hovered = self.hovered_span(window.modifiers());
         let pressed = self.pressed_span();
         let selection = self.selection_range().filter(|_| pressed.is_none());
         let ligatures = self.settings.ligatures;
@@ -292,6 +293,14 @@ impl Render for TerminalView {
                             for (row, line) in frame.rows.iter().enumerate() {
                                 let highlights = &rows[row].highlights;
                                 for link in &line.links {
+                                    // Web links are underlined only while Ctrl-hovered.
+                                    let web =
+                                        line.cells[link.start].link.as_deref().is_some_and(|uri| {
+                                            link_action(uri) == LinkAction::OpenBrowser
+                                        });
+                                    if web && !highlights.hovered.contains(&link.start) {
+                                        continue;
+                                    }
                                     // Cells with an underline of their own keep its style.
                                     let mut column = link.start;
                                     while column < link.end {

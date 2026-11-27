@@ -225,13 +225,36 @@ The defaults are 4 workers and 4 GiB.
 
 Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` to open its agent tree. DAG cards and their details show the latest known model for each attempt. The agent tree displays models and matches them in search. Managed agents and their attempts retain their model after exit. Attach to a worker from either view without interrupting its work. An input request highlights the box and the worker's tab when attached. Answer in that worker's terminal. Its highlight clears when it reports that the request is resolved, and the box highlight clears when its last request is resolved.
 
+## Command palette
+
+Press Ctrl+B then `p` to search every box and tab command by name, including plugin commands. Each row shows its key binding. With an empty search, the three commands you ran most recently come first, whether you ran them from the palette or with their keys. Press Enter to run the selected command.
+
+## Dashboard
+
+Press Ctrl+B then `o` to open the dashboard, or pick "Open dashboard" in the command palette. It shows:
+
+- **Summary**: working agents, terminals, attached and total terminals, CPU, and RAM with a bar.
+- **DAGs**: one line per active or stalled run with its box, title, completed and total tasks, a progress bar, workers, and an estimated time left. Stalled runs use the scheme's error color.
+- **Usage**: rate-limit windows with used share and reset time for each Claude and Codex model in use, or "no data".
+- **Boxes**: terminals attached and total, working agents, and active runs per box.
+
+Press `j`/`k` or the arrows to scroll and Esc, or Ctrl+B then `o` again, to close. It refreshes every 2 seconds while open. Set `dashboard.refresh_ms` in `config.lua` to change that. The dashboard is a [bundled Wasm plugin](plugins/dashboard/README.md).
+
+### Plugin commands
+
+Panel plugins add commands with namespaced ids and default keys. Put components implementing the [panel interface](plugins/wit/panel.wit) in the `plugins` folder next to `config.lua` and press Ctrl+B then `r`. Their commands appear in the command palette and the shortcut help, and you rebind them by id like built-in keys:
+
+```lua
+keys.box["dashboard.open"] = "g"
+```
+
 ## Power-bar
 
 The status bar shows the main checkout, active worktree, and foreground agent type. It also shows the agent's model and task when available. Press Ctrl+S then `y` to copy either full path.
 
 `{dag.progress}` shows a count such as `DAG 1/6 done` on the coordinator's and workers' tabs while the run has ready, working, or input-blocked tasks. If a coordinator has several live runs, its tab shows the newest.
 
-Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok.
+Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok. For jcode, each `power session task`, `power session model` or `power dag report` the agent runs also reads its current model from the jcode session record.
 
 Set `power_bar` in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua` and press Ctrl+B then `r` to reload. The default uses colored Powerline joins and changes the rightmost accent with the active agent. Set `separator` to `""` for rounded joins or to Unicode text such as `" │ "` for a plain separator. Each segment can set an `icon`, foreground, and background. [Bundled defaults](plugins/power-bar/defaults.json)
 
@@ -313,11 +336,13 @@ previews.history = 50          -- artifacts the link search lists, default 20
 
 With `auto_open = "when_pane_open"`, an artifact an agent publishes replaces or joins the previews only when that box already shows its preview pane. With `"always"`, a publish also opens the pane. Auto-open never moves keyboard focus away from the terminal.
 
-The key sections are `prefix`, `box`, `tab`, `picker`, `dialog` (pickers without a search field), `preview`, `hints` and `terminal` (`copy` and `paste` while a terminal has focus). Ctrl+B then `r` reloads the file. If the file has a typo, an unknown command, a clash between two commands, or a value of the wrong type, Power names the entry and keeps the bindings it was already using.
+The key sections are `prefix`, `box`, `tab`, `picker`, `dialog` (pickers without a search field), `dag` (the task graph), `panel` (the dashboard and other plugin panels), `preview`, `hints` and `terminal` (`copy` and `paste` while a terminal has focus). Ctrl+B then `r` reloads the file. If the file has a typo, an unknown command, a clash between two commands, or a value of the wrong type, Power names the entry and keeps the bindings it was already using.
 
 ## Preview an artifact
 
-Click a local PNG, JPEG, WebP, MP4, WebM, or HTML link in the terminal, or open it from the keyboard. Ctrl+S then `o` numbers up to nine links on screen, newest output first. Press `1`–`9` to open and focus a preview, or Esc to back out of the numbered links. Ctrl+S then `o` then `s` searches this box's published artifacts, newest first, along with any other links on screen. Selecting a preview from the search also focuses it. Ctrl+S then `v` focuses the preview pane, including after typing into a web page. In the pane, `h`/`l` switch previews, Esc or `x` closes the active preview, and Tab returns to the terminal with the preview open. Space plays or pauses video, `,`/`.` seek, `j`/`k` scroll a page, `r` reloads it, and `i` types into it. Loopback URLs such as `http://localhost:3000/` open in the same pane. Shift-drag selects text when the terminal app is handling mouse events. Ctrl-Shift-C and Ctrl-Shift-V copy and paste; pastes are bracketed when the program asks. Input methods (Pinyin, Japanese, Korean, dead keys) compose underlined at the cursor, and programs that turn on focus reporting or the Kitty keyboard protocol get focus changes and key releases.
+Click a local PNG, JPEG, WebP, MP4, WebM, or HTML link in the terminal to open a preview. Loopback URLs such as `http://localhost:3000/` open in the same pane. Ctrl-click other HTTP and HTTPS links to open them in your default browser. Hold Ctrl over a link to underline it and show the pointer cursor, even if the link wraps across rows.
+
+Ctrl+S then `o` numbers up to nine links on screen, newest output first. Press `1`–`9` to open a link, or Esc to back out of the numbered links. Ctrl+S then `o` then `s` searches this box's published artifacts, newest first, along with any other links on screen. Opening a preview from either shortcut also focuses it. Ctrl+S then `v` focuses the preview pane, including after typing into a web page. In the pane, `h`/`l` switch previews, Esc or `x` closes the active preview, and Tab returns to the terminal with the preview open. Space plays or pauses video, `,`/`.` seek, `j`/`k` scroll a page, `r` reloads it, and `i` types into it. Shift-drag selects text when the terminal app is handling mouse events. Ctrl-Shift-C and Ctrl-Shift-V copy and paste; pastes are bracketed when the program asks. Input methods (Pinyin, Japanese, Korean, dead keys) compose underlined at the cursor, and programs that turn on focus reporting or the Kitty keyboard protocol get focus changes and key releases.
 
 Run `power skills get power-artifacts` for the full guide to publishing artifacts and sharing their links. From any Power terminal, you can publish a file or a running server.
 

@@ -218,6 +218,8 @@ mod tests {
             title: id.into(),
             instructions: String::new(),
             deps: deps.iter().map(|dep| (*dep).into()).collect(),
+            provider: None,
+            model: None,
             state: TaskState::Waiting,
             queued_at: None,
             current_attempt: None,

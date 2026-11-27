@@ -684,6 +684,12 @@ enum DagAction {
         instructions_file: Option<PathBuf>,
         #[arg(long = "after")]
         deps: Vec<String>,
+        /// Planned coding agent profile ID, or `command`, for dispatches without --provider.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Planned model for the planned provider. Power must know the provider's model flag.
+        #[arg(long, requires = "provider")]
+        model: Option<String>,
     },
     Apply {
         run: String,
@@ -694,6 +700,21 @@ enum DagAction {
         run: String,
         task: String,
         dep: String,
+    },
+    /// Set, change or clear a task's planned provider and model.
+    Plan {
+        run: String,
+        task: String,
+        /// New planned provider. Without --model, it also clears the planned model.
+        #[arg(long)]
+        provider: Option<String>,
+        /// New planned model. An empty value clears it. A model without a provider applies to
+        /// the provider that dispatch names with --provider.
+        #[arg(long)]
+        model: Option<String>,
+        /// Clear the plan before applying --provider and --model.
+        #[arg(long)]
+        clear: bool,
     },
     Ready {
         run: String,
@@ -730,10 +751,14 @@ enum DagAction {
 struct DispatchArgs {
     run: String,
     task: String,
-    /// Coding agent profile ID, or `command` to run an executable directly. Like any
-    /// provider, `command` needs `--allow-main-checkout` to run in the main checkout.
+    /// Coding agent profile ID, or `command` to run an executable directly. Defaults to the
+    /// task's planned provider and model. A provider other than the planned one ignores the
+    /// plan for this attempt. The planned provider itself keeps the planned model unless the
+    /// arguments after -- select a model. A plan with only a model needs --provider and
+    /// launches that provider with the planned model. Like any provider, `command` needs
+    /// `--allow-main-checkout` to run in the main checkout.
     #[arg(long)]
-    provider: String,
+    provider: Option<String>,
     #[command(flatten)]
     worktree: WorktreeArgs,
     /// Fail instead of queueing the task when the worker budget is full.
@@ -838,11 +863,17 @@ fn report_conversation() {
         else {
             continue;
         };
+        let model = infrastructure::agents::conversation_model(&profile.id, &conversation);
         let _ = client::set_conversation(
             session.clone(),
             profile.id.as_str().to_owned(),
             conversation,
         );
+        // An agent without a model callback, like jcode, records its model in its
+        // session, so each report also refreshes the model shown in the bar.
+        if let Some(model) = model {
+            let _ = client::set_model(session.clone(), model);
+        }
     }
 }
 
@@ -1089,7 +1120,7 @@ fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
     Ok(DagRequest::Dispatch {
         run: launch.run,
         task: launch.task,
-        provider: launch.provider.into(),
+        provider: launch.provider.map(Into::into),
         worktree,
         allow_main_checkout,
         retry,
@@ -1203,6 +1234,8 @@ fn run_dag(command: DagAction) -> Result<()> {
             instructions,
             instructions_file,
             deps,
+            provider,
+            model,
         } => {
             let instructions = match instructions_file {
                 Some(file) => std::fs::read_to_string(&file)
@@ -1216,6 +1249,8 @@ fn run_dag(command: DagAction) -> Result<()> {
                     title,
                     instructions,
                     deps,
+                    provider: provider.map(Into::into),
+                    model,
                 }],
             }
         }
@@ -1234,6 +1269,25 @@ fn run_dag(command: DagAction) -> Result<()> {
             }
         }
         DagAction::AddDep { run, task, dep } => DagRequest::AddDependency { run, task, dep },
+        DagAction::Plan {
+            run,
+            task,
+            provider,
+            model,
+            clear,
+        } => {
+            anyhow::ensure!(
+                clear || provider.is_some() || model.is_some(),
+                "Specify --provider, --model or --clear"
+            );
+            DagRequest::PlanTask {
+                run,
+                task,
+                provider: provider.map(Into::into),
+                model,
+                clear,
+            }
+        }
         DagAction::Ready { run } => {
             let (tasks, queued): (Vec<_>, Vec<_>) = protocol_run(run)?
                 .tasks

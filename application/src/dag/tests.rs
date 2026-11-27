@@ -400,11 +400,35 @@ impl DagTransaction for MemoryDb {
                 title: task.title.clone(),
                 instructions: task.instructions.clone(),
                 deps: task.deps.clone(),
+                provider: task.provider.clone(),
+                model: task.model.clone(),
                 state: TaskState::Waiting,
                 queued_at: None,
                 current_attempt: None,
                 attempts: Vec::new(),
             }));
+        Ok(())
+    }
+
+    fn set_task_plan(
+        &self,
+        run: &str,
+        task: &str,
+        provider: Option<&Provider>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let mut records = self.0.borrow_mut();
+        let task = records
+            .runs
+            .iter_mut()
+            .find(|entry| entry.id == run)
+            .context("Unknown run")?
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .context("Unknown task")?;
+        task.provider = provider.cloned();
+        task.model = model.map(str::to_owned);
         Ok(())
     }
 
@@ -799,7 +823,7 @@ fn application_with(
     records: Arc<dyn SessionStore>,
 ) -> Arc<Application<FakeTerminal>> {
     static ID: AtomicU64 = AtomicU64::new(0);
-    let profiles = ["claude", "codex"]
+    let profiles = ["claude", "codex", "custom"]
         .into_iter()
         .map(|id| AgentProfile {
             id: id.into(),
@@ -859,6 +883,8 @@ fn spec(id: &str, deps: &[&str]) -> TaskSpec {
         title: id.into(),
         instructions: format!("Implement {id}"),
         deps: deps.iter().map(|id| (*id).into()).collect(),
+        provider: None,
+        model: None,
     }
 }
 
@@ -866,7 +892,7 @@ fn command(run: &str, retry: bool) -> Dispatch {
     Dispatch {
         run: run.into(),
         task: "work".into(),
-        provider: Provider::Command,
+        provider: Some(Provider::Command),
         worktree: WorktreeRequest::Existing {
             path: "/worktree".into(),
             allow_main_checkout: false,
@@ -904,7 +930,7 @@ fn new_worktree(run: &str, branch: &str, base: Option<&str>) -> Dispatch {
             branch: branch.into(),
             base: base.map(str::to_owned),
         },
-        provider: Provider::Agent("codex".into()),
+        provider: Some(Provider::Agent("codex".into())),
         args: Vec::new(),
         ..command(run, false)
     }
@@ -1126,7 +1152,7 @@ fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> R
     for number in 2..=3 {
         dag.session_exited(previous.session.as_deref().unwrap(), "interrupted", true)?;
         let retry = dag.start(Dispatch {
-            provider: Provider::Agent("codex".into()),
+            provider: Some(Provider::Agent("codex".into())),
             worktree: WorktreeRequest::RetryManaged,
             args: Vec::new(),
             ..command(&run, true)
@@ -1454,7 +1480,7 @@ fn restore_tells_only_workers_with_active_attempts_to_continue() -> Result<()> {
     dag.add_tasks(&run.id, &[spec("work", &[]), spec("blocked", &[])])?;
     let claude = |task: &str| Dispatch {
         task: task.into(),
-        provider: Provider::Agent("claude".into()),
+        provider: Some(Provider::Agent("claude".into())),
         args: Vec::new(),
         caller: Some(caller.id.clone()),
         ..command(&run.id, false)
@@ -1568,7 +1594,7 @@ fn restore_brings_back_only_workers_whose_attempt_is_open() -> Result<()> {
     for task in tasks {
         let dispatched = dag.start(Dispatch {
             task: task.into(),
-            provider: Provider::Agent("claude".into()),
+            provider: Some(Provider::Agent("claude".into())),
             args: Vec::new(),
             caller: Some(caller.id.clone()),
             ..command(&run.id, false)
@@ -2210,7 +2236,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     assert_eq!(live, std::slice::from_ref(&coordinator));
     let worker = dag.start(Dispatch {
         task: "join".into(),
-        provider: Provider::Agent("claude".into()),
+        provider: Some(Provider::Agent("claude".into())),
         caller: Some(caller.id),
         args: vec!["--flag".into()],
         ..command(&run.id, false)
@@ -2503,6 +2529,344 @@ fn box_icons_follow_the_caller_or_selector() -> Result<()> {
     Ok(())
 }
 
+fn planned(id: &str, provider: Option<&str>, model: Option<&str>) -> TaskSpec {
+    TaskSpec {
+        provider: provider.map(|id| Provider::Agent(id.into())),
+        model: model.map(str::to_owned),
+        ..spec(id, &[])
+    }
+}
+
+fn last_launch(dag: &TestDag) -> (Agent, Vec<OsString>) {
+    let launches = dag.application.runtime.launches.lock().unwrap();
+    let (session, options) = launches.last().unwrap();
+    (session.agent.clone(), options.args.clone())
+}
+
+fn planned_dispatch(run: &str, task: &str, provider: Option<&str>, args: &[&str]) -> Dispatch {
+    Dispatch {
+        task: task.into(),
+        provider: provider.map(|id| Provider::Agent(id.into())),
+        args: args.iter().map(|arg| (*arg).into()).collect(),
+        ..command(run, false)
+    }
+}
+
+#[test]
+fn applied_plans_round_trip_and_reject_unusable_models() -> Result<()> {
+    let (dag, run) = setup()?;
+    let shown = dag.add_tasks(
+        &run,
+        &[planned("plan", Some("codex"), Some(" gpt-6.2-sol "))],
+    )?;
+    let task = find_task(&shown, "plan")?;
+    assert_eq!(task.provider, Some(Provider::Agent("codex".into())));
+    assert_eq!(task.model.as_deref(), Some("gpt-6.2-sol"));
+    assert_eq!(find_task(&dag.run(&run)?, "plan")?, task);
+    for bad in [
+        planned("blank", Some("codex"), Some("  ")),
+        TaskSpec {
+            provider: Some(Provider::Command),
+            ..planned("command", None, Some("model"))
+        },
+    ] {
+        assert!(dag.add_tasks(&run, &[bad]).is_err());
+    }
+    assert_eq!(dag.run(&run)?.tasks.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn dispatch_without_a_provider_uses_the_plan() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("codex", Some("codex"), Some("gpt-6.2-sol")),
+            planned("bare", Some("claude"), None),
+            planned("unplanned", None, None),
+        ],
+    )?;
+    let worker = dag.start(planned_dispatch(&run, "codex", None, &["--full-auto"]))?;
+    assert_eq!(worker.attempt.provider, Provider::Agent("codex".into()));
+    assert_eq!(
+        last_launch(&dag),
+        (
+            Agent::Coding("codex".into()),
+            ["--model", "gpt-6.2-sol", "--full-auto"]
+                .map(OsString::from)
+                .into()
+        )
+    );
+    dag.dispatch(planned_dispatch(&run, "bare", None, &[]))?;
+    assert_eq!(last_launch(&dag), (Agent::Coding("claude".into()), vec![]));
+    let error = dag
+        .dispatch(planned_dispatch(&run, "unplanned", None, &[]))
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("--provider"), "{error:#}");
+    Ok(())
+}
+
+#[test]
+fn explicit_providers_and_model_args_override_the_plan() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("other", Some("codex"), Some("gpt")),
+            planned("args", Some("codex"), Some("gpt")),
+        ],
+    )?;
+    dag.dispatch(planned_dispatch(&run, "other", Some("claude"), &[]))?;
+    assert_eq!(last_launch(&dag), (Agent::Coding("claude".into()), vec![]));
+    dag.dispatch(planned_dispatch(&run, "args", None, &["-m=mini"]))?;
+    assert_eq!(last_launch(&dag).1, [OsString::from("-m=mini")]);
+    Ok(())
+}
+
+#[test]
+fn an_explicit_planned_provider_keeps_the_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("same", Some("codex"), Some("gpt")),
+            planned("same-args", Some("codex"), Some("gpt")),
+        ],
+    )?;
+    // Naming the planned provider is not an override: only model arguments replace the model.
+    dag.dispatch(planned_dispatch(
+        &run,
+        "same",
+        Some("codex"),
+        &["--full-auto"],
+    ))?;
+    assert_eq!(
+        last_launch(&dag).1,
+        ["--model", "gpt", "--full-auto"].map(OsString::from)
+    );
+    dag.dispatch(planned_dispatch(
+        &run,
+        "same-args",
+        Some("codex"),
+        &["--model", "mini"],
+    ))?;
+    assert_eq!(last_launch(&dag).1, ["--model", "mini"].map(OsString::from));
+    Ok(())
+}
+
+#[test]
+fn an_attached_model_value_replaces_the_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    let ids = ["short", "short-eq", "long-eq"];
+    dag.add_tasks(
+        &run,
+        &ids.map(|id| planned(id, Some("codex"), Some("plan-model"))),
+    )?;
+    for (id, arg) in ids
+        .into_iter()
+        .zip(["-mother-model", "-m=other-model", "--model=other-model"])
+    {
+        dag.dispatch(planned_dispatch(&run, id, None, &[arg]))?;
+        let args = last_launch(&dag).1;
+        assert_eq!(args, [OsString::from(arg)], "{id}");
+        assert_eq!(
+            domain::agent::requested_model("codex", &args).as_deref(),
+            Some("other-model")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unrelated_args_never_drop_a_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    // Power cannot pass a model to a profile whose model flag it does not know.
+    assert!(
+        dag.add_tasks(&run, &[planned("custom", Some("custom"), Some("big"))])
+            .is_err()
+    );
+    assert!(
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "work".into(),
+            clear: false,
+            provider: Some(Provider::Agent("custom".into())),
+            model: Some("big".into()),
+        })
+        .is_err()
+    );
+    // A plan stored before that check, or a model-only plan dispatched to such a profile,
+    // fails instead of launching without the model.
+    let mut task = find_task(&dag.run(&run)?, "work")?.clone();
+    task.provider = Some(Provider::Agent("custom".into()));
+    task.model = Some("big".into());
+    for args in [vec![], vec!["--verbose".to_owned()]] {
+        let error = planned_launch(&run, &task, None, &args).err().unwrap();
+        assert!(format!("{error:#}").contains("--model ''"), "{error:#}");
+    }
+    task.provider = None;
+    let verbose = ["--verbose".to_owned()];
+    assert!(
+        planned_launch(
+            &run,
+            &task,
+            Some(Provider::Agent("custom".into())),
+            &verbose
+        )
+        .is_err()
+    );
+    assert!(planned_launch(&run, &task, Some(Provider::Command), &verbose).is_err());
+    // Codex adds the planned model in front of unrelated arguments.
+    dag.add_tasks(&run, &[planned("codex", Some("codex"), Some("big"))])?;
+    dag.dispatch(planned_dispatch(&run, "codex", None, &["--verbose"]))?;
+    assert_eq!(
+        last_launch(&dag).1,
+        ["--model", "big", "--verbose"].map(OsString::from)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_model_only_plan_launches_with_an_explicit_provider() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[planned("solo", None, Some("solo-model"))])?;
+    let replanned = dag.plan_task(PlanTask {
+        run: run.clone(),
+        task: "work".into(),
+        clear: false,
+        provider: None,
+        model: Some("work-model".into()),
+    })?;
+    let work = find_task(&replanned, "work")?;
+    assert_eq!(
+        (&work.provider, work.model.as_deref()),
+        (&None, Some("work-model"))
+    );
+    for (task, model) in [("solo", "solo-model"), ("work", "work-model")] {
+        let error = dag
+            .dispatch(planned_dispatch(&run, task, None, &[]))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("Pass --provider"),
+            "{error:#}"
+        );
+        let worker = dag.start(planned_dispatch(
+            &run,
+            task,
+            Some("codex"),
+            &["--full-auto"],
+        ))?;
+        assert_eq!(worker.attempt.provider, Provider::Agent("codex".into()));
+        assert_eq!(
+            last_launch(&dag),
+            (
+                Agent::Coding("codex".into()),
+                ["--model", model, "--full-auto"].map(OsString::from).into()
+            )
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn plans_name_a_known_agent_profile() -> Result<()> {
+    let (dag, run) = setup()?;
+    assert!(
+        dag.add_tasks(&run, &[planned("typo", Some("codx"), None)])
+            .is_err()
+    );
+    assert!(
+        dag.plan_task(PlanTask {
+            run,
+            task: "work".into(),
+            clear: false,
+            provider: Some(Provider::Agent("codx".into())),
+            model: None,
+        })
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn planning_changes_clears_and_reports_the_plan() -> Result<()> {
+    let (dag, run) = setup()?;
+    let plan = |provider: Option<&str>, model: Option<&str>, clear: bool| {
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "work".into(),
+            clear,
+            provider: provider.map(|id| Provider::Agent(id.into())),
+            model: model.map(str::to_owned),
+        })
+        .map(|run| {
+            let task = run.tasks.into_iter().next().unwrap();
+            (task.provider, task.model)
+        })
+    };
+    let codex = Some(Provider::Agent("codex".into()));
+    let claude = Some(Provider::Agent("claude".into()));
+    assert_eq!(
+        plan(Some("codex"), Some("gpt"), false)?,
+        (codex.clone(), Some("gpt".into()))
+    );
+    assert_eq!(
+        plan(None, Some("mini"), false)?,
+        (codex.clone(), Some("mini".into()))
+    );
+    assert_eq!(plan(Some("claude"), None, false)?, (claude.clone(), None));
+    assert_eq!(
+        plan(None, Some("opus"), false)?,
+        (claude.clone(), Some("opus".into()))
+    );
+    assert_eq!(plan(None, Some(""), false)?, (claude.clone(), None));
+    let before = dag.latest_seq()?;
+    assert_eq!(plan(None, None, false)?, (claude, None));
+    assert_eq!(
+        dag.latest_seq()?,
+        before,
+        "an unchanged plan emits no event"
+    );
+    assert_eq!(plan(None, None, true)?, (None, None));
+    assert!(plan(None, Some("x"), false).is_ok());
+    assert!(
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "missing".into(),
+            clear: true,
+            provider: None,
+            model: None,
+        })
+        .is_err()
+    );
+    let summaries: Vec<_> = dag
+        .events(
+            EventScope::Run(&run, &[RunEventKind::TaskPlanned]),
+            0,
+            Duration::ZERO,
+        )?
+        .events
+        .into_iter()
+        .map(|event| event.summary.unwrap())
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            "codex / gpt",
+            "codex / mini",
+            "claude",
+            "claude / opus",
+            "claude",
+            "no plan",
+            "x"
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn runs_sort_active_then_stalled_then_completed_newest_first() {
     let run = |id: &str, created_at: u64, states: &[TaskState]| Run {
@@ -2523,6 +2887,8 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
                 title: String::new(),
                 instructions: String::new(),
                 deps: Vec::new(),
+                provider: None,
+                model: None,
                 state: *state,
                 queued_at: None,
                 current_attempt: None,
