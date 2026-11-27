@@ -26,12 +26,9 @@ use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
     io::BufReader,
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
-        },
+    os::unix::{
+        fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
     },
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -89,6 +86,7 @@ pub fn serve(
     finished_worker_grace: Option<Duration>,
     talk_policy: NoticePolicy,
     budget: LocalWorkerBudget,
+    stall_after: Option<Duration>,
 ) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
@@ -187,6 +185,12 @@ pub fn serve(
         let persistence = TimerScheduler::start("power-forget", scheduler::DEFAULT_CAPACITY)?;
         dag = dag.with_finished_worker_cleanup(grace, Arc::new(teardown), Arc::new(persistence));
     }
+    if let Some(after) = stall_after {
+        dag = dag.with_stall_check(
+            after,
+            crate::stall_probe::LocalWorkerProbe::new(application.clone()),
+        );
+    }
     let dag = dag.shared();
     terminal_application
         .set(Arc::downgrade(&application))
@@ -221,6 +225,7 @@ pub fn serve(
     let talk = talk_adapter::start(application.clone(), store, talk_policy, talk_activity);
     handle_shutdown(application.clone(), shutting_down)?;
     start_queue(dag.clone(), &listener);
+    start_stall_checks(dag.clone());
     // Lets a test hold startup open, as if a later session were still restoring.
     delay_for_tests("POWER_TEST_RESTORE_DELAY_MS");
     startup.open(Arc::new(Server {
@@ -265,6 +270,27 @@ fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
             match dag.events(EventScope::Watch(None), cursor, QUEUE_RECHECK) {
                 Ok(page) => cursor = page.cursor,
                 Err(_) => thread::sleep(QUEUE_RECHECK),
+            }
+        }
+    });
+}
+
+/// Flags idle workers whose builds and tests are not running, so a coordinator sees
+/// them without polling transcripts.
+fn start_stall_checks(dag: Arc<DaemonDag>) {
+    let Some(interval) = dag.stall_interval() else {
+        return;
+    };
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+            match dag.check_stalls() {
+                Ok(stalled) => {
+                    for attempt in stalled {
+                        eprintln!("Attempt {attempt} looks stalled.");
+                    }
+                }
+                Err(error) => eprintln!("Could not check for stalled DAG workers. {error:#}"),
             }
         }
     });
@@ -570,7 +596,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             let value = (!value.is_empty()).then(|| value.to_owned());
             let (send, receive) = mpsc::sync_channel(1);
             application.terminal(&session)?.send(Command::SetMetadata {
-                pid: peer_pid(socket)?,
+                pid: wire::peer_pid(socket)?,
                 field,
                 value,
                 reply: send,
@@ -597,7 +623,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             application
                 .terminal(&session)?
                 .send(Command::SetConversation {
-                    pid: peer_pid(socket)?,
+                    pid: wire::peer_pid(socket)?,
                     agent: Agent::Coding(agent.into()),
                     conversation,
                     reply: send,
@@ -699,28 +725,4 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         }
         Request::Subscribe { .. } => unreachable!("Subscriptions use the streaming handler"),
     }
-}
-
-fn peer_pid(socket: &UnixStream) -> Result<u32> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Linux supplies the credentials of the process that connected to this socket.
-    let result = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    ensure!(
-        length as usize == std::mem::size_of::<libc::ucred>(),
-        "Missing peer credentials"
-    );
-    let credentials = unsafe { credentials.assume_init() };
-    Ok(credentials.pid.try_into()?)
 }

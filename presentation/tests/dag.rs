@@ -2289,6 +2289,11 @@ case "$1" in
     *) exit 2 ;;
 esac
 printf '%s %s\n' "$mode" "$POWER_TASK" >> "$fixture_dir/launches"
+# Records the prompt this launch was given, if any, as the agent would receive it.
+shift 2
+if test "$#" -gt 0; then
+    printf '%s' "$1" > "$fixture_dir/prompt-$mode-$POWER_TASK"
+fi
 case "$mode $POWER_TASK" in
     "fresh finished") "$POWER_BIN" dag report success --summary "Finished before the restart" ;;
     "resume active") "$POWER_BIN" dag report success --summary "Finished after the resume" ;;
@@ -2350,6 +2355,26 @@ exec sleep 600
         ["fresh active", "fresh finished", "resume active"],
         "the finished worker was relaunched or the resumed one restarted fresh"
     );
+    // The resumed worker received the rerun wording as its prompt, and no fresh launch
+    // was given it.
+    let prompt = fs::read_to_string(fixture.root().join("prompt-resume-active"))
+        .expect("the resumed worker received no prompt");
+    for expected in [
+        "Power restarted",
+        "killed every background command",
+        "re-run your background commands",
+        &format!("run {run}"),
+        "task active",
+    ] {
+        assert!(
+            prompt.contains(expected),
+            "{expected:?} missing from {prompt:?}"
+        );
+    }
+    for fresh in ["prompt-fresh-active", "prompt-fresh-finished"] {
+        let given = fs::read_to_string(fixture.root().join(fresh)).unwrap_or_default();
+        assert!(!given.contains("Power restarted"), "{fresh}: {given:?}");
+    }
     let listed = sessions(&fixture);
     assert!(!listed.contains(&finished_session), "{listed}");
     assert!(!listed.contains(&active_session), "{listed}");
@@ -2815,4 +2840,268 @@ fn a_daemon_crash_during_a_stop_holds_the_retry_until_the_old_tree_is_gone() {
         !fixture.root().join("crash-pid.reported").exists(),
         "the stopped worker outlived the restart"
     );
+}
+
+#[test]
+fn an_idle_command_worker_is_flagged_stalled_and_one_with_a_quiet_command_running_is_not() {
+    let fixture = Fixture::with_configure(|root| write_config(root, "dag.stall_after = 1\n"));
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "idle");
+    fixture.add_task(&run, "busy");
+    let since = fixture.events(&run, 0, &[]).cursor;
+    let (idle, _) = dispatched(fixture.dispatch(
+        &run,
+        "idle",
+        &fixture.worktrees[0],
+        false,
+        &["idle", "idle"],
+    ));
+    let (busy, _) = dispatched(fixture.dispatch(
+        &run,
+        "busy",
+        &fixture.worktrees[1],
+        false,
+        &["busy", "busy"],
+    ));
+
+    let stalled = poll("the idle worker to be flagged stalled", || {
+        let page = fixture.events(&run, since, &["attempt_stalled"]);
+        (!page.events.is_empty()).then_some(page.events)
+    });
+    assert_eq!(stalled.len(), 1, "{stalled:?}");
+    assert_eq!(stalled[0].kind, RunEventKind::AttemptStalled);
+    assert_eq!(stalled[0].attempt.as_deref(), Some(idle.id.as_str()));
+    let shown = fixture.show(&run);
+    let attempt = |task: &str| {
+        shown
+            .tasks
+            .iter()
+            .find(|entry| entry.id == task)
+            .unwrap()
+            .attempts[0]
+            .clone()
+    };
+    assert!(attempt("idle").stalled);
+    assert!(!attempt("busy").stalled);
+
+    // Several more checks pass, and the busy worker is still not flagged, nor the idle
+    // one twice.
+    thread::sleep(Duration::from_secs(4));
+    let page = fixture.events(&run, since, &["attempt_stalled"]);
+    let attempts: Vec<_> = page
+        .events
+        .iter()
+        .map(|event| event.attempt.clone())
+        .collect();
+    assert_eq!(attempts, [Some(idle.id.clone())]);
+    assert_ne!(busy.id, idle.id);
+}
+
+/// A fake daemon on an isolated socket that answers each connection with `reply`, or
+/// closes it unanswered when `reply` is empty.
+fn fake_daemon(socket: &Path, reply: &'static str) -> thread::JoinHandle<()> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(stream.try_clone().unwrap()),
+                &mut line,
+            );
+            if line.contains("stop-fake") {
+                return;
+            }
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+        }
+    })
+}
+
+fn restart_check(root: &Path, args: &[&str]) -> Output {
+    power(root)
+        .arg("restart-check")
+        .args(args)
+        .env_remove("POWER_FORCE_RESTART")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn restart_check_refuses_a_daemon_that_cannot_list_its_workers() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let socket = root.join("power.sock");
+
+    // Nothing listens: nothing to interrupt, and no PID to restart.
+    let none = restart_check(root, &[]);
+    assert!(none.status.success(), "{none:?}");
+    assert!(none.stdout.is_empty(), "{none:?}");
+
+    for (reply, why) in [
+        (
+            "{\"event\":\"error\",\"message\":\"overloaded\"}\n",
+            "overloaded",
+        ),
+        ("not json\n", "Could not list"),
+        ("", "disconnected"),
+    ] {
+        let _ = fs::remove_file(&socket);
+        let server = fake_daemon(&socket, reply);
+        let refused = restart_check(root, &[]);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!refused.status.success(), "{reply:?} passed: {refused:?}");
+        assert!(stderr.contains(why), "{reply:?}: {stderr}");
+        assert!(stderr.contains("Restart cancelled"), "{stderr}");
+        assert!(stderr.contains("--force"), "{stderr}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+
+        // Forced, it clears exactly the daemon it reached, this process.
+        let forced = restart_check(root, &["--force"]);
+        assert!(forced.status.success(), "{forced:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&forced.stdout).trim(),
+            std::process::id().to_string()
+        );
+        let target = restart_check(root, &["--target"]);
+        assert!(target.status.success(), "{target:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&target.stdout).trim(),
+            std::process::id().to_string()
+        );
+        let mut stop = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        std::io::Write::write_all(&mut stop, b"stop-fake\n").unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn a_forced_restart_check_asks_a_wedged_daemon_for_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let socket = root.join("power.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Accepts and never answers, recording whatever each connection sends.
+    let (sent, received) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let sent = sent.clone();
+            thread::spawn(move || {
+                let mut data = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut &stream, &mut data);
+                let _ = sent.send(data);
+            });
+        }
+    });
+    let started = Instant::now();
+    let forced = restart_check(root, &["--force"]);
+    assert!(forced.status.success(), "{forced:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "{forced:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&forced.stdout).trim(),
+        std::process::id().to_string()
+    );
+    let data = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(data.is_empty(), "sent {:?}", String::from_utf8_lossy(&data));
+}
+
+/// A stand-in daemon in a child process: it listens on `socket` and, given a reply,
+/// answers each request with it.
+fn fake_daemon_process(socket: &Path, reply: &str) -> Child {
+    let child = Command::new("python3")
+        .args([
+            "-c",
+            "import socket,sys\n\
+             s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1]);s.listen()\n\
+             while True:\n\
+             \tc,_=s.accept()\n\
+             \ttry:c.makefile().readline();c.sendall(sys.argv[2].encode())\n\
+             \texcept OSError:pass\n\
+             \tc.close()\n",
+        ])
+        .arg(socket)
+        .arg(reply)
+        .spawn()
+        .unwrap();
+    poll("fake daemon socket", || {
+        std::os::unix::net::UnixStream::connect(socket)
+            .ok()
+            .map(drop)
+    });
+    child
+}
+
+#[test]
+fn restart_check_stops_only_the_daemon_it_checked() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let socket = root.join("power.sock");
+    let idle_reply = "{\"event\":\"dag\",\"dag\":{\"kind\":\"agents\",\"agents\":[]}}\n";
+
+    // Without --force, an unanswered daemon is refused and nothing is signalled.
+    let mut wedged = fake_daemon_process(&socket, "");
+    let refused = restart_check(root, &["--stop"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert_eq!(
+        wedged.try_wait().unwrap(),
+        None,
+        "a refused check signalled it"
+    );
+
+    // A daemon already running the given executable is left alone.
+    let exe = fs::read_link(format!("/proc/{}/exe", wedged.id())).unwrap();
+    let same = restart_check(
+        root,
+        &["--stop", "--force", "--unless-exe", exe.to_str().unwrap()],
+    );
+    assert!(same.status.success(), "{same:?}");
+    assert!(same.stdout.is_empty(), "{same:?}");
+    assert_eq!(
+        wedged.try_wait().unwrap(),
+        None,
+        "an up-to-date daemon was stopped"
+    );
+
+    // Forced, it stops exactly the daemon it identified.
+    let forced = restart_check(root, &["--stop", "--force"]);
+    assert!(forced.status.success(), "{forced:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&forced.stdout).trim(),
+        wedged.id().to_string()
+    );
+    assert!(wedged.wait().unwrap().code().is_none());
+    let _ = fs::remove_file(&socket);
+
+    // A daemon that lists no open workers is cleared and stopped without --force.
+    let mut idle = fake_daemon_process(&socket, idle_reply);
+    let checked = restart_check(root, &["--stop"]);
+    assert!(checked.status.success(), "{checked:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&checked.stdout).trim(),
+        idle.id().to_string()
+    );
+    assert!(idle.wait().unwrap().code().is_none());
+    let _ = fs::remove_file(&socket);
+
+    // Gone: nothing listens, so nothing is signalled.
+    let none = restart_check(root, &["--stop"]);
+    assert!(none.status.success(), "{none:?}");
+    assert!(none.stdout.is_empty(), "{none:?}");
+}
+
+#[test]
+fn restart_check_names_the_daemon_on_the_callers_socket() {
+    let fixture = Fixture::new();
+    let checked = restart_check(fixture.root(), &[]);
+    assert!(checked.status.success(), "{checked:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&checked.stdout).trim(),
+        fixture.daemon.0.id().to_string()
+    );
+    // Another socket names no daemon, so a restart there signals none.
+    let other = tempfile::tempdir().unwrap();
+    let elsewhere = restart_check(other.path(), &[]);
+    assert!(elsewhere.status.success(), "{elsewhere:?}");
+    assert!(elsewhere.stdout.is_empty(), "{elsewhere:?}");
 }

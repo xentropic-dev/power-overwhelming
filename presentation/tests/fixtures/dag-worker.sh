@@ -139,6 +139,17 @@ case "$1" in
         wait_for_marker "$3"
         report success "Used the selected option"
         ;;
+    idle)
+        # Sits silent with nothing running, like an agent whose build was killed.
+        exec sleep 600
+        ;;
+    busy)
+        # Sits silent while a quiet, long-lived command runs, like an agent waiting on a
+        # test that waits on a timer. The command clears its environment, so only its
+        # ancestry and cgroup tie it to the session.
+        env -i /bin/sleep 600 &
+        wait
+        ;;
     exit)
         wait_for_marker "$2"
         printf 'Fixture exiting before reporting a result\n' >&2

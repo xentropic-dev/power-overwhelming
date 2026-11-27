@@ -51,19 +51,41 @@ pub fn load_finished_worker_grace(defaults: Sections) -> Result<Option<Duration>
 }
 
 pub(crate) fn finished_worker_grace(sections: &Sections) -> Result<Option<Duration>> {
-    let default = Some(application::dag::FINISHED_WORKER_GRACE);
+    dag_seconds(
+        sections,
+        "end_finished_workers_after",
+        Some(application::dag::FINISHED_WORKER_GRACE),
+    )
+}
+
+/// How long a DAG worker may sit idle, with nothing it started working, before its
+/// attempt is flagged stalled, from `dag.stall_after` in seconds. `false` turns it off.
+pub fn load_stall_after(defaults: Sections) -> Result<Option<Duration>> {
+    stall_after(&load(with_bundled_defaults(defaults))?)
+}
+
+pub(crate) fn stall_after(sections: &Sections) -> Result<Option<Duration>> {
+    dag_seconds(sections, "stall_after", Some(application::dag::STALL_AFTER))
+}
+
+/// A `dag` setting in seconds from 0 to 86400, or `false` for none.
+fn dag_seconds(
+    sections: &Sections,
+    name: &str,
+    default: Option<Duration>,
+) -> Result<Option<Duration>> {
     let Some(value) = sections.get(DAG_SECTION) else {
         return Ok(default);
     };
     let table = value.as_object().context("dag must be a table")?;
-    match table.get("end_finished_workers_after") {
+    match table.get(name) {
         None | Some(JsonValue::Null) => Ok(default),
         Some(JsonValue::Bool(false)) => Ok(None),
         Some(value) => value
             .as_f64()
             .filter(|seconds| seconds.is_finite() && (0.0..=86_400.0).contains(seconds))
             .map(|seconds| Some(Duration::from_secs_f64(seconds)))
-            .context("dag.end_finished_workers_after must be seconds from 0 to 86400, or false"),
+            .with_context(|| format!("dag.{name} must be seconds from 0 to 86400, or false")),
     }
 }
 
@@ -96,7 +118,7 @@ pub(crate) fn worker_budget(sections: &Sections) -> Result<WorkerBudget> {
                 })?;
                 budget.min_available_memory = (bytes > 0).then_some(bytes);
             }
-            "end_finished_workers_after" => {}
+            "end_finished_workers_after" | "stall_after" => {}
             _ => bail!("dag.{name} is not a setting"),
         }
     }
@@ -499,6 +521,17 @@ mod tests {
             Some(Duration::from_millis(2500))
         );
         assert_eq!(grace("dag.end_finished_workers_after = false")?, None);
+        let stall = |source: &str| {
+            fs::write(&path, source)?;
+            stall_after(&load_from(&path, with_bundled_defaults(Sections::new()))?)
+        };
+        assert_eq!(stall("")?, Some(application::dag::STALL_AFTER));
+        assert_eq!(
+            stall("dag.stall_after = 90")?,
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(stall("dag.stall_after = false")?, None);
+        assert!(stall("dag.stall_after = 'later'").is_err());
         for invalid in [
             "dag.end_finished_workers_after = -1",
             "dag.end_finished_workers_after = true",

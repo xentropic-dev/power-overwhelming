@@ -21,6 +21,7 @@ mod scheduler;
 pub mod shell;
 pub mod skill_install;
 pub mod skills;
+mod stall_probe;
 mod talk_adapter;
 mod terminal;
 pub mod theme;
