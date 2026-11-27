@@ -479,7 +479,10 @@ read -r finish
             root,
             Command::new(env!("CARGO_BIN_EXE_power"))
                 .env("SHELL", "/bin/sh")
-                .env("PATH", &path),
+                .env("PATH", &path)
+                // A daemon started from inside jcode inherits its conversation, which
+                // no session it launches may report as its own.
+                .env("JCODE_SESSION_ID", "session_of_the_outer_jcode"),
         )
     };
     let (daemon, socket) = start();
