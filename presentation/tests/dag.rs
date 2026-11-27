@@ -303,6 +303,7 @@ impl Fixture {
             active_box: Some(BOX_ID.into()),
             onboarded: true,
             color_scheme: None,
+            recent_commands: Vec::new(),
         };
         fs::write(
             state.join("boxes.json"),
