@@ -875,7 +875,8 @@ mod tests {
             INSERT INTO runs (id, box_id, title, coordinator, created_at)
                 VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
             INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');
-            INSERT INTO attempts VALUES
+            INSERT INTO attempts (id, run_id, task_id, number, agent, state, summary,
+                                  blocker, detail, started_at, ended_at) VALUES
                 ('attempt-a', 'run', 'task', 1, 'a', 'failed', NULL, NULL, NULL, 1, 2),
                 ('attempt-b', 'run', 'task', 2, 'b', 'failed', NULL, NULL, NULL, 3, 4),
                 ('attempt-c', 'run', 'task', 3, 'c', 'succeeded', NULL, NULL, NULL, 5, 6);
