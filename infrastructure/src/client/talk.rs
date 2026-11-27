@@ -128,7 +128,7 @@ pub fn wait(
         },
         Duration::from_secs(seconds.saturating_add(10)),
     )?;
-    match decode(wire::receive(&mut socket)?.context("Daemon disconnected")?)? {
+    match decode(wire::reply(&mut socket)?)? {
         TalkResponse::Reply { message } => Ok(message.map(|message| (*message).into())),
         _ => bail!("Unexpected talk response"),
     }
@@ -154,7 +154,7 @@ fn connect(
     command: TalkCommand,
     timeout: Duration,
 ) -> Result<BufReader<UnixStream>> {
-    let mut socket = UnixStream::connect(wire::socket_path()).context("Connect to power daemon")?;
+    let mut socket = wire::connect()?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     wire::send(&mut socket, &request(caller, command))?;

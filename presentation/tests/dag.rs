@@ -1143,6 +1143,14 @@ fn background_workers_unlock_dependent_task_only_after_both_succeed() {
         .collect();
     assert!(!live.contains(&alpha_agent.id.as_str().into()));
     assert!(live.contains(&beta_agent.id.as_str().into()));
+    let everywhere = fixture.json(&["agent", "list", "--all-boxes"])["agents"].take();
+    assert!(
+        everywhere
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == beta_agent.id.as_str())
+    );
     fixture.release("alpha-exit");
     poll("alpha agent to exit", || {
         (status(&alpha_agent.id) == "exited").then_some(())
