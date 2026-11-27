@@ -217,6 +217,22 @@ impl TerminalView {
                 |event| tx.send_blocking(event).is_ok(),
             );
         });
+        Self::with_transport(session, scheme, settings, hold, commands, rx, window, cx)
+    }
+
+    /// Builds the view over a given command sink and event source, starting no
+    /// daemon-client threads.
+    #[allow(clippy::too_many_arguments)]
+    fn with_transport(
+        session: Session,
+        scheme: &'static Scheme,
+        settings: TerminalSettings,
+        hold: InputHold,
+        commands: async_channel::Sender<TerminalControl>,
+        rx: async_channel::Receiver<TerminalEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let follow = cx.spawn_in(window, async move |view, cx| {
             while let Ok(first) = rx.recv().await {
                 let deadline = Instant::now() + OUTPUT_TURN;
@@ -763,9 +779,6 @@ mod gesture_tests {
     }
 
     fn open(cx: &mut TestAppContext) -> (Entity<TerminalView>, &mut VisualTestContext) {
-        // No daemon listens here, so the view runs on what the test feeds it.
-        // SAFETY: set before any thread reads it, and every test sets the same value.
-        unsafe { std::env::set_var("POWER_SOCKET", "/nonexistent/power-gesture-test.sock") };
         let (host, cx) = cx.add_window_view(|window, cx| {
             let session = Session {
                 id: "gesture-test".into(),
@@ -776,12 +789,17 @@ mod gesture_tests {
                 copy_on_select: true,
                 ..TerminalSettings::default()
             };
+            // In-memory transport: no daemon client, so the view runs on what the test feeds it.
+            let (commands, _) = async_channel::unbounded();
+            let (_, events) = async_channel::unbounded();
             Host(cx.new(|cx| {
-                TerminalView::new(
+                TerminalView::with_transport(
                     session,
                     infrastructure::theme::default_scheme(),
                     settings,
                     InputHold::default(),
+                    commands,
+                    events,
                     window,
                     cx,
                 )
