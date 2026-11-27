@@ -16,9 +16,9 @@ use crate::{
     status_bar::{ConfigChanged, StatusBar},
     talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{
-        AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, TerminalBell,
-        TerminalNotification, TerminalTitleChanged, TerminalView, column_width, link_action,
-        load_bundled_fonts, terminal_font_family,
+        AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, ScrollTarget,
+        TerminalBell, TerminalNotification, TerminalTitleChanged, TerminalView, column_width,
+        link_action, load_bundled_fonts, terminal_font_family,
     },
 };
 use anyhow::{Context as _, Result, ensure};
@@ -3065,6 +3065,12 @@ impl Workspace {
             tab.view.update(cx, |view, cx| match command {
                 Command::TerminalCopy if !event.is_held => view.copy(cx),
                 Command::TerminalPaste => view.paste(cx),
+                Command::TerminalScrollLineUp => view.scroll_history(ScrollTarget::Lines(-1), cx),
+                Command::TerminalScrollLineDown => view.scroll_history(ScrollTarget::Lines(1), cx),
+                Command::TerminalScrollPageUp => view.scroll_history(ScrollTarget::Pages(-1), cx),
+                Command::TerminalScrollPageDown => view.scroll_history(ScrollTarget::Pages(1), cx),
+                Command::TerminalScrollTop => view.scroll_history(ScrollTarget::Top, cx),
+                Command::TerminalScrollBottom => view.scroll_history(ScrollTarget::Bottom, cx),
                 _ => {}
             });
             return;
