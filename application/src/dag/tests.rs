@@ -3251,10 +3251,22 @@ fn a_report_after_a_stop_begins_never_finishes_the_attempt() -> Result<()> {
         "Reported after stop",
     )?;
     assert!(!late.applied);
-    assert_eq!(late.reason.as_deref(), Some("attempt interrupted"));
+    assert_eq!(late.reason.as_deref(), Some("agent is stopping"));
+    // Until the exit is confirmed, the attempt stays open: no retry, slot kept.
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Active);
+    assert!(attempt.summary.is_none(), "{attempt:?}");
+    assert!(dag.start(command(&run, true)).is_err());
+    let session = started.agent.session.clone().unwrap();
+    dag.session_exited(&session, "ended, but a helper still runs", false)?;
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Active);
+    dag.session_exited(&session, "ended", true)?;
     let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
     assert_eq!(attempt.state, AttemptState::Interrupted);
+    assert_eq!(attempt.detail.as_deref(), Some("stopped by Power"));
     assert!(attempt.summary.is_none(), "{attempt:?}");
+    dag.start(command(&run, true))?;
     Ok(())
 }
 

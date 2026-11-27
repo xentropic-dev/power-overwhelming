@@ -1916,20 +1916,35 @@ impl Workspace {
         };
         picker.message = None;
         let picker_id = picker.id;
+        let session = tree.agent(&id).and_then(|agent| agent.session.clone());
         let task = cx
             .background_executor()
             .spawn(async move { client::stop_agent(agent) });
         cx.spawn_in(window, async move |app, cx| {
             let result = task.await;
             let _ = app.update(cx, |this, cx| {
-                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
-                else {
-                    return;
-                };
-                picker.message = result
-                    .err()
-                    .map(|error| format!("Could not stop agent. {error:#}"));
+                // A stopped session is forgotten by the daemon and cannot be reattached,
+                // so its tab and saved view go with it, as when a tab's session ends.
+                if result.is_ok()
+                    && let Some(session) = &session
+                {
+                    this.terminals.remove(session);
+                    this.sessions.remove(session);
+                    for entry in &mut this.layout.boxes {
+                        if let Some(index) =
+                            entry.views.iter().position(|view| &view.session == session)
+                        {
+                            entry.remove_view(index);
+                        }
+                    }
+                    this.save();
+                }
                 let _ = this.dag_refresh.try_send(());
+                if let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id) {
+                    picker.message = result
+                        .err()
+                        .map(|error| format!("Could not stop agent. {error:#}"));
+                }
                 cx.notify();
             });
         })

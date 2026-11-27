@@ -1800,12 +1800,14 @@ fn dag_resume_continues_a_live_paused_worker() {
 
 #[test]
 fn a_stopped_worker_that_ignores_sigterm_never_reports_success() {
+    let one_worker = |root: &Path| write_config(root, "dag.max_active_workers = 1\n");
     for fixture in [
-        Fixture::new(),
-        Fixture::with_configure_env(|_| {}, &[("POWER_WORKER_CGROUPS", "0")]),
+        Fixture::with_configure(one_worker),
+        Fixture::with_configure_env(one_worker, &[("POWER_WORKER_CGROUPS", "0")]),
     ] {
         let run = fixture.create_run().id;
         fixture.add_task(&run, "stubborn");
+        fixture.add_task(&run, "other");
         let (attempt, agent) = dispatched(fixture.dispatch(
             &run,
             "stubborn",
@@ -1826,13 +1828,56 @@ fn a_stopped_worker_that_ignores_sigterm_never_reports_success() {
         });
         let reply = fs::read_to_string(fixture.root().join("stubborn-pid.report")).unwrap();
         assert!(!reply.contains("\"applied\":true"), "{reply}");
+
+        // During the teardown the attempt keeps its slot and cannot be retried.
+        let retried = fixture.dispatch(
+            &run,
+            "stubborn",
+            &fixture.worktrees[0],
+            true,
+            &["success", "retry-go", "Retried after the exit"],
+        );
+        assert_rejected(&retried);
+        let other = json_output(fixture.dispatch(
+            &run,
+            "other",
+            &fixture.worktrees[1],
+            false,
+            &["success", "other-go", "Started after the exit"],
+        ));
+        assert_eq!(other["queued"], true, "{other}");
+        assert!(
+            pids.iter().all(|pid| process_running(*pid)),
+            "the teardown ended before its checks"
+        );
+        let held = task(&fixture.show(&run), "stubborn").attempts[0].state;
+        assert_eq!(held, AttemptState::Active);
+        assert!(!fixture.root().join("other-go.started").exists());
+        assert!(!fixture.root().join("retry-go.started").exists());
+
+        wait_for_exit_after(&fixture, &agent.id, &pids);
         let interrupted = fixture.wait_for_state(&run, "stubborn", TaskState::Interrupted);
         assert_eq!(interrupted.attempts[0].id, attempt.id);
-        wait_for_exit_after(&fixture, &agent.id, &pids);
-        let shown = fixture.show(&run);
-        let attempt = &task(&shown, "stubborn").attempts[0];
-        assert_eq!(attempt.state, AttemptState::Interrupted);
-        assert!(attempt.summary.is_none(), "{attempt:?}");
+        let stopped = &interrupted.attempts[0];
+        assert_eq!(stopped.state, AttemptState::Interrupted);
+        assert!(stopped.summary.is_none(), "{stopped:?}");
+
+        // Once the exit is confirmed, the slot is free and the retry starts in the
+        // same worktree.
+        fixture.wait_for_worker("other-go");
+        fixture.release("other-go");
+        fixture.wait_for_state(&run, "other", TaskState::Completed);
+        let (retry, _) = dispatched(fixture.dispatch(
+            &run,
+            "stubborn",
+            &fixture.worktrees[0],
+            true,
+            &["success", "retry-go", "Retried after the exit"],
+        ));
+        assert_eq!(retry.number, 2);
+        assert_eq!(retry.worktree, interrupted.attempts[0].worktree);
+        fixture.release("retry-go");
+        fixture.wait_for_state(&run, "stubborn", TaskState::Completed);
     }
 }
 
