@@ -682,6 +682,15 @@ impl DagTransaction for DagDb<'_> {
         Ok(())
     }
 
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()> {
+        let updated = self.0.execute(
+            "UPDATE tasks SET title = ?3, instructions = ?4 WHERE run_id = ?1 AND id = ?2",
+            params![run, task, title, instructions],
+        )?;
+        anyhow::ensure!(updated == 1, "Unknown task {task:?} in run {run:?}");
+        Ok(())
+    }
+
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()> {
         self.0.execute(
             "INSERT INTO attempts (id, run_id, task_id, number, agent, state, started_at)

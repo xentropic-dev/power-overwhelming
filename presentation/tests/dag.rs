@@ -3280,3 +3280,84 @@ fn overview_counts_runs_workers_terminals_and_attached_tabs() {
     assert_eq!(done["boxes"][0]["agents_working"], 0);
     fixture.release("alpha-exit");
 }
+
+#[test]
+fn a_waiting_task_edited_before_dispatch_gets_the_new_instructions_in_its_prompt() {
+    let fixture = Fixture::with_configure(|root| {
+        fake_jcode(
+            root,
+            r#""$POWER_BIN" dag report success --summary "edited done""#,
+        );
+    });
+    let run = fixture.create_run().id;
+    json_output(fixture.apply(
+        &run,
+        json!([
+            {"id": "first", "title": "First"},
+            {"id": "later", "title": "Later", "instructions": "Old plan", "deps": ["first"]}
+        ]),
+    ));
+    let instructions = fixture.root().join("new-instructions.txt");
+    fs::write(&instructions, "Follow the corrected plan").unwrap();
+    let edited = fixture.json(&[
+        "dag",
+        "edit-task",
+        &run,
+        "later",
+        "--title",
+        "Later, corrected",
+        "--instructions-file",
+        instructions.to_str().unwrap(),
+    ]);
+    assert_eq!(edited["task"]["state"], "waiting");
+    assert_eq!(edited["delivery"], json!({"status": "none"}));
+    let page = fixture.events(&run, 0, &["task_edited"]);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].task.as_deref(), Some("later"));
+
+    // Edits are refused without a change, for blank text, or for unknown targets.
+    for args in [
+        &["dag", "edit-task", &run, "later"][..],
+        &["dag", "edit-task", &run, "later", "--title", " "],
+        &["dag", "edit-task", &run, "nope", "--title", "x"],
+        &["dag", "edit-task", "nope", "later", "--title", "x"],
+    ] {
+        assert!(!fixture.command(args).status.success(), "{args:?}");
+    }
+
+    let (first, _) = dispatched(fixture.dispatch(
+        &run,
+        "first",
+        &fixture.worktrees[0],
+        false,
+        &["success", "first.go", "first done"],
+    ));
+    fixture.release("first.go");
+    fixture.wait_for_state(&run, "first", TaskState::Completed);
+    let refused = fixture.command(&["dag", "edit-task", &run, "first", "--title", "Again"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Add a new task instead"),
+        "{refused:?}"
+    );
+    assert_eq!(task(&fixture.show(&run), "first").attempts[0].id, first.id);
+
+    dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "later",
+        "--provider",
+        "jcode",
+        "--worktree",
+        fixture.worktrees[1].to_str().unwrap(),
+    ]));
+    fixture.wait_for_state(&run, "later", TaskState::Completed);
+    let message = fs::read_to_string(fixture.root().join("jcode.1.message")).unwrap();
+    assert!(
+        message.contains("Task: later — Later, corrected"),
+        "{message:?}"
+    );
+    assert!(message.contains("Follow the corrected plan"), "{message:?}");
+    assert!(!message.contains("Old plan"), "{message:?}");
+}

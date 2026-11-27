@@ -696,6 +696,25 @@ enum DagAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Correct a task's title or instructions. A running worker is sent the new
+    /// instructions through power talk. A completed task is refused.
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args(["title", "instructions", "instructions_file"]),
+    ))]
+    EditTask {
+        run: String,
+        task: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, conflicts_with = "instructions_file")]
+        instructions: Option<String>,
+        /// Read instructions from a file, or from stdin with `-`.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+    },
     AddDep {
         run: String,
         task: String,
@@ -1098,6 +1117,11 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
             "reason": reason,
         }),
         DagResponse::Reported { applied, reason } => json!({"applied": applied, "reason": reason}),
+        DagResponse::TaskEdited {
+            run,
+            task,
+            delivery,
+        } => json!({"run": run, "task": task, "delivery": delivery}),
         DagResponse::Events { events, cursor } => json!({"events": events, "cursor": cursor}),
         _ => anyhow::bail!("Unexpected daemon response"),
     };
@@ -1269,6 +1293,34 @@ fn run_dag(command: DagAction) -> Result<()> {
             }
         }
         DagAction::AddDep { run, task, dep } => DagRequest::AddDependency { run, task, dep },
+        DagAction::EditTask {
+            run,
+            task,
+            title,
+            instructions,
+            instructions_file,
+        } => {
+            let instructions = match instructions_file {
+                Some(file) if file.as_os_str() == "-" => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut text)
+                        .context("Read instructions from stdin")?;
+                    Some(text)
+                }
+                Some(file) => Some(
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("Read instructions from {}", file.display()))?,
+                ),
+                None => instructions,
+            };
+            DagRequest::EditTask {
+                run,
+                task,
+                title,
+                instructions,
+                caller: caller_session(),
+            }
+        }
         DagAction::Plan {
             run,
             task,
@@ -1350,6 +1402,7 @@ fn run_dag(command: DagAction) -> Result<()> {
                     AttemptStalled,
                     TaskReady,
                     QueuedDispatchFailed,
+                    TaskEdited,
                 ];
             }
             return dag_reply(

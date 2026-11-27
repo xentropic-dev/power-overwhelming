@@ -910,6 +910,33 @@ struct Plan {
     remind: Vec<Queued>,
 }
 
+impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::TaskMessenger for Talk<S, A, N> {
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String> {
+        let messages = self.send(SendMessage {
+            caller: Caller {
+                session: caller,
+                box_id: None,
+                desktop: false,
+            },
+            target: Target::One(Address::Agent(agent.into())),
+            run: Some(run.into()),
+            body,
+            urgent: false,
+        })?;
+        messages
+            .into_iter()
+            .next()
+            .map(|message| message.id.0)
+            .context("Talk queued no message for the worker")
+    }
+}
+
 fn ids(batch: &[Queued]) -> Vec<&MessageId> {
     batch.iter().map(|message| &message.id).collect()
 }
