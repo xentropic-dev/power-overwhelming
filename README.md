@@ -254,7 +254,7 @@ The status bar shows the main checkout, active worktree, and foreground agent ty
 
 `{dag.progress}` shows a count such as `DAG 1/6 done` on the coordinator's and workers' tabs while the run has ready, working, or input-blocked tasks. If a coordinator has several live runs, its tab shows the newest.
 
-Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok.
+Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok. For jcode, each `power session task`, `power session model` or `power dag report` the agent runs also reads its current model from the jcode session record.
 
 Set `power_bar` in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua` and press Ctrl+B then `r` to reload. The default uses colored Powerline joins and changes the rightmost accent with the active agent. Set `separator` to `""` for rounded joins or to Unicode text such as `" │ "` for a plain separator. Each segment can set an `icon`, foreground, and background. [Bundled defaults](plugins/power-bar/defaults.json)
 
