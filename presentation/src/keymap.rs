@@ -79,6 +79,9 @@ pub enum Command {
     DagArtifact,
     DagStartNow,
     DagClose,
+    PanelUp,
+    PanelDown,
+    PanelClose,
     TabOpenLink,
     TabPreview,
     TerminalZoomIn,
@@ -122,6 +125,8 @@ pub enum Scope {
     Runs,
     /// On the task graph.
     Dag,
+    /// In a plugin panel, such as the dashboard.
+    Panel,
     /// While the preview pane has focus.
     Preview,
     /// While links on screen show number hints. Digits 1–9 always open a hint.
@@ -142,6 +147,7 @@ impl Scope {
             Self::Talk => "talk",
             Self::Runs => "runs",
             Self::Dag => "dag",
+            Self::Panel => "panel",
             Self::Preview => "preview",
             Self::Hints => "hints",
             Self::Terminal => "terminal",
@@ -314,6 +320,9 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
     entry(S::Dag, "start_now", C::DagStartNow, &["s"], "Start the selected queued task now, over the worker budget"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
+    entry(S::Panel, "up", C::PanelUp, &["k", "up"], "Scroll the panel up"),
+    entry(S::Panel, "down", C::PanelDown, &["j", "down"], "Scroll the panel down"),
+    entry(S::Panel, "close", C::PanelClose, &["escape"], "Close the panel"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
     entry(S::Preview, "close", C::PreviewClose, &["escape", "x"], "Close preview"),
@@ -721,6 +730,7 @@ impl Keymap {
                 Scope::Talk => format!("In talk: {keys}"),
                 Scope::Runs => format!("In the run picker: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
+                Scope::Panel => format!("In panels such as the dashboard: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
                 Scope::Terminal => format!("In the terminal: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
