@@ -307,10 +307,196 @@ fn event_time(event: &Value) -> Option<u64> {
     u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).ok()
 }
 
+/// Unix seconds of an RFC 3339 time with a `Z` or `±HH:MM` offset.
+fn rfc3339_seconds(stamp: &str) -> Option<u64> {
+    let utc = event_time(&serde_json::json!({ "timestamp": stamp }))?;
+    let zone = stamp.get(19..)?;
+    let zone = zone.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset: i64 = match zone {
+        "Z" | "z" | "" => 0,
+        _ => {
+            let sign = match zone.get(..1)? {
+                "+" => 1,
+                "-" => -1,
+                _ => return None,
+            };
+            let hours: i64 = zone.get(1..3)?.parse().ok()?;
+            let minutes: i64 = zone.get(4..6)?.parse().ok()?;
+            sign * (hours * 3600 + minutes * 60)
+        }
+    };
+    u64::try_from(i64::try_from(utc).ok()? - offset).ok()
+}
+
+/// How long a jcode reading is reused before `jcode usage` runs again.
+const JCODE_CACHE: Duration = Duration::from_secs(60);
+/// How long `jcode usage` may run before its reading is given up.
+const JCODE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A short label for a jcode limit name such as `5-hour window` or `7-day window`.
+fn jcode_window_label(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let digits: String = lower.chars().take_while(char::is_ascii_digit).collect();
+    let rest = lower[digits.len()..].trim_start_matches(['-', ' ']);
+    let minutes = digits.parse::<u64>().ok().and_then(|count| {
+        let unit = rest.split([' ', '-']).next()?;
+        match unit.trim_end_matches('s') {
+            "minute" | "min" | "m" => Some(count),
+            "hour" | "hr" | "h" => Some(count * 60),
+            "day" | "d" => Some(count * 1440),
+            "week" | "w" => Some(count * 10080),
+            _ => None,
+        }
+    });
+    minutes.map_or_else(|| name.trim().to_owned(), window_label)
+}
+
+/// Each provider's name in a jcode report, with its limits.
+type JcodeProviders = Vec<(String, Vec<UsageWindow>)>;
+
+/// The limits of each provider in a `jcode usage --json` report, keyed by its
+/// `provider_name`, such as `OpenAI (ChatGPT) (…)` or `Anthropic (Claude) (…)`.
+fn jcode_report_windows(report: &Value) -> JcodeProviders {
+    let Some(providers) = report["providers"].as_array() else {
+        return Vec::new();
+    };
+    providers
+        .iter()
+        .filter_map(|provider| {
+            let name = provider["provider_name"].as_str()?.to_owned();
+            let windows: Vec<_> = provider["limits"]
+                .as_array()?
+                .iter()
+                .filter_map(|limit| {
+                    Some(UsageWindow {
+                        label: jcode_window_label(limit["name"].as_str()?),
+                        used_percent: percent(&limit["usage_percent"])?,
+                        resets_at: limit["resets_at"].as_str().and_then(rfc3339_seconds),
+                    })
+                })
+                .collect();
+            (!windows.is_empty()).then_some((name, windows))
+        })
+        .collect()
+}
+
+/// The provider in a jcode report whose limits apply to `model`: the one whose name
+/// matches the model's family, or the only one with limits.
+fn jcode_model_windows(
+    providers: &[(String, Vec<UsageWindow>)],
+    model: Option<&str>,
+) -> Vec<UsageWindow> {
+    let family: &[&str] = match model.map(str::to_ascii_lowercase) {
+        Some(model) if model.contains("claude") => &["anthropic", "claude"],
+        Some(model) if model.starts_with("gpt") || model.contains("codex") => {
+            &["openai", "chatgpt"]
+        }
+        Some(model) if model.contains("gemini") => &["gemini", "google"],
+        Some(model) if model.contains("grok") => &["xai", "grok"],
+        _ => &[],
+    };
+    let matching = providers.iter().find(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        family.iter().any(|word| name.contains(word))
+    });
+    match (matching, providers) {
+        (Some((_, windows)), _) => windows.clone(),
+        (None, [(_, windows)]) if family.is_empty() => windows.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Reads the limits jcode reports through `jcode usage --json`. The command queries the
+/// providers over the network, so it runs on its own thread and the overview gets the
+/// latest finished reading.
+pub struct JcodeUsage {
+    command: PathBuf,
+    state: std::sync::Arc<Mutex<JcodeState>>,
+}
+
+#[derive(Default)]
+struct JcodeState {
+    reading: Option<(Instant, JcodeProviders)>,
+    running: bool,
+}
+
+impl JcodeUsage {
+    pub fn new(command: PathBuf) -> Self {
+        Self {
+            command,
+            state: Default::default(),
+        }
+    }
+
+    fn windows(&self, model: Option<&str>, now: u64) -> Vec<UsageWindow> {
+        let mut state = self.state.lock().unwrap();
+        let stale = state
+            .reading
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= JCODE_CACHE);
+        if stale && !state.running {
+            state.running = true;
+            let command = self.command.clone();
+            let shared = self.state.clone();
+            std::thread::spawn(move || {
+                let reading = read_jcode_usage(&command);
+                let mut state = shared.lock().unwrap();
+                state.running = false;
+                // A failed reading keeps the last one, but still waits out the cache.
+                let providers = reading
+                    .or_else(|| state.reading.take().map(|(_, providers)| providers))
+                    .unwrap_or_default();
+                state.reading = Some((Instant::now(), providers));
+            });
+        }
+        state
+            .reading
+            .as_ref()
+            .map_or_else(Vec::new, |(_, providers)| {
+                current(&jcode_model_windows(providers, model), now)
+            })
+    }
+}
+
+/// Runs `jcode usage --json`, or `None` when it fails or takes too long.
+fn read_jcode_usage(command: &Path) -> Option<JcodeProviders> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(command)
+        .args(["usage", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < JCODE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = reader.join().ok()?.ok()?;
+    let report: Value = serde_json::from_slice(&output).ok()?;
+    Some(jcode_report_windows(&report))
+}
+
 /// Usage from every provider Power knows how to read. Other providers report no data.
 pub struct ProviderUsage {
     pub claude: ClaudeReports,
     pub codex: Option<CodexRollouts>,
+    pub jcode: Option<JcodeUsage>,
 }
 
 impl ProviderUsage {
@@ -318,6 +504,7 @@ impl ProviderUsage {
         Self {
             claude: ClaudeReports::default(),
             codex: CodexRollouts::from_env(),
+            jcode: Some(JcodeUsage::new("jcode".into())),
         }
     }
 }
@@ -336,6 +523,10 @@ impl UsageSource for ProviderUsage {
                         .codex
                         .as_ref()
                         .map_or_else(Vec::new, |codex| codex.windows(now)),
+                    "jcode" => self
+                        .jcode
+                        .as_ref()
+                        .map_or_else(Vec::new, |jcode| jcode.windows(entry.model.as_deref(), now)),
                     _ => Vec::new(),
                 },
             })
@@ -457,6 +648,7 @@ mod tests {
         let usage = ProviderUsage {
             claude: ClaudeReports::default(),
             codex: Some(codex),
+            jcode: None,
         };
         let models = [
             ModelInUse {
@@ -474,6 +666,72 @@ mod tests {
         assert!(!reported[0].windows.is_empty());
         assert_eq!(reported[1].model.as_deref(), Some("grok-5"));
         assert!(reported[1].windows.is_empty());
+    }
+
+    #[test]
+    fn jcode_limits_are_matched_to_the_model_provider() {
+        let report = json!({"providers": [
+            {"provider_name": "OpenAI (ChatGPT) (a***b@example.com)", "limits": [
+                {"name": "5-hour window", "usage_percent": 12.5, "resets_at": "2026-11-29T15:34:24+00:00"},
+                {"name": "7-day window", "usage_percent": 74.0, "resets_at": "2026-11-29T10:34:24-05:00"},
+                {"name": "Credits", "usage_percent": 3}
+            ], "error": null},
+            {"provider_name": "Anthropic (Claude)", "limits": [], "error": "429"}
+        ]});
+        let providers = jcode_report_windows(&report);
+        let reset = 1_795_966_464;
+        let openai = vec![
+            window("5h", 12.5, Some(reset)),
+            window("7d", 74.0, Some(reset)),
+            window("Credits", 3.0, None),
+        ];
+        assert_eq!(
+            providers,
+            [(
+                "OpenAI (ChatGPT) (a***b@example.com)".into(),
+                openai.clone()
+            )]
+        );
+        assert_eq!(jcode_model_windows(&providers, Some("gpt-6.2-sol")), openai);
+        assert_eq!(jcode_model_windows(&providers, None), openai);
+        // Another provider's limits never stand in for Claude's.
+        assert!(jcode_model_windows(&providers, Some("claude-opus-5-5")).is_empty());
+        assert!(jcode_report_windows(&json!({"oops": 1})).is_empty());
+        assert_eq!(rfc3339_seconds("2026-11-29T15:34:24.123Z"), Some(reset));
+    }
+
+    #[test]
+    fn jcode_usage_runs_the_command_off_the_caller_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("jcode");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ \"$1 $2\" = \"usage --json\" ] || exit 1\necho '{\"providers\":[{\"provider_name\":\"OpenAI\",\"limits\":[{\"name\":\"7-day window\",\"usage_percent\":40}]}]}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let usage = ProviderUsage {
+            claude: ClaudeReports::default(),
+            codex: None,
+            jcode: Some(JcodeUsage::new(script)),
+        };
+        let models = [ModelInUse {
+            provider: "jcode".into(),
+            model: Some("gpt-5.5".into()),
+        }];
+        // The first call starts the reading and returns at once.
+        assert!(usage.usage(&models)[0].windows.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let windows = usage.usage(&models).remove(0).windows;
+            if !windows.is_empty() {
+                assert_eq!(windows, [window("7d", 40.0, None)]);
+                break;
+            }
+            assert!(Instant::now() < deadline, "jcode usage was never read");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
