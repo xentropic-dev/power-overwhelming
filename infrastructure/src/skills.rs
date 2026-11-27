@@ -40,6 +40,12 @@ const SKILLS: &[EmbeddedSkill] = &[
             ),
         ],
     },
+    EmbeddedSkill {
+        stub: include_str!("../../skills/power-talk/SKILL.md"),
+        shipped_stub_hashes: &["afd990d2c62ab0e5f06e5e00dabf767a499d40c0697ce68328fab492ca83c1ed"],
+        guide: include_str!("../../skills/power-talk/guide.md"),
+        references: &[],
+    },
 ];
 
 pub struct EmbeddedSkillCatalog;

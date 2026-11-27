@@ -1,3 +1,5 @@
+pub mod talk;
+
 pub use crate::wire::SessionMetadata;
 use crate::wire::{self, Request, Response};
 use anyhow::{Context, Result, bail};
@@ -12,7 +14,6 @@ use std::{
     io::BufReader,
     os::unix::{
         fs::{DirBuilderExt, OpenOptionsExt},
-        net::UnixStream,
         process::CommandExt,
     },
     path::PathBuf,
@@ -187,7 +188,7 @@ pub fn watch_box_icons(deliver: impl Fn(String) -> bool) {
 fn watch(request: &Request, deliver: impl Fn(Response) -> Result<bool>) {
     loop {
         let result = (|| -> Result<bool> {
-            let mut socket = UnixStream::connect(wire::socket_path())?;
+            let mut socket = wire::connect()?;
             socket.set_read_timeout(Some(Duration::from_secs(15)))?;
             wire::send(&mut socket, request)?;
             let mut reader = BufReader::new(socket);
@@ -233,7 +234,7 @@ fn subscribe(
     is_closed: &impl Fn() -> bool,
     deliver: &impl Fn(TerminalEvent) -> bool,
 ) -> Result<()> {
-    let mut socket = UnixStream::connect(wire::socket_path())?;
+    let mut socket = wire::connect()?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     wire::send(
         &mut socket,
@@ -339,17 +340,19 @@ pub fn ensure_daemon() -> Result<()> {
 
 pub use crate::wire::WorktreeScope;
 pub use domain::dag::{
-    AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, ManagedAgent, Provider,
-    ReportStatus, Run, RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState,
+    AgentState, AgentStatus, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator,
+    ManagedAgent, Provider, ReportStatus, Run, RunEvent, RunEventKind, RunStatus, Task, TaskSpec,
+    TaskState,
 };
 pub use domain::worktree::{KeepReason, ManagedWorktree, PruneVerdict, WorktreeCreator};
 
 /// The DAG wire contract, for callers that print or forward its JSON.
 pub mod protocol {
     pub use crate::wire::{
-        AgentState, Attempt, AttemptState, BoxAttention, BoxInfo, Coordinator, DagRequest,
-        DagResponse, ManagedAgent, ManagedWorktree, Provider, ReportStatus, Run, RunEvent,
-        RunEventKind, RunStatus, Task, TaskSpec, TaskState, WorktreeRequest, WorktreeScope,
+        AgentState, AgentStatus, Attempt, AttemptState, BoxAttention, BoxInfo, BudgetMode,
+        Coordinator, DagRequest, DagResponse, ManagedAgent, ManagedWorktree, Provider,
+        ReportStatus, Run, RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState,
+        WorktreeRequest, WorktreeScope,
     };
 }
 
@@ -358,19 +361,20 @@ use protocol::{DagRequest, DagResponse};
 /// Sends one DAG request. `timeout` bounds the reply, which matters for blocking waits.
 pub fn dag(request: DagRequest, timeout: Duration) -> Result<DagResponse> {
     use std::io::Write as _;
-    let mut socket = UnixStream::connect(wire::socket_path()).context("Connect to power daemon")?;
+    let mut socket = wire::connect()?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     wire::send(&mut socket, &Request::Dag { dag: request })?;
     socket.flush()?;
-    match wire::receive::<Response>(&mut BufReader::new(socket))?.context("Daemon disconnected")? {
+    match wire::reply::<Response>(&mut BufReader::new(socket))? {
         Response::Dag { dag } => Ok(*dag),
         Response::Error { message } => bail!("{message}"),
         _ => bail!("Unexpected daemon response"),
     }
 }
 
-const DAG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Generous, because a read timeout on an applied request would report a false failure.
+const DAG_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn domain_list<T: Into<U>, U>(values: Vec<T>) -> Vec<U> {
     values.into_iter().map(Into::into).collect()
@@ -403,15 +407,33 @@ pub fn set_box_icon(
     }
 }
 
-pub fn list_agents(box_sel: Option<String>, caller: Option<String>) -> Result<Vec<ManagedAgent>> {
-    match dag(DagRequest::ListAgents { box_sel, caller }, DAG_TIMEOUT)? {
+pub fn list_agents(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<ManagedAgent>> {
+    let request = DagRequest::ListAgents {
+        box_sel,
+        caller,
+        include_finished,
+    };
+    match dag(request, DAG_TIMEOUT)? {
         DagResponse::Agents { agents } => Ok(domain_list(agents)),
         _ => bail!("Unexpected daemon response"),
     }
 }
 
-pub fn list_runs(box_sel: Option<String>, caller: Option<String>) -> Result<Vec<Run>> {
-    match dag(DagRequest::ListRuns { box_sel, caller }, DAG_TIMEOUT)? {
+pub fn list_runs(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<Run>> {
+    let request = DagRequest::ListRuns {
+        box_sel,
+        caller,
+        include_finished,
+    };
+    match dag(request, DAG_TIMEOUT)? {
         DagResponse::Runs { runs } => Ok(domain_list(runs)),
         _ => bail!("Unexpected daemon response"),
     }
@@ -419,6 +441,70 @@ pub fn list_runs(box_sel: Option<String>, caller: Option<String>) -> Result<Vec<
 
 pub fn get_run(run: String) -> Result<Run> {
     match dag(DagRequest::GetRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Archives a run. Refused while it has open attempts, unless `force`.
+pub fn archive_run(run: String, force: bool) -> Result<Run> {
+    match dag(DagRequest::ArchiveRun { run, force }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Starts a queued task now, over the worker budget.
+pub fn start_queued(run: String, task: String) -> Result<()> {
+    match dag(DagRequest::StartQueued { run, task }, DAG_TIMEOUT)? {
+        DagResponse::Dispatched { .. } => Ok(()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses a run's workers and stops dispatching from it.
+pub fn pause_run(run: String) -> Result<Run> {
+    match dag(DagRequest::PauseRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Resumes a paused run.
+pub fn resume_run(run: String) -> Result<Run> {
+    match dag(DagRequest::ResumeRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Stops one agent through the daemon's guarded use case, which ends only the agent's
+/// own session and refuses an agent sharing a shell session.
+pub fn stop_agent(agent: String) -> Result<ManagedAgent> {
+    match dag(DagRequest::StopAgent { agent }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses or resumes one agent's process tree.
+pub fn set_agent_paused(agent: String, paused: bool) -> Result<ManagedAgent> {
+    match dag(DagRequest::SetAgentPaused { agent, paused }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses every running agent except `keep` and the caller's own session.
+pub fn pause_all_except(keep: Vec<String>, caller: Option<String>) -> Result<Vec<ManagedAgent>> {
+    match dag(DagRequest::PauseAllExcept { keep, caller }, DAG_TIMEOUT)? {
+        DagResponse::Agents { agents } => Ok(agents.into_iter().map(Into::into).collect()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+pub fn unarchive_run(run: String) -> Result<Run> {
+    match dag(DagRequest::UnarchiveRun { run }, DAG_TIMEOUT)? {
         DagResponse::Run { run } => Ok(run.into()),
         _ => bail!("Unexpected daemon response"),
     }
@@ -480,7 +566,7 @@ pub fn attention() -> Result<Vec<BoxAttention>> {
 
 /// Streams run events until `deliver` returns false or the daemon goes away.
 pub fn watch_runs(box_sel: Option<String>, deliver: impl Fn(RunEvent) -> bool) -> Result<()> {
-    let mut socket = UnixStream::connect(wire::socket_path()).context("Connect to power daemon")?;
+    let mut socket = wire::connect()?;
     // The daemon sends keepalives every few seconds, so a long silence means it is gone.
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     wire::send(

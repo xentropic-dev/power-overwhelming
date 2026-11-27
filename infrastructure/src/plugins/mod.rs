@@ -29,6 +29,8 @@ pub struct ActiveView {
     pub agent_type: String,
     pub agent_task: Option<String>,
     pub agent_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dag_progress: Option<String>,
 }
 
 pub fn valid_status_field(name: &str) -> bool {

@@ -28,10 +28,17 @@ impl Workspace for WorktreeWorkspace {
     fn validate_box_worktree(&self, _: &Path, _: &Path) -> Result<PathBuf> {
         bail!("Unexpected worktree validation")
     }
+    fn main_checkout(&self, _: &Path) -> Result<Option<PathBuf>> {
+        bail!("Unexpected main checkout lookup")
+    }
 
     fn head(&self, path: &Path) -> Result<String> {
         ensure!(path == Path::new("/view-source"), "Wrong source worktree");
         Ok("view-head".into())
+    }
+
+    fn resolve_commit(&self, _: &Path, commitish: &str) -> Result<String> {
+        Ok(commitish.into())
     }
 
     fn branch_exists(&self, repository: &Path, _: &str) -> Result<BranchStatus> {
@@ -272,6 +279,8 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 label: "fixture".into(),
             },
             created_at: 0,
+            archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         })?;
         db.insert_tasks(&worktree.branch, &[spec("work", &[])])?;
@@ -292,6 +301,7 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 detail: None,
                 started_at: 0,
                 ended_at: None,
+                paused: false,
                 artifacts: Vec::new(),
             },
         )
@@ -425,6 +435,8 @@ fn add_agent(
             task: None,
             attempt: None,
             state,
+            paused: false,
+            status: domain::dag::AgentStatus::derive(state, false, None),
             label: id.into(),
             created_at: 0,
         })
@@ -481,7 +493,7 @@ fn removing_a_worktree_retires_the_agents_left_in_it() -> Result<()> {
     assert_eq!(agent_state(&dag, "elsewhere")?, AgentState::Running);
     // The session's exit report marks this one, as for any other exit.
     assert_eq!(agent_state(&dag, "with-session")?, AgentState::Running);
-    dag.session_exited(&stale.id, "ended")?;
+    dag.session_exited(&stale.id, "ended", true)?;
     assert_eq!(agent_state(&dag, "with-session")?, AgentState::Exited);
     Ok(())
 }

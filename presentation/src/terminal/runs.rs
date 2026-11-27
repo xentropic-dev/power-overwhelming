@@ -492,14 +492,17 @@ fn needs_ligatures(text: &str, font: &Font) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::frame::{Frame, frame};
+    use crate::terminal::frame::Frame;
     use ghostty_vt::{Terminal, render::RenderState, terminal::Options};
     use gpui::{ShapedGlyph, ShapedRun, font, px, rgb};
 
     fn screen(output: &[u8]) -> Frame {
         let mut terminal = Terminal::new(Options::default()).unwrap();
         terminal.vt_write(output);
-        frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap()
+        Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap()
     }
 
     fn cells(frame: &Frame, row: usize) -> Vec<RunCell<'_>> {
@@ -605,7 +608,8 @@ mod tests {
     fn inverse_swaps_colors_invisible_hides_text_and_faint_is_a_style() {
         let frame = screen(b"\x1b[7mA\x1b[0;8mB\x1b[0;2mC");
         let cells = &frame.rows[0].cells;
-        assert_eq!(cells[0].bg, Some(Hsla::from(rgb(0xdbe3ee))));
+        // The default foreground becomes the background.
+        assert_eq!(cells[0].bg, Some(cells[1].fg));
         assert_ne!(cells[0].fg, cells[0].bg.unwrap());
         assert_eq!(cells[1].text, "B");
         assert!(cells[1].style.invisible);

@@ -2,6 +2,8 @@
 pub(crate) mod agent_tree;
 #[path = "dag_view.rs"]
 mod dag_view;
+#[path = "workspace_talk.rs"]
+mod workspace_talk;
 
 use self::{agent_tree::AgentTree, dag_view::DagView};
 use crate::{
@@ -10,12 +12,14 @@ use crate::{
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
+    talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView, load_bundled_fonts},
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
+    dag::{AgentStatus, Coordinator, RunStatus, TaskState},
     link::dag_run_id,
     session::{Agent, Session},
 };
@@ -58,15 +62,104 @@ enum Prefix {
 }
 
 enum DagQuery {
-    Runs(String),
-    Run { id: String, repository: PathBuf },
-    Agents(String),
+    Runs {
+        box_id: String,
+        include_finished: bool,
+    },
+    Run {
+        id: String,
+        repository: PathBuf,
+    },
+    Agents {
+        box_id: String,
+        include_finished: bool,
+    },
 }
 
 enum DagSnapshot {
     Runs(Vec<Run>),
     Run(Run, Box<DagWorktrees>),
     Agents(Vec<ManagedAgent>),
+}
+
+/// The empty picker text, naming the key that shows finished items while they are hidden.
+fn empty_message(
+    none: &str,
+    none_live: &str,
+    show_finished: bool,
+    toggle: &str,
+    finished: &str,
+) -> String {
+    if show_finished {
+        none.to_owned()
+    } else {
+        format!("{none_live} {toggle} shows {finished}.")
+    }
+}
+
+/// What one press of the end-worker key does to the selected agent.
+#[derive(Debug, Eq, PartialEq)]
+enum EndWorker {
+    NoSession,
+    /// The worker is still busy; the next press of the key ends it.
+    Confirm(String),
+    /// Stop this agent through `DagRequest::StopAgent`, the guarded use case behind
+    /// `power agent stop`, never by ending its session, which may be a shell's.
+    Stop(String),
+}
+
+/// A still-working worker needs a second press, so a stray key never cuts it off.
+fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndWorker {
+    if agent.session.is_none() {
+        return EndWorker::NoSession;
+    }
+    if armed == Some(agent.id.as_str()) {
+        return EndWorker::Stop(agent.id.clone());
+    }
+    match agent.status {
+        AgentStatus::Working | AgentStatus::Paused | AgentStatus::NeedsInput => EndWorker::Confirm(
+            format!("Worker is still working — press {key} again to end it."),
+        ),
+        // Idle agents are interactive sessions such as coordinators, not finished workers.
+        AgentStatus::Idle => EndWorker::Confirm(format!(
+            "This agent has no task and may be in use — press {key} again to end its session."
+        )),
+        _ => EndWorker::Stop(agent.id.clone()),
+    }
+}
+
+fn running_progress(run: &Run) -> Option<String> {
+    if run.tasks.is_empty() || run.status() != RunStatus::Active {
+        return None;
+    }
+    Some(format!(
+        "DAG {}/{} done",
+        run.completed_tasks(),
+        run.tasks.len()
+    ))
+}
+
+fn session_dag_progress(box_id: String, session: &str) -> Result<Option<String>> {
+    // A worker whose attempt is done keeps its session, so finished agents count here.
+    let agents = client::list_agents(Some(box_id.clone()), None, true)?;
+    let Some(agent) = agents
+        .into_iter()
+        .find(|agent| agent.session.as_deref() == Some(session))
+    else {
+        return Ok(None);
+    };
+    if let Some(run) = agent.run {
+        return Ok(running_progress(&client::get_run(run)?));
+    }
+    let runs = client::list_runs(Some(box_id), None, false)?;
+    Ok(runs
+        .iter()
+        .filter(
+            |run| matches!(&run.coordinator, Coordinator::Agent { agent: id } if id == &agent.id),
+        )
+        .filter_map(|run| Some((run.created_at, running_progress(run)?)))
+        .max_by_key(|(created_at, _)| *created_at)
+        .map(|(_, progress)| progress))
 }
 
 #[derive(Default, PartialEq)]
@@ -155,6 +248,9 @@ struct Workspace {
     picker: Option<Picker>,
     dag: Option<DagView>,
     dag_refresh: async_channel::Sender<()>,
+    talk: Option<TalkDialog>,
+    talk_refresh: async_channel::Sender<()>,
+    dag_progress: Option<(String, String)>,
     attention: HashMap<String, HashSet<String>>,
     previews: Vec<PreviewTab>,
     active_previews: HashMap<String, u64>,
@@ -181,6 +277,7 @@ struct Workspace {
 
 pub fn run() {
     Application::new().run(|cx| {
+        crate::terminal::bench::start();
         load_bundled_fonts(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -252,6 +349,7 @@ impl Workspace {
         Self::watch_artifacts(window, cx);
         Self::watch_box_icons(window, cx);
         let dag_refresh = Self::watch_dag(window, cx);
+        let talk_refresh = Self::watch_talk(window, cx);
         let status_bar =
             cx.new(|cx| StatusBar::new(window, cx, Settings::defaults(), Settings::from_sections));
         let bar_config = cx.subscribe_in(
@@ -290,6 +388,9 @@ impl Workspace {
             picker: None,
             dag: None,
             dag_refresh,
+            talk: None,
+            talk_refresh,
+            dag_progress: None,
             attention: HashMap::new(),
             previews: Vec::new(),
             active_previews: HashMap::new(),
@@ -748,9 +849,19 @@ impl Workspace {
             .detach();
         cx.spawn_in(window, async move |app, cx| {
             while rx.recv().await.is_ok() {
-                let Ok(query) = app.update(cx, |this, _| this.dag_query()) else {
+                let Ok((query, view)) = app.update(cx, |this, _| {
+                    let view = this
+                        .active_box()
+                        .and_then(|entry| Some((entry.id.clone(), entry.active_view.clone()?)));
+                    (this.dag_query(), view)
+                }) else {
                     break;
                 };
+                let progress = view.map(|(box_id, session)| {
+                    cx.background_executor().spawn(async move {
+                        session_dag_progress(box_id, &session).map(|progress| (session, progress))
+                    })
+                });
                 let attention = cx
                     .background_executor()
                     .spawn(async { client::attention() });
@@ -759,17 +870,21 @@ impl Workspace {
                         .background_executor()
                         .spawn(async move {
                             match query {
-                                DagQuery::Runs(box_id) => {
-                                    client::list_runs(Some(box_id), None).map(DagSnapshot::Runs)
-                                }
+                                DagQuery::Runs {
+                                    box_id,
+                                    include_finished,
+                                } => client::list_runs(Some(box_id), None, include_finished)
+                                    .map(DagSnapshot::Runs),
                                 DagQuery::Run { id, repository } => {
                                     let run = client::get_run(id)?;
                                     let worktrees = DagWorktrees::load(&repository);
                                     Ok(DagSnapshot::Run(run, Box::new(worktrees)))
                                 }
-                                DagQuery::Agents(box_id) => {
-                                    client::list_agents(Some(box_id), None).map(DagSnapshot::Agents)
-                                }
+                                DagQuery::Agents {
+                                    box_id,
+                                    include_finished,
+                                } => client::list_agents(Some(box_id), None, include_finished)
+                                    .map(DagSnapshot::Agents),
                             }
                         })
                         .await;
@@ -781,6 +896,22 @@ impl Workspace {
                     {
                         break;
                     }
+                }
+                if let Some(progress) = progress
+                    && let Ok((session, progress)) = progress.await
+                    && app
+                        .update(cx, |this, cx| {
+                            if this.active_view().as_deref() == Some(&session) {
+                                let progress = progress.map(|value| (session, value));
+                                if this.dag_progress != progress {
+                                    this.dag_progress = progress;
+                                    this.sync_status_bar(cx);
+                                }
+                            }
+                        })
+                        .is_err()
+                {
+                    break;
                 }
                 let Ok(attention) = attention.await else {
                     continue;
@@ -817,9 +948,17 @@ impl Workspace {
             ));
         }
         let picker = self.picker.as_ref()?;
+        let include_finished = picker.show_finished;
         let query = match &picker.kind {
-            Kind::Runs { box_id, .. } => DagQuery::Runs(box_id.clone()),
-            Kind::Agents { box_id, .. } => DagQuery::Agents(box_id.clone()),
+            // The first load lists every run, so a box with finished runs never skips the list.
+            Kind::Runs { box_id, .. } => DagQuery::Runs {
+                box_id: box_id.clone(),
+                include_finished: include_finished || picker.loading,
+            },
+            Kind::Agents { box_id, .. } => DagQuery::Agents {
+                box_id: box_id.clone(),
+                include_finished,
+            },
             _ => return None,
         };
         Some((picker.id, query))
@@ -854,22 +993,42 @@ impl Workspace {
             }
         } else if let Some(picker) = self.picker.as_mut().filter(|picker| picker.id == id) {
             let initial = std::mem::take(&mut picker.loading);
+            let toggle = |scope| self.keymap.first(scope, Command::ToggleFinished);
             match result {
                 Ok(DagSnapshot::Runs(mut runs)) => {
-                    // Skip the list only when there is nothing else to pick.
+                    // Skip the list only when the box has no other run, finished or not.
                     if initial && runs.len() == 1 {
                         if let Some(run) = runs.pop() {
                             self.open_dag(run, window, cx);
                         }
                         return;
                     }
-                    picker.message = runs.is_empty().then(|| "This box has no DAG runs.".into());
+                    if !picker.show_finished {
+                        runs.retain(|run| !run.status().is_finished());
+                    }
+                    picker.message = picker.run_notice.clone().or_else(|| {
+                        runs.is_empty().then(|| {
+                            empty_message(
+                                "This box has no DAG runs.",
+                                "This box has no unfinished DAG runs.",
+                                picker.show_finished,
+                                &toggle(Scope::Runs),
+                                "completed and archived runs",
+                            )
+                        })
+                    });
                     picker.set_runs(runs);
                 }
                 Ok(DagSnapshot::Agents(agents)) => {
-                    picker.message = agents
-                        .is_empty()
-                        .then(|| "This box has no managed agents.".into());
+                    picker.message = agents.is_empty().then(|| {
+                        empty_message(
+                            "This box has no managed agents.",
+                            "This box has no live managed agents.",
+                            picker.show_finished,
+                            &toggle(Scope::AgentTree),
+                            "exited and done agents",
+                        )
+                    });
                     picker.set_agents(agents);
                 }
                 Err(error) => {
@@ -1067,7 +1226,9 @@ impl Workspace {
         if self.hinting.is_some() {
             self.end_hints(cx);
         }
-        if let Some(dag) = &self.dag {
+        if let Some(talk) = &self.talk {
+            talk.focus(window);
+        } else if let Some(dag) = &self.dag {
             dag.focus.focus(window);
         } else if let Some(picker) = &self.picker {
             picker.focus.focus(window);
@@ -1089,6 +1250,7 @@ impl Workspace {
             self.focus.focus(window);
         }
         self.sync_status_bar(cx);
+        let _ = self.dag_refresh.try_send(());
         cx.notify();
     }
 
@@ -1137,6 +1299,10 @@ impl Workspace {
                 agent_type: terminal.session.agent.name().into(),
                 agent_task: terminal.metadata.task.clone(),
                 agent_model: terminal.metadata.model.clone(),
+                dag_progress: self
+                    .dag_progress
+                    .as_ref()
+                    .and_then(|(id, progress)| (id == session).then(|| progress.clone())),
             })
         });
         let scheme = cx.global::<DesktopScheme>().0;
@@ -1374,6 +1540,69 @@ impl Workspace {
         .detach();
     }
 
+    /// Starts the task graph's queued task now, over the worker budget. An error shows in the
+    /// graph's message line.
+    fn start_queued_task(
+        &mut self,
+        view: u64,
+        run: String,
+        task: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = cx
+            .background_executor()
+            .spawn(async move { client::start_queued(run, task) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = start.await;
+            let _ = app.update(cx, |this, cx| {
+                if let Some(dag) = this.dag.as_mut().filter(|dag| dag.id == view) {
+                    dag.message = result
+                        .err()
+                        .map(|error| format!("Could not start the task. {error:#}"));
+                }
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Archives the run picker's selected run, or unarchives it when `archived`. A refusal,
+    /// such as open attempts, shows in the picker message; there is no confirm step.
+    fn toggle_run_archive(
+        &mut self,
+        picker: u64,
+        run: String,
+        archived: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            if archived {
+                client::unarchive_run(run)
+            } else {
+                client::archive_run(run, false)
+            }
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker) else {
+                    return;
+                };
+                let action = if archived { "unarchive" } else { "archive" };
+                picker.run_notice = result
+                    .err()
+                    .map(|error| format!("Could not {action} run. {error:#}"));
+                picker.message = picker.run_notice.clone();
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Streams a recursive directory listing into the new box picker when its query asks for one.
     fn start_directory_walk(&mut self, cx: &mut Context<Self>) {
         let Some(picker) = self.picker.as_mut() else {
@@ -1480,6 +1709,7 @@ impl Workspace {
         focus.focus(window);
         self.picker = None;
         self.dag = Some(DagView::new(self.next_id(), run, focus));
+        let _ = self.talk_refresh.try_send(());
         let _ = self.dag_refresh.try_send(());
         cx.notify();
     }
@@ -1543,6 +1773,183 @@ impl Workspace {
             picker.message = Some("Looking up agents…".into());
         }
         let _ = self.dag_refresh.try_send(());
+        let _ = self.talk_refresh.try_send(());
+    }
+
+    /// Pauses the agent tree's selected agent, or resumes it when it is paused.
+    fn toggle_selected_pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let Some(Choice::Agent(id)) = picker.selection() else {
+            return;
+        };
+        let Kind::Agents { tree, .. } = &picker.kind else {
+            return;
+        };
+        let Some(agent) = tree.agent(&id) else {
+            return;
+        };
+        let paused = !agent.paused;
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::set_agent_paused(id, paused) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                let action = if paused { "pause" } else { "resume" };
+                picker.message = result
+                    .err()
+                    .map(|error| format!("Could not {action} agent. {error:#}"));
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The emergency stop: pauses every running agent except the selected one and the
+    /// agent of the active terminal, through the same use case as
+    /// `power agent pause --all-except`.
+    fn pause_all_except_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let caller = self.active_view();
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let keep = match picker.selection() {
+            Some(Choice::Agent(id)) => vec![id],
+            _ => Vec::new(),
+        };
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::pause_all_except(keep, caller) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                picker.message = Some(match result {
+                    Ok(paused) => format!(
+                        "Paused {} agent{}.",
+                        paused.len(),
+                        if paused.len() == 1 { "" } else { "s" }
+                    ),
+                    Err(error) => format!("Could not pause agents. {error:#}"),
+                });
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_run_pause(
+        &mut self,
+        picker: u64,
+        run: String,
+        paused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            if paused {
+                client::resume_run(run)
+            } else {
+                client::pause_run(run)
+            }
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker) else {
+                    return;
+                };
+                let action = if paused { "resume" } else { "pause" };
+                picker.run_notice = result
+                    .err()
+                    .map(|error| format!("Could not {action} run. {error:#}"));
+                picker.message = picker.run_notice.clone();
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Stops the agent tree's selected worker through the same guarded use case as
+    /// `power agent stop`, so it never ends a shell session the agent only runs in.
+    fn end_selected_worker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.keymap.first(Scope::AgentTree, Command::EndWorker);
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let Some(Choice::Agent(id)) = picker.selection() else {
+            return;
+        };
+        let Kind::Agents { tree, .. } = &picker.kind else {
+            return;
+        };
+        let Some(agent) = tree.agent(&id) else {
+            return;
+        };
+        let step = end_worker_step(agent, picker.armed_end.as_deref(), &key);
+        picker.armed_end = None;
+        let agent = match step {
+            EndWorker::NoSession => {
+                self.show_error("This worker has no terminal session.", cx);
+                return;
+            }
+            EndWorker::Confirm(message) => {
+                picker.armed_end = Some(id);
+                picker.message = Some(message);
+                cx.notify();
+                return;
+            }
+            EndWorker::Stop(agent) => agent,
+        };
+        picker.message = None;
+        let picker_id = picker.id;
+        let session = tree.agent(&id).and_then(|agent| agent.session.clone());
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::stop_agent(agent) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                // A stopped session is forgotten by the daemon and cannot be reattached,
+                // so its tab and saved view go with it, as when a tab's session ends.
+                if result.is_ok()
+                    && let Some(session) = &session
+                {
+                    this.terminals.remove(session);
+                    this.sessions.remove(session);
+                    for entry in &mut this.layout.boxes {
+                        if let Some(index) =
+                            entry.views.iter().position(|view| &view.session == session)
+                        {
+                            entry.remove_view(index);
+                        }
+                    }
+                    this.save();
+                }
+                let _ = this.dag_refresh.try_send(());
+                if let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id) {
+                    picker.message = result
+                        .err()
+                        .map(|error| format!("Could not stop agent. {error:#}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_worker(
@@ -2068,11 +2475,14 @@ impl Workspace {
         }
     }
 
+    /// Ends a session, with or without an open tab, and removes any saved view of it.
     fn end_session(&mut self, session: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.terminals.get_mut(&session).filter(|tab| !tab.closing) else {
-            return;
-        };
-        tab.closing = true;
+        if let Some(tab) = self.terminals.get_mut(&session) {
+            if tab.closing {
+                return;
+            }
+            tab.closing = true;
+        }
         let target = session.clone();
         let end = cx.background_executor().spawn(async move {
             let result = client::end_session(target.clone());
@@ -2099,6 +2509,7 @@ impl Workspace {
                     }
                     this.error = None;
                     this.save();
+                    let _ = this.dag_refresh.try_send(());
                     this.restore_focus(window, cx);
                 }
                 Err(error) => {
@@ -2115,6 +2526,10 @@ impl Workspace {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let stroke = &event.keystroke;
         let key = stroke.key.as_str();
+        if self.talk.is_some() {
+            self.talk_key(event, window, cx);
+            return;
+        }
         if let Some(dag) = &mut self.dag {
             cx.stop_propagation();
             if dag.picking_artifact {
@@ -2152,6 +2567,29 @@ impl Workspace {
                     } else {
                         self.show_error("This task has no assigned worker.", cx);
                     }
+                }
+                Some(Command::AgentTalk) if !event.is_held => {
+                    if let Some(attempt) = dag.attempt() {
+                        let label = dag
+                            .task()
+                            .map_or_else(|| attempt.agent.clone(), |task| task.title.clone());
+                        let target = TalkTarget::Agent {
+                            id: attempt.agent.clone(),
+                            label,
+                        };
+                        let box_id = dag.run.box_id.clone();
+                        self.open_talk(box_id, target, window, cx);
+                    }
+                }
+                Some(Command::DagStartNow) if !event.is_held && !dag.opening => {
+                    match dag.task().filter(|task| task.state == TaskState::Queued) {
+                        Some(task) => {
+                            let (id, run, task) = (dag.id, dag.run.id.clone(), task.id.clone());
+                            self.start_queued_task(id, run, task, window, cx);
+                        }
+                        None => dag.message = Some("This task is not queued.".into()),
+                    }
+                    cx.notify();
                 }
                 Some(Command::DagArtifact) if !event.is_held && !dag.opening => {
                     let artifacts = dag.artifacts();
@@ -2195,12 +2633,19 @@ impl Workspace {
             cx.stop_propagation();
             let scope = if matches!(picker.kind, Kind::Agents { .. }) {
                 Scope::AgentTree
+            } else if matches!(picker.kind, Kind::Runs { .. }) {
+                Scope::Runs
             } else if picker.has_text_field() {
                 Scope::Picker
             } else {
                 Scope::Dialog
             };
-            match self.keymap.command(scope, stroke) {
+            let command = self.keymap.command(scope, stroke);
+            if command != Some(Command::EndWorker) && picker.armed_end.take().is_some() {
+                picker.message = None;
+                cx.notify();
+            }
+            match command {
                 Some(Command::PickerCancel) => self.dismiss_picker(window, cx),
                 Some(Command::PickerSelect) => {
                     if event.is_held || picker.waiting {
@@ -2226,6 +2671,49 @@ impl Workspace {
                     picker.step(false);
                     self.preview_selected_scheme(cx);
                     cx.notify();
+                }
+                Some(Command::ToggleFinished) => {
+                    if !picker.waiting {
+                        picker.show_finished = !picker.show_finished;
+                        let _ = self.dag_refresh.try_send(());
+                    }
+                }
+                Some(Command::AgentTalk) if !event.is_held && !picker.waiting => {
+                    self.open_agent_talk(window, cx);
+                }
+                Some(Command::EndWorker) => {
+                    if !event.is_held && !picker.waiting {
+                        self.end_selected_worker(window, cx);
+                    }
+                }
+                Some(Command::PauseAgent) => {
+                    if !event.is_held && !picker.waiting {
+                        self.toggle_selected_pause(window, cx);
+                    }
+                }
+                Some(Command::PauseAllExcept) => {
+                    if !event.is_held && !picker.waiting {
+                        self.pause_all_except_selected(window, cx);
+                    }
+                }
+                Some(Command::PauseRun) => {
+                    if !event.is_held
+                        && !picker.waiting
+                        && let Some(run) = picker.selected_run()
+                    {
+                        let (picker_id, run, paused) =
+                            (picker.id, run.id.clone(), run.paused_at.is_some());
+                        self.toggle_run_pause(picker_id, run, paused, window, cx);
+                    }
+                }
+                Some(Command::ArchiveRun) => {
+                    if !picker.waiting
+                        && let Some(run) = picker.selected_run()
+                    {
+                        let (picker_id, run, archived) =
+                            (picker.id, run.id.clone(), run.archived_at.is_some());
+                        self.toggle_run_archive(picker_id, run, archived, window, cx);
+                    }
                 }
                 Some(command @ (Command::AgentCollapse | Command::AgentExpand)) => {
                     if !picker.waiting {
@@ -2308,6 +2796,11 @@ impl Workspace {
             Some(Command::BoxPick) => self.pick_boxes(window, cx),
             Some(Command::BoxRuns) => self.pick_runs(window, cx),
             Some(Command::BoxAgents) => self.pick_agents(window, cx),
+            Some(Command::BoxTalk) => {
+                if let Some(box_id) = self.layout.active_box.clone() {
+                    self.open_talk(box_id, TalkTarget::User, window, cx);
+                }
+            }
             Some(Command::Reload) => {
                 self.status_bar.update(cx, StatusBar::reload);
             }
@@ -2713,6 +3206,7 @@ fn attention_fill(colors: &Colors, strength: u32) -> u32 {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::terminal::bench::count(&crate::terminal::bench::WINDOW);
         let colors = colors(cx);
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
@@ -2815,21 +3309,25 @@ impl Render for Workspace {
             });
         let previews = self.previews(window, cx);
         let entity = cx.weak_entity();
-        let modal = self.picker.as_ref().map(|picker| {
-            let picker_id = picker.id;
-            picker.render(colors, move |index, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    if let Some(choice) = this
-                        .picker
-                        .as_ref()
-                        .filter(|picker| picker.id == picker_id)
-                        .and_then(|picker| picker.choice(index))
-                    {
-                        this.choose(choice, window, cx);
-                    }
-                });
-            })
-        });
+        let modal = self
+            .picker
+            .as_ref()
+            .filter(|_| self.talk.is_none())
+            .map(|picker| {
+                let picker_id = picker.id;
+                picker.render(colors, move |index, window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        if let Some(choice) = this
+                            .picker
+                            .as_ref()
+                            .filter(|picker| picker.id == picker_id)
+                            .and_then(|picker| picker.choice(index))
+                        {
+                            this.choose(choice, window, cx);
+                        }
+                    });
+                })
+            });
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
@@ -2962,6 +3460,11 @@ impl Render for Workspace {
             )
             .children(modal)
             .children(graph)
+            .children(
+                self.talk
+                    .as_ref()
+                    .map(|talk| talk.render(colors, &self.keymap)),
+            )
     }
 }
 
@@ -2975,7 +3478,118 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkAction, link_action};
+    use super::{
+        AgentStatus, Coordinator, EndWorker, LinkAction, ManagedAgent, Run, Task, empty_message,
+        end_worker_step, link_action, running_progress,
+    };
+    use domain::dag::{AgentState, Provider, TaskState};
+
+    #[test]
+    fn ending_a_busy_worker_needs_a_second_press() {
+        let mut agent = ManagedAgent {
+            id: "worker".into(),
+            box_id: "box".into(),
+            worktree: "/repo".into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: None,
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            paused: false,
+            status: AgentStatus::Working,
+            label: "worker".into(),
+            created_at: 0,
+        };
+        assert_eq!(
+            end_worker_step(&agent, None, "Ctrl+X"),
+            EndWorker::NoSession
+        );
+        agent.session = Some("session".into());
+        let end = EndWorker::Stop("worker".into());
+        for status in [AgentStatus::Working, AgentStatus::NeedsInput] {
+            agent.status = status;
+            assert_eq!(
+                end_worker_step(&agent, None, "Ctrl+X"),
+                EndWorker::Confirm(
+                    "Worker is still working — press Ctrl+X again to end it.".into()
+                )
+            );
+            // Arming another worker does not confirm this one.
+            assert!(matches!(
+                end_worker_step(&agent, Some("other"), "Ctrl+X"),
+                EndWorker::Confirm(_)
+            ));
+            assert_eq!(end_worker_step(&agent, Some("worker"), "Ctrl+X"), end);
+        }
+        agent.status = AgentStatus::Idle;
+        assert!(matches!(
+            end_worker_step(&agent, None, "Ctrl+X"),
+            EndWorker::Confirm(_)
+        ));
+        assert_eq!(end_worker_step(&agent, Some("worker"), "Ctrl+X"), end);
+        for status in [AgentStatus::Done, AgentStatus::Failed] {
+            agent.status = status;
+            assert_eq!(end_worker_step(&agent, None, "Ctrl+X"), end);
+        }
+    }
+
+    #[test]
+    fn empty_pickers_name_the_toggle_while_finished_items_are_hidden() {
+        let message = |show_finished| {
+            empty_message(
+                "No runs.",
+                "No unfinished runs.",
+                show_finished,
+                "Ctrl+F",
+                "completed runs",
+            )
+        };
+        assert_eq!(
+            message(false),
+            "No unfinished runs. Ctrl+F shows completed runs."
+        );
+        assert_eq!(message(true), "No runs.");
+    }
+
+    #[test]
+    fn shows_progress_while_the_dag_has_actionable_work() {
+        let mut run = Run {
+            id: "run".into(),
+            box_id: "box".into(),
+            title: "Review a change".into(),
+            coordinator: Coordinator::Agent {
+                agent: "coordinator".into(),
+            },
+            created_at: 0,
+            archived_at: None,
+            paused_at: None,
+            tasks: Vec::new(),
+        };
+        assert_eq!(running_progress(&run), None);
+        for (id, state) in [("done", TaskState::Completed), ("review", TaskState::Ready)] {
+            run.tasks.push(Task {
+                id: id.into(),
+                title: id.into(),
+                instructions: String::new(),
+                deps: Vec::new(),
+                state,
+                queued_at: None,
+                current_attempt: None,
+                attempts: Vec::new(),
+            });
+        }
+        for state in [TaskState::Ready, TaskState::Working, TaskState::NeedsInput] {
+            run.tasks[1].state = state;
+            assert_eq!(running_progress(&run).as_deref(), Some("DAG 1/2 done"));
+        }
+        for state in [TaskState::Waiting, TaskState::Failed, TaskState::Completed] {
+            run.tasks[1].state = state;
+            assert_eq!(running_progress(&run), None);
+        }
+    }
 
     #[test]
     fn dag_links_open_runs_directly() {
