@@ -632,6 +632,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             agent,
             conversation,
             fresh,
+            resumed,
         } => {
             ensure!(
                 !agent.is_empty()
@@ -649,6 +650,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                     agent: Agent::Coding(agent.into()),
                     conversation,
                     fresh,
+                    resumed,
                     reply: send,
                 })?;
             ensure!(

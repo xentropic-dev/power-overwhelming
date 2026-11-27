@@ -97,10 +97,13 @@ fn setup(root: &Path) {
     std::fs::write(
         &agent,
         format!(
-            "#!/bin/sh\ncase \"$*\" in *--resume*) [ ! -f {fail} ] || exit 1;; esac\nif [ -f {fail} ]; then : > {fresh}; fi\nif [ ! -f {marker} ]; then\n  : > {marker}\n  power session task 'Saved task'\n  power session model reported-model\nfi\n# With its input redirected, the agent stays until it is killed.\nread finish || sleep 30\n",
+            "#!/bin/sh\nprev=\nfor arg in \"$@\"; do\n  if [ \"$prev\" = --session-id ]; then printf '%s\\n' \"$arg\" >> {ids}; fi\n  if [ \"$arg\" = --fork-session ]; then printf 'fork\\n' >> {forks}; fi\n  if [ \"$arg\" = --continue ]; then : > {continued}; fi\n  prev=$arg\ndone\ncase \"$*\" in *--resume*) [ ! -f {fail} ] || exit 1;; esac\nif [ -f {fail} ]; then : > {fresh}; fi\nif [ ! -f {marker} ]; then\n  : > {marker}\n  power session task 'Saved task'\n  power session model reported-model\nfi\n# With its input redirected, the agent stays until it is killed.\nread finish || sleep 30\n",
             marker = root.join("reported").display(),
             fail = root.join("fail-claude").display(),
             fresh = root.join("claude-fresh").display(),
+            ids = root.join("claude-ids").display(),
+            forks = root.join("claude-forks").display(),
+            continued = root.join("claude-continued").display(),
         ),
     )
     .unwrap();
@@ -547,5 +550,255 @@ fn a_shell_fallback_that_reuses_the_failed_id_drops_the_old_labels() {
     assert_eq!(
         metadata_now(&socket, &session),
         json!({"task":null, "model":null})
+    );
+}
+
+/// Waits until `session` shows `agent` in its foreground, with no labels on the way.
+fn agent_seen_without_labels(socket: &Path, session: &Value, agent: &str) {
+    let mut attached = request(socket, json!({"request":"subscribe", "session":session}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "{agent} was never seen");
+        let message = event(&mut attached);
+        assert_ne!(message["event"], "metadata", "{message}");
+        if message["event"] == "agent" && message["agent"] == agent {
+            break;
+        }
+    }
+    // Still none after the restored shell's grace period would have run out.
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        metadata_now(socket, session),
+        json!({"task":null, "model":null})
+    );
+}
+
+fn saved_labels(root: &Path) -> Vec<(Option<String>, Option<String>)> {
+    let db = rusqlite::Connection::open(root.join("state/sessions.sqlite3")).unwrap();
+    let mut statement = db.prepare("SELECT task, model FROM sessions").unwrap();
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    assert!(!rows.is_empty(), "No saved sessions");
+    rows
+}
+
+fn session_id(root: &Path) -> String {
+    let ids = std::fs::read_to_string(root.join("claude-ids")).unwrap();
+    ids.lines().next().unwrap().to_owned()
+}
+
+/// Makes the next shell skip the automatic resume, as a user can before it runs.
+fn skip_resume_hook(root: &Path, skip: bool) {
+    let rc = root.join(".bashrc");
+    let text = std::fs::read_to_string(&rc).unwrap();
+    let text = text.replace("unset POWER_RESUME\n", "");
+    let text = if skip {
+        format!("unset POWER_RESUME\n{text}")
+    } else {
+        text
+    };
+    std::fs::write(rc, text).unwrap();
+}
+
+#[test]
+fn a_shell_fork_of_a_conversation_never_brings_back_its_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    // The fork opens a new conversation that Claude names, not `parent`.
+    let (session, _attached) = start_agent_with(&socket, "claude --resume parent --fork-session\n");
+    daemon.terminate();
+
+    // The fork's ID is unknown, so the restore cannot continue it, and neither the
+    // parent nor whatever `--continue` opens owns the fork's labels.
+    let daemon = Daemon::start(root);
+    agent_seen_without_labels(&socket, &session, "claude");
+    assert!(root.join("claude-continued").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("claude-forks")).unwrap(),
+        "fork\n",
+        "The restore forked again"
+    );
+    daemon.terminate();
+    assert!(
+        saved_labels(root)
+            .iter()
+            .all(|labels| *labels == (None, None)),
+        "{:?}",
+        saved_labels(root)
+    );
+}
+
+#[test]
+fn a_manual_fresh_start_under_the_saved_id_drops_the_old_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    let (session, _attached) = start_agent(&socket);
+    let id = session_id(root);
+    daemon.terminate();
+
+    // The automatic resume is skipped, and the user starts a new conversation that
+    // reuses the saved ID. It is not the conversation that reported the labels.
+    skip_resume_hook(root, true);
+    let daemon = Daemon::start(root);
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    input(&socket, &session, &format!("claude --session-id {id}\n"));
+    agent_seen_without_labels(&socket, &session, "claude");
+    daemon.terminate();
+    assert!(
+        saved_labels(root)
+            .iter()
+            .all(|labels| *labels == (None, None)),
+        "{:?}",
+        saved_labels(root)
+    );
+
+    // A later resume of that ID shows none either.
+    skip_resume_hook(root, false);
+    let _daemon = Daemon::start(root);
+    agent_seen_without_labels(&socket, &session, "claude");
+}
+
+#[test]
+fn a_manual_resume_of_the_saved_id_keeps_its_labels() {
+    // Positive control for the manual fresh start: a resume that selects the saved
+    // conversation continues it, so its labels come back.
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let daemon = Daemon::start(root);
+    let (session, _attached) = start_agent(&socket);
+    let id = session_id(root);
+    daemon.terminate();
+
+    skip_resume_hook(root, true);
+    let _daemon = Daemon::start(root);
+    let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+    assert_eq!(event(&mut attached)["event"], "snapshot");
+    input(&socket, &session, &format!("claude --resume {id}\n"));
+    metadata_until(
+        &mut attached,
+        json!({"task":"Saved task", "model":"reported-model"}),
+    );
+}
+
+#[test]
+fn a_managed_fork_is_restored_without_forking_again_or_its_labels() {
+    let (directory, socket) = sandbox();
+    let root = directory.path();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "initial",
+    ]);
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    std::fs::write(
+        root.join("state/boxes.json"),
+        json!({
+            "boxes": [{
+                "id": "box", "repository": root.join(".git"), "checkout": root,
+                "shortcut": null, "views": [], "active_view": null, "previous_view": null,
+            }],
+            "active_box": "box",
+            "onboarded": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let daemon = Daemon::start(root);
+    let start = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_power"));
+        command
+            .current_dir(root)
+            .env("POWER_SOCKET", &socket)
+            .env("POWER_STATE_DIR", root.join("state"))
+            .env("HOME", root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    root.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+        for name in [
+            "POWER_SESSION",
+            "POWER_BOX",
+            "POWER_AGENT",
+            "POWER_RUN",
+            "POWER_TASK",
+            "POWER_ATTEMPT",
+            "POWER_BIN",
+            "POWER_PLUGIN_DIR",
+        ] {
+            command.env_remove(name);
+        }
+        let output = command
+            .args([
+                "agent",
+                "start",
+                "--box",
+                "box",
+                "--provider",
+                "claude",
+                "--worktree",
+            ])
+            .arg(root)
+            .arg("--allow-main-checkout")
+            .arg("--")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+        reply["agent"]["session"].clone()
+    };
+    let session = start(&["--resume", "parent", "--fork-session"]);
+    labels_become(
+        &socket,
+        &session,
+        json!({"task":"Saved task", "model":"reported-model"}),
+    );
+    daemon.terminate();
+
+    let daemon = Daemon::start(root);
+    wait_for(&root.join("claude-continued"));
+    assert_eq!(
+        metadata_now(&socket, &session),
+        json!({"task":null, "model":null})
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("claude-forks")).unwrap(),
+        "fork\n",
+        "The restore forked again"
+    );
+    daemon.terminate();
+    assert!(
+        saved_labels(root)
+            .iter()
+            .all(|labels| *labels == (None, None)),
+        "{:?}",
+        saved_labels(root)
     );
 }

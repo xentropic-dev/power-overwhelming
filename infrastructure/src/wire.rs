@@ -116,6 +116,11 @@ pub enum Request {
         /// of the labels saved for a conversation, even one with the same ID.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fresh: bool,
+        /// Whether the agent resumes `conversation`, an existing one, rather than
+        /// starting a new conversation under that ID. Only a resume continues the
+        /// conversation that owns saved labels.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resumed: bool,
     },
     Launch {
         worktree: PathBuf,
@@ -1573,6 +1578,7 @@ mod profile_tests {
             agent: "claude".into(),
             conversation: Some("conversation".into()),
             fresh: false,
+            resumed: true,
         };
         let mut line = Vec::new();
         send(&mut line, &request)?;
@@ -1583,12 +1589,13 @@ mod profile_tests {
                 "session": "session",
                 "agent": "claude",
                 "conversation": "conversation",
+                "resumed": true,
             })
         );
         let decoded = receive::<Request>(&mut line.as_slice())?;
         assert!(matches!(
             decoded,
-            Some(Request::SetConversation { session, agent, conversation, fresh: false })
+            Some(Request::SetConversation { session, agent, conversation, fresh: false, resumed: true })
                 if session == "session" && agent == "claude"
                     && conversation.as_deref() == Some("conversation")
         ));

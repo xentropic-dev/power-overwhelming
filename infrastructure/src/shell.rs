@@ -275,7 +275,7 @@ fn quote_words(program: &str, args: &[OsString]) -> OsString {
 pub(crate) fn assign_conversation(
     profile: &AgentProfile,
     user: &[OsString],
-) -> Option<(Vec<OsString>, Option<String>)> {
+) -> Option<domain::agent::Launch> {
     let skipped = user
         .first()
         .and_then(|arg| arg.to_str())
@@ -290,7 +290,7 @@ pub(crate) fn assign_conversation(
         return None;
     }
     let Some(resume) = &profile.resume else {
-        return Some((Vec::new(), None));
+        return Some(domain::agent::Launch::default());
     };
     Some(resume.launch(user, || uuid::Uuid::new_v4().to_string()))
 }
@@ -696,8 +696,8 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
     // A notify-only provider marks the session with its first ready report.
     let (callbacks, _) = launch_callbacks(callback_profile, &args, &cwd);
     command.args(callbacks);
-    if let Some((assign, conversation)) = assign_conversation(profile, &args) {
-        command.args(assign);
+    if let Some(launch) = assign_conversation(profile, &args) {
+        command.args(launch.args);
         // The report identifies this process, which the agent replaces, as the agent
         // that owns the conversation and the labels it reports. The agent starts either
         // way. Without the report it restarts fresh and its labels are not saved.
@@ -705,8 +705,11 @@ pub fn exec_agent(profile: &AgentProfile, args: Vec<OsString>) -> Result<()> {
             let _ = crate::client::set_conversation(
                 session.to_string_lossy().into_owned(),
                 profile.id.as_str().to_owned(),
-                conversation,
+                launch.conversation,
                 fresh,
+                // Only a resume that names the conversation continues it. An ID
+                // assigned to a new one, here or by the user, starts it fresh.
+                launch.resumed && !fresh,
             );
         }
     }
@@ -1165,15 +1168,20 @@ mod tests {
         let claude = profiles.resolve(&"claude".into()).unwrap();
         let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
 
-        let (assign, conversation) =
-            assign_conversation(claude, &args(&["--model", "opus"])).unwrap();
-        let conversation = conversation.expect("an interactive launch gets an ID");
-        assert_eq!(assign, args(&["--session-id", &conversation]));
+        let launch = assign_conversation(claude, &args(&["--model", "opus"])).unwrap();
+        let conversation = launch
+            .conversation
+            .expect("an interactive launch gets an ID");
+        assert_eq!(launch.args, args(&["--session-id", &conversation]));
+        assert!(!launch.resumed);
         // A resume reports the conversation it resumes.
-        assert_eq!(
-            assign_conversation(claude, &args(&["--resume", "conv"])),
-            Some((Vec::new(), Some("conv".into())))
-        );
+        let resumed = assign_conversation(claude, &args(&["--resume", "conv"])).unwrap();
+        assert_eq!(resumed.conversation.as_deref(), Some("conv"));
+        assert!(resumed.resumed);
+        // A fork of it is a new conversation the launch cannot name.
+        let fork =
+            assign_conversation(claude, &args(&["--resume", "conv", "--fork-session"])).unwrap();
+        assert_eq!(fork.conversation, None);
 
         for skipped in [&["mcp", "list"][..], &["update"], &["--help"], &["-v"]] {
             assert_eq!(
@@ -1184,7 +1192,7 @@ mod tests {
         }
         // Codex cannot name its conversation, but a launch still starts one.
         let codex = profiles.resolve(&"codex".into()).unwrap();
-        assert_eq!(assign_conversation(codex, &[]), Some((Vec::new(), None)));
+        assert_eq!(assign_conversation(codex, &[]), Some(Default::default()));
     }
 
     #[test]

@@ -267,6 +267,7 @@ struct ResumeConfig {
     resume: Option<Vec<String>>,
     resume_last: Option<Vec<String>>,
     conflicts: Option<Vec<String>>,
+    forks: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -312,7 +313,10 @@ fn read_agent_profile(
         normalize_empty_lists(callback, &["args"]);
     }
     if let Some(resume) = value.get_mut("resume") {
-        normalize_empty_lists(resume, &["assign", "resume", "resume_last", "conflicts"]);
+        normalize_empty_lists(
+            resume,
+            &["assign", "resume", "resume_last", "conflicts", "forks"],
+        );
     }
     // Lua cannot tell an empty table from an empty list.
     if let Some(env) = value.get_mut("env")
@@ -403,6 +407,7 @@ fn read_agent_profile(
             resume: config.resume.unwrap_or(defaults.resume),
             resume_last: config.resume_last.unwrap_or(defaults.resume_last),
             conflicts: config.conflicts.unwrap_or(defaults.conflicts),
+            forks: config.forks.unwrap_or(defaults.forks),
         });
     }
     Ok(profile)
@@ -761,6 +766,7 @@ mod tests {
                 resume: vec!["reopen".into(), "{id}".into()],
                 resume_last: vec!["reopen".into(), "--last".into()],
                 conflicts: vec!["--id".into(), "reopen".into()],
+                forks: Vec::new(),
             })
         );
         Ok(())

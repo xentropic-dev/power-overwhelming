@@ -221,7 +221,12 @@ impl<R: TerminalRuntime> Application<R> {
                 .ok()
                 .and_then(|profile| profile.resume.as_ref())
                 // Only an `{id}` argument selects the saved conversation itself.
-                .is_some_and(|resume| resume.resume.iter().any(|arg| arg.contains("{id}")))
+                .is_some_and(|resume| {
+                    resume.resume.iter().any(|arg| arg.contains("{id}"))
+                        // A forked launch opened a new conversation. A record saved
+                        // before forks were told apart names its parent instead.
+                        && !resume.forks(&record.args)
+                })
     }
 }
 
@@ -380,6 +385,7 @@ mod tests {
             resume: vec!["--resume".into(), "{id}".into()],
             resume_last: vec!["--continue".into()],
             conflicts: vec!["--resume".into()],
+            forks: vec!["--fork-session".into()],
         };
         let codex = Resume {
             resume_last: vec!["resume".into(), "--last".into()],
@@ -777,6 +783,58 @@ mod tests {
         assert_eq!(saved.foreground, coding("claude"));
         assert_eq!(saved.conversation.as_deref(), Some("conv"));
         assert_eq!(saved.cwd.as_deref(), Some(Path::new("/repo/sub")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_forked_launch_is_never_restored_as_a_pinned_resume() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let store = Arc::new(MemorySessions::default());
+        let saved = Labels {
+            task: Some("Fork task".into()),
+            model: Some("model".into()),
+            model_reported: true,
+        };
+        // A record from before forks were told apart names the parent conversation.
+        let mut fork = record(
+            "fork",
+            worktree.path(),
+            coding("claude"),
+            &["--resume", "parent", "--fork-session", "--model", "opus"],
+        );
+        fork.conversation = Some("parent".into());
+        fork.labels = saved.clone();
+        store.save(&fork)?;
+        // Positive control: the same launch without the fork keeps its labels.
+        let mut pinned = record(
+            "pinned",
+            worktree.path(),
+            coding("claude"),
+            &["--resume", "parent", "--model", "opus"],
+        );
+        pinned.conversation = Some("parent".into());
+        pinned.labels = saved.clone();
+        store.save(&pinned)?;
+        let (application, starts) = app(store.clone());
+        application.restore_sessions()?;
+
+        let starts = starts.0.lock().unwrap();
+        let options = |id: &str| &starts.iter().find(|(s, _)| s.id == id).unwrap().1;
+        // The restore resumes the saved conversation itself and never forks again.
+        assert_eq!(
+            options("fork").args,
+            os(&["--resume", "parent", "--model", "opus"])
+        );
+        assert_eq!(
+            options("fork").fallback_args,
+            Some(os(&["--session-id", "parent", "--model", "opus"]))
+        );
+        assert_eq!(options("fork").labels, Labels::default());
+        assert_eq!(options("pinned").labels, saved);
+        let records = store.list()?;
+        let labels = |id: &str| records.iter().find(|r| r.id == id).unwrap().labels.clone();
+        assert_eq!(labels("fork"), Labels::default());
+        assert_eq!(labels("pinned"), saved);
         Ok(())
     }
 

@@ -87,34 +87,81 @@ pub struct Resume {
     pub resume: Vec<String>,
     pub resume_last: Vec<String>,
     pub conflicts: Vec<String>,
+    /// Flags that make a resume open a new conversation branched from the one it names,
+    /// such as Claude's `--fork-session`. The named ID is the parent's, not the fork's.
+    pub forks: Vec<String>,
+}
+
+/// What a launch adds and what it is known to open.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Launch {
+    /// Arguments to prepend.
+    pub args: Vec<OsString>,
+    /// The conversation the launch opens, when it is known.
+    pub conversation: Option<String>,
+    /// Whether the launch resumes `conversation`, an existing one, rather than starting
+    /// a new conversation under that ID.
+    pub resumed: bool,
 }
 
 impl Resume {
-    /// Return arguments to prepend at launch and the conversation ID to record.
-    pub fn launch(
-        &self,
-        user_args: &[OsString],
-        new_id: impl FnOnce() -> String,
-    ) -> (Vec<OsString>, Option<String>) {
+    /// Return arguments to prepend at launch and the conversation it opens.
+    pub fn launch(&self, user_args: &[OsString], new_id: impl FnOnce() -> String) -> Launch {
         let conflicts = user_args
             .iter()
             .any(|arg| self.conflicts.iter().any(|token| arg == token.as_str()));
         if !conflicts && !self.assign.is_empty() {
             let id = new_id();
-            return (Self::substitute(&self.assign, &id), Some(id));
+            return Launch {
+                args: Self::substitute(&self.assign, &id),
+                conversation: Some(id),
+                resumed: false,
+            };
         }
+        let find = |flags: &[String]| {
+            let flags: Vec<&str> = flags
+                .windows(2)
+                .filter(|pair| pair[1] == "{id}")
+                .map(|pair| pair[0].as_str())
+                .collect();
+            user_args
+                .windows(2)
+                .filter(|pair| flags.iter().any(|flag| pair[0] == *flag))
+                .find_map(|pair| pair[1].to_str().map(str::to_owned))
+        };
+        let assigned = find(&self.assign);
+        if self.forks(user_args) {
+            // A fork opens a new conversation. Only an ID assigned to it names that one.
+            return Launch {
+                conversation: assigned,
+                ..Launch::default()
+            };
+        }
+        if let Some(id) = assigned {
+            return Launch {
+                conversation: Some(id),
+                ..Launch::default()
+            };
+        }
+        let conversation = find(&self.resume);
+        Launch {
+            resumed: conversation.is_some(),
+            conversation,
+            ..Launch::default()
+        }
+    }
 
-        let id_flags = self
-            .assign
-            .windows(2)
-            .chain(self.resume.windows(2))
-            .filter(|pair| pair[1] == "{id}")
-            .map(|pair| pair[0].as_str());
-        let id = user_args
-            .windows(2)
-            .filter(|pair| id_flags.clone().any(|flag| pair[0] == flag))
-            .find_map(|pair| pair[1].to_str().map(str::to_owned));
-        (Vec::new(), id)
+    /// Whether `args` fork the conversation they resume.
+    pub fn forks(&self, args: &[OsString]) -> bool {
+        args.iter().any(|arg| {
+            let text = arg.to_string_lossy();
+            self.forks.iter().any(|flag| {
+                text == flag.as_str()
+                    || text
+                        .strip_prefix(flag.as_str())
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        })
     }
 
     /// Return arguments for a known conversation or the profile's fallback.
@@ -139,7 +186,13 @@ impl Resume {
     /// `args` without the options that select a conversation by ID, such as
     /// `--resume <id>` or `--resume=<id>`, so a restore can pass its own selector instead
     /// of a second, conflicting one.
+    /// Fork flags go too, since a restore continues the saved conversation itself.
     pub fn without_selectors(&self, args: &[OsString]) -> Vec<OsString> {
+        let args: Vec<OsString> = args
+            .iter()
+            .filter(|arg| !self.forks(std::slice::from_ref(*arg)))
+            .cloned()
+            .collect();
         let flags: Vec<&str> = self
             .assign
             .windows(2)
@@ -317,6 +370,15 @@ mod tests {
             conflicts: ["--session-id", "--resume", "--continue", "--print"]
                 .map(String::from)
                 .into(),
+            forks: vec!["--fork-session".into()],
+        }
+    }
+
+    fn opened(conversation: Option<&str>, resumed: bool) -> Launch {
+        Launch {
+            args: Vec::new(),
+            conversation: conversation.map(Into::into),
+            resumed,
         }
     }
 
@@ -325,22 +387,56 @@ mod tests {
         let args = ["--resume-like", "mention --print"].map(OsString::from);
         assert_eq!(
             resume_spec().launch(&args, || "new-id".into()),
-            (
-                vec!["--session-id".into(), "new-id".into()],
-                Some("new-id".into())
-            )
+            Launch {
+                args: vec!["--session-id".into(), "new-id".into()],
+                conversation: Some("new-id".into()),
+                resumed: false,
+            }
         );
     }
 
     #[test]
-    fn launch_captures_an_explicit_assignment_or_resume_id() {
-        for flag in ["--session-id", "--resume"] {
-            let args = [flag, "existing-id"].map(OsString::from);
-            assert_eq!(
-                resume_spec().launch(&args, || panic!("explicit ID")),
-                (vec![], Some("existing-id".into()))
-            );
-        }
+    fn launch_tells_an_assigned_id_from_a_resumed_one() {
+        let launch = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            resume_spec().launch(&args, || panic!("explicit ID"))
+        };
+        // `--session-id <id>` starts a new conversation, even under a saved ID.
+        assert_eq!(
+            launch(&["--session-id", "existing-id"]),
+            opened(Some("existing-id"), false)
+        );
+        assert_eq!(
+            launch(&["--resume", "existing-id"]),
+            opened(Some("existing-id"), true)
+        );
+    }
+
+    #[test]
+    fn a_forked_resume_never_reports_the_parent_conversation() {
+        let launch = |args: &[&str]| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            resume_spec().launch(&args, || panic!("explicit ID"))
+        };
+        assert_eq!(
+            launch(&["--resume", "parent", "--fork-session"]),
+            opened(None, false)
+        );
+        assert_eq!(
+            launch(&["--fork-session=true", "--resume", "parent"]),
+            opened(None, false)
+        );
+        // An ID assigned to the fork names the fork, which is new.
+        assert_eq!(
+            launch(&[
+                "--resume",
+                "parent",
+                "--fork-session",
+                "--session-id",
+                "fork"
+            ]),
+            opened(Some("fork"), false)
+        );
     }
 
     #[test]
@@ -348,7 +444,7 @@ mod tests {
         for flag in ["--continue", "--print", "--resume"] {
             assert_eq!(
                 resume_spec().launch(&[flag.into()], || panic!("conflicting flag")),
-                (vec![], None)
+                opened(None, false)
             );
         }
     }
@@ -361,13 +457,13 @@ mod tests {
         };
         assert_eq!(
             spec.launch(&[], || panic!("no assign args")),
-            (vec![], None)
+            opened(None, false)
         );
         assert_eq!(
             spec.launch(&["--resume".into(), "existing-id".into()], || panic!(
                 "no assign args"
             )),
-            (vec![], Some("existing-id".into()))
+            opened(Some("existing-id"), true)
         );
     }
 
@@ -419,6 +515,7 @@ mod tests {
             "--session-id=x",
             "--resume=other",
             "--resumes",
+            "--fork-session",
         ]
         .map(Into::into)
         .into();

@@ -379,6 +379,8 @@ pub enum Command {
         conversation: Option<String>,
         /// The agent starts fresh in place of a failed resume.
         fresh: bool,
+        /// The agent resumes `conversation` rather than starting it.
+        resumed: bool,
         reply: SyncSender<bool>,
     },
     Output(Vec<u8>),
@@ -782,11 +784,10 @@ fn agent_command(
     command.args(crate::shell::instruction_args(profile, args, &installed)?);
     let (callbacks, ready_only) = crate::shell::launch_callbacks(profile, args, worktree);
     command.args(callbacks);
-    let (assign, conversation) =
-        crate::shell::assign_conversation(profile, args).unwrap_or_default();
-    command.args(assign);
+    let launch = crate::shell::assign_conversation(profile, args).unwrap_or_default();
+    command.args(launch.args);
     command.args(args);
-    Ok((command, conversation, ready_only))
+    Ok((command, launch.conversation, ready_only))
 }
 
 /// Sets the environment and directory every process in a Power terminal starts with.
@@ -1537,6 +1538,7 @@ fn terminal_actor(
                 agent,
                 conversation,
                 fresh,
+                resumed,
                 reply,
             } => {
                 // Only a session's own descendants may name its conversation: a wrapper
@@ -1547,16 +1549,16 @@ fn terminal_actor(
                     && descendant
                     && (launched_agent == Agent::Shell || launched_agent == agent);
                 if accepted && launched_agent == Agent::Shell {
+                    let identity = Identity {
+                        agent,
+                        conversation,
+                    };
                     if fresh {
                         restore.fresh_start(lifecycle);
+                    } else if !resumed {
+                        restore.new_conversation(&identity, lifecycle);
                     }
-                    restore.started(
-                        pid,
-                        Identity {
-                            agent,
-                            conversation,
-                        },
-                    );
+                    restore.started(pid, identity, resumed);
                 } else if accepted
                     && let Some(conversation) = conversation
                     && reported.as_ref() != Some(&conversation)
@@ -1724,8 +1726,9 @@ struct RestoreState {
     /// A restored session's saved owner, until the agent resumed with that conversation
     /// claims its labels.
     restored: Option<Owner>,
-    /// Agents whose wrappers reported their start, newest last.
-    started: Vec<(u32, Identity)>,
+    /// Agents whose wrappers reported their start, newest last, and whether each
+    /// resumed the conversation it named rather than starting it.
+    started: Vec<(u32, Identity, bool)>,
     cwd: Option<PathBuf>,
     cwd_checked: Instant,
     /// When the owner being out of the foreground makes the saved state stale.
@@ -1836,23 +1839,28 @@ impl RestoreState {
     }
 
     /// Records an agent wrapper's start. The wrapper's process becomes the agent.
-    fn started(&mut self, pid: u32, identity: Identity) {
+    fn started(&mut self, pid: u32, identity: Identity, resumed: bool) {
         self.started
-            .retain(|(pid, _)| Path::new(&format!("/proc/{pid}")).exists());
+            .retain(|(pid, _, _)| Path::new(&format!("/proc/{pid}")).exists());
         if self.started.len() >= STARTED_LIMIT {
             self.started.remove(0);
         }
-        self.started.push((pid, identity));
+        self.started.push((pid, identity, resumed));
+    }
+
+    /// The wrapper start of the agent process `pid`, if one reported it.
+    fn start_of(&self, pid: u32, agent: &Agent) -> Option<&(u32, Identity, bool)> {
+        self.started
+            .iter()
+            .rev()
+            .find(|(start, identity, _)| identity.agent == *agent && descends_from(pid, *start))
     }
 
     /// The identity a report established for the agent process `pid`: its wrapper's
     /// start, or its own earlier labels.
     fn known(&self, pid: u32, agent: &Agent) -> Option<Identity> {
-        self.started
-            .iter()
-            .rev()
-            .find(|(start, identity)| identity.agent == *agent && descends_from(pid, *start))
-            .map(|(_, identity)| identity.clone())
+        self.start_of(pid, agent)
+            .map(|(_, identity, _)| identity.clone())
             .or_else(|| {
                 (self.owner_pid == Some(pid) && self.saved.identity.agent == *agent)
                     .then(|| self.saved.identity.clone())
@@ -1867,6 +1875,11 @@ impl RestoreState {
             return Some(self.saved.labels.clone());
         }
         identity.conversation.as_ref()?;
+        // Only a resume selecting the saved conversation continues it. A launch that
+        // assigns the same ID starts a new conversation under it.
+        self.start_of(pid, &identity.agent)
+            .is_some_and(|(_, _, resumed)| *resumed)
+            .then_some(())?;
         self.restored
             .take_if(|restored| restored.identity == *identity)
             .map(|restored| restored.labels)
@@ -1884,6 +1897,19 @@ impl RestoreState {
             self.clear_at = None;
             self.saved.labels = Labels::default();
             self.save(lifecycle, false);
+        }
+    }
+
+    /// A wrapper started a new conversation, not a resume. If it reuses the restored
+    /// conversation's ID, as a manual `--session-id <id>` can, it is still a different
+    /// conversation, so the restored labels go.
+    fn new_conversation(&mut self, identity: &Identity, lifecycle: &Lifecycle) {
+        if self
+            .restored
+            .as_ref()
+            .is_some_and(|restored| restored.identity == *identity)
+        {
+            self.fresh_start(lifecycle);
         }
     }
 
@@ -3133,7 +3159,7 @@ mod tests {
     #[test]
     fn a_wrapper_start_identifies_the_agent_and_its_conversation() {
         let mut restore = shell_restore(None);
-        restore.started(me(), identity(claude(), Some("conv")));
+        restore.started(me(), identity(claude(), Some("conv")), true);
         assert_eq!(restore.known(me(), &codex()), None);
         assert_eq!(
             restore.known(me(), &claude()),
@@ -3160,6 +3186,14 @@ mod tests {
             None
         );
         assert_eq!(restore.labels_for(me(), &identity(claude(), None)), None);
+        // A start that assigned the saved ID to a new conversation gets none either.
+        restore.started(me(), identity(claude(), Some("conv-a")), false);
+        assert_eq!(
+            restore.labels_for(me(), &identity(claude(), Some("conv-a"))),
+            None
+        );
+        // Only a start that resumed the saved conversation gets them.
+        restore.started(me(), identity(claude(), Some("conv-a")), true);
         assert_eq!(
             restore.labels_for(me(), &identity(claude(), Some("conv-a"))),
             Some(saved)
