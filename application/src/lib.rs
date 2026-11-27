@@ -1,6 +1,7 @@
 pub mod agents;
 mod commands;
 pub mod dag;
+pub mod overview;
 mod queries;
 mod restore;
 mod scheduler;

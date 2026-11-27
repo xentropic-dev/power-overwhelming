@@ -19,6 +19,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         box_selector: &str,
         from_session: &str,
         branch: &str,
+        path: Option<&Path>,
     ) -> Result<PathBuf> {
         let boxes = self.registry.boxes()?;
         let entry = select_box(&boxes, box_selector)?;
@@ -31,7 +32,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         let mut created_path = None;
         let result = self.store.write(|db| {
             let source = self.application.session(from_session)?;
-            let path = self.new_worktree_path(&entry.info, branch)?;
+            let path = self.new_worktree_path(&entry.info, branch, path)?;
             let base = workspace.head(&source.worktree)?;
             let created =
                 workspace.create_worktree(&entry.info.repository, &path, branch, &base)?;
@@ -60,7 +61,14 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         result
     }
 
-    pub(super) fn new_worktree_path(&self, info: &BoxInfo, branch: &str) -> Result<PathBuf> {
+    /// Validates the branch and picks the checkout path: `requested` when given, otherwise the
+    /// default under the worktree root.
+    pub(super) fn new_worktree_path(
+        &self,
+        info: &BoxInfo,
+        branch: &str,
+        requested: Option<&Path>,
+    ) -> Result<PathBuf> {
         ensure!(
             !branch.trim().is_empty() && !matches!(branch, "." | ".."),
             "Invalid branch name {branch:?}"
@@ -81,6 +89,19 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 );
             }
             bail!("Branch {branch:?} already exists");
+        }
+        if let Some(path) = requested {
+            ensure!(
+                path.is_absolute(),
+                "Worktree path {} must be absolute",
+                path.display()
+            );
+            ensure!(
+                path.symlink_metadata().is_err(),
+                "{} already exists",
+                path.display()
+            );
+            return Ok(path.to_path_buf());
         }
         let root = root.worktree_root()?;
         Ok(default_worktree_path(&root, &info.name, branch, |path| {

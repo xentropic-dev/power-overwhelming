@@ -9,9 +9,11 @@ use crate::{
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
     scheduler::{self, TimerScheduler},
+    system::ProcSystem,
     talk_adapter::{self, DaemonTalk},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
+    usage::ProviderUsage,
     wire::{self, DagRequest, DagResponse, Request, Response},
     workspace::{LocalWorkspace, LocalWorktreeRoot},
 };
@@ -76,6 +78,8 @@ struct Server {
     dag: Arc<DaemonDag>,
     talk: Arc<DaemonTalk>,
     talk_wake: mpsc::SyncSender<()>,
+    system: ProcSystem,
+    usage: ProviderUsage,
 }
 
 /// Runs the daemon. `finished_worker_grace` is how long a DAG worker runs after its
@@ -235,6 +239,8 @@ pub fn serve(
         dag,
         application,
         scheme,
+        system: ProcSystem::default(),
+        usage: ProviderUsage::from_env(),
     }));
     acceptor
         .join()
@@ -539,7 +545,8 @@ fn handle(mut socket: UnixStream, request: Request, server: &Server) -> Result<(
         return Ok(());
     }
 
-    let is_talk = matches!(&request, Request::Talk { .. });
+    let is_talk = matches!(&request, Request::Talk { .. })
+        || matches!(&request, Request::Dag { dag } if matches!(dag, DagRequest::EditTask { .. }));
     let response =
         handle_request(request, server, &socket).unwrap_or_else(|error| Response::Error {
             message: format!("{error:#}"),
@@ -593,6 +600,10 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 crate::terminal::valid_metadata(value),
                 "Session metadata must be at most 120 characters on one line"
             );
+            if matches!(field, wire::MetadataField::Usage) {
+                crate::usage::decode_usage(value)?;
+            }
+            let usage = matches!(field, wire::MetadataField::Usage).then(|| value.to_owned());
             let value = (!value.is_empty()).then(|| value.to_owned());
             let (send, receive) = mpsc::sync_channel(1);
             application.terminal(&session)?.send(Command::SetMetadata {
@@ -605,6 +616,9 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 receive.recv_timeout(Duration::from_secs(3))??,
                 "Session metadata must come from the active agent"
             );
+            if let Some(usage) = usage {
+                server.usage.claude.record(&usage)?;
+            }
             Ok(Response::Ok)
         }
         Request::SetConversation {
@@ -712,13 +726,26 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             talk: talk_adapter::request(&server.talk, &server.dag, talk)?,
         }),
         Request::Dag { dag } => {
-            let dag = dag_adapter::request(&server.dag, dag)?;
+            let dag = dag_adapter::request(&server.dag, &server.talk, dag)?;
             if let DagResponse::BoxIcon { box_id } = &dag {
                 broadcast(&BOX_ICON_WATCHERS, || Response::BoxIconChanged {
                     box_id: box_id.clone(),
                 });
             }
             Ok(Response::Dag { dag: Box::new(dag) })
+        }
+        Request::Overview => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs());
+            let overview = application::overview::OverviewQuery {
+                system: &server.system,
+                usage: &server.usage,
+            }
+            .execute(&*server.dag, now)?;
+            Ok(Response::Overview {
+                overview: Box::new(overview.into()),
+            })
         }
         Request::WatchArtifacts | Request::WatchBoxIcons => {
             unreachable!("Watches use the streaming handler")

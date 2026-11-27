@@ -26,18 +26,57 @@ Both `power dag create` and `power dag show` return JSON with `run` and `link` f
 
 ## Define the tasks
 
-Use `power dag apply "$RUN" --file tasks.json` to add a batch. The file is an array of tasks, or an object with a `tasks` array. Each task has `id`, `title`, and optional `instructions` and `deps`. IDs are unique within the run and match `[a-z0-9][a-z0-9_-]{0,63}`. Dependencies refer to IDs in the batch or already in the run. An invalid reference or cycle rejects the entire batch.
+Use `power dag apply "$RUN" --file tasks.json` to add a batch. The file is an array of tasks, or an object with a `tasks` array. Each task has `id`, `title`, and optional `instructions`, `deps`, `provider` and `model`. IDs are unique within the run and match `[a-z0-9][a-z0-9_-]{0,63}`. Dependencies refer to IDs in the batch or already in the run. An invalid reference or cycle rejects the entire batch.
+
+Record the provider and model you choose for each task as you plan it, so the graph shows them before dispatch and a resumed coordinator can see your choices. `provider` is an agent profile ID such as `claude` or `codex`, or `command`. `model` is the model name to launch it with:
+
+```json
+[
+  {"id": "build", "title": "Build", "provider": "codex", "model": "gpt-6.2-sol"},
+  {"id": "test", "title": "Run tests", "deps": ["build"], "provider": "claude", "model": "opus"}
+]
+```
 
 To add tasks and dependencies one at a time, use these forms. Repeat `--after` for multiple prerequisites, and use `--instructions-file` to supply instructions from a file.
 
 ```sh
-power dag add-task "$RUN" --id test --title "Run tests" --instructions "Run the workspace tests" --after build
+power dag add-task "$RUN" --id test --title "Run tests" --instructions "Run the workspace tests" --after build --provider claude --model opus
 power dag add-dep "$RUN" test lint  # test depends on lint
 ```
+
+## Correct a task
+
+`power dag apply` refuses an ID that is already in the run. To change a task's title or instructions after it is applied, use `edit-task`. Pass `--title`, `--instructions`, or `--instructions-file` (a path, or `-` for stdin), alone or together.
+
+```sh
+power dag edit-task "$RUN" test --instructions "Run the workspace tests with --release"
+```
+
+| Task state | Effect |
+| --- | --- |
+| `waiting`, `ready`, `queued` | The next dispatch uses the new text. |
+| `working`, `needs_input` | The running worker gets a power talk message with the new instructions, which replace its earlier ones. It keeps running. |
+| `failed`, `interrupted` | The next `power dag retry` uses the new text. |
+| `completed` | Refused. Add a new task instead. |
+
+The JSON output has the updated `task` and a `delivery`: `none` when nothing is running, `sent` with the `message` ID and the `attempt` it went to, or `failed` with the error. The stored edit stands even when delivery fails. Each edit records a `task_edited` event, which `power dag wait` returns by default.
+To set or change the plan of an existing task, for example to backfill a plan or choose a different model before a retry, use `power dag plan`. It prints the updated run and records a `task_planned` event.
+
+```sh
+power dag plan "$RUN" test --provider codex --model gpt-6.2-sol  # replace provider and model
+power dag plan "$RUN" test --model gpt-6.2-mini                  # keep the provider, change the model
+power dag plan "$RUN" test --provider claude                     # a new provider without --model clears the model
+power dag plan "$RUN" test --model ""                            # clear only the model
+power dag plan "$RUN" test --clear                               # remove the plan
+```
+
+`power dag show` lists each task's planned `provider` and `model`, which are `null` when there is no plan. Each attempt's `provider` and `model` record what actually ran.
 
 ## Dispatch and monitor
 
 1. Use `power dag ready "$RUN"` to find tasks whose prerequisites have all completed successfully. Set `PROFILE` to an installed agent profile ID, such as `claude`, `codex`, `grok`, `jcode`, or a profile from `config.lua`. For test fixtures, `--provider command` runs the command supplied after `--`. It follows the same worktree rules as other providers, so pointing it at the main checkout with `--worktree` also needs `--allow-main-checkout`.
+
+   `dispatch` and `retry` without `--provider` use the task's planned provider and model. Power passes the planned model as `--model <model>` ahead of any arguments after `--`. An explicit `--provider` that differs from the plan ignores the plan for that attempt. An explicit `--provider` equal to the planned provider is not an override: it keeps the planned model, so to run the planned provider with its default model, clear the model with `power dag plan "$RUN" "$TASK" --model ""` first. Model arguments after `--`, such as `-- --model gpt-6.2-mini`, `-- --model=gpt-6.2-mini` or Codex's `-- -mgpt-6.2-mini`, override the planned model. Other arguments after `--` keep it. A plan with a model and no provider cannot dispatch without `--provider`; with one, Power launches that provider with the planned model. Power knows the model flags of `claude`, `codex`, `grok` and `jcode`, and rejects a planned model for any other profile, or for `command`: plan the provider alone and pass the model after `--` yourself.
 2. Dispatch each ready task with the appropriate worktree.
 
    - For edits, run `power dag dispatch "$RUN" "$TASK" --provider "$PROFILE" --branch "$BRANCH"`. Power creates a worktree for the task on that branch, which is the default when `--worktree` is omitted. Choose a distinct, unused branch name for each task. Inside Power, the new branch starts at the coordinator's current HEAD. Pass `--base` with a branch or other commit-ish to override it. For a dependent task that builds on a prerequisite's commits, pass the prerequisite's branch, for example `--base docs/setup`. Outside Power, `--base` is required when creating a worktree.

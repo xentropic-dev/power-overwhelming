@@ -5,8 +5,8 @@ use application::dag::{
 };
 use domain::{
     dag::{
-        AgentStatus, Attempt, Coordinator, ManagedAgent, Run, RunEvent, RunEventKind, Task,
-        TaskSpec, TaskState,
+        AgentStatus, Attempt, Coordinator, ManagedAgent, Provider, Run, RunEvent, RunEventKind,
+        Task, TaskSpec, TaskState,
     },
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest},
 };
@@ -46,7 +46,8 @@ impl SqliteDagStore {
              );
              CREATE TABLE IF NOT EXISTS tasks (
                  run_id TEXT NOT NULL REFERENCES runs(id), id TEXT NOT NULL,
-                 title TEXT NOT NULL, instructions TEXT NOT NULL, PRIMARY KEY (run_id, id)
+                 title TEXT NOT NULL, instructions TEXT NOT NULL, provider TEXT, model TEXT,
+                 PRIMARY KEY (run_id, id)
              );
              CREATE TABLE IF NOT EXISTS deps (
                  run_id TEXT NOT NULL, task_id TEXT NOT NULL, dep TEXT NOT NULL,
@@ -94,13 +95,19 @@ impl SqliteDagStore {
                  FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, id)
              );",
         )?;
-        let has_model: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agents') WHERE name = 'model')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_model {
-            db.execute("ALTER TABLE agents ADD COLUMN model TEXT", [])?;
+        for (table, column) in [
+            ("agents", "model"),
+            ("tasks", "provider"),
+            ("tasks", "model"),
+        ] {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                [table, column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                db.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+            }
         }
         let has_archived_at: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('runs') WHERE name = 'archived_at')",
@@ -192,7 +199,8 @@ impl DagDb<'_> {
     fn load_tasks(&self, run: &mut Run) -> Result<()> {
         let tasks = rows(
             self.0,
-            "SELECT id, title, instructions FROM tasks WHERE run_id = ?1 ORDER BY rowid",
+            "SELECT id, title, instructions, provider, model FROM tasks
+             WHERE run_id = ?1 ORDER BY rowid",
             [&run.id],
             |row| {
                 Ok(Task {
@@ -200,6 +208,8 @@ impl DagDb<'_> {
                     title: row.get(1)?,
                     instructions: row.get(2)?,
                     deps: Vec::new(),
+                    provider: optional_provider(row, 3)?,
+                    model: row.get(4)?,
                     state: TaskState::Waiting,
                     queued_at: None,
                     current_attempt: None,
@@ -643,8 +653,16 @@ impl DagTransaction for DagDb<'_> {
         // All task rows must exist before inserting edges with forward references.
         for task in tasks {
             self.0.execute(
-                "INSERT INTO tasks (run_id, id, title, instructions) VALUES (?1, ?2, ?3, ?4)",
-                params![run, task.id, task.title, task.instructions],
+                "INSERT INTO tasks (run_id, id, title, instructions, provider, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run,
+                    task.id,
+                    task.title,
+                    task.instructions,
+                    provider_name(task.provider.as_ref())?,
+                    task.model
+                ],
             )?;
         }
         for task in tasks {
@@ -655,12 +673,36 @@ impl DagTransaction for DagDb<'_> {
         Ok(())
     }
 
+    fn set_task_plan(
+        &self,
+        run: &str,
+        task: &str,
+        provider: Option<&Provider>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let updated = self.0.execute(
+            "UPDATE tasks SET provider = ?3, model = ?4 WHERE run_id = ?1 AND id = ?2",
+            params![run, task, provider_name(provider)?, model],
+        )?;
+        anyhow::ensure!(updated == 1, "Unknown task {task:?} in run {run:?}");
+        Ok(())
+    }
+
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()> {
         self.0.execute(
             "INSERT INTO deps (run_id, task_id, dep) VALUES (?1, ?2, ?3)
              ON CONFLICT(run_id, task_id, dep) DO NOTHING",
             params![run, task, dep],
         )?;
+        Ok(())
+    }
+
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()> {
+        let updated = self.0.execute(
+            "UPDATE tasks SET title = ?3, instructions = ?4 WHERE run_id = ?1 AND id = ?2",
+            params![run, task, title, instructions],
+        )?;
+        anyhow::ensure!(updated == 1, "Unknown task {task:?} in run {run:?}");
         Ok(())
     }
 
@@ -818,6 +860,18 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     })
 }
 
+fn provider_name(provider: Option<&Provider>) -> Result<Option<String>> {
+    provider
+        .map(|provider| enum_name(wire::Provider::from(provider.clone())))
+        .transpose()
+}
+
+fn optional_provider(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Provider>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|_| enum_column::<wire::Provider>(row, column).map(Into::into))
+        .transpose()
+}
+
 fn rows<T>(
     db: &Connection,
     sql: &str,
@@ -858,7 +912,7 @@ mod tests {
         let path = directory.path().join("dag.sqlite3");
         let db = Connection::open(&path)?;
         db.execute_batch(
-            "CREATE TABLE agents (
+            r#"CREATE TABLE agents (
                 id TEXT PRIMARY KEY, box_id TEXT NOT NULL, worktree TEXT NOT NULL,
                 provider TEXT NOT NULL, parent TEXT REFERENCES agents(id), session TEXT UNIQUE,
                 state TEXT NOT NULL, label TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -866,15 +920,22 @@ mod tests {
              INSERT INTO agents VALUES
                 ('a', 'box', '/repo', 'codex', NULL, 'session-a', 'exited', 'Codex', 1),
                 ('b', 'box', '/repo', 'claude', NULL, 'session-b', 'exited', 'Claude', 1),
-                ('c', 'box', '/repo', 'command', NULL, 'session-c', 'exited', 'Command', 1);",
+                ('c', 'box', '/repo', 'command', NULL, 'session-c', 'exited', 'Command', 1);
+             CREATE TABLE runs (
+                 id TEXT PRIMARY KEY, box_id TEXT NOT NULL, title TEXT NOT NULL,
+                 coordinator TEXT NOT NULL, created_at INTEGER NOT NULL
+             );
+             CREATE TABLE tasks (
+                 run_id TEXT NOT NULL REFERENCES runs(id), id TEXT NOT NULL,
+                 title TEXT NOT NULL, instructions TEXT NOT NULL, PRIMARY KEY (run_id, id)
+             );
+             INSERT INTO runs VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
+             INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');"#,
         )?;
         let store = SqliteDagStore::initialize(db)?;
         store.0.lock().unwrap().execute_batch(
             r#"
             DROP TABLE IF EXISTS worktrees;
-            INSERT INTO runs (id, box_id, title, coordinator, created_at)
-                VALUES ('run', 'box', 'Old run', '{"kind":"external","label":"old"}', 1);
-            INSERT INTO tasks VALUES ('run', 'task', 'Task', 'Old instructions');
             INSERT INTO attempts (id, run_id, task_id, number, agent, state, summary,
                                   blocker, detail, started_at, ended_at) VALUES
                 ('attempt-a', 'run', 'task', 1, 'a', 'failed', NULL, NULL, NULL, 1, 2),
@@ -888,6 +949,9 @@ mod tests {
         store.read(|db| {
             assert!(db.list_worktrees(None)?.is_empty());
             let run = db.run("run")?;
+            assert_eq!(run.tasks[0].instructions, "Old instructions");
+            assert_eq!(run.tasks[0].provider, None);
+            assert_eq!(run.tasks[0].model, None);
             let attempts = &run.tasks[0].attempts;
             assert_eq!(attempts.len(), 3);
             for (attempt, expected) in attempts.iter().zip([
@@ -906,6 +970,78 @@ mod tests {
             }
             Ok(())
         })
+    }
+
+    #[test]
+    fn stores_and_replans_task_provider_and_model() -> Result<()> {
+        let store = SqliteDagStore::initialize(Connection::open_in_memory()?)?;
+        let spec = |id: &str, provider: Option<Provider>, model: Option<&str>| TaskSpec {
+            id: id.into(),
+            title: id.into(),
+            instructions: String::new(),
+            deps: Vec::new(),
+            provider,
+            model: model.map(Into::into),
+        };
+        store.write(|db| {
+            db.insert_run(&Run {
+                id: "run".into(),
+                box_id: "box".into(),
+                title: "Run".into(),
+                coordinator: domain::dag::Coordinator::External {
+                    label: "test".into(),
+                },
+                created_at: 1,
+                archived_at: None,
+                paused_at: None,
+                tasks: Vec::new(),
+            })?;
+            db.insert_tasks(
+                "run",
+                &[
+                    spec("codex", Some(Provider::Agent("codex".into())), Some("gpt")),
+                    spec("command", Some(Provider::Command), None),
+                    spec("none", None, None),
+                ],
+            )
+        })?;
+        let plans = |store: &SqliteDagStore| -> Result<Vec<_>> {
+            store.read(|db| {
+                Ok(db
+                    .run("run")?
+                    .tasks
+                    .into_iter()
+                    .map(|task| (task.provider, task.model))
+                    .collect())
+            })
+        };
+        assert_eq!(
+            plans(&store)?,
+            [
+                (Some(Provider::Agent("codex".into())), Some("gpt".into())),
+                (Some(Provider::Command), None),
+                (None, None),
+            ]
+        );
+        let claude = Provider::Agent("claude".into());
+        store.write(|db| {
+            db.set_task_plan("run", "codex", None, None)?;
+            db.set_task_plan("run", "none", Some(&claude), Some("opus"))
+        })?;
+        assert!(
+            store
+                .write(|db| db.set_task_plan("run", "missing", None, None))
+                .is_err()
+        );
+        assert_eq!(
+            plans(&store)?,
+            [
+                (None, None),
+                (Some(Provider::Command), None),
+                (Some(claude), Some("opus".into())),
+            ]
+        );
+        Ok(())
     }
 
     #[test]

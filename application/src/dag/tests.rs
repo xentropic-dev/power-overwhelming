@@ -145,13 +145,21 @@ impl DagReader for MemoryDb {
     }
 
     fn run(&self, id: &str) -> Result<Run> {
-        self.0
-            .borrow()
+        let records = self.0.borrow();
+        let mut run = records
             .runs
             .iter()
             .find(|run| run.id == id)
             .cloned()
-            .context("Unknown run")
+            .context("Unknown run")?;
+        // An attempt is paused when its agent is, as the SQLite store joins it.
+        for attempt in run.tasks.iter_mut().flat_map(|task| &mut task.attempts) {
+            attempt.paused = records
+                .agents
+                .iter()
+                .any(|agent| agent.id == attempt.agent && agent.paused);
+        }
+        Ok(run)
     }
 
     fn run_box(&self, id: &str) -> Result<String> {
@@ -403,11 +411,35 @@ impl DagTransaction for MemoryDb {
                 title: task.title.clone(),
                 instructions: task.instructions.clone(),
                 deps: task.deps.clone(),
+                provider: task.provider.clone(),
+                model: task.model.clone(),
                 state: TaskState::Waiting,
                 queued_at: None,
                 current_attempt: None,
                 attempts: Vec::new(),
             }));
+        Ok(())
+    }
+
+    fn set_task_plan(
+        &self,
+        run: &str,
+        task: &str,
+        provider: Option<&Provider>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let mut records = self.0.borrow_mut();
+        let task = records
+            .runs
+            .iter_mut()
+            .find(|entry| entry.id == run)
+            .context("Unknown run")?
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .context("Unknown task")?;
+        task.provider = provider.cloned();
+        task.model = model.map(str::to_owned);
         Ok(())
     }
 
@@ -426,6 +458,22 @@ impl DagTransaction for MemoryDb {
         if !deps.iter().any(|id| id == dep) {
             deps.push(dep.into());
         }
+        Ok(())
+    }
+
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()> {
+        let mut records = self.0.borrow_mut();
+        let entry = records
+            .runs
+            .iter_mut()
+            .find(|entry| entry.id == run)
+            .context("Unknown run")?
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .context("Unknown task")?;
+        entry.title = title.into();
+        entry.instructions = instructions.into();
         Ok(())
     }
 
@@ -808,7 +856,7 @@ fn application_with(
     records: Arc<dyn SessionStore>,
 ) -> Arc<Application<FakeTerminal>> {
     static ID: AtomicU64 = AtomicU64::new(0);
-    let profiles = ["claude", "codex"]
+    let profiles = ["claude", "codex", "custom"]
         .into_iter()
         .map(|id| AgentProfile {
             id: id.into(),
@@ -868,6 +916,8 @@ fn spec(id: &str, deps: &[&str]) -> TaskSpec {
         title: id.into(),
         instructions: format!("Implement {id}"),
         deps: deps.iter().map(|id| (*id).into()).collect(),
+        provider: None,
+        model: None,
     }
 }
 
@@ -875,7 +925,7 @@ fn command(run: &str, retry: bool) -> Dispatch {
     Dispatch {
         run: run.into(),
         task: "work".into(),
-        provider: Provider::Command,
+        provider: Some(Provider::Command),
         worktree: WorktreeRequest::Existing {
             path: "/worktree".into(),
             allow_main_checkout: false,
@@ -913,7 +963,7 @@ fn new_worktree(run: &str, branch: &str, base: Option<&str>) -> Dispatch {
             branch: branch.into(),
             base: base.map(str::to_owned),
         },
-        provider: Provider::Agent("codex".into()),
+        provider: Some(Provider::Agent("codex".into())),
         args: Vec::new(),
         ..command(run, false)
     }
@@ -1135,7 +1185,7 @@ fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> R
     for number in 2..=3 {
         dag.session_exited(previous.session.as_deref().unwrap(), "interrupted", true)?;
         let retry = dag.start(Dispatch {
-            provider: Provider::Agent("codex".into()),
+            provider: Some(Provider::Agent("codex".into())),
             worktree: WorktreeRequest::RetryManaged,
             args: Vec::new(),
             ..command(&run, true)
@@ -1463,7 +1513,7 @@ fn restore_tells_only_workers_with_active_attempts_to_continue() -> Result<()> {
     dag.add_tasks(&run.id, &[spec("work", &[]), spec("blocked", &[])])?;
     let claude = |task: &str| Dispatch {
         task: task.into(),
-        provider: Provider::Agent("claude".into()),
+        provider: Some(Provider::Agent("claude".into())),
         args: Vec::new(),
         caller: Some(caller.id.clone()),
         ..command(&run.id, false)
@@ -1577,7 +1627,7 @@ fn restore_brings_back_only_workers_whose_attempt_is_open() -> Result<()> {
     for task in tasks {
         let dispatched = dag.start(Dispatch {
             task: task.into(),
-            provider: Provider::Agent("claude".into()),
+            provider: Some(Provider::Agent("claude".into())),
             args: Vec::new(),
             caller: Some(caller.id.clone()),
             ..command(&run.id, false)
@@ -2219,7 +2269,7 @@ fn caller_registers_once_and_worker_receives_parent_and_prompt() -> Result<()> {
     assert_eq!(live, std::slice::from_ref(&coordinator));
     let worker = dag.start(Dispatch {
         task: "join".into(),
-        provider: Provider::Agent("claude".into()),
+        provider: Some(Provider::Agent("claude".into())),
         caller: Some(caller.id),
         args: vec!["--flag".into()],
         ..command(&run.id, false)
@@ -2512,6 +2562,344 @@ fn box_icons_follow_the_caller_or_selector() -> Result<()> {
     Ok(())
 }
 
+fn planned(id: &str, provider: Option<&str>, model: Option<&str>) -> TaskSpec {
+    TaskSpec {
+        provider: provider.map(|id| Provider::Agent(id.into())),
+        model: model.map(str::to_owned),
+        ..spec(id, &[])
+    }
+}
+
+fn last_launch(dag: &TestDag) -> (Agent, Vec<OsString>) {
+    let launches = dag.application.runtime.launches.lock().unwrap();
+    let (session, options) = launches.last().unwrap();
+    (session.agent.clone(), options.args.clone())
+}
+
+fn planned_dispatch(run: &str, task: &str, provider: Option<&str>, args: &[&str]) -> Dispatch {
+    Dispatch {
+        task: task.into(),
+        provider: provider.map(|id| Provider::Agent(id.into())),
+        args: args.iter().map(|arg| (*arg).into()).collect(),
+        ..command(run, false)
+    }
+}
+
+#[test]
+fn applied_plans_round_trip_and_reject_unusable_models() -> Result<()> {
+    let (dag, run) = setup()?;
+    let shown = dag.add_tasks(
+        &run,
+        &[planned("plan", Some("codex"), Some(" gpt-6.2-sol "))],
+    )?;
+    let task = find_task(&shown, "plan")?;
+    assert_eq!(task.provider, Some(Provider::Agent("codex".into())));
+    assert_eq!(task.model.as_deref(), Some("gpt-6.2-sol"));
+    assert_eq!(find_task(&dag.run(&run)?, "plan")?, task);
+    for bad in [
+        planned("blank", Some("codex"), Some("  ")),
+        TaskSpec {
+            provider: Some(Provider::Command),
+            ..planned("command", None, Some("model"))
+        },
+    ] {
+        assert!(dag.add_tasks(&run, &[bad]).is_err());
+    }
+    assert_eq!(dag.run(&run)?.tasks.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn dispatch_without_a_provider_uses_the_plan() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("codex", Some("codex"), Some("gpt-6.2-sol")),
+            planned("bare", Some("claude"), None),
+            planned("unplanned", None, None),
+        ],
+    )?;
+    let worker = dag.start(planned_dispatch(&run, "codex", None, &["--full-auto"]))?;
+    assert_eq!(worker.attempt.provider, Provider::Agent("codex".into()));
+    assert_eq!(
+        last_launch(&dag),
+        (
+            Agent::Coding("codex".into()),
+            ["--model", "gpt-6.2-sol", "--full-auto"]
+                .map(OsString::from)
+                .into()
+        )
+    );
+    dag.dispatch(planned_dispatch(&run, "bare", None, &[]))?;
+    assert_eq!(last_launch(&dag), (Agent::Coding("claude".into()), vec![]));
+    let error = dag
+        .dispatch(planned_dispatch(&run, "unplanned", None, &[]))
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("--provider"), "{error:#}");
+    Ok(())
+}
+
+#[test]
+fn explicit_providers_and_model_args_override_the_plan() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("other", Some("codex"), Some("gpt")),
+            planned("args", Some("codex"), Some("gpt")),
+        ],
+    )?;
+    dag.dispatch(planned_dispatch(&run, "other", Some("claude"), &[]))?;
+    assert_eq!(last_launch(&dag), (Agent::Coding("claude".into()), vec![]));
+    dag.dispatch(planned_dispatch(&run, "args", None, &["-m=mini"]))?;
+    assert_eq!(last_launch(&dag).1, [OsString::from("-m=mini")]);
+    Ok(())
+}
+
+#[test]
+fn an_explicit_planned_provider_keeps_the_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(
+        &run,
+        &[
+            planned("same", Some("codex"), Some("gpt")),
+            planned("same-args", Some("codex"), Some("gpt")),
+        ],
+    )?;
+    // Naming the planned provider is not an override: only model arguments replace the model.
+    dag.dispatch(planned_dispatch(
+        &run,
+        "same",
+        Some("codex"),
+        &["--full-auto"],
+    ))?;
+    assert_eq!(
+        last_launch(&dag).1,
+        ["--model", "gpt", "--full-auto"].map(OsString::from)
+    );
+    dag.dispatch(planned_dispatch(
+        &run,
+        "same-args",
+        Some("codex"),
+        &["--model", "mini"],
+    ))?;
+    assert_eq!(last_launch(&dag).1, ["--model", "mini"].map(OsString::from));
+    Ok(())
+}
+
+#[test]
+fn an_attached_model_value_replaces_the_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    let ids = ["short", "short-eq", "long-eq"];
+    dag.add_tasks(
+        &run,
+        &ids.map(|id| planned(id, Some("codex"), Some("plan-model"))),
+    )?;
+    for (id, arg) in ids
+        .into_iter()
+        .zip(["-mother-model", "-m=other-model", "--model=other-model"])
+    {
+        dag.dispatch(planned_dispatch(&run, id, None, &[arg]))?;
+        let args = last_launch(&dag).1;
+        assert_eq!(args, [OsString::from(arg)], "{id}");
+        assert_eq!(
+            domain::agent::requested_model("codex", &args).as_deref(),
+            Some("other-model")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unrelated_args_never_drop_a_planned_model() -> Result<()> {
+    let (dag, run) = setup()?;
+    // Power cannot pass a model to a profile whose model flag it does not know.
+    assert!(
+        dag.add_tasks(&run, &[planned("custom", Some("custom"), Some("big"))])
+            .is_err()
+    );
+    assert!(
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "work".into(),
+            clear: false,
+            provider: Some(Provider::Agent("custom".into())),
+            model: Some("big".into()),
+        })
+        .is_err()
+    );
+    // A plan stored before that check, or a model-only plan dispatched to such a profile,
+    // fails instead of launching without the model.
+    let mut task = find_task(&dag.run(&run)?, "work")?.clone();
+    task.provider = Some(Provider::Agent("custom".into()));
+    task.model = Some("big".into());
+    for args in [vec![], vec!["--verbose".to_owned()]] {
+        let error = planned_launch(&run, &task, None, &args).err().unwrap();
+        assert!(format!("{error:#}").contains("--model ''"), "{error:#}");
+    }
+    task.provider = None;
+    let verbose = ["--verbose".to_owned()];
+    assert!(
+        planned_launch(
+            &run,
+            &task,
+            Some(Provider::Agent("custom".into())),
+            &verbose
+        )
+        .is_err()
+    );
+    assert!(planned_launch(&run, &task, Some(Provider::Command), &verbose).is_err());
+    // Codex adds the planned model in front of unrelated arguments.
+    dag.add_tasks(&run, &[planned("codex", Some("codex"), Some("big"))])?;
+    dag.dispatch(planned_dispatch(&run, "codex", None, &["--verbose"]))?;
+    assert_eq!(
+        last_launch(&dag).1,
+        ["--model", "big", "--verbose"].map(OsString::from)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_model_only_plan_launches_with_an_explicit_provider() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[planned("solo", None, Some("solo-model"))])?;
+    let replanned = dag.plan_task(PlanTask {
+        run: run.clone(),
+        task: "work".into(),
+        clear: false,
+        provider: None,
+        model: Some("work-model".into()),
+    })?;
+    let work = find_task(&replanned, "work")?;
+    assert_eq!(
+        (&work.provider, work.model.as_deref()),
+        (&None, Some("work-model"))
+    );
+    for (task, model) in [("solo", "solo-model"), ("work", "work-model")] {
+        let error = dag
+            .dispatch(planned_dispatch(&run, task, None, &[]))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("Pass --provider"),
+            "{error:#}"
+        );
+        let worker = dag.start(planned_dispatch(
+            &run,
+            task,
+            Some("codex"),
+            &["--full-auto"],
+        ))?;
+        assert_eq!(worker.attempt.provider, Provider::Agent("codex".into()));
+        assert_eq!(
+            last_launch(&dag),
+            (
+                Agent::Coding("codex".into()),
+                ["--model", model, "--full-auto"].map(OsString::from).into()
+            )
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn plans_name_a_known_agent_profile() -> Result<()> {
+    let (dag, run) = setup()?;
+    assert!(
+        dag.add_tasks(&run, &[planned("typo", Some("codx"), None)])
+            .is_err()
+    );
+    assert!(
+        dag.plan_task(PlanTask {
+            run,
+            task: "work".into(),
+            clear: false,
+            provider: Some(Provider::Agent("codx".into())),
+            model: None,
+        })
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn planning_changes_clears_and_reports_the_plan() -> Result<()> {
+    let (dag, run) = setup()?;
+    let plan = |provider: Option<&str>, model: Option<&str>, clear: bool| {
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "work".into(),
+            clear,
+            provider: provider.map(|id| Provider::Agent(id.into())),
+            model: model.map(str::to_owned),
+        })
+        .map(|run| {
+            let task = run.tasks.into_iter().next().unwrap();
+            (task.provider, task.model)
+        })
+    };
+    let codex = Some(Provider::Agent("codex".into()));
+    let claude = Some(Provider::Agent("claude".into()));
+    assert_eq!(
+        plan(Some("codex"), Some("gpt"), false)?,
+        (codex.clone(), Some("gpt".into()))
+    );
+    assert_eq!(
+        plan(None, Some("mini"), false)?,
+        (codex.clone(), Some("mini".into()))
+    );
+    assert_eq!(plan(Some("claude"), None, false)?, (claude.clone(), None));
+    assert_eq!(
+        plan(None, Some("opus"), false)?,
+        (claude.clone(), Some("opus".into()))
+    );
+    assert_eq!(plan(None, Some(""), false)?, (claude.clone(), None));
+    let before = dag.latest_seq()?;
+    assert_eq!(plan(None, None, false)?, (claude, None));
+    assert_eq!(
+        dag.latest_seq()?,
+        before,
+        "an unchanged plan emits no event"
+    );
+    assert_eq!(plan(None, None, true)?, (None, None));
+    assert!(plan(None, Some("x"), false).is_ok());
+    assert!(
+        dag.plan_task(PlanTask {
+            run: run.clone(),
+            task: "missing".into(),
+            clear: true,
+            provider: None,
+            model: None,
+        })
+        .is_err()
+    );
+    let summaries: Vec<_> = dag
+        .events(
+            EventScope::Run(&run, &[RunEventKind::TaskPlanned]),
+            0,
+            Duration::ZERO,
+        )?
+        .events
+        .into_iter()
+        .map(|event| event.summary.unwrap())
+        .collect();
+    assert_eq!(
+        summaries,
+        [
+            "codex / gpt",
+            "codex / mini",
+            "claude",
+            "claude / opus",
+            "claude",
+            "no plan",
+            "x"
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn runs_sort_active_then_stalled_then_completed_newest_first() {
     let run = |id: &str, created_at: u64, states: &[TaskState]| Run {
@@ -2532,6 +2920,8 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
                 title: String::new(),
                 instructions: String::new(),
                 deps: Vec::new(),
+                provider: None,
+                model: None,
                 state: *state,
                 queued_at: None,
                 current_attempt: None,
@@ -3721,6 +4111,373 @@ fn an_attempt_that_reports_while_it_is_sampled_is_not_flagged_stalled() -> Resul
     Ok(())
 }
 
+/// Caller, run, agent and body of one message.
+type SentEdit = (Option<String>, String, String, String);
+
+#[derive(Default)]
+struct FakeMessenger {
+    sent: Mutex<Vec<SentEdit>>,
+    fail: bool,
+}
+
+impl TaskMessenger for FakeMessenger {
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String> {
+        if self.fail {
+            bail!("Talk target is gone");
+        }
+        let mut sent = self.sent.lock().unwrap();
+        sent.push((caller, run.into(), agent.into(), body));
+        Ok(format!("message-{}", sent.len()))
+    }
+}
+
+fn edit(run: &str, task: &str, title: Option<&str>, instructions: Option<&str>) -> EditTask {
+    EditTask {
+        run: run.into(),
+        task: task.into(),
+        title: title.map(str::to_owned),
+        instructions: instructions.map(str::to_owned),
+        caller: Some("coordinator-session".into()),
+    }
+}
+
+fn edit_events(dag: &TestDag, run: &str) -> Result<Vec<RunEvent>> {
+    Ok(dag
+        .events(
+            EventScope::Run(run, &[RunEventKind::TaskEdited]),
+            0,
+            Duration::ZERO,
+        )?
+        .events)
+}
+
+fn agent_dispatch(run: &str, task: &str, retry: bool) -> Dispatch {
+    Dispatch {
+        task: task.into(),
+        provider: Some(Provider::Agent("codex".into())),
+        args: Vec::new(),
+        ..command(run, retry)
+    }
+}
+
+#[test]
+fn editing_a_waiting_or_ready_task_updates_the_next_dispatch_without_a_message() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("later", &["work"])])?;
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(
+        edit(&run, "later", None, Some("Use the new plan")),
+        &messenger,
+    )?;
+    assert_eq!(edited.task.state, TaskState::Waiting);
+    assert_eq!(edited.task.instructions, "Use the new plan");
+    assert_eq!(edited.task.title, "later");
+    assert!(matches!(edited.delivery, EditDelivery::None));
+    let edited = dag.edit_task(edit(&run, "work", Some("Renamed"), None), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::Ready);
+    assert_eq!(edited.task.title, "Renamed");
+    assert_eq!(edited.task.instructions, "Implement work");
+    assert!(messenger.sent.lock().unwrap().is_empty());
+
+    let events = edit_events(&dag, &run)?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].task.as_deref(), Some("later"));
+    assert_eq!(events[0].attempt, None);
+    assert_eq!(events[0].summary.as_deref(), Some("Updated instructions"));
+    assert_eq!(events[1].summary.as_deref(), Some("Updated title"));
+
+    dag.start(agent_dispatch(&run, "work", false))?;
+    let prompt = last_worker_prompt(&dag);
+    assert!(prompt.contains("Task: work — Renamed\n"), "{prompt}");
+    Ok(())
+}
+
+#[test]
+fn editing_a_running_task_messages_its_current_attempt() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(
+        edit(&run, "work", Some("Fix it"), Some("Do it the new way")),
+        &messenger,
+    )?;
+    assert_eq!(edited.task.state, TaskState::Working);
+    let EditDelivery::Sent {
+        agent,
+        attempt,
+        message,
+    } = &edited.delivery
+    else {
+        panic!("Expected a sent message");
+    };
+    assert_eq!(agent, &started.agent.id);
+    assert_eq!(attempt, &started.attempt.id);
+    assert_eq!(message, "message-1");
+    {
+        let sent = messenger.sent.lock().unwrap();
+        let (caller, to_run, to_agent, body) = &sent[0];
+        assert_eq!(caller.as_deref(), Some("coordinator-session"));
+        assert_eq!((to_run, to_agent), (&run, &started.agent.id));
+        assert!(body.contains("replace your earlier instructions"), "{body}");
+        assert!(body.contains("Task: work — Fix it"), "{body}");
+        assert!(body.ends_with("Instructions:\nDo it the new way"), "{body}");
+    }
+    let events = edit_events(&dag, &run)?;
+    assert_eq!(
+        events[0].attempt.as_deref(),
+        Some(started.attempt.id.as_str())
+    );
+    assert_eq!(
+        events[0].summary.as_deref(),
+        Some("Updated title and instructions")
+    );
+
+    // A worker waiting on input is still running, so it is told as well.
+    dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::NeedsInput,
+        "Which way?",
+    )?;
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Second fix")), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::NeedsInput);
+    assert!(matches!(edited.delivery, EditDelivery::Sent { .. }));
+    assert_eq!(messenger.sent.lock().unwrap().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_failed_delivery_keeps_the_stored_edit() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let messenger = FakeMessenger {
+        fail: true,
+        ..FakeMessenger::default()
+    };
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Kept")), &messenger)?;
+    assert!(
+        matches!(&edited.delivery, EditDelivery::Failed { error, .. } if error.contains("gone"))
+    );
+    assert_eq!(dag.run(&run)?.tasks[0].instructions, "Kept");
+    Ok(())
+}
+
+#[test]
+fn editing_a_failed_or_interrupted_task_updates_the_retry_without_a_message() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("failing", &[])])?;
+    let interrupted = dag.start(command(&run, false))?;
+    dag.session_exited(
+        interrupted.agent.session.as_deref().unwrap(),
+        "exited",
+        true,
+    )?;
+    let failing = dag.start(Dispatch {
+        task: "failing".into(),
+        ..command(&run, false)
+    })?;
+    dag.report(
+        &run,
+        "failing",
+        &failing.attempt.id,
+        ReportStatus::Failed,
+        "broken",
+    )?;
+    let messenger = FakeMessenger::default();
+    for (task, state) in [
+        ("work", TaskState::Interrupted),
+        ("failing", TaskState::Failed),
+    ] {
+        let edited = dag.edit_task(edit(&run, task, None, Some("Retry this way")), &messenger)?;
+        assert_eq!(edited.task.state, state);
+        assert!(matches!(edited.delivery, EditDelivery::None));
+    }
+    assert!(messenger.sent.lock().unwrap().is_empty());
+    dag.start(agent_dispatch(&run, "failing", true))?;
+    let prompt = last_worker_prompt(&dag);
+    assert!(
+        prompt.contains("Instructions:\nRetry this way\n"),
+        "{prompt}"
+    );
+    Ok(())
+}
+
+#[test]
+fn edits_refuse_completed_tasks_unknown_targets_and_empty_text() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let messenger = FakeMessenger::default();
+    let before = dag.latest_seq()?;
+    let error = |command| {
+        dag.edit_task(command, &messenger)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap()
+    };
+    assert!(error(edit(&run, "work", Some("New"), None)).contains("Add a new task instead"));
+    assert!(error(edit(&run, "missing", Some("New"), None)).contains("Unknown task"));
+    assert!(error(edit("nope", "work", Some("New"), None)).contains("Unknown run"));
+    assert!(error(edit(&run, "work", Some("  "), None)).contains("title is empty"));
+    assert!(error(edit(&run, "work", None, Some(""))).contains("instructions are empty"));
+    assert!(error(edit(&run, "work", None, None)).contains("Specify --title"));
+    assert_eq!(dag.latest_seq()?, before);
+    assert_eq!(dag.run(&run)?.tasks[0].title, "work");
+    assert!(messenger.sent.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_paused_worker_reads_the_current_instructions_when_it_resumes() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let session = started.agent.session.clone().unwrap();
+    dag.pause_run(&run)?;
+    assert_eq!(dag.run(&run)?.tasks[0].state, TaskState::Paused);
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Paused fix")), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::Paused);
+    assert!(
+        matches!(&edited.delivery, EditDelivery::Sent { agent, .. } if agent == &started.agent.id)
+    );
+    // The edit leaves the worker paused. Its message waits in the inbox.
+    assert!(terminal_paused(&dag, &session)?);
+    dag.resume_run(&run)?;
+    assert!(!terminal_paused(&dag, &session)?);
+    let task = dag.run(&run)?.tasks[0].clone();
+    assert_eq!(task.state, TaskState::Working);
+    // Same worker and attempt, and the one message it reads matches what is stored.
+    assert_eq!(task.attempts.len(), 1);
+    assert_eq!(
+        task.current_attempt.as_deref(),
+        Some(started.attempt.id.as_str())
+    );
+    let sent = messenger.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].2, started.agent.id);
+    assert!(
+        sent[0].3.ends_with("Instructions:\nPaused fix"),
+        "{}",
+        sent[0].3
+    );
+    Ok(())
+}
+
+/// Holds the first send until the test releases it, and reports when it is inside.
+struct GatedFirstMessenger {
+    inner: FakeMessenger,
+    first: std::sync::Once,
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl TaskMessenger for GatedFirstMessenger {
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String> {
+        let mut gated = false;
+        self.first.call_once(|| gated = true);
+        if gated {
+            self.entered.lock().unwrap().send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("The test releases the first send");
+        }
+        self.inner.send_to_worker(caller, run, agent, body)
+    }
+}
+
+#[test]
+fn crossed_edits_enqueue_messages_in_commit_order() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let messenger = GatedFirstMessenger {
+        inner: FakeMessenger::default(),
+        first: std::sync::Once::new(),
+        entered: Mutex::new(entered_tx),
+        release: Mutex::new(release_rx),
+    };
+    thread::scope(|scope| {
+        let first =
+            scope.spawn(|| dag.edit_task(edit(&run, "work", None, Some("Plan A")), &messenger));
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Edit A reaches its send");
+        // A has committed and is inside its send, still holding the edit lock.
+        assert!(
+            dag.task_edits.try_lock().is_err(),
+            "The edit lock is held through the send"
+        );
+        let second =
+            scope.spawn(|| dag.edit_task(edit(&run, "work", None, Some("Plan B")), &messenger));
+        assert!(messenger.inner.sent.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            first.join().unwrap().unwrap().delivery,
+            EditDelivery::Sent { .. }
+        ));
+        assert!(matches!(
+            second.join().unwrap().unwrap().delivery,
+            EditDelivery::Sent { .. }
+        ));
+    });
+    let stored = dag.run(&run)?.tasks[0].instructions.clone();
+    let sent = messenger.inner.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[1].3.ends_with(&format!("Instructions:\n{stored}")),
+        "{stored}: {sent:?}"
+    );
+    assert!(sent[0].3.ends_with("Instructions:\nPlan A"), "{sent:?}");
+    Ok(())
+}
+
+#[test]
+fn oversized_titles_or_instructions_still_send_a_bounded_pointer() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let messenger = FakeMessenger::default();
+    let huge = "x".repeat(17 * 1024);
+    for (title, instructions) in [
+        (Some(huge.as_str()), None),
+        (None, Some(huge.as_str())),
+        (Some(huge.as_str()), Some(huge.as_str())),
+    ] {
+        let edited = dag.edit_task(edit(&run, "work", title, instructions), &messenger)?;
+        assert!(matches!(edited.delivery, EditDelivery::Sent { .. }));
+    }
+    let sent = messenger.sent.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    for (_, _, _, body) in sent.iter() {
+        assert!(body.len() < 1024, "{} bytes", body.len());
+        assert!(!body.contains("xxxx"));
+        assert!(body.contains(&format!("power dag show {run}")), "{body}");
+        assert!(body.contains("(task work)"), "{body}");
+    }
+    Ok(())
+}
+
 /// A DAG whose worker budget allows `max` workers, with `memory` GiB free, and a run
 /// with `tasks` dispatched to coding-agent workers in `worktree`, in order.
 fn budget_restart(
@@ -3770,7 +4527,7 @@ fn budget_restart(
     for task in tasks {
         let started = dag.start(Dispatch {
             task: (*task).into(),
-            provider: Provider::Agent("claude".into()),
+            provider: Some(Provider::Agent("claude".into())),
             args: vec!["--model".into(), "opus".into()],
             caller: Some(caller.id.clone()),
             budget: BudgetMode::Override,
@@ -3958,7 +4715,7 @@ fn queued_retry_keeps_a_changed_worktree(legacy: bool) -> Result<()> {
     for task in ["a", "b"] {
         let result = dag.start(Dispatch {
             task: task.into(),
-            provider: Provider::Agent("claude".into()),
+            provider: Some(Provider::Agent("claude".into())),
             args: Vec::new(),
             budget: BudgetMode::Override,
             worktree: WorktreeRequest::Existing {

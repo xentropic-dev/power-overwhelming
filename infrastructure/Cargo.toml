@@ -44,3 +44,7 @@ required-features = ["wasm-plugins"]
 
 [dev-dependencies]
 wat = "1"
+
+# Desktop notifications over the freedesktop D-Bus interface. GPUI already links this zbus.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io"] }

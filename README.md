@@ -71,7 +71,7 @@ To install the integration later, press `ctrl-b i` in the app or run `power setu
 
 After a daemon restart or reboot, Power restores each open session with its original ID and worktree. Shells reopen in their last directory with their scrollback. Agents with a `resume` spec pick up their conversations, including agents started from a shell with the integration installed. See [Agent profiles](#agent-profiles). Power skips one-off commands and drops sessions whose worktree is gone. Closing a tab ends its session. When the GUI reopens, it shows the last box and its active tab.
 
-Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
+Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `p` opens the command palette: type to fuzzy-search every box and tab command, with the three you ran most recently listed first. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
 
 ## Skills
 
@@ -199,6 +199,8 @@ terminal.padding = 6            -- space around the grid in logical pixels, 0 to
 
 The table also holds `ligatures` (default `false`), `scroll_speed` (0.1 to 5, default 1), `copy_on_select` (default `false`), `clipboard_write` (`"allow"` or `"deny"`, for OSC 52), `minimum_contrast` (1 to 21, default 1) and `opacity` (0 to 1, default 1). Power reports an unknown key or a value out of range. Ctrl+S then `+` or `=` makes terminal text bigger, Ctrl+S then `-` makes it smaller and Ctrl+S then `0` restores the configured size. Zoom applies to every terminal and resizes their sessions.
 
+In a terminal, drag to select, double-click for a word, triple-click for a line and Shift+click to extend. Dragging past the top or bottom edge scrolls. The selection stays on its text while output arrives. Ctrl+Shift+A selects the screen and scrollback. A finished selection goes to the clipboard when `copy_on_select` is on, and to PRIMARY on Linux, where middle-click pastes it.
+
 ## DAG orchestration
 
 Run `power skills get power-dag` to load the bundled coordinator skill, or `power dag guide` (an alias for `power skills get power-dag --full`) to print it with all references, including a three-task example. From a Power terminal, `power dag list` finds unfinished runs in the current box (`--all` adds completed and archived ones; `power agent list --all` likewise adds exited and done agents, and `--all-boxes` lists agents in every box). Archive an abandoned run with `power dag archive <run>` (`--force` if attempts are still open) and restore it with `power dag unarchive <run>`; in the run picker, Ctrl+X does the same for the selected run. Pause a run with `power dag pause <run>`: every active worker is stopped (SIGSTOP on its own process tree only) and nothing is dispatched from it until `power dag resume <run>`. One agent works the same way with `power agent pause|resume <agent>`, `power agent pause --all-except <agent…>` pauses everything else in an emergency, and `power agent stop <agent>` ends a worker cleanly, leaving its attempt `interrupted` for `--retry`. A coding agent started by hand in a shell tab shares that tab's session with the shell and its other jobs, so Power refuses to pause or stop it; use that terminal instead. A stopped paused worker is never resumed first: it gets SIGTERM before SIGCONT. Paused agents and tasks show `paused`, over `needs-input` too; Ctrl+Z toggles a pause in the agent tree and the run picker, and Ctrl+Shift+Z there pauses every other agent, keeping the selected one and the active terminal's agent running. From an external terminal, use `power box list` and pass `--box` when listing or creating a run, plus `--coordinator` on creation. Create a run with `power dag create`, add tasks and dependencies with `power dag apply`, then use `power dag ready` and `power dag dispatch --provider <profile id>` to start background workers in existing worktrees. Follow results with `power dag wait --since` and explicitly retry failed or interrupted work with `power dag retry`.
@@ -227,13 +229,36 @@ A daemon restart holds restored workers to the same budget, including its memory
 
 Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` to open its agent tree. DAG cards and their details show the latest known model for each attempt. The agent tree displays models and matches them in search. Managed agents and their attempts retain their model after exit. Attach to a worker from either view without interrupting its work. An input request highlights the box and the worker's tab when attached. Answer in that worker's terminal. Its highlight clears when it reports that the request is resolved, and the box highlight clears when its last request is resolved.
 
+## Command palette
+
+Press Ctrl+B then `p` to search every box and tab command by name, including plugin commands. Each row shows its key binding. With an empty search, the three commands you ran most recently come first, whether you ran them from the palette or with their keys. Press Enter to run the selected command.
+
+## Dashboard
+
+Press Ctrl+B then `o` to open the dashboard, or pick "Open dashboard" in the command palette. It shows:
+
+- **Summary**: working agents, terminals, attached and total terminals, CPU, and RAM with a bar.
+- **DAGs**: one line per active or stalled run with its box, title, completed and total tasks, a progress bar, workers, and an estimated time left. Stalled runs use the scheme's error color.
+- **Usage**: rate-limit windows with used share and reset time for each Claude and Codex model in use, or "no data".
+- **Boxes**: terminals attached and total, working agents, and active runs per box.
+
+Press `j`/`k` or the arrows to scroll and Esc, or Ctrl+B then `o` again, to close. It refreshes every 2 seconds while open. Set `dashboard.refresh_ms` in `config.lua` to change that. The dashboard is a [bundled Wasm plugin](plugins/dashboard/README.md).
+
+### Plugin commands
+
+Panel plugins add commands with namespaced ids and default keys. Put components implementing the [panel interface](plugins/wit/panel.wit) in the `plugins` folder next to `config.lua` and press Ctrl+B then `r`. Their commands appear in the command palette and the shortcut help, and you rebind them by id like built-in keys:
+
+```lua
+keys.box["dashboard.open"] = "g"
+```
+
 ## Power-bar
 
 The status bar shows the main checkout, active worktree, and foreground agent type. It also shows the agent's model and task when available. Press Ctrl+S then `y` to copy either full path.
 
 `{dag.progress}` shows a count such as `DAG 1/6 done` on the coordinator's and workers' tabs while the run has ready, working, or input-blocked tasks. If a coordinator has several live runs, its tab shows the newest.
 
-Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok.
+Power's launch instructions ask agents to set `{agent.task}` with `power session task "Fix WebM playback"`. Agents that can verify their active model set `{agent.model}` with `power session model "Model name"`. They update those labels as their work or model changes, including at major milestones on long tasks. Power also reads explicit `--model` flags for Claude Code, Codex, and Grok, including `-m` for Codex and Grok. For jcode, each `power session task`, `power session model` or `power dag report` the agent runs also reads its current model from the jcode session record.
 
 Set `power_bar` in `${XDG_CONFIG_HOME:-~/.config}/power-overwhelming/config.lua` and press Ctrl+B then `r` to reload. The default uses colored Powerline joins and changes the rightmost accent with the active agent. Set `separator` to `""` for rounded joins or to Unicode text such as `" │ "` for a plain separator. Each segment can set an `icon`, foreground, and background. [Bundled defaults](plugins/power-bar/defaults.json)
 
@@ -263,7 +288,7 @@ When Power launches Claude Code through shell integration, it passes `--settings
 
 Codex and Grok also use the manual setup. Codex runs hooks from any source, including `-c` overrides, only after you review and trust them. Set `[ui.status_line]` in Grok's config file. The `GROK_CONFIG` overlay cannot set it.
 
-Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
+Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. When the payload also has Claude Code's `rate_limits` (`five_hour`, `seven_day`, `spend_limit`), Power keeps the latest report per model for 10 minutes to show usage limits. For Codex, Power reads the limits from the newest rollout in `$CODEX_HOME/sessions` (default `~/.codex/sessions`). For jcode, Power runs `jcode usage --json` in the background at most once a minute and shows the limits of the provider that matches the agent's model. The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
 
 For **Codex**, add these entries to the corresponding hook arrays in `~/.codex/hooks.json`, then review and trust the hooks in `/hooks`. Codex reports the model on session start and on the next submitted prompt after a model switch. [Codex hooks](https://learn.chatgpt.com/docs/hooks)
 
@@ -315,11 +340,13 @@ previews.history = 50          -- artifacts the link search lists, default 20
 
 With `auto_open = "when_pane_open"`, an artifact an agent publishes replaces or joins the previews only when that box already shows its preview pane. With `"always"`, a publish also opens the pane. Auto-open never moves keyboard focus away from the terminal.
 
-The key sections are `prefix`, `box`, `tab`, `picker`, `dialog` (pickers without a search field), `preview`, `hints` and `terminal` (`copy` and `paste` while a terminal has focus). Ctrl+B then `r` reloads the file. If the file has a typo, an unknown command, a clash between two commands, or a value of the wrong type, Power names the entry and keeps the bindings it was already using.
+The key sections are `prefix`, `box`, `tab`, `picker`, `dialog` (pickers without a search field), `dag` (the task graph), `panel` (the dashboard and other plugin panels), `preview`, `hints` and `terminal` (`copy` and `paste` while a terminal has focus). Ctrl+B then `r` reloads the file. If the file has a typo, an unknown command, a clash between two commands, or a value of the wrong type, Power names the entry and keeps the bindings it was already using.
 
 ## Preview an artifact
 
-Click a local PNG, JPEG, WebP, MP4, WebM, or HTML link in the terminal, or open it from the keyboard. Ctrl+S then `o` numbers up to nine links on screen, newest output first. Press `1`–`9` to open and focus a preview, or Esc to back out of the numbered links. Ctrl+S then `o` then `s` searches this box's published artifacts, newest first, along with any other links on screen. Selecting a preview from the search also focuses it. Ctrl+S then `v` focuses the preview pane, including after typing into a web page. In the pane, `h`/`l` switch previews, Esc or `x` closes the active preview, and Tab returns to the terminal with the preview open. Space plays or pauses video, `,`/`.` seek, `j`/`k` scroll a page, `r` reloads it, and `i` types into it. Loopback URLs such as `http://localhost:3000/` open in the same pane. Shift-drag selects text when the terminal app is handling mouse events. Ctrl-Shift-C and Ctrl-Shift-V copy and paste; pastes are bracketed when the program asks. Input methods (Pinyin, Japanese, Korean, dead keys) compose underlined at the cursor, and programs that turn on focus reporting or the Kitty keyboard protocol get focus changes and key releases.
+Click a local PNG, JPEG, WebP, MP4, WebM, or HTML link in the terminal to open a preview. Loopback URLs such as `http://localhost:3000/` open in the same pane. Ctrl-click other HTTP and HTTPS links to open them in your default browser. Hold Ctrl over a link to underline it and show the pointer cursor, even if the link wraps across rows.
+
+Ctrl+S then `o` numbers up to nine links on screen, newest output first. Press `1`–`9` to open a link, or Esc to back out of the numbered links. Ctrl+S then `o` then `s` searches this box's published artifacts, newest first, along with any other links on screen. Opening a preview from either shortcut also focuses it. Ctrl+S then `v` focuses the preview pane, including after typing into a web page. In the pane, `h`/`l` switch previews, Esc or `x` closes the active preview, and Tab returns to the terminal with the preview open. Space plays or pauses video, `,`/`.` seek, `j`/`k` scroll a page, `r` reloads it, and `i` types into it. Shift-drag selects text when the terminal app is handling mouse events. Ctrl-Shift-C and Ctrl-Shift-V copy and paste; pastes are bracketed when the program asks. Input methods (Pinyin, Japanese, Korean, dead keys) compose underlined at the cursor, and programs that turn on focus reporting or the Kitty keyboard protocol get focus changes and key releases.
 
 Run `power skills get power-artifacts` for the full guide to publishing artifacts and sharing their links. From any Power terminal, you can publish a file or a running server.
 

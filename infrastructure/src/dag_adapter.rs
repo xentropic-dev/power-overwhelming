@@ -2,18 +2,24 @@ use crate::{
     box_icons::IconFiles,
     boxes::BoxesFile,
     dag_store::SqliteDagStore,
+    talk_adapter::DaemonTalk,
     terminal::PtyRuntime,
     wire::{self, DagRequest, DagResponse, Response, WorktreePruneEntry, WorktreeScope},
 };
 use anyhow::{Context, Result};
 use application::dag::{
-    BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EventScope, StartAgent,
+    BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EditDelivery, EditTask,
+    EventScope, PlanTask, StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
 pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile, IconFiles>;
 
-pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<DagResponse> {
+pub(crate) fn request(
+    application: &DaemonDag,
+    talk: &DaemonTalk,
+    request: DagRequest,
+) -> Result<DagResponse> {
     use DagResponse as Reply;
     let response = match request {
         DagRequest::ListBoxes => Reply::Boxes {
@@ -105,6 +111,70 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::AddDependency { run, task, dep } => Reply::Run {
             run: application.add_dependency(&run, &task, &dep)?.into(),
         },
+        DagRequest::EditTask {
+            run,
+            task,
+            title,
+            instructions,
+            caller,
+        } => {
+            if let Some(session) = &caller {
+                // As for `power talk send`, a coding session sends as a peer.
+                application.register_coding_session(session)?;
+            }
+            let edited = application.edit_task(
+                EditTask {
+                    run,
+                    task,
+                    title,
+                    instructions,
+                    caller,
+                },
+                talk,
+            )?;
+            Reply::TaskEdited {
+                run: edited.run.id,
+                task: edited.task.into(),
+                delivery: match edited.delivery {
+                    EditDelivery::None => wire::EditDelivery::None,
+                    EditDelivery::Sent {
+                        agent,
+                        attempt,
+                        message,
+                    } => wire::EditDelivery::Sent {
+                        agent,
+                        attempt,
+                        message,
+                    },
+                    EditDelivery::Failed {
+                        agent,
+                        attempt,
+                        error,
+                    } => wire::EditDelivery::Failed {
+                        agent,
+                        attempt,
+                        error,
+                    },
+                },
+            }
+        }
+        DagRequest::PlanTask {
+            run,
+            task,
+            provider,
+            model,
+            clear,
+        } => Reply::Run {
+            run: application
+                .plan_task(PlanTask {
+                    run,
+                    task,
+                    clear,
+                    provider: provider.map(Into::into),
+                    model,
+                })?
+                .into(),
+        },
         DagRequest::StartAgent {
             box_sel,
             caller,
@@ -144,7 +214,7 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         } => match application.dispatch(Dispatch {
             run: run.clone(),
             task: task.clone(),
-            provider: provider.into(),
+            provider: provider.map(Into::into),
             worktree: worktree.into_domain(allow_main_checkout),
             retry,
             args,
@@ -170,8 +240,14 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             box_sel,
             from_session,
             branch,
+            path,
         } => Reply::ViewWorktreeCreated {
-            path: application.create_view_worktree(&box_sel, &from_session, &branch)?,
+            path: application.create_view_worktree(
+                &box_sel,
+                &from_session,
+                &branch,
+                path.as_deref(),
+            )?,
         },
         DagRequest::ListManagedWorktrees { scope } => {
             let box_id = worktree_box(application, scope)?;

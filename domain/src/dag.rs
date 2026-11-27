@@ -15,6 +15,10 @@ pub struct TaskSpec {
     pub title: String,
     pub instructions: String,
     pub deps: Vec<String>,
+    /// Planned provider for dispatches that do not name one.
+    pub provider: Option<Provider>,
+    /// Planned model, passed to the planned provider when dispatch args do not choose one.
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,6 +280,10 @@ pub struct Task {
     pub title: String,
     pub instructions: String,
     pub deps: Vec<String>,
+    /// Planned provider, chosen by the coordinator before dispatch.
+    pub provider: Option<Provider>,
+    /// Planned model. An attempt records the model it actually ran.
+    pub model: Option<String>,
     /// Derived by the daemon from persisted attempts and prerequisite states.
     pub state: TaskState,
     /// Unix seconds, while a dispatch of the task waits for the worker budget.
@@ -306,6 +314,8 @@ pub enum RunEventKind {
     RunCreated,
     TaskAdded,
     TaskReady,
+    /// The task's planned provider or model changed.
+    TaskPlanned,
     AttemptStarted,
     AgentModelChanged,
     AttemptSucceeded,
@@ -330,6 +340,9 @@ pub enum RunEventKind {
     TaskQueued,
     /// A queued dispatch could not be started. The summary has the error.
     QueuedDispatchFailed,
+    /// The coordinator changed the task's title or instructions. The attempt is set when
+    /// a running worker was sent the new instructions.
+    TaskEdited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -562,6 +575,34 @@ pub fn run_status(states: impl IntoIterator<Item = TaskState>) -> RunStatus {
 pub fn can_dispatch(state: TaskState, retry: bool) -> bool {
     state == TaskState::Ready
         || (retry && matches!(state, TaskState::Failed | TaskState::Interrupted))
+}
+
+/// What editing a task's title or instructions does in its current state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskEdit {
+    /// Only the stored copy changes. The next dispatch or retry uses it.
+    Store,
+    /// The stored copy changes and the running worker is told the new instructions.
+    StoreAndNotify,
+    /// A completed task keeps its record. Add a new task instead.
+    Refused,
+}
+
+pub fn task_edit(state: TaskState) -> TaskEdit {
+    use TaskState as T;
+    match state {
+        // A queued dispatch reads the task when it starts, so it gets the edit too.
+        T::Waiting | T::Ready | T::Queued | T::Failed | T::Interrupted => TaskEdit::Store,
+        // A paused worker keeps its session. The message waits in its inbox and is
+        // the first thing it reads after the resume.
+        T::Working | T::NeedsInput | T::Paused => TaskEdit::StoreAndNotify,
+        T::Completed => TaskEdit::Refused,
+    }
+}
+
+/// Title and instructions must not be blank.
+pub fn valid_task_text(text: &str) -> bool {
+    !text.trim().is_empty()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -812,6 +853,8 @@ mod tests {
                 title: "a".into(),
                 instructions: String::new(),
                 deps: Vec::new(),
+                provider: None,
+                model: None,
                 state: TaskState::Waiting,
                 queued_at: Some(5),
                 current_attempt: None,
@@ -859,6 +902,8 @@ mod tests {
                     title: "a".into(),
                     instructions: String::new(),
                     deps: Vec::new(),
+                    provider: None,
+                    model: None,
                     state: TaskState::Waiting,
                     queued_at: None,
                     current_attempt: None,
@@ -890,6 +935,8 @@ mod tests {
             title: id.into(),
             instructions: String::new(),
             deps: deps.iter().map(|dep| (*dep).into()).collect(),
+            provider: None,
+            model: None,
         }
     }
 
@@ -957,6 +1004,21 @@ mod tests {
             validate_batch(&[task("a", &[])], &[task("a", &[])]),
             Err(GraphError::DuplicateTask("a".into()))
         );
+    }
+
+    #[test]
+    fn edits_store_notify_running_workers_and_refuse_completed_tasks() {
+        use TaskState as T;
+        for state in [T::Waiting, T::Ready, T::Queued, T::Failed, T::Interrupted] {
+            assert_eq!(task_edit(state), TaskEdit::Store, "{state:?}");
+        }
+        for state in [T::Working, T::NeedsInput, T::Paused] {
+            assert_eq!(task_edit(state), TaskEdit::StoreAndNotify, "{state:?}");
+        }
+        assert_eq!(task_edit(T::Completed), TaskEdit::Refused);
+        assert!(valid_task_text("Fix it"));
+        assert!(!valid_task_text(""));
+        assert!(!valid_task_text(" \n\t"));
     }
 
     #[test]

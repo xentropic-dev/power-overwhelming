@@ -303,6 +303,7 @@ impl Fixture {
             active_box: Some(BOX_ID.into()),
             onboarded: true,
             color_scheme: None,
+            recent_commands: Vec::new(),
         };
         fs::write(
             state.join("boxes.json"),
@@ -1126,6 +1127,77 @@ done
         Some("actual-model")
     );
     assert_eq!(fixture.agents()[0].model.as_deref(), Some("actual-model"));
+}
+
+#[test]
+fn planned_provider_and_model_apply_when_dispatch_names_no_provider() {
+    let fixture = Fixture::with_configure(|root| {
+        let program = root.join("codex");
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+# Power may add its own arguments, such as a turn hook, around the planned model.
+while [ "$#" -gt 1 ] && [ "$1" != "--model" ]; do shift; done
+test "$1" = "--model"
+test "$2" = "planned-model"
+"$POWER_BIN" dag report success --summary "Ran the plan"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = root.join("config/power-overwhelming");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.lua"),
+            format!(
+                r#"agents.codex = {{ command = {:?}, injection = {{ kind = "none" }} }}"#,
+                program.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+    });
+    let run = fixture.create_run().id;
+    assert_success(&fixture.apply(
+        &run,
+        json!([
+            {"id": "planned", "title": "Planned", "provider": "codex", "model": "planned-model"},
+            {"id": "later", "title": "Later", "deps": ["planned"], "provider": "codex", "model": "first"},
+            {"id": "open", "title": "Unplanned"},
+        ]),
+    ));
+    let shown = fixture.json(&["dag", "show", &run]);
+    let tasks = shown["run"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks[0]["provider"], "codex");
+    assert_eq!(tasks[0]["model"], "planned-model");
+    assert_eq!(tasks[2]["provider"], Value::Null);
+    assert_eq!(tasks[2]["model"], Value::Null);
+
+    let replanned = fixture.json(&["dag", "plan", &run, "later", "--model", "second"]);
+    assert_eq!(replanned["run"]["tasks"][1]["provider"], "codex");
+    assert_eq!(replanned["run"]["tasks"][1]["model"], "second");
+    let cleared = fixture.json(&["dag", "plan", &run, "later", "--clear"]);
+    assert_eq!(cleared["run"]["tasks"][1]["model"], Value::Null);
+    assert_eq!(fixture.events(&run, 0, &["task_planned"]).events.len(), 2);
+
+    let worktree = fixture.worktrees[0].to_str().unwrap();
+    let unplanned = output(power(fixture.root()).args([
+        "dag",
+        "dispatch",
+        &run,
+        "open",
+        "--worktree",
+        worktree,
+    ]));
+    assert!(!unplanned.status.success());
+    assert!(String::from_utf8_lossy(&unplanned.stderr).contains("--provider"));
+
+    let (attempt, agent) =
+        dispatched(fixture.command(&["dag", "dispatch", &run, "planned", "--worktree", worktree]));
+    assert_eq!(attempt.provider, Provider::Agent("codex".into()));
+    assert_eq!(attempt.model.as_deref(), Some("planned-model"));
+    assert_eq!(agent.model, attempt.model);
+    fixture.wait_for_state(&run, "planned", TaskState::Completed);
 }
 
 #[test]
@@ -3268,4 +3340,188 @@ fn restart_check_names_the_daemon_on_the_callers_socket() {
     let elsewhere = restart_check(other.path(), &[]);
     assert!(elsewhere.status.success(), "{elsewhere:?}");
     assert!(elsewhere.stdout.is_empty(), "{elsewhere:?}");
+}
+
+#[test]
+fn overview_counts_runs_workers_terminals_and_attached_tabs() {
+    let fixture = Fixture::new();
+    let overview = || -> Value {
+        let mut reply = fixture.request(json!({"request": "overview"}));
+        let mut line = String::new();
+        reply.read_line(&mut line).unwrap();
+        let mut response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["event"], "overview", "{response}");
+        response["overview"].take()
+    };
+    let empty = overview();
+    assert_eq!(empty["runs"], json!([]));
+    assert_eq!(
+        empty["totals"],
+        json!({"agents_working": 0, "terminals": 0, "attached": 0})
+    );
+    assert!(empty["system"]["mem_total"].as_u64().unwrap() > 0);
+
+    let run = fixture.create_run().id;
+    json_output(fixture.apply(
+        &run,
+        json!([
+            {"id": "alpha", "title": "First"},
+            {"id": "beta", "title": "Second", "deps": ["alpha"]},
+            {"id": "gamma", "title": "Third", "deps": ["beta"]}
+        ]),
+    ));
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "alpha",
+        &fixture.worktrees[0],
+        false,
+        &["success", "alpha-go", "Alpha result", "alpha-exit"],
+    ));
+    let session = agent.session.clone().unwrap();
+
+    let working = overview();
+    let runs = working["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["run"], run.as_str());
+    assert_eq!(runs[0]["box_id"], BOX_ID);
+    assert_eq!(runs[0]["title"], "Fixture run");
+    assert_eq!(
+        (
+            &runs[0]["completed"],
+            &runs[0]["total"],
+            &runs[0]["workers"]
+        ),
+        (&json!(0), &json!(3), &json!(1))
+    );
+    assert_eq!(runs[0]["status"], "active");
+    // Nothing has succeeded yet, so there is no estimate.
+    assert_eq!(runs[0].get("eta_secs"), None);
+    assert_eq!(
+        working["totals"],
+        json!({"agents_working": 1, "terminals": 1, "attached": 0})
+    );
+    assert_eq!(
+        working["boxes"],
+        json!([{
+            "id": BOX_ID,
+            "name": "box-repo",
+            "terminals": 1,
+            "attached": 0,
+            "agents_working": 1,
+            "runs_active": 1
+        }])
+    );
+    // Command workers have no provider usage.
+    assert_eq!(working["usage"], json!([]));
+
+    fixture.release("alpha-go");
+    fixture.wait_for_state(&run, "alpha", TaskState::Completed);
+    // The worker's session is still open, now as a tab in the box.
+    let state = fixture.root().join("state/boxes.json");
+    let mut layout: Layout = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    layout.boxes[0]
+        .views
+        .push(infrastructure::boxes::SavedView {
+            session: session.clone(),
+            worktree: fixture.worktrees[0].clone(),
+        });
+    fs::write(&state, serde_json::to_vec(&layout).unwrap()).unwrap();
+
+    let done = overview();
+    let runs = done["runs"].as_array().unwrap();
+    assert_eq!(
+        (&runs[0]["completed"], &runs[0]["workers"]),
+        (&json!(1), &json!(0))
+    );
+    // Two dependent tasks remain, one after the other, each as long as the first.
+    assert!(runs[0]["eta_secs"].is_u64(), "{done}");
+    assert_eq!(
+        done["totals"],
+        json!({"agents_working": 0, "terminals": 1, "attached": 1})
+    );
+    assert_eq!(done["boxes"][0]["terminals"], 1);
+    assert_eq!(done["boxes"][0]["attached"], 1);
+    assert_eq!(done["boxes"][0]["agents_working"], 0);
+    fixture.release("alpha-exit");
+}
+
+#[test]
+fn a_waiting_task_edited_before_dispatch_gets_the_new_instructions_in_its_prompt() {
+    let fixture = Fixture::with_configure(|root| {
+        fake_jcode(
+            root,
+            r#""$POWER_BIN" dag report success --summary "edited done""#,
+        );
+    });
+    let run = fixture.create_run().id;
+    json_output(fixture.apply(
+        &run,
+        json!([
+            {"id": "first", "title": "First"},
+            {"id": "later", "title": "Later", "instructions": "Old plan", "deps": ["first"]}
+        ]),
+    ));
+    let instructions = fixture.root().join("new-instructions.txt");
+    fs::write(&instructions, "Follow the corrected plan").unwrap();
+    let edited = fixture.json(&[
+        "dag",
+        "edit-task",
+        &run,
+        "later",
+        "--title",
+        "Later, corrected",
+        "--instructions-file",
+        instructions.to_str().unwrap(),
+    ]);
+    assert_eq!(edited["task"]["state"], "waiting");
+    assert_eq!(edited["delivery"], json!({"status": "none"}));
+    let page = fixture.events(&run, 0, &["task_edited"]);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].task.as_deref(), Some("later"));
+
+    // Edits are refused without a change, for blank text, or for unknown targets.
+    for args in [
+        &["dag", "edit-task", &run, "later"][..],
+        &["dag", "edit-task", &run, "later", "--title", " "],
+        &["dag", "edit-task", &run, "nope", "--title", "x"],
+        &["dag", "edit-task", "nope", "later", "--title", "x"],
+    ] {
+        assert!(!fixture.command(args).status.success(), "{args:?}");
+    }
+
+    let (first, _) = dispatched(fixture.dispatch(
+        &run,
+        "first",
+        &fixture.worktrees[0],
+        false,
+        &["success", "first.go", "first done"],
+    ));
+    fixture.release("first.go");
+    fixture.wait_for_state(&run, "first", TaskState::Completed);
+    let refused = fixture.command(&["dag", "edit-task", &run, "first", "--title", "Again"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Add a new task instead"),
+        "{refused:?}"
+    );
+    assert_eq!(task(&fixture.show(&run), "first").attempts[0].id, first.id);
+
+    dispatched(fixture.command(&[
+        "dag",
+        "dispatch",
+        &run,
+        "later",
+        "--provider",
+        "jcode",
+        "--worktree",
+        fixture.worktrees[1].to_str().unwrap(),
+    ]));
+    fixture.wait_for_state(&run, "later", TaskState::Completed);
+    let message = fs::read_to_string(fixture.root().join("jcode.1.message")).unwrap();
+    assert!(
+        message.contains("Task: later — Later, corrected"),
+        "{message:?}"
+    );
+    assert!(message.contains("Follow the corrected plan"), "{message:?}");
+    assert!(!message.contains("Old plan"), "{message:?}");
 }

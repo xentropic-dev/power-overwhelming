@@ -69,6 +69,27 @@ pub fn set_model(session: String, value: String) -> Result<()> {
     })
 }
 
+/// Reports a model's rate-limit windows, which the daemon keeps for the dashboard.
+pub fn set_usage(
+    session: String,
+    model: &str,
+    windows: &[domain::overview::UsageWindow],
+) -> Result<()> {
+    expect_ok(&Request::SetMetadata {
+        session,
+        field: wire::MetadataField::Usage,
+        value: crate::usage::encode_usage(model, windows),
+    })
+}
+
+/// Every box, live run, model in use and the machine's load.
+pub fn overview() -> Result<domain::overview::Overview> {
+    match wire::request(&Request::Overview)? {
+        Response::Overview { overview } => Ok((*overview).into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
 /// Reports the conversation an agent wrapper is about to start, so a restore can resume it.
 pub fn set_conversation(session: String, agent: String, conversation: String) -> Result<()> {
     expect_ok(&Request::SetConversation {
@@ -563,17 +584,20 @@ pub fn unarchive_run(run: String) -> Result<Run> {
     }
 }
 
-/// Creates a checkout based on the source view's HEAD and returns its path.
+/// Creates a checkout based on the source view's HEAD and returns its path. Without `path`,
+/// the daemon picks one under the worktree root.
 pub fn create_view_worktree(
     box_sel: String,
     from_session: String,
     branch: String,
+    path: Option<PathBuf>,
 ) -> Result<PathBuf> {
     match dag(
         DagRequest::CreateViewWorktree {
             box_sel,
             from_session,
             branch,
+            path,
         },
         DAG_TIMEOUT,
     )? {

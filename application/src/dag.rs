@@ -7,8 +7,8 @@ use domain::{
     dag::{
         AgentState, AgentStatus, Attempt, AttemptArtifact, AttemptState, BoxAttention, BoxInfo,
         BudgetLimit, Coordinator, ManagedAgent, Provider, ReportStatus, ReportTransition, Run,
-        RunEvent, RunEventKind, RunStatus, Task, TaskSpec, TaskState, WorkerBudget, WorkerLoad,
-        can_dispatch, report_transition, validate_batch,
+        RunEvent, RunEventKind, RunStatus, Task, TaskEdit, TaskSpec, TaskState, WorkerBudget,
+        WorkerLoad, can_dispatch, report_transition, task_edit, valid_task_text, validate_batch,
     },
     session::Agent,
     worktree::{ManagedWorktree, WorktreeCreator, WorktreeRequest, default_worktree_path},
@@ -84,6 +84,14 @@ pub trait DagTransaction: DagReader {
     fn set_run_archived(&self, id: &str, archived_at: Option<u64>) -> Result<()>;
     fn insert_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<()>;
     fn insert_dep(&self, run: &str, task: &str, dep: &str) -> Result<()>;
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()>;
+    fn set_task_plan(
+        &self,
+        run: &str,
+        task: &str,
+        provider: Option<&Provider>,
+        model: Option<&str>,
+    ) -> Result<()>;
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()>;
     fn update_attempt(&self, attempt: &Attempt) -> Result<()>;
     fn insert_worktree(&self, worktree: &ManagedWorktree) -> Result<()>;
@@ -155,7 +163,8 @@ pub struct StartAgent {
 pub struct Dispatch {
     pub run: String,
     pub task: String,
-    pub provider: Provider,
+    /// `None` uses the task's planned provider and model.
+    pub provider: Option<Provider>,
     pub worktree: WorktreeRequest,
     pub retry: bool,
     pub args: Vec<String>,
@@ -198,7 +207,7 @@ impl QueuedDispatch {
         Dispatch {
             run: self.run,
             task: self.task,
-            provider: self.provider,
+            provider: Some(self.provider),
             worktree: self.worktree,
             retry: self.retry,
             args: self.args,
@@ -248,6 +257,18 @@ struct StallCheck {
     flagged: Mutex<BTreeSet<String>>,
 }
 
+/// A change to a task's planned provider and model.
+pub struct PlanTask {
+    pub run: String,
+    pub task: String,
+    /// Drops the current plan before applying `provider` and `model`.
+    pub clear: bool,
+    /// A new provider. Without `model`, it also drops the planned model.
+    pub provider: Option<Provider>,
+    /// A new model. An empty string drops the planned model.
+    pub model: Option<String>,
+}
+
 pub struct DispatchResult {
     pub agent: ManagedAgent,
     pub attempt: Attempt,
@@ -261,6 +282,50 @@ pub struct ReportResult {
     pub reason: Option<String>,
 }
 
+/// Delivers a corrected task to the worker on its current attempt. The talk use case
+/// implements it, so the message is durable and reaches the worker when it is idle.
+pub trait TaskMessenger {
+    /// Sends `body` to `agent` within `run`, as `caller`. Returns the message ID.
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String>;
+}
+
+pub struct EditTask {
+    pub run: String,
+    pub task: String,
+    pub title: Option<String>,
+    pub instructions: Option<String>,
+    /// The coordinator's session, which sends the message to a running worker.
+    pub caller: Option<String>,
+}
+
+/// The message sent to the running worker, or why it could not be sent. The stored edit
+/// stands either way.
+pub enum EditDelivery {
+    /// Nothing is running. The next dispatch or retry uses the edit.
+    None,
+    Sent {
+        agent: String,
+        attempt: String,
+        message: String,
+    },
+    Failed {
+        agent: String,
+        attempt: String,
+        error: String,
+    },
+}
+
+pub struct TaskEdited {
+    pub run: Run,
+    pub task: Task,
+    pub delivery: EditDelivery,
+}
 /// How long a worker keeps running after it reports success or failure, so it can
 /// finish its last message before its session ends.
 pub const FINISHED_WORKER_GRACE: Duration = Duration::from_secs(10);
@@ -283,6 +348,9 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     /// Serializes run pauses and resumes, so a run's flag and its workers' pauses
     /// change together and two transitions never interleave.
     run_transitions: Mutex<()>,
+    /// Serializes task edits from the stored write through the message enqueue, so a
+    /// running worker's last message always matches the stored instructions.
+    task_edits: Mutex<()>,
 }
 
 /// Ends finished workers. Due teardowns and the record writes that follow them run
@@ -345,6 +413,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
             run_transitions: Mutex::new(()),
+            task_edits: Mutex::new(()),
         }
     }
 
@@ -585,6 +654,16 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .into_iter()
             .map(|entry| entry.info)
             .collect())
+    }
+
+    /// Every registered box with the sessions open as its tabs.
+    pub fn registered_boxes(&self) -> Result<Vec<RegisteredBox>> {
+        self.registry.boxes()
+    }
+
+    /// Every live session this daemon hosts.
+    pub fn list_sessions(&self) -> Vec<domain::session::Session> {
+        self.application.list_sessions()
     }
 
     pub fn select_box(&self, selector: &str) -> Result<String> {
@@ -1015,6 +1094,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     pub fn add_tasks(&self, run: &str, tasks: &[TaskSpec]) -> Result<Run> {
+        let tasks = tasks
+            .iter()
+            .map(|task| {
+                let (provider, model) = self
+                    .validate_plan(task.provider.clone(), task.model.clone())
+                    .with_context(|| format!("Task {:?}", task.id))?;
+                Ok(TaskSpec {
+                    provider,
+                    model,
+                    ..task.clone()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tasks = tasks.as_slice();
         self.write(|db| {
             let before = load_run(db, run)?;
             validate_batch(&task_specs(&before), tasks)?;
@@ -1030,6 +1123,93 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         })
     }
 
+    /// Corrects a task's title or instructions. The stored copy changes in every open
+    /// state, so the next dispatch or retry uses it, and a running worker is sent the new
+    /// instructions through `messenger`. A completed task is refused.
+    pub fn edit_task(
+        &self,
+        command: EditTask,
+        messenger: &dyn TaskMessenger,
+    ) -> Result<TaskEdited> {
+        ensure!(
+            command.title.is_some() || command.instructions.is_some(),
+            "Specify --title, --instructions or --instructions-file"
+        );
+        if let Some(title) = &command.title {
+            ensure!(valid_task_text(title), "Task title is empty");
+        }
+        if let Some(instructions) = &command.instructions {
+            ensure!(valid_task_text(instructions), "Task instructions are empty");
+        }
+        // Held until the message is enqueued. Two crossed edits would otherwise commit
+        // A then B but enqueue B then A, and the worker would follow the stale A.
+        let _edit = self.task_edits.lock().unwrap();
+        let (run, notify) = self.write(|db| {
+            let before = load_run(db, &command.run)?;
+            let task = find_task(&before, &command.task)?;
+            let edit = task_edit(task.state);
+            ensure!(
+                edit != TaskEdit::Refused,
+                "Task {:?} is completed. Add a new task instead",
+                task.id
+            );
+            let title = command.title.as_deref().unwrap_or(&task.title);
+            let instructions = command
+                .instructions
+                .as_deref()
+                .unwrap_or(&task.instructions);
+            db.update_task(&before.id, &task.id, title, instructions)?;
+            let notify = match edit {
+                TaskEdit::StoreAndNotify => task
+                    .current_attempt
+                    .as_deref()
+                    .and_then(|id| task.attempts.iter().find(|attempt| attempt.id == id))
+                    .map(|attempt| (attempt.agent.clone(), attempt.id.clone())),
+                _ => None,
+            };
+            let changed = [
+                command.title.as_ref().map(|_| "title"),
+                command.instructions.as_ref().map(|_| "instructions"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ");
+            db.event(
+                &before.id,
+                RunEventKind::TaskEdited,
+                Some(&task.id),
+                notify.as_ref().map(|(_, attempt)| attempt.as_str()),
+                Some(&format!("Updated {changed}")),
+            )?;
+            Ok((load_run(db, &command.run)?, notify))
+        })?;
+        let task = find_task(&run, &command.task)?.clone();
+        let delivery = match notify {
+            None => EditDelivery::None,
+            Some((agent, attempt)) => {
+                let body = edit_message(&run, &task);
+                match messenger.send_to_worker(command.caller, &run.id, &agent, body) {
+                    Ok(message) => EditDelivery::Sent {
+                        agent,
+                        attempt,
+                        message,
+                    },
+                    Err(error) => EditDelivery::Failed {
+                        agent,
+                        attempt,
+                        error: format!("{error:#}"),
+                    },
+                }
+            }
+        };
+        Ok(TaskEdited {
+            run,
+            task,
+            delivery,
+        })
+    }
+
     pub fn add_dependency(&self, run: &str, task: &str, dep: &str) -> Result<Run> {
         self.write(|db| {
             let mut specs = task_specs(&load_run(db, run)?);
@@ -1042,6 +1222,71 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             db.insert_dep(run, task, dep)?;
             load_run(db, run)
         })
+    }
+
+    /// Sets, changes or clears a task's planned provider and model.
+    pub fn plan_task(&self, command: PlanTask) -> Result<Run> {
+        self.write(|db| {
+            let run = load_run(db, &command.run)?;
+            let task = find_task(&run, &command.task)?;
+            let (mut provider, mut model) = if command.clear {
+                (None, None)
+            } else {
+                (task.provider.clone(), task.model.clone())
+            };
+            if let Some(next) = command.provider {
+                provider = Some(next);
+                model = None;
+            }
+            if let Some(next) = command.model {
+                model = (!next.trim().is_empty()).then_some(next);
+            }
+            let (provider, model) = self.validate_plan(provider, model)?;
+            if (&provider, &model) == (&task.provider, &task.model) {
+                return Ok(run);
+            }
+            db.set_task_plan(&run.id, &task.id, provider.as_ref(), model.as_deref())?;
+            db.event(
+                &run.id,
+                RunEventKind::TaskPlanned,
+                Some(&task.id),
+                None,
+                Some(&plan_summary(provider.as_ref(), model.as_deref())),
+            )?;
+            load_run(db, &run.id)
+        })
+    }
+
+    /// Normalizes a planned model and rejects plans that dispatch could not honour.
+    fn validate_plan(
+        &self,
+        provider: Option<Provider>,
+        model: Option<String>,
+    ) -> Result<(Option<Provider>, Option<String>)> {
+        if let Some(Provider::Agent(id)) = &provider {
+            self.application.agents.resolve(id)?;
+        }
+        let model = match model {
+            None => None,
+            Some(value) => Some(
+                domain::agent::model_name(&value)
+                    .with_context(|| format!("Invalid model name {value:?}"))?,
+            ),
+        };
+        if let Some(model) = &model {
+            match &provider {
+                Some(Provider::Command) => bail!("The command provider takes no planned model"),
+                Some(Provider::Agent(id)) => ensure!(
+                    domain::agent::model_args(id.as_str(), model).is_some(),
+                    "Power does not know the model flag of {:?}, so it cannot launch a \
+                     planned model. Plan the provider alone and pass the model after --",
+                    id.as_str()
+                ),
+                // Dispatch names the provider and Power checks its model flag then.
+                None => {}
+            }
+        }
+        Ok((provider, model))
     }
 
     pub fn start_agent(&self, command: StartAgent) -> Result<ManagedAgent> {
@@ -1221,6 +1466,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     .checked_add(1)
                     .context("Too many attempts for this task")
             })?;
+            let (provider, args) =
+                planned_launch(&run.id, task, command.provider.clone(), &command.args)?;
             let entry = self.registered_box(&run.box_id)?;
             let caller = self.hosted_caller(command.caller.as_deref());
             let DispatchWorktree { path, kind } =
@@ -1252,7 +1499,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                     id: self.new_id(),
                     run: run.id.clone(),
                     task: task.id.clone(),
-                    provider: command.provider,
+                    // The resolved provider. Starting it re-applies the plan's current model.
+                    provider,
                     worktree,
                     retry: command.retry,
                     args: command.args,
@@ -1290,7 +1538,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             let mut agent = self.new_agent(
                 run.box_id.clone(),
                 path,
-                command.provider,
+                provider,
                 parent,
                 task.title.clone(),
             );
@@ -1321,13 +1569,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 let prompt = (agent.provider != Provider::Command).then(|| {
                     worker_prompt(&run, task, &agent.worktree, branch.as_deref(), resuming)
                 });
-                self.launch_worker(
-                    &mut agent,
-                    command.args,
-                    prompt,
-                    Some(&task.title),
-                    launched,
-                )?;
+                self.launch_worker(&mut agent, args, prompt, Some(&task.title), launched)?;
                 Ok(branch)
             })();
             let start = match start {
@@ -2786,6 +3028,31 @@ fn worker_prompt(
     prompt
 }
 
+/// Talk bodies are limited, so instructions that do not fit are left for `dag show`.
+const EDIT_MESSAGE_LIMIT: usize = 15 * 1024;
+
+fn edit_message(run: &Run, task: &Task) -> String {
+    let intro = format!(
+        "The coordinator edited your task {} in run {}. These instructions replace your \
+         earlier instructions for this task. Follow them from now on.\n\n",
+        task.id, run.id,
+    );
+    let full = format!(
+        "{intro}Task: {} — {}\n\nInstructions:\n{}",
+        task.id, task.title, task.instructions
+    );
+    if full.len() <= EDIT_MESSAGE_LIMIT {
+        full
+    } else {
+        // IDs are short, so this fits whatever the title and instructions are.
+        format!(
+            "{intro}The new title and instructions are too long for a message. Read them \
+             with `power dag show {}` (task {}).",
+            run.id, task.id
+        )
+    }
+}
+
 fn task_specs(run: &Run) -> Vec<TaskSpec> {
     run.tasks
         .iter()
@@ -2794,8 +3061,88 @@ fn task_specs(run: &Run) -> Vec<TaskSpec> {
             title: task.title.clone(),
             instructions: task.instructions.clone(),
             deps: task.deps.clone(),
+            provider: task.provider.clone(),
+            model: task.model.clone(),
         })
         .collect()
+}
+
+fn plan_summary(provider: Option<&Provider>, model: Option<&str>) -> String {
+    match (provider, model) {
+        (None, None) => "no plan".into(),
+        (Some(provider), None) => provider_id(provider).into(),
+        (None, Some(model)) => model.into(),
+        (Some(provider), Some(model)) => format!("{} / {model}", provider_id(provider)),
+    }
+}
+
+fn provider_id(provider: &Provider) -> &str {
+    match provider {
+        Provider::Agent(id) => id.as_str(),
+        Provider::Command => "command",
+    }
+}
+
+/// The provider and launch arguments for an attempt.
+///
+/// Without `explicit`, the attempt uses the planned provider. An explicit provider replaces
+/// the plan for this attempt when it differs from the planned one. An explicit provider equal
+/// to the planned one keeps the planned model, so `--provider codex` on a `codex / gpt` plan
+/// still launches `gpt`; pass model arguments to run another model. A plan with a model and
+/// no provider applies its model to whichever provider the dispatch names. Arguments that do
+/// not select a model never drop the planned model: when Power does not know the provider's
+/// model flag, the launch fails rather than run without the planned model.
+fn planned_launch(
+    run: &str,
+    task: &Task,
+    explicit: Option<Provider>,
+    args: &[String],
+) -> Result<(Provider, Vec<String>)> {
+    let clear_model = || format!("`power dag plan {run} {} --model ''`", task.id);
+    let provider = match (explicit, &task.provider, &task.model) {
+        (Some(provider), _, _) => provider,
+        (None, Some(planned), _) => planned.clone(),
+        (None, None, Some(model)) => bail!(
+            "Task {:?} plans the model {model:?} without a provider. Pass --provider <id> to \
+             launch it with that provider, or plan one with `power dag plan {run} {} --provider <id>`",
+            task.id,
+            task.id
+        ),
+        (None, None, None) => bail!(
+            "Specify --provider, or plan one with `power dag plan {run} {} --provider <id>`",
+            task.id
+        ),
+    };
+    let Some(model) = &task.model else {
+        return Ok((provider, args.to_vec()));
+    };
+    if task
+        .provider
+        .as_ref()
+        .is_some_and(|planned| planned != &provider)
+    {
+        return Ok((provider, args.to_vec()));
+    }
+    let Provider::Agent(id) = &provider else {
+        bail!(
+            "The command provider takes no model. Clear the planned model {model:?} with {}",
+            clear_model()
+        )
+    };
+    if domain::agent::passes_model_flag(id.as_str(), args) {
+        return Ok((provider, args.to_vec()));
+    }
+    let model_args = domain::agent::model_args(id.as_str(), model).with_context(|| {
+        format!(
+            "Power does not know the model flag of {:?}, so it cannot pass the planned model \
+             {model:?}. Clear it with {} and pass the model after --",
+            id.as_str(),
+            clear_model()
+        )
+    })?;
+    let mut launch = model_args;
+    launch.extend_from_slice(args);
+    Ok((provider, launch))
 }
 
 /// Active runs first, then stalled, then completed; newest first within each group.

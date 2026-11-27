@@ -1,0 +1,164 @@
+package power:panel@0.1.0;
+
+interface types {
+    use power:terminal-ui/types@0.1.0.{segment};
+
+    /// Which key prefix a command's keys follow.
+    enum command-scope {
+        /// After the box prefix, Ctrl+B by default.
+        box,
+        /// After the tab prefix, Ctrl+S by default.
+        tab,
+    }
+
+    record command {
+        /// A namespaced id such as `dashboard.open`. Users rebind it in config.lua with
+        /// `keys.box["dashboard.open"] = "g"`.
+        id: string,
+        /// A short name, such as `Open dashboard`.
+        title: string,
+        /// One sentence for the command palette and help.
+        description: string,
+        scope: command-scope,
+        /// Key names such as `o` or `ctrl-o`, used until config.lua sets others.
+        default-keys: list<string>,
+    }
+
+    variant effect {
+        /// Nothing more for the host to do.
+        none,
+        /// Open the panel with this id. The host then calls `render-panel` with fresh data.
+        open-panel(string),
+    }
+
+    record box-overview {
+        id: string,
+        name: string,
+        /// Live terminals that belong to the box, attached or not.
+        terminals: u32,
+        /// Terminals open as a tab in the box.
+        attached: u32,
+        agents-working: u32,
+        runs-active: u32,
+    }
+
+    enum run-status {
+        active,
+        completed,
+        stalled,
+        archived,
+    }
+
+    record run-overview {
+        run: string,
+        box-id: string,
+        title: string,
+        completed: u32,
+        total: u32,
+        /// Open attempts.
+        workers: u32,
+        /// Seconds until every task should be done. None while unknown or paused.
+        eta-secs: option<u64>,
+        status: run-status,
+        paused: bool,
+    }
+
+    record usage-window {
+        /// Short name, such as `5h` or `7d`.
+        label: string,
+        /// From 0 to 100.
+        used-percent: f32,
+        /// Unix seconds when the window resets.
+        resets-at: option<u64>,
+    }
+
+    record model-usage {
+        provider: string,
+        model: option<string>,
+        /// Empty when the provider reported no limits.
+        windows: list<usage-window>,
+    }
+
+    record system-stats {
+        /// Busy share of all CPUs, from 0 to 100. None when unknown.
+        cpu-percent: option<f32>,
+        /// Bytes. Both are 0 when unknown.
+        mem-used: u64,
+        mem-total: u64,
+    }
+
+    record totals {
+        agents-working: u32,
+        terminals: u32,
+        /// Terminals open as a tab in some box. The rest still run in the daemon, detached.
+        attached: u32,
+    }
+
+    record overview {
+        boxes: list<box-overview>,
+        /// Active and stalled runs, live ones first.
+        runs: list<run-overview>,
+        usage: list<model-usage>,
+        system: system-stats,
+        totals: totals,
+        /// Unix seconds when this overview was taken.
+        at: u64,
+    }
+
+    record bar {
+        /// From 0 to 1. The host clamps other values.
+        ratio: f32,
+        /// Width in terminal columns.
+        width: u32,
+        /// Fill and track colors, with the same names and hex values as segments.
+        fg: option<string>,
+        bg: option<string>,
+    }
+
+    variant item {
+        text(segment),
+        bar(bar),
+        /// Flexible space between items.
+        spacer,
+    }
+
+    record line {
+        left: list<item>,
+        right: list<item>,
+    }
+
+    record section {
+        heading: string,
+        lines: list<line>,
+    }
+
+    record panel {
+        title: string,
+        sections: list<section>,
+    }
+}
+
+/// A plugin that registers commands and draws full panels.
+world panel-plugin {
+    use power:terminal-ui/types@0.1.0.{plugin-settings};
+    use types.{command, effect, overview, panel};
+    import power:terminal-ui/palette@0.1.0;
+
+    /// Optional Lua configuration table name and its defaults, as for bottom-row plugins.
+    export settings: func() -> option<plugin-settings>;
+
+    /// Prepare the resolved settings, supplied as JSON (`{}` without settings). Return how
+    /// often, in milliseconds, the host should redraw this plugin's open panels with fresh
+    /// data, or none for the host default. Called after loading and after every reload.
+    export configure: func(config-json: string) -> result<option<u32>, string>;
+
+    /// The commands this plugin adds to the keymap and the command palette.
+    export commands: func() -> list<command>;
+
+    /// Run one of the plugin's commands.
+    export invoke: func(id: string) -> result<effect, string>;
+
+    /// Draw a panel this plugin opened, fitted to `width-cols` terminal columns.
+    /// `palette.get-palette` returns the active scheme during this call.
+    export render-panel: func(panel-id: string, data: overview, width-cols: u32) -> result<panel, string>;
+}

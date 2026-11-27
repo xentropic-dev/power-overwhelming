@@ -7,6 +7,7 @@ pub mod client;
 #[cfg(feature = "lua-config")]
 pub mod config;
 pub mod daemon;
+pub mod notify;
 pub mod plugins;
 
 mod agent_socket;
@@ -22,8 +23,10 @@ pub mod shell;
 pub mod skill_install;
 pub mod skills;
 mod stall_probe;
+mod system;
 mod talk_adapter;
 mod terminal;
 pub mod theme;
+pub mod usage;
 mod wire;
 pub mod workspace;
