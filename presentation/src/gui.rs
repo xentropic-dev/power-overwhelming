@@ -14,7 +14,8 @@ use crate::{
     status_bar::{ConfigChanged, StatusBar},
     talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{
-        AgentChanged, BarContextChanged, InputHold, OpenLink, TerminalView, load_bundled_fonts,
+        AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, TerminalView,
+        link_action, load_bundled_fonts,
     },
 };
 use anyhow::{Context as _, Result, ensure};
@@ -22,7 +23,6 @@ use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
     dag::{AgentStatus, Coordinator, RunStatus, TaskState},
-    link::dag_run_id,
     session::{Agent, Session},
 };
 use gpui::{prelude::*, *};
@@ -207,16 +207,6 @@ impl DagWorktrees {
         };
         (branch, creator)
     }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum LinkAction<'a> {
-    OpenDag(&'a str),
-    ResolveArtifact,
-}
-
-fn link_action(target: &str) -> LinkAction<'_> {
-    dag_run_id(target).map_or(LinkAction::ResolveArtifact, LinkAction::OpenDag)
 }
 
 struct TerminalTab {
@@ -2909,6 +2899,7 @@ impl Workspace {
     ) {
         match link_action(&target) {
             LinkAction::OpenDag(run) => self.open_dag_link(run.to_owned(), window, cx),
+            LinkAction::OpenBrowser => cx.open_url(&target),
             LinkAction::ResolveArtifact => {
                 if let Some(box_id) = self.layout.active_box.clone() {
                     self.resolve_in(box_id, session, target, focus_preview, window, cx);
@@ -3391,6 +3382,14 @@ impl Render for Workspace {
             .id("workspace")
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::key_down))
+            // Modifier events follow focus, even when the pointer is over the terminal.
+            .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, _, cx| {
+                if let Some(tab) = this.active_view().and_then(|id| this.terminals.get(&id))
+                    && tab.view.read(cx).pointer_over_link()
+                {
+                    tab.view.update(cx, |_, cx| cx.notify());
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -3626,18 +3625,31 @@ mod tests {
     }
 
     #[test]
-    fn dag_links_open_runs_directly() {
+    fn terminal_link_destinations_use_their_existing_routes_and_open_web_urls_in_a_browser() {
         assert_eq!(
             link_action("pwr://dag/Run-123"),
             LinkAction::OpenDag("Run-123")
         );
         for target in [
             "pwr://artifact/abc",
+            "power://artifact/abc",
             "pwr://dag/",
             "pwr://dag/a/b",
             "./report.html",
+            "file:///tmp/report.html",
+            "http://localhost:3000/",
+            "https://127.1/",
+            "http://[::1]:80/",
         ] {
             assert_eq!(link_action(target), LinkAction::ResolveArtifact);
+        }
+        for target in [
+            "https://example.com/",
+            "HTTP://example.com/report.html",
+            "http://localhost.example.com/",
+            "https://[2001:db8::1]:8443/view",
+        ] {
+            assert_eq!(link_action(target), LinkAction::OpenBrowser);
         }
     }
 }
