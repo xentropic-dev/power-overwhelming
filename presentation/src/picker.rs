@@ -547,23 +547,7 @@ impl Picker {
                 .into_iter()
                 .collect();
         }
-        let mut rows: Vec<Row> = self
-            .rows
-            .iter()
-            .filter(|row| {
-                query.split_whitespace().all(|word| {
-                    row.label.to_lowercase().contains(word)
-                        || row.detail.to_lowercase().contains(word)
-                        || matches!(row.choice, Choice::ColorScheme(scheme) if scheme.aliases.iter().any(|alias| alias.to_lowercase().contains(word)))
-                })
-            })
-            .cloned()
-            .collect();
-        if matches!(self.kind, Kind::Runs { .. }) {
-            // Run IDs are UUIDs, so short queries match them by accident. Prefer title matches.
-            rows.sort_by_key(|row| !title_matches(&row.label, &query));
-        }
-        rows
+        fuzzy_rows(&self.rows, &self.query)
     }
 
     /// The run under the selection in the run picker.
@@ -879,6 +863,12 @@ impl Picker {
             let rows = std::mem::take(&mut visible);
             let selected = self.selected;
             let select = select.clone();
+            let query = self.query.clone();
+            let matched = HighlightStyle {
+                color: Some(rgb(colors.accent).into()),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            };
             let height = px(30. * rows.len().min(10) as f32);
             uniform_list("scheme-options", rows.len(), move |range, _, _| {
                 range
@@ -898,7 +888,15 @@ impl Picker {
                             .cursor_pointer()
                             .when(index == selected, |row| row.bg(rgb(colors.raised)))
                             .hover(|row| row.bg(rgb(colors.raised)))
-                            .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+                            .child(
+                                div().flex_1().min_w_0().truncate().child(
+                                    StyledText::new(row.label.clone()).with_highlights(
+                                        fuzzy_highlights(&query, &row.label)
+                                            .into_iter()
+                                            .map(|range| (range, matched)),
+                                    ),
+                                ),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -934,11 +932,19 @@ impl Picker {
         });
         let rows = visible.into_iter().enumerate().map(|(index, row)| {
             let select = select.clone();
-            let highlights = completing
-                .then(|| self.completions.get(index))
-                .flatten()
-                .map(|completion| completion.highlights.clone())
-                .unwrap_or_default();
+            let highlights = if completing {
+                self.completions
+                    .get(index)
+                    .map(|completion| completion.highlights.clone())
+                    .unwrap_or_default()
+            } else {
+                fuzzy_highlights(&self.query, &row.label)
+            };
+            let detail_highlights = if completing {
+                Vec::new()
+            } else {
+                fuzzy_highlights(&self.query, &row.detail)
+            };
             let matched = HighlightStyle {
                 color: Some(rgb(colors.accent).into()),
                 font_weight: Some(FontWeight::BOLD),
@@ -961,7 +967,9 @@ impl Picker {
                             .text_xs()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(row.detail),
+                            .child(StyledText::new(row.detail).with_highlights(
+                                detail_highlights.into_iter().map(|range| (range, matched)),
+                            )),
                     )
                 })
                 .on_click(move |_, window, cx| select(index, window, cx))
@@ -1607,18 +1615,97 @@ mod tests {
     }
 }
 
-fn title_matches(title: &str, query: &str) -> bool {
-    let title = title.to_lowercase();
-    query.split_whitespace().all(|word| title.contains(word))
+/// Fuzzy-filters rows with nucleo (fzf syntax, smart case). Rows whose label matches on its own
+/// rank first, so run titles beat accidental hits inside UUIDs or details. Ties keep list order.
+fn fuzzy_rows(rows: &[Row], query: &str) -> Vec<Row> {
+    let query = query.trim();
+    if query.is_empty() {
+        return rows.to_vec();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buffer = Vec::new();
+    let mut ranked: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let label = pattern.score(Utf32Str::new(row.label.trim(), &mut buffer), &mut matcher);
+            let rank = match label {
+                Some(score) => (true, score),
+                None => {
+                    let mut text = format!("{} {}", row.label, row.detail);
+                    if let Choice::ColorScheme(scheme) = &row.choice {
+                        for alias in scheme.aliases.iter() {
+                            text.push(' ');
+                            text.push_str(alias);
+                        }
+                    }
+                    (
+                        false,
+                        pattern.score(Utf32Str::new(&text, &mut buffer), &mut matcher)?,
+                    )
+                }
+            };
+            Some((Reverse(rank), index, row))
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, index, _)| (rank, index));
+    ranked.into_iter().map(|(_, _, row)| row.clone()).collect()
+}
+
+/// Byte ranges of `text` that the fuzzy `query` matches, for highlighting. Empty when it doesn't match.
+fn fuzzy_highlights(query: &str, text: &str) -> Vec<Range<usize>> {
+    let query = query.trim();
+    if query.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut indices = Vec::new();
+    let mut buffer = Vec::new();
+    match pattern.indices(Utf32Str::new(text, &mut buffer), &mut matcher, &mut indices) {
+        Some(_) => byte_ranges(text, indices),
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]
-mod run_search_tests {
-    use super::title_matches;
+mod fuzzy_row_tests {
+    use super::{Choice, Row, fuzzy_rows};
+
+    fn row(label: &str, detail: &str) -> Row {
+        Row {
+            label: label.into(),
+            detail: detail.into(),
+            choice: Choice::NewBox,
+        }
+    }
+
+    fn labels(rows: &[Row], query: &str) -> Vec<String> {
+        fuzzy_rows(rows, query)
+            .into_iter()
+            .map(|row| row.label)
+            .collect()
+    }
 
     #[test]
-    fn title_matches_need_every_word_in_the_title() {
-        assert!(title_matches("Acceptance 2", "acceptance 2"));
-        assert!(!title_matches("Acceptance 1", "acceptance 2"));
+    fn matches_partial_and_scattered_words() {
+        let rows = [row("Acceptance tests", ""), row("Refactor picker", "")];
+        assert_eq!(labels(&rows, "accep"), ["Acceptance tests"]);
+        assert_eq!(labels(&rows, "rfpk"), ["Refactor picker"]);
+        assert_eq!(labels(&rows, "acc tst"), ["Acceptance tests"]);
+    }
+
+    #[test]
+    fn highlights_cover_the_matched_characters() {
+        assert_eq!(super::fuzzy_highlights("acc", "Acceptance"), [0..3]);
+        assert_eq!(super::fuzzy_highlights("rfp", "Refactor picker").len(), 3);
+        assert!(super::fuzzy_highlights("zzz", "Acceptance").is_empty());
+    }
+
+    #[test]
+    fn label_matches_beat_detail_matches() {
+        let rows = [row("Other", "acceptance"), row("Acceptance 2", "")];
+        assert_eq!(labels(&rows, "acceptance"), ["Acceptance 2", "Other"]);
     }
 }
