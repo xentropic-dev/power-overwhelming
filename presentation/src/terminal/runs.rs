@@ -284,9 +284,6 @@ pub(super) struct Shaping<'a> {
     pub(super) cell_height: Pixels,
     /// The bundled symbols font, which draws icons the terminal font lacks.
     pub(super) symbols: FontId,
-    /// The color emoji font, when the machine has one. A cluster with U+FE0F is shaped with it
-    /// even when the terminal font has a text glyph for its base character.
-    pub(super) emoji: Option<&'a Font>,
     /// Whether the terminal font has a glyph for a character, as opposed to a fallback face.
     pub(super) has_glyph: &'a dyn Fn(char) -> bool,
     pub(super) ligatures: bool,
@@ -342,13 +339,8 @@ pub(super) fn row_ops(
             Fit::Shrunk(size) => Some(size),
             _ => None,
         };
-        let emoji = matches!(fits[start], Fit::Emoji);
         let mut end = x;
-        if first.cell.wide == CellWide::Narrow
-            && fitted.is_none()
-            && !emoji
-            && cursor != Some(start)
-        {
+        if first.cell.wide == CellWide::Narrow && fitted.is_none() && cursor != Some(start) {
             while x < row.len()
                 && cursor != Some(x)
                 && matches!(fits[x], Fit::Plain)
@@ -364,17 +356,14 @@ pub(super) fn row_ops(
         }
         let cells = &row[start..end];
         let plain: String = cells.iter().map(|cell| cell.cell.text.as_str()).collect();
-        let mut font = match shaping.emoji {
-            Some(emoji_font) if emoji => emoji_font.clone(),
-            _ => shaping.font.clone(),
-        };
+        let mut font = shaping.font.clone();
         if first.cell.style.bold {
             font.weight = shaping.bold_weight;
         }
         if first.cell.style.italic {
             font.style = FontStyle::Italic;
         }
-        let ligatures = shaping.ligatures && !emoji && needs_ligatures(&plain, &font);
+        let ligatures = shaping.ligatures && needs_ligatures(&plain, &font);
         font.features = ligature_features(ligatures);
         let text = RunText::new(cells, ligatures);
         let run = TextRun {
@@ -410,8 +399,6 @@ enum Fit {
     Plain,
     /// A Private Use Area icon the font lacks, fitted from the symbols font.
     Icon(IconGlyph),
-    /// An emoji presentation sequence (U+FE0F), shaped with the color emoji font.
-    Emoji,
     /// A fallback glyph wider than its cell, shrunk to fit at this size.
     Shrunk(Pixels),
 }
@@ -429,9 +416,6 @@ fn fallback_fits(
             let text = cell.cell.text.as_str();
             if text.is_ascii() || cell.blank() {
                 return Fit::Plain;
-            }
-            if shaping.emoji.is_some() && text.contains('\u{fe0f}') {
-                return Fit::Emoji;
             }
             let Some(first) = text.chars().next() else {
                 return Fit::Plain;
@@ -478,9 +462,6 @@ fn is_icon(text: &str) -> bool {
 
 /// The bundled symbols font's family, as GPUI names it.
 pub(crate) const SYMBOLS_FAMILY: &str = "Symbols Nerd Font";
-
-/// The color emoji font that emoji presentation sequences are shaped with.
-pub(crate) const EMOJI_FAMILY: &str = "Noto Color Emoji";
 
 /// An icon's outline box in the symbols font, in font units, read from the file itself and not
 /// through shaping, which may take the character from another installed font (old Nerd Fonts
@@ -752,7 +733,6 @@ mod tests {
             cell_width: px(8.),
             cell_height: px(18.),
             symbols: FontId(1),
-            emoji: None,
             has_glyph: &|c| c != '\u{e0b0}' && c != '\u{f09b}',
             ligatures,
             bold_weight: FontWeight::BOLD,
@@ -1083,49 +1063,64 @@ mod tests {
     }
 
     #[test]
-    fn emoji_presentation_sequences_shape_with_the_emoji_font() {
+    fn emoji_keep_the_face_gpui_falls_back_to() {
+        // Emoji are shaped with the terminal font, so GPUI's own fallback picks the color
+        // face: naming Noto Color Emoji drops it on Linux, which has no `m` glyph.
         let font = font("JetBrains Mono");
-        let emoji = Font {
-            family: "Noto Color Emoji".into(),
-            ..font.clone()
-        };
-        let frame = screen("a\u{2194}\u{fe0f}\u{2122}\u{fe0f}b".as_bytes());
-        let fonts = std::cell::RefCell::new(Vec::new());
-        // The terminal font has every character, as JetBrains Mono does for these.
+        let frame = screen("a\u{2764}\u{fe0f}b".as_bytes());
         let has_glyph = |_: char| true;
         let shaping = Shaping {
-            emoji: Some(&emoji),
             has_glyph: &has_glyph,
             ..shaping(&font, false, None)
         };
-        row_ops(&cells(&frame, 0), &shaping, |text, size, runs| {
-            fonts
-                .borrow_mut()
-                .push((text.to_owned(), runs[0].font.family.clone()));
+        let emoji_face = FontId(7);
+        let ops = row_ops(&cells(&frame, 0), &shaping, |text, size, runs| {
+            assert_eq!(runs[0].font.family, font.family, "{text}");
+            let glyphs = text
+                .char_indices()
+                .filter(|(_, c)| *c != '\u{fe0f}')
+                .enumerate()
+                .map(|(n, (index, c))| ShapedGlyph {
+                    is_emoji: c == '\u{2764}',
+                    ..glyph(index, 7. * n as f32)
+                })
+                .collect::<Vec<_>>();
+            let (emoji, text_glyphs): (Vec<_>, Vec<_>) =
+                glyphs.into_iter().partition(|glyph| glyph.is_emoji);
             Arc::new(LineLayout {
                 font_size: size,
                 len: text.len(),
+                runs: vec![
+                    ShapedRun {
+                        font_id: FontId(0),
+                        glyphs: text_glyphs,
+                    },
+                    ShapedRun {
+                        font_id: emoji_face,
+                        glyphs: emoji,
+                    },
+                ],
                 ..LineLayout::default()
             })
         });
-        let fonts = fonts.into_inner();
-        let emoji_texts: Vec<_> = fonts
+        let placed: Vec<_> = ops
             .iter()
-            .filter(|(_, family)| *family == emoji.family)
-            .map(|(text, _)| text.as_str())
+            .filter_map(|op| match op {
+                RowOp::Text { glyphs, .. } => Some(glyphs),
+                _ => None,
+            })
+            .flatten()
             .collect();
+        let heart = placed.iter().find(|glyph| glyph.emoji).expect("{placed:?}");
+        assert_eq!(heart.font, emoji_face);
         assert_eq!(
-            emoji_texts,
-            ["\u{2194}\u{fe0f}", "\u{2122}\u{fe0f}"],
-            "{fonts:?}"
-        );
-        assert!(
-            fonts
+            placed
                 .iter()
-                .any(|(text, family)| text == "a" && *family == font.family)
+                .filter(|glyph| glyph.font == FontId(0))
+                .count(),
+            2
         );
     }
-
     #[test]
     fn symbols_font_has_a_glyph_for_common_icons() {
         for c in ['\u{e0b0}', '\u{f09b}', '\u{e62b}'] {
@@ -1401,7 +1396,6 @@ mod tests {
                             cell_width,
                             cell_height: px(font_size * 1.4),
                             symbols: FontId(1),
-                            emoji: None,
                             has_glyph: &|_| true,
                             ligatures,
                             bold_weight: FontWeight::BOLD,
