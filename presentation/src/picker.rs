@@ -738,6 +738,12 @@ impl Picker {
             let rows = std::mem::take(&mut visible);
             let selected = self.selected;
             let select = select.clone();
+            let query = self.query.clone();
+            let matched = HighlightStyle {
+                color: Some(rgb(colors.accent).into()),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            };
             let height = px(30. * rows.len().min(10) as f32);
             uniform_list("scheme-options", rows.len(), move |range, _, _| {
                 range
@@ -757,7 +763,15 @@ impl Picker {
                             .cursor_pointer()
                             .when(index == selected, |row| row.bg(rgb(colors.raised)))
                             .hover(|row| row.bg(rgb(colors.raised)))
-                            .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+                            .child(
+                                div().flex_1().min_w_0().truncate().child(
+                                    StyledText::new(row.label.clone()).with_highlights(
+                                        fuzzy_highlights(&query, &row.label)
+                                            .into_iter()
+                                            .map(|range| (range, matched)),
+                                    ),
+                                ),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -793,11 +807,19 @@ impl Picker {
         });
         let rows = visible.into_iter().enumerate().map(|(index, row)| {
             let select = select.clone();
-            let highlights = completing
-                .then(|| self.completions.get(index))
-                .flatten()
-                .map(|completion| completion.highlights.clone())
-                .unwrap_or_default();
+            let highlights = if completing {
+                self.completions
+                    .get(index)
+                    .map(|completion| completion.highlights.clone())
+                    .unwrap_or_default()
+            } else {
+                fuzzy_highlights(&self.query, &row.label)
+            };
+            let detail_highlights = if completing {
+                Vec::new()
+            } else {
+                fuzzy_highlights(&self.query, &row.detail)
+            };
             let matched = HighlightStyle {
                 color: Some(rgb(colors.accent).into()),
                 font_weight: Some(FontWeight::BOLD),
@@ -820,7 +842,9 @@ impl Picker {
                             .text_xs()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(row.detail),
+                            .child(StyledText::new(row.detail).with_highlights(
+                                detail_highlights.into_iter().map(|range| (range, matched)),
+                            )),
                     )
                 })
                 .on_click(move |_, window, cx| select(index, window, cx))
@@ -1416,6 +1440,22 @@ fn fuzzy_rows(rows: &[Row], query: &str) -> Vec<Row> {
     ranked.into_iter().map(|(_, _, row)| row.clone()).collect()
 }
 
+/// Byte ranges of `text` that the fuzzy `query` matches, for highlighting. Empty when it doesn't match.
+fn fuzzy_highlights(query: &str, text: &str) -> Vec<Range<usize>> {
+    let query = query.trim();
+    if query.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut indices = Vec::new();
+    let mut buffer = Vec::new();
+    match pattern.indices(Utf32Str::new(text, &mut buffer), &mut matcher, &mut indices) {
+        Some(_) => byte_ranges(text, indices),
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod fuzzy_row_tests {
     use super::{Choice, Row, fuzzy_rows};
@@ -1441,6 +1481,13 @@ mod fuzzy_row_tests {
         assert_eq!(labels(&rows, "accep"), ["Acceptance tests"]);
         assert_eq!(labels(&rows, "rfpk"), ["Refactor picker"]);
         assert_eq!(labels(&rows, "acc tst"), ["Acceptance tests"]);
+    }
+
+    #[test]
+    fn highlights_cover_the_matched_characters() {
+        assert_eq!(super::fuzzy_highlights("acc", "Acceptance"), [0..3]);
+        assert_eq!(super::fuzzy_highlights("rfp", "Refactor picker").len(), 3);
+        assert!(super::fuzzy_highlights("zzz", "Acceptance").is_empty());
     }
 
     #[test]
