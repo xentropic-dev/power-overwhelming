@@ -3821,6 +3821,8 @@ mod tests {
                 title: id.into(),
                 instructions: String::new(),
                 deps: Vec::new(),
+                provider: None,
+                model: None,
                 state,
                 queued_at: None,
                 current_attempt: None,

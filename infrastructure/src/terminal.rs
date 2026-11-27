@@ -1945,43 +1945,10 @@ fn requested_model(
     agent: &Agent,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Option<String> {
-    let short_flag = match agent.as_str() {
-        "codex" | "grok" | "jcode" => true,
-        "claude" => false,
-        _ => return None,
-    };
-    let mut model = None;
-    let mut expecting_value = false;
-    for arg in args {
-        let arg = arg.as_ref();
-        if arg == "--" {
-            break;
-        }
-        if std::mem::take(&mut expecting_value) {
-            model = arg
-                .to_str()
-                .filter(|value| !value.starts_with('-'))
-                .and_then(model_name);
-        }
-        if arg == "--model" || (short_flag && arg == "-m") {
-            expecting_value = true;
-        } else if let Some((flag, value)) = arg.to_str().and_then(|arg| arg.split_once('='))
-            && (flag == "--model" || (short_flag && flag == "-m"))
-        {
-            model = model_name(value);
-        }
-    }
-    if expecting_value { None } else { model }
+    domain::agent::requested_model(agent.as_str(), args)
 }
 
-fn model_name(value: &str) -> Option<String> {
-    let value = value.trim();
-    (valid_metadata(value) && !value.is_empty()).then(|| value.to_owned())
-}
-
-pub(crate) fn valid_metadata(value: &str) -> bool {
-    value.chars().count() <= 120 && !value.chars().any(char::is_control)
-}
+pub(crate) use domain::agent::valid_metadata;
 
 fn program_name(arg: &str) -> &str {
     let name = arg.rsplit('/').next().unwrap_or(arg);
