@@ -230,6 +230,9 @@ pub struct Attempt {
     pub ended_at: Option<u64>,
     /// Whether the attempt's worker is paused. Derived from its agent when a run is read.
     pub paused: bool,
+    /// Whether the attempt's worker looks stalled: idle, with no build or test running.
+    /// Derived by the daemon's stall check when a run is read; never persisted.
+    pub stalled: bool,
     /// Artifacts published from the attempt's session, in publish order, newest last.
     /// Derived from the artifact store when a run is read; never persisted with the run.
     pub artifacts: Vec<AttemptArtifact>,
@@ -308,6 +311,9 @@ pub enum RunEventKind {
     AttemptInterrupted,
     /// A daemon restart resumed the worker's session, and the worker was told to continue.
     AttemptResumed,
+    /// The worker's agent has been idle past the stall threshold, and nothing it
+    /// started is doing work. Recorded once per idle period.
+    AttemptStalled,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
     RunArchived,
@@ -830,6 +836,7 @@ mod tests {
             started_at: 1,
             ended_at: None,
             paused,
+            stalled: false,
             artifacts: Vec::new(),
         };
         let run_with = |state, paused| {

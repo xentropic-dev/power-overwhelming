@@ -1498,6 +1498,8 @@ fn restore_tells_only_workers_with_active_attempts_to_continue() -> Result<()> {
         .unwrap();
     for expected in [
         "Power restarted",
+        "killed every background command",
+        "re-run your background commands",
         &format!("run {}", run.id),
         "task work",
         "worker-contract",
@@ -3558,5 +3560,87 @@ fn a_stopped_agent_whose_record_was_not_deleted_is_never_relaunched() -> Result<
     );
     assert!(records.list()?.is_empty());
     assert!(dag.store.read(|db| db.stopping_sessions())?.is_empty());
+    Ok(())
+}
+
+/// A worker probe whose idle time and child work tests set per session.
+#[derive(Clone, Default)]
+struct FakeProbe(Arc<Mutex<BTreeMap<String, (Duration, bool)>>>);
+
+impl FakeProbe {
+    fn set(&self, session: &str, idle: Duration, working: bool) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(session.into(), (idle, working));
+    }
+}
+
+impl WorkerProbe for FakeProbe {
+    fn idle_for(&self, session: &str) -> Option<Duration> {
+        self.0.lock().unwrap().get(session).map(|entry| entry.0)
+    }
+
+    fn children_working(&self, session: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|entry| entry.1)
+    }
+}
+
+#[test]
+fn an_idle_worker_with_no_working_children_is_flagged_stalled_once() -> Result<()> {
+    let probe = FakeProbe::default();
+    let dag = TestDag::new(
+        application(),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_stall_check(Duration::from_secs(60), probe.clone());
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("busy", &[])])?;
+    let idle = dag.start(command(&run, false))?;
+    let busy = dag.start(Dispatch {
+        task: "busy".into(),
+        ..command(&run, false)
+    })?;
+    let idle_session = idle.agent.session.clone().unwrap();
+    let busy_session = busy.agent.session.clone().unwrap();
+    let before = dag.latest_seq()?;
+
+    // Under the threshold, nothing is flagged.
+    probe.set(&idle_session, Duration::from_secs(30), false);
+    probe.set(&busy_session, Duration::from_secs(600), true);
+    assert!(dag.check_stalls()?.is_empty());
+
+    // Past it, only the worker whose children do no work is flagged, and only once.
+    probe.set(&idle_session, Duration::from_secs(61), false);
+    assert_eq!(dag.check_stalls()?, std::slice::from_ref(&idle.attempt.id));
+    assert!(dag.check_stalls()?.is_empty());
+    let page = dag.events(EventScope::Run(&run, &[]), before, Duration::ZERO)?;
+    let stalled: Vec<_> = page
+        .events
+        .iter()
+        .filter(|event| event.kind == RunEventKind::AttemptStalled)
+        .map(|event| event.attempt.as_deref())
+        .collect();
+    assert_eq!(stalled, [Some(idle.attempt.id.as_str())]);
+    let shown = dag.run(&run)?;
+    let flags: BTreeMap<_, _> = shown
+        .tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.attempts[0].stalled))
+        .collect();
+    assert_eq!(flags, BTreeMap::from([("work", true), ("busy", false)]));
+
+    // Activity ends the idle period, and a later one is flagged again.
+    probe.set(&idle_session, Duration::from_secs(1), false);
+    assert!(dag.check_stalls()?.is_empty());
+    assert!(!dag.run(&run)?.tasks[0].attempts[0].stalled);
+    probe.set(&idle_session, Duration::from_secs(61), false);
+    assert_eq!(dag.check_stalls()?, [idle.attempt.id]);
     Ok(())
 }

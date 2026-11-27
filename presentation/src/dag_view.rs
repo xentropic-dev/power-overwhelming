@@ -611,6 +611,13 @@ impl DagView {
                 let action = action.clone();
                 let origin = self.graph.positions[index].origin() * scale + offset;
                 let (label, tint) = task_style(colors, task.state);
+                let stalled = current_attempt(task).is_some_and(|attempt| attempt.stalled);
+                let label = if stalled && task.state == TaskState::Working {
+                    "Working · stalled"
+                } else {
+                    label
+                };
+                let tint = if stalled { colors.indexed[3] } else { tint };
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
                 let model = current_attempt(task).and_then(|attempt| attempt.model.clone());
@@ -777,6 +784,12 @@ fn details(
                 ("Result", attempt.summary.clone()),
                 ("Blocker", attempt.blocker.clone()),
                 ("Interruption", attempt.detail.clone()),
+                (
+                    "Stalled",
+                    attempt.stalled.then(|| {
+                        "Idle with no build or test running. Check the worker.".to_string()
+                    }),
+                ),
             ]
             .into_iter()
             .filter_map(|(label, value)| Some((label, value?))),
@@ -895,6 +908,7 @@ mod tests {
             started_at: 0,
             ended_at: None,
             paused: false,
+            stalled: false,
             artifacts: titles
                 .iter()
                 .map(|title| AttemptArtifact {

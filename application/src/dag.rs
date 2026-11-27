@@ -227,6 +227,27 @@ pub trait MemoryProbe: Send + Sync {
     fn available_memory(&self) -> Option<u64>;
 }
 
+/// What the stall check sees of a worker's session.
+pub trait WorkerProbe: Send + Sync {
+    /// How long the session's agent has produced no output and received no input, or
+    /// `None` when the session is not running here.
+    fn idle_for(&self, session: &str) -> Option<Duration>;
+    /// Whether anything the agent started, such as a build or test, did work since the
+    /// previous call for this session: a new process started, or they used CPU.
+    fn children_working(&self, session: &str) -> bool;
+}
+
+/// How long a worker may sit idle, with nothing it started working, before its attempt
+/// is flagged stalled.
+pub const STALL_AFTER: Duration = Duration::from_secs(15 * 60);
+
+struct StallCheck {
+    after: Duration,
+    probe: Box<dyn WorkerProbe>,
+    /// Attempts flagged in their current idle period. One leaves when it works again.
+    flagged: Mutex<BTreeSet<String>>,
+}
+
 pub struct DispatchResult {
     pub agent: ManagedAgent,
     pub attempt: Attempt,
@@ -254,6 +275,7 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     /// `None` keeps finished workers running.
     finished_cleanup: Option<FinishedCleanup>,
     budget: Option<(Box<dyn WorkerBudgetSource>, Box<dyn MemoryProbe>)>,
+    stalls: Option<StallCheck>,
     /// This application, once shared, so a scheduled reclaim can call back.
     weak: Mutex<std::sync::Weak<Self>>,
     event_generation: Mutex<u64>,
@@ -302,6 +324,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             worktree_root: None,
             finished_cleanup: None,
             budget: None,
+            stalls: None,
             weak: Mutex::new(std::sync::Weak::new()),
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
@@ -348,6 +371,100 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     ) -> Self {
         self.budget = Some((Box::new(source), Box::new(memory)));
         self
+    }
+
+    /// Flags an active attempt stalled once its worker has been idle for `after`, with
+    /// nothing it started working. Without this, `check_stalls` does nothing.
+    pub fn with_stall_check(mut self, after: Duration, probe: impl WorkerProbe + 'static) -> Self {
+        self.stalls = Some(StallCheck {
+            after,
+            probe: Box::new(probe),
+            flagged: Mutex::new(BTreeSet::new()),
+        });
+        self
+    }
+
+    /// How often the daemon should call `check_stalls`, if stall checks are on.
+    pub fn stall_interval(&self) -> Option<Duration> {
+        self.stalls
+            .as_ref()
+            .map(|check| (check.after / 4).clamp(Duration::from_secs(1), Duration::from_secs(30)))
+    }
+
+    /// Records `AttemptStalled` for each active, unpaused attempt whose worker has been
+    /// idle past the threshold with no child process working, once per idle period.
+    /// Returns the attempts newly flagged.
+    pub fn check_stalls(&self) -> Result<Vec<String>> {
+        let Some(check) = &self.stalls else {
+            return Ok(Vec::new());
+        };
+        let open = self.store.read(|db| {
+            let mut open = Vec::new();
+            for entry in db.open_attempts(None)? {
+                if entry.attempt.state == AttemptState::Active
+                    && !db.agent(&entry.attempt.agent)?.paused
+                {
+                    open.push(entry);
+                }
+            }
+            Ok(open)
+        })?;
+        let mut stalled = Vec::new();
+        for entry in &open {
+            let Some(session) = entry.attempt.session.as_deref() else {
+                continue;
+            };
+            // Sample children every time, so a sample always covers one interval.
+            let working = check.probe.children_working(session);
+            let idle = check
+                .probe
+                .idle_for(session)
+                .is_some_and(|idle| idle >= check.after);
+            if idle && !working {
+                stalled.push(entry);
+            }
+        }
+        let mut flagged = check.flagged.lock().unwrap();
+        let fresh: Vec<_> = stalled
+            .iter()
+            .filter(|entry| !flagged.contains(&entry.attempt.id))
+            .copied()
+            .collect();
+        *flagged = stalled
+            .iter()
+            .map(|entry| entry.attempt.id.clone())
+            .collect();
+        drop(flagged);
+        if !fresh.is_empty() {
+            let minutes = check.after.as_secs_f64() / 60.;
+            let summary =
+                format!("worker idle for {minutes:.1} min or more with no build or test running");
+            self.write(|db| {
+                for entry in &fresh {
+                    db.event(
+                        &entry.run,
+                        RunEventKind::AttemptStalled,
+                        Some(&entry.task),
+                        Some(&entry.attempt.id),
+                        Some(&summary),
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(fresh
+            .into_iter()
+            .map(|entry| entry.attempt.id.clone())
+            .collect())
+    }
+
+    /// Marks the attempts the last stall check flagged.
+    fn attach_stalls(&self, run: &mut Run) {
+        let Some(check) = &self.stalls else { return };
+        let flagged = check.flagged.lock().unwrap();
+        for attempt in run.tasks.iter_mut().flat_map(|task| &mut task.attempts) {
+            attempt.stalled = flagged.contains(&attempt.id);
+        }
     }
 
     fn worker_budget(&self) -> Result<Option<WorkerBudget>> {
@@ -566,6 +683,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         })?;
         for run in &mut runs {
             self.attach_artifacts(run)?;
+            self.attach_stalls(run);
         }
         sort_runs(&mut runs);
         Ok(runs)
@@ -574,6 +692,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     pub fn run(&self, id: &str) -> Result<Run> {
         let mut run = self.store.read(|db| load_run(db, id))?;
         self.attach_artifacts(&mut run)?;
+        self.attach_stalls(&mut run);
         Ok(run)
     }
 
@@ -2163,6 +2282,7 @@ fn insert_dispatch_attempt(
         started_at: agent.created_at,
         ended_at: error.map(|_| now()),
         paused: false,
+        stalled: false,
         artifacts: Vec::new(),
     };
     db.insert_agent(agent)?;
@@ -2226,8 +2346,10 @@ const RESUME_DETAIL: &str = "daemon restarted; session resumed and told to conti
 /// What a worker whose session was resumed after a daemon restart is told.
 fn continuation_prompt(open: &OpenAttempt) -> String {
     format!(
-        "Power restarted and resumed this session. Continue your task (run {}, task {}) \
-         from where you left off, and report through the worker contract when done: \
+        "Power restarted and resumed this session. The restart killed every background \
+         command you had running (builds, tests, servers), so don't assume they finished: \
+         re-run your background commands and check their results. Continue your task \
+         (run {}, task {}) from where you left off, and report through the worker contract when done: \
          `power skills get power-dag --reference worker-contract`.",
         open.run, open.task
     )

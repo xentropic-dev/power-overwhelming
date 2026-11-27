@@ -56,6 +56,14 @@ struct Cli {
 enum Action {
     Gui,
     Daemon,
+    /// Check that restarting the daemon would not kill DAG workers mid-task. Lists the
+    /// open attempts and asks to confirm, or fails when it cannot ask. Exits 0 when no
+    /// daemon runs. Run it before anything that restarts the daemon.
+    RestartCheck {
+        /// Allow the restart even with workers mid-task.
+        #[arg(long)]
+        force: bool,
+    },
     Session {
         #[command(subcommand)]
         command: SessionAction,
@@ -272,6 +280,13 @@ fn main() -> Result<()> {
                 domain::talk::NoticePolicy::default()
             }),
             LocalWorkerBudget::new(settings::Settings::defaults()),
+            config::load_stall_after(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load dag.stall_after. {error:#}");
+                Some(application::dag::STALL_AFTER)
+            }),
+        ),
+        Some(Action::RestartCheck { force }) => restart_check(
+            force || std::env::var_os("POWER_FORCE_RESTART").is_some_and(|value| value == "1"),
         ),
         Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {
@@ -1253,6 +1268,7 @@ fn run_dag(command: DagAction) -> Result<()> {
                     InputResolved,
                     AttemptInterrupted,
                     AttemptResumed,
+                    AttemptStalled,
                     TaskReady,
                     QueuedDispatchFailed,
                 ];
@@ -1295,6 +1311,62 @@ fn set_paused(ids: Vec<String>, paused: bool) -> Result<()> {
         }
     }
     print_json(json!({"agents": agents}))
+}
+
+/// Never starts a daemon: with none running there is nothing to interrupt.
+fn restart_check(force: bool) -> Result<()> {
+    use client::protocol::AgentStatus;
+    use std::io::IsTerminal as _;
+    let Ok(agents) = list_agents(None, None, false) else {
+        return Ok(());
+    };
+    let open: Vec<_> = agents
+        .iter()
+        .filter(|agent| {
+            agent.run.is_some()
+                && matches!(
+                    agent.status,
+                    AgentStatus::Working | AgentStatus::NeedsInput | AgentStatus::Paused
+                )
+        })
+        .collect();
+    if open.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "{} DAG worker{} mid-task. Restarting the daemon kills every command they run, \
+         such as builds and tests:",
+        open.len(),
+        if open.len() == 1 { " is" } else { "s are" }
+    );
+    for agent in &open {
+        eprintln!(
+            "  {} {}/{} ({}) {}",
+            agent.id,
+            agent.run.as_deref().unwrap_or("-"),
+            agent.task.as_deref().unwrap_or("-"),
+            serde_json::to_value(agent.status)?
+                .as_str()
+                .unwrap_or_default(),
+            agent.label
+        );
+    }
+    if force {
+        eprintln!("Restarting anyway (--force).");
+        return Ok(());
+    }
+    if std::io::stdin().is_terminal() {
+        eprint!("Restart anyway? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if matches!(answer.trim(), "y" | "Y" | "yes") {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Restart cancelled. Wait for these workers to report, pause their runs, or set \
+         POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+    )
 }
 
 fn protocol_agents(

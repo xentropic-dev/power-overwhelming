@@ -89,6 +89,7 @@ pub fn serve(
     finished_worker_grace: Option<Duration>,
     talk_policy: NoticePolicy,
     budget: LocalWorkerBudget,
+    stall_after: Option<Duration>,
 ) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
@@ -187,6 +188,12 @@ pub fn serve(
         let persistence = TimerScheduler::start("power-forget", scheduler::DEFAULT_CAPACITY)?;
         dag = dag.with_finished_worker_cleanup(grace, Arc::new(teardown), Arc::new(persistence));
     }
+    if let Some(after) = stall_after {
+        dag = dag.with_stall_check(
+            after,
+            crate::stall_probe::LocalWorkerProbe::new(application.clone()),
+        );
+    }
     let dag = dag.shared();
     terminal_application
         .set(Arc::downgrade(&application))
@@ -221,6 +228,7 @@ pub fn serve(
     let talk = talk_adapter::start(application.clone(), store, talk_policy, talk_activity);
     handle_shutdown(application.clone(), shutting_down)?;
     start_queue(dag.clone(), &listener);
+    start_stall_checks(dag.clone());
     // Lets a test hold startup open, as if a later session were still restoring.
     delay_for_tests("POWER_TEST_RESTORE_DELAY_MS");
     startup.open(Arc::new(Server {
@@ -265,6 +273,27 @@ fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
             match dag.events(EventScope::Watch(None), cursor, QUEUE_RECHECK) {
                 Ok(page) => cursor = page.cursor,
                 Err(_) => thread::sleep(QUEUE_RECHECK),
+            }
+        }
+    });
+}
+
+/// Flags idle workers whose builds and tests are not running, so a coordinator sees
+/// them without polling transcripts.
+fn start_stall_checks(dag: Arc<DaemonDag>) {
+    let Some(interval) = dag.stall_interval() else {
+        return;
+    };
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+            match dag.check_stalls() {
+                Ok(stalled) => {
+                    for attempt in stalled {
+                        eprintln!("Attempt {attempt} looks stalled.");
+                    }
+                }
+                Err(error) => eprintln!("Could not check for stalled DAG workers. {error:#}"),
             }
         }
     });

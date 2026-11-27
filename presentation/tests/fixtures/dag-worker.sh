@@ -139,6 +139,16 @@ case "$1" in
         wait_for_marker "$3"
         report success "Used the selected option"
         ;;
+    idle)
+        # Sits silent with a child that does nothing, like an agent whose build was killed.
+        sleep 600 &
+        wait
+        ;;
+    busy)
+        # Sits silent while a child keeps working, like an agent waiting on a build.
+        /bin/sh -c 'while :; do sleep 0.2; done' &
+        wait
+        ;;
     exit)
         wait_for_marker "$2"
         printf 'Fixture exiting before reporting a result\n' >&2

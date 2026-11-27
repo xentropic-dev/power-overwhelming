@@ -2816,3 +2816,58 @@ fn a_daemon_crash_during_a_stop_holds_the_retry_until_the_old_tree_is_gone() {
         "the stopped worker outlived the restart"
     );
 }
+
+#[test]
+fn an_idle_command_worker_with_no_working_children_is_flagged_stalled_and_a_busy_one_is_not() {
+    let fixture = Fixture::with_configure(|root| write_config(root, "dag.stall_after = 1\n"));
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "idle");
+    fixture.add_task(&run, "busy");
+    let since = fixture.events(&run, 0, &[]).cursor;
+    let (idle, _) = dispatched(fixture.dispatch(
+        &run,
+        "idle",
+        &fixture.worktrees[0],
+        false,
+        &["idle", "idle"],
+    ));
+    let (busy, _) = dispatched(fixture.dispatch(
+        &run,
+        "busy",
+        &fixture.worktrees[1],
+        false,
+        &["busy", "busy"],
+    ));
+
+    let stalled = poll("the idle worker to be flagged stalled", || {
+        let page = fixture.events(&run, since, &["attempt_stalled"]);
+        (!page.events.is_empty()).then_some(page.events)
+    });
+    assert_eq!(stalled.len(), 1, "{stalled:?}");
+    assert_eq!(stalled[0].kind, RunEventKind::AttemptStalled);
+    assert_eq!(stalled[0].attempt.as_deref(), Some(idle.id.as_str()));
+    let shown = fixture.show(&run);
+    let attempt = |task: &str| {
+        shown
+            .tasks
+            .iter()
+            .find(|entry| entry.id == task)
+            .unwrap()
+            .attempts[0]
+            .clone()
+    };
+    assert!(attempt("idle").stalled);
+    assert!(!attempt("busy").stalled);
+
+    // Several more checks pass, and the busy worker is still not flagged, nor the idle
+    // one twice.
+    thread::sleep(Duration::from_secs(4));
+    let page = fixture.events(&run, since, &["attempt_stalled"]);
+    let attempts: Vec<_> = page
+        .events
+        .iter()
+        .map(|event| event.attempt.clone())
+        .collect();
+    assert_eq!(attempts, [Some(idle.id.clone())]);
+    assert_ne!(busy.id, idle.id);
+}

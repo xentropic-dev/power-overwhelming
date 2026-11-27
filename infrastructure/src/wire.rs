@@ -552,6 +552,9 @@ pub struct Attempt {
     /// Whether the attempt's worker is paused.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paused: bool,
+    /// Whether the attempt's worker looks stalled: idle, with no build or test running.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stalled: bool,
     /// Artifacts published from the attempt's session, in publish order, newest last.
     #[serde(default)]
     pub artifacts: Vec<AttemptArtifact>,
@@ -650,6 +653,8 @@ pub enum RunEventKind {
     AttemptInterrupted,
     /// A daemon restart resumed the worker's session, and the worker was told to continue.
     AttemptResumed,
+    /// The worker has been idle past the stall threshold with nothing it started working.
+    AttemptStalled,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
     RunArchived,
@@ -1179,6 +1184,7 @@ mod dag_dto {
         InputResolved,
         AttemptInterrupted,
         AttemptResumed,
+        AttemptStalled,
         StaleReport,
         RunArchived,
         RunUnarchived,
@@ -1228,6 +1234,7 @@ mod dag_dto {
         started_at,
         ended_at,
         paused,
+        stalled,
     } lists { artifacts });
     impl From<dag::AttemptArtifact> for AttemptArtifact {
         fn from(value: dag::AttemptArtifact) -> Self {
