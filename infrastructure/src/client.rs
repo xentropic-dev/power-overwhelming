@@ -478,6 +478,15 @@ pub fn resume_run(run: String) -> Result<Run> {
     }
 }
 
+/// Stops one agent through the daemon's guarded use case, which ends only the agent's
+/// own session and refuses an agent sharing a shell session.
+pub fn stop_agent(agent: String) -> Result<ManagedAgent> {
+    match dag(DagRequest::StopAgent { agent }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
 /// Pauses or resumes one agent's process tree.
 pub fn set_agent_paused(agent: String, paused: bool) -> Result<ManagedAgent> {
     match dag(DagRequest::SetAgentPaused { agent, paused }, DAG_TIMEOUT)? {

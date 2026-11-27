@@ -112,6 +112,17 @@ case "$1" in
         until test -f "$fixture_dir/$2"; do sleep 0.1 & wait $! || true; done
         report success "Ran on after a stop"
         ;;
+    term-ignoring)
+        # Ignores SIGTERM and reports success as soon as the marker exists, the way a
+        # worker that defers or ignores the end of a stop reports during the teardown.
+        trap '' TERM
+        printf '%s\n' "$$" > "$fixture_dir/$3.tmp"
+        mv "$fixture_dir/$3.tmp" "$fixture_dir/$3"
+        until test -f "$fixture_dir/$2"; do sleep 0.05; done
+        "$POWER_BIN" dag report success --summary "Reported after stop" > "$fixture_dir/$3.report" 2>&1 || true
+        : > "$fixture_dir/$3.reported"
+        exec sleep 600
+        ;;
     graced)
         # Reports success, then marks each tenth of a second it still runs.
         wait_for_marker "$2"

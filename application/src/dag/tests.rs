@@ -3238,6 +3238,27 @@ fn a_restart_between_a_run_pause_and_its_workers_pauses_them() -> Result<()> {
 }
 
 #[test]
+fn a_report_after_a_stop_begins_never_finishes_the_attempt() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    dag.stop_agent(&started.agent.id)?;
+    // A worker that ignores SIGTERM reports while its teardown is still under way.
+    let late = dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::Success,
+        "Reported after stop",
+    )?;
+    assert!(!late.applied);
+    assert_eq!(late.reason.as_deref(), Some("attempt interrupted"));
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Interrupted);
+    assert!(attempt.summary.is_none(), "{attempt:?}");
+    Ok(())
+}
+
+#[test]
 fn a_coding_agent_in_a_shell_foreground_is_never_paused_or_stopped() -> Result<()> {
     let (dag, _) = setup()?;
     let shell = dag.application.start_session(StartSession {

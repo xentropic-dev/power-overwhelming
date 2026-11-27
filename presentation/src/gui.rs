@@ -103,16 +103,18 @@ enum EndWorker {
     NoSession,
     /// The worker is still busy; the next press of the key ends it.
     Confirm(String),
-    End(String),
+    /// Stop this agent through `DagRequest::StopAgent`, the guarded use case behind
+    /// `power agent stop`, never by ending its session, which may be a shell's.
+    Stop(String),
 }
 
 /// A still-working worker needs a second press, so a stray key never cuts it off.
 fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndWorker {
-    let Some(session) = agent.session.clone() else {
+    if agent.session.is_none() {
         return EndWorker::NoSession;
-    };
+    }
     if armed == Some(agent.id.as_str()) {
-        return EndWorker::End(session);
+        return EndWorker::Stop(agent.id.clone());
     }
     match agent.status {
         AgentStatus::Working | AgentStatus::Paused | AgentStatus::NeedsInput => EndWorker::Confirm(
@@ -122,7 +124,7 @@ fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndW
         AgentStatus::Idle => EndWorker::Confirm(format!(
             "This agent has no task and may be in use — press {key} again to end its session."
         )),
-        _ => EndWorker::End(session),
+        _ => EndWorker::Stop(agent.id.clone()),
     }
 }
 
@@ -1881,7 +1883,8 @@ impl Workspace {
         .detach();
     }
 
-    /// Ends the agent tree's selected worker through the same path as ending its tab.
+    /// Stops the agent tree's selected worker through the same guarded use case as
+    /// `power agent stop`, so it never ends a shell session the agent only runs in.
     fn end_selected_worker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.keymap.first(Scope::AgentTree, Command::EndWorker);
         let Some(picker) = &mut self.picker else {
@@ -1898,7 +1901,7 @@ impl Workspace {
         };
         let step = end_worker_step(agent, picker.armed_end.as_deref(), &key);
         picker.armed_end = None;
-        let session = match step {
+        let agent = match step {
             EndWorker::NoSession => {
                 self.show_error("This worker has no terminal session.", cx);
                 return;
@@ -1909,10 +1912,28 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-            EndWorker::End(session) => session,
+            EndWorker::Stop(agent) => agent,
         };
         picker.message = None;
-        self.end_session(session, window, cx);
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::stop_agent(agent) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                picker.message = result
+                    .err()
+                    .map(|error| format!("Could not stop agent. {error:#}"));
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_worker(
@@ -3470,7 +3491,7 @@ mod tests {
             EndWorker::NoSession
         );
         agent.session = Some("session".into());
-        let end = EndWorker::End("session".into());
+        let end = EndWorker::Stop("worker".into());
         for status in [AgentStatus::Working, AgentStatus::NeedsInput] {
             agent.status = status;
             assert_eq!(

@@ -695,10 +695,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
 
     /// Stops an agent cleanly: ends its own terminal session, which interrupts its open
     /// attempt so it can be dispatched again. A paused agent is ended without being
-    /// resumed first.
+    /// resumed first. Its open attempt is interrupted before anything wakes, so a
+    /// worker that ignores or defers SIGTERM and reports during the teardown is
+    /// refused instead of finishing the attempt it was stopped from.
     pub fn stop_agent(&self, id: &str) -> Result<ManagedAgent> {
         let agent = self.store.read(|db| db.agent(id))?;
         let session = self.isolated_session(&agent)?;
+        self.write(|db| interrupt(db, Some(&session), STOP_DETAIL, &|_| false))?;
         self.application.end_session(&session)?;
         Ok(agent)
     }
@@ -2078,6 +2081,7 @@ fn select_box<'a>(entries: &'a [RegisteredBox], selector: &str) -> Result<&'a Re
     Ok(entry)
 }
 
+const STOP_DETAIL: &str = "stopped by Power";
 const RESTART_DETAIL: &str = "daemon restarted; session unavailable";
 const RESUME_DETAIL: &str = "daemon restarted; session resumed and told to continue";
 
@@ -2290,10 +2294,15 @@ fn report(
             )
             .then(|| attempt.session.clone())
             .flatten();
+            let reason = if attempt.state == AttemptState::Interrupted {
+                "attempt interrupted"
+            } else {
+                "already reported"
+            };
             return Ok((
                 ReportResult {
                     applied: false,
-                    reason: Some("already reported".into()),
+                    reason: Some(reason.into()),
                 },
                 finished,
             ));

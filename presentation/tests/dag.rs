@@ -1765,6 +1765,78 @@ fn a_paused_run_pauses_its_workers_and_dispatches_nothing_until_it_resumes() {
 }
 
 #[test]
+fn dag_resume_continues_a_live_paused_worker() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "live");
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "live",
+        &fixture.worktrees[0],
+        false,
+        &["pausable", "live-go", "live-pids"],
+    ));
+    let pids = read_pids(&fixture.root().join("live-pids"), 2);
+    let paused = fixture.json(&["dag", "pause", &run]);
+    assert!(paused["run"]["paused_at"].is_u64(), "{paused}");
+    wait_for_states(&pids, true);
+    let frozen = ticks(&fixture, "live-pids");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(ticks(&fixture, "live-pids"), frozen, "a paused worker ran");
+
+    let resumed = fixture.json(&["dag", "resume", &run]);
+    assert!(resumed["run"].get("paused_at").is_none(), "{resumed}");
+    // Both the parent and its child leave T and tick again.
+    wait_for_states(&pids, false);
+    poll("both processes to tick after the resume", || {
+        let ticks = fs::read_to_string(fixture.root().join("live-pids.ticks")).unwrap();
+        let after: Vec<_> = ticks.lines().skip(frozen).collect();
+        (after.contains(&"parent") && after.contains(&"child")).then_some(())
+    });
+    assert_eq!(agent_status(&fixture, &agent.id), "working");
+    fixture.release("live-go");
+    fixture.wait_for_state(&run, "live", TaskState::Completed);
+}
+
+#[test]
+fn a_stopped_worker_that_ignores_sigterm_never_reports_success() {
+    for fixture in [
+        Fixture::new(),
+        Fixture::with_configure_env(|_| {}, &[("POWER_WORKER_CGROUPS", "0")]),
+    ] {
+        let run = fixture.create_run().id;
+        fixture.add_task(&run, "stubborn");
+        let (attempt, agent) = dispatched(fixture.dispatch(
+            &run,
+            "stubborn",
+            &fixture.worktrees[0],
+            false,
+            &["term-ignoring", "stubborn-go", "stubborn-pid"],
+        ));
+        let pids = read_pids(&fixture.root().join("stubborn-pid"), 1);
+        assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+        wait_for_states(&pids, true);
+        // Released while frozen, so the worker reports as soon as the stop wakes it,
+        // inside the teardown grace, since it ignores SIGTERM.
+        fixture.release("stubborn-go");
+        assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+        let reported = fixture.root().join("stubborn-pid.reported");
+        poll("the stubborn worker to report", || {
+            reported.is_file().then_some(())
+        });
+        let reply = fs::read_to_string(fixture.root().join("stubborn-pid.report")).unwrap();
+        assert!(!reply.contains("\"applied\":true"), "{reply}");
+        let interrupted = fixture.wait_for_state(&run, "stubborn", TaskState::Interrupted);
+        assert_eq!(interrupted.attempts[0].id, attempt.id);
+        wait_for_exit_after(&fixture, &agent.id, &pids);
+        let shown = fixture.show(&run);
+        let attempt = &task(&shown, "stubborn").attempts[0];
+        assert_eq!(attempt.state, AttemptState::Interrupted);
+        assert!(attempt.summary.is_none(), "{attempt:?}");
+    }
+}
+
+#[test]
 fn stop_ends_a_paused_worker_with_sigterm_and_never_lets_it_report() {
     for fixture in [
         Fixture::new(),
