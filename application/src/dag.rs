@@ -460,12 +460,14 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(fresh)
     }
 
-    /// Marks the attempts the last stall check flagged.
+    /// Marks the attempts the last stall check flagged that are still working. A
+    /// finished or input-blocked attempt is never stalled, even before the next check.
     fn attach_stalls(&self, run: &mut Run) {
         let Some(check) = &self.stalls else { return };
         let flagged = check.flagged.lock().unwrap();
         for attempt in run.tasks.iter_mut().flat_map(|task| &mut task.attempts) {
-            attempt.stalled = flagged.contains(&attempt.id);
+            attempt.stalled =
+                attempt.state == AttemptState::Active && flagged.contains(&attempt.id);
         }
     }
 

@@ -25,7 +25,52 @@ use std::{
 const SNAPSHOT_AGE: Duration = Duration::from_millis(500);
 /// Programs whose children are commands a worker runs.
 const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "fish", "ksh", "mksh", "ash"];
-/// Processes that start within this long of the worker are its own helpers.
+/// Build and test programs. One of these, or anything below one, is a command whenever
+/// it started, so a build an agent execs directly during its startup still counts.
+const COMMANDS: &[&str] = &[
+    "cargo",
+    "rustc",
+    "make",
+    "gmake",
+    "cmake",
+    "ctest",
+    "ninja",
+    "meson",
+    "go",
+    "gcc",
+    "g++",
+    "cc",
+    "c++",
+    "clang",
+    "clang++",
+    "ld",
+    "zig",
+    "mise",
+    "just",
+    "bazel",
+    "mvn",
+    "gradle",
+    "sbt",
+    "dotnet",
+    "pytest",
+    "tox",
+    "nox",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "deno",
+    "jest",
+    "vitest",
+    "tsc",
+    "mix",
+    "rake",
+    "bundle",
+    "swift",
+    "xcodebuild",
+];
+/// Other processes that start within this long of the worker are its own helpers.
 const STARTUP: Duration = Duration::from_secs(30);
 
 pub(crate) struct LocalWorkerProbe {
@@ -43,6 +88,8 @@ struct Process {
     /// When it started, in clock ticks since boot.
     started: u64,
     shell: bool,
+    /// Whether it runs a build or test program.
+    command: bool,
     /// Its cgroup v2 path, as `/proc/<pid>/cgroup` names it.
     cgroup: String,
     /// The `POWER_SESSION` it started with.
@@ -175,6 +222,9 @@ impl Processes {
                     // `current` is the worker itself. It is no command of its own.
                     return current != *pid && (below_shell || process.shell);
                 }
+                if process.command {
+                    return true;
+                }
                 if current != *pid && process.shell {
                     below_shell = true;
                 }
@@ -242,6 +292,7 @@ fn read(pid: u32) -> Option<Process> {
         parent,
         started,
         shell: SHELLS.contains(&name),
+        command: COMMANDS.contains(&name),
         cgroup,
         session,
     })
@@ -256,6 +307,7 @@ mod tests {
             parent,
             started: 0,
             shell: SHELLS.contains(&name),
+            command: COMMANDS.contains(&name),
             cgroup: String::new(),
             session: session.map(Into::into),
         }
@@ -297,6 +349,38 @@ mod tests {
         exec.started = 31 * clock_ticks();
         processes.0.insert(15, exec);
         assert!(processes.commands_running("s", &[]));
+    }
+
+    #[test]
+    fn a_build_execed_during_startup_counts_while_it_runs() {
+        // agent (10) execs `cargo test` (11) two seconds in, which runs a test binary
+        // (12) with a hashed name. Both are quiet and well inside the startup window.
+        let mut processes = Processes(BTreeMap::from([
+            (1, process(0, "systemd", None)),
+            (10, process(1, "jcode", Some("s"))),
+        ]));
+        let mut cargo = process(10, "cargo", Some("s"));
+        cargo.started = 2 * clock_ticks();
+        processes.0.insert(11, cargo);
+        assert!(processes.commands_running("s", &[]));
+        let mut test = process(11, "power-1a2b3c4d", None);
+        test.started = 3 * clock_ticks();
+        processes.0.insert(12, test);
+        assert!(processes.commands_running("s", &[]));
+        // Cargo exited and the test binary was reparented to init: still owned through
+        // the cgroup, and detached from the worker, so it counts.
+        processes.0.remove(&11);
+        processes.0.get_mut(&12).unwrap().parent = 1;
+        for pid in [10, 12] {
+            processes.0.get_mut(&pid).unwrap().cgroup = "/power-s.scope".into();
+        }
+        assert!(processes.commands_running("s", &["/power-s.scope".into()]));
+        // Once it ends, an early helper alone does not hide the stall.
+        processes.0.remove(&12);
+        let mut helper = process(10, "node", Some("s"));
+        helper.started = 2 * clock_ticks();
+        processes.0.insert(13, helper);
+        assert!(!processes.commands_running("s", &["/power-s.scope".into()]));
     }
 
     #[test]

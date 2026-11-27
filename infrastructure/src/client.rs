@@ -407,19 +407,22 @@ pub fn set_box_icon(
     }
 }
 
-/// The daemon a restart would end, found through this caller's socket: its PID and the
-/// agents it lists, or the error that kept it from listing them. `None` only when
+pub use wire::DaemonProcess;
+
+/// The daemon a restart would end, found through this caller's socket: its process and
+/// the agents it lists, or the error that kept it from listing them. `None` only when
 /// nothing listens there.
 #[allow(clippy::type_complexity)]
 pub fn restart_target(
     timeout: Duration,
-) -> Result<Option<(u32, Result<Vec<protocol::ManagedAgent>>)>> {
+) -> Result<Option<(DaemonProcess, Result<Vec<protocol::ManagedAgent>>)>> {
     use std::io::Write as _;
     let path = wire::socket_path();
-    let (mut socket, pid) = match wire::probe(&path)? {
+    let (mut socket, process) = match wire::probe(&path)? {
         wire::Probe::Absent => return Ok(None),
-        wire::Probe::Listening(socket, pid) => (socket, pid),
+        wire::Probe::Listening(socket, process) => (socket, process),
     };
+    let pid = process.pid;
     let mut ask = || -> Result<Vec<protocol::ManagedAgent>> {
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -445,15 +448,15 @@ pub fn restart_target(
             path.display()
         )
     });
-    Ok(Some((pid, agents)))
+    Ok(Some((process, agents)))
 }
 
-/// The PID of the daemon listening on this caller's socket, or `None` when nothing
-/// listens there. Sends no request.
-pub fn daemon_pid() -> Result<Option<u32>> {
+/// The daemon process listening on this caller's socket, or `None` when nothing listens
+/// there. Sends no request.
+pub fn daemon_process() -> Result<Option<DaemonProcess>> {
     Ok(match wire::probe(&wire::socket_path())? {
         wire::Probe::Absent => None,
-        wire::Probe::Listening(_, pid) => Some(pid),
+        wire::Probe::Listening(_, process) => Some(process),
     })
 }
 

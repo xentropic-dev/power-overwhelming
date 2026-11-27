@@ -611,12 +611,12 @@ impl DagView {
                 let action = action.clone();
                 let origin = self.graph.positions[index].origin() * scale + offset;
                 let (label, tint) = task_style(colors, task.state);
-                let stalled = current_attempt(task).is_some_and(|attempt| attempt.stalled);
-                let label = if stalled && task.state == TaskState::Working {
-                    "Working · stalled"
-                } else {
-                    label
-                };
+                let stalled = task.state == TaskState::Working
+                    && current_attempt(task).is_some_and(|attempt| {
+                        attempt.stalled
+                            && attempt.state == infrastructure::client::AttemptState::Active
+                    });
+                let label = if stalled { "Working · stalled" } else { label };
                 let tint = if stalled { colors.indexed[3] } else { tint };
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
@@ -786,9 +786,11 @@ fn details(
                 ("Interruption", attempt.detail.clone()),
                 (
                     "Stalled",
-                    attempt.stalled.then(|| {
-                        "Idle with no build or test running. Check the worker.".to_string()
-                    }),
+                    (attempt.stalled
+                        && attempt.state == infrastructure::client::AttemptState::Active)
+                        .then(|| {
+                            "Idle with no build or test running. Check the worker.".to_string()
+                        }),
                 ),
             ]
             .into_iter()
