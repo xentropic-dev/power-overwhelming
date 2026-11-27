@@ -7,6 +7,7 @@ use std::{
     path::PathBuf,
 };
 
+pub mod overview;
 pub mod talk;
 pub use talk::{TalkRequest, TalkResponse};
 
@@ -64,6 +65,9 @@ pub struct SessionMetadata {
 pub enum MetadataField {
     Task,
     Model,
+    /// A Claude Code rate-limit report, kept by the daemon per model rather than on the
+    /// session. See `usage::encode_usage`.
+    Usage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -150,6 +154,8 @@ pub enum Request {
     Dag {
         dag: DagRequest,
     },
+    /// Every box, live run, model in use and the machine's load, for the dashboard.
+    Overview,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -212,6 +218,9 @@ pub enum Response {
     },
     Dag {
         dag: Box<DagResponse>,
+    },
+    Overview {
+        overview: Box<overview::Overview>,
     },
 }
 

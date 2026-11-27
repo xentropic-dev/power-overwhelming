@@ -38,13 +38,7 @@ impl MemoryProbe for ProcMemory {
 }
 
 fn meminfo_available(meminfo: &str) -> Option<u64> {
-    let field = |name: &str| {
-        meminfo.lines().find_map(|line| {
-            let value = line.strip_prefix(name)?.strip_prefix(':')?;
-            let kib: u64 = value.trim().strip_suffix("kB")?.trim().parse().ok()?;
-            kib.checked_mul(1024)
-        })
-    };
+    let field = |name| crate::system::meminfo_field(meminfo, name);
     Some(field("MemAvailable")? + field("SwapFree").unwrap_or(0))
 }
 

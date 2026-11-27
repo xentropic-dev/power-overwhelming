@@ -261,7 +261,7 @@ When Power launches Claude Code through shell integration, it passes `--settings
 
 Codex and Grok also use the manual setup. Codex runs hooks from any source, including `-c` overrides, only after you review and trust them. Set `[ui.status_line]` in Grok's config file. The `GROK_CONFIG` overlay cannot set it.
 
-Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
+Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. When the payload also has Claude Code's `rate_limits` (`five_hour`, `seven_day`, `spend_limit`), Power keeps the latest report per model for 10 minutes to show usage limits. For Codex, Power reads the limits from the newest rollout in `$CODEX_HOME/sessions` (default `~/.codex/sessions`). The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
 
 For **Codex**, add these entries to the corresponding hook arrays in `~/.codex/hooks.json`, then review and trust the hooks in `/hooks`. Codex reports the model on session start and on the next submitted prompt after a model switch. [Codex hooks](https://learn.chatgpt.com/docs/hooks)
 
