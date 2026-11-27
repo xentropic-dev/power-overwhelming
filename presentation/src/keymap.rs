@@ -13,7 +13,7 @@
 //! `keys.box["dashboard.open"]`. Users rebind them exactly like built-in commands.
 
 use anyhow::{Context as _, Result, bail};
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
@@ -83,6 +83,7 @@ pub enum Command {
     PanelDown,
     PanelClose,
     TabOpenLink,
+    TerminalOpenLink,
     TabPreview,
     TerminalZoomIn,
     TerminalZoomOut,
@@ -102,6 +103,17 @@ pub enum Command {
     PreviewExit,
     HintSearch,
     HintCancel,
+}
+
+impl Command {
+    pub(crate) fn terminal_link(modifiers: Modifiers, requires_control: bool) -> Option<Self> {
+        (!modifiers.shift && (!requires_control || terminal_link_modifier(modifiers)))
+            .then_some(Self::TerminalOpenLink)
+    }
+}
+
+pub(crate) fn terminal_link_modifier(modifiers: Modifiers) -> bool {
+    modifiers.control && !modifiers.shift && !modifiers.alt && !modifiers.platform
 }
 
 /// Where a key press is interpreted.
@@ -756,6 +768,23 @@ mod tests {
 
     fn stroke(text: &str) -> Keystroke {
         Keystroke::parse(text).unwrap()
+    }
+
+    #[test]
+    fn terminal_link_click_preserves_selection_and_preview_gestures() {
+        for (modifiers, browser, preview) in [
+            (Modifiers::default(), None, Some(C::TerminalOpenLink)),
+            (
+                stroke("ctrl-a").modifiers,
+                Some(C::TerminalOpenLink),
+                Some(C::TerminalOpenLink),
+            ),
+            (stroke("shift-a").modifiers, None, None),
+            (stroke("ctrl-shift-a").modifiers, None, None),
+        ] {
+            assert_eq!(Command::terminal_link(modifiers, true), browser);
+            assert_eq!(Command::terminal_link(modifiers, false), preview);
+        }
     }
 
     #[test]

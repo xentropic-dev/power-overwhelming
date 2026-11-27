@@ -14,6 +14,7 @@ mod selection;
 mod sprites;
 mod typing;
 
+pub(crate) use self::links::{LinkAction, link_action};
 #[cfg(test)]
 pub(crate) use self::metrics::has_family;
 use self::metrics::preload_font_files;
