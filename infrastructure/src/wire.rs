@@ -241,13 +241,66 @@ pub fn socket_path() -> PathBuf {
         .join("power-overwhelming.sock")
 }
 
+/// Connects to the daemon. A loaded daemon can fill its listen backlog, so `EAGAIN` and
+/// `ECONNREFUSED` while the socket exists are retried for a few seconds. Nothing has been
+/// sent yet, so retrying cannot apply a request twice.
+pub fn connect() -> Result<UnixStream> {
+    connect_to(&socket_path(), std::time::Duration::from_secs(10))
+}
+
+fn connect_to(path: &std::path::Path, patience: std::time::Duration) -> Result<UnixStream> {
+    let deadline = std::time::Instant::now() + patience;
+    let mut delay = std::time::Duration::from_millis(20);
+    loop {
+        match UnixStream::connect(path) {
+            Ok(socket) => return Ok(socket),
+            Err(error) if is_busy(&error, path) && std::time::Instant::now() + delay < deadline => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(500));
+            }
+            Err(error) => return Err(error).context("Connect to power daemon"),
+        }
+    }
+}
+
+fn is_busy(error: &std::io::Error, path: &std::path::Path) -> bool {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::WouldBlock | ErrorKind::Interrupted => true,
+        ErrorKind::ConnectionRefused => path.exists(),
+        _ => false,
+    }
+}
+
+/// Reads the daemon's reply to a request already sent. A timeout here means the daemon may
+/// still apply the request, so it is reported as unknown rather than as a plain OS error.
+pub fn reply<T: DeserializeOwned>(stream: &mut impl BufRead) -> Result<T> {
+    match receive(stream) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => bail!("Daemon disconnected before replying; the request may have been applied"),
+        Err(error) if is_timeout(&error) => bail!(
+            "The daemon did not reply in time and may still apply the request; check its state before retrying"
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    })
+}
+
 pub fn request(message: &Request) -> Result<Response> {
-    let mut socket = UnixStream::connect(socket_path()).context("Connect to power daemon")?;
-    let timeout = Some(std::time::Duration::from_secs(5));
+    let mut socket = connect()?;
+    let timeout = Some(std::time::Duration::from_secs(30));
     socket.set_read_timeout(timeout)?;
     socket.set_write_timeout(timeout)?;
     send(&mut socket, message)?;
-    match receive::<Response>(&mut BufReader::new(socket))?.context("Daemon disconnected")? {
+    match reply::<Response>(&mut BufReader::new(socket))? {
         Response::Error { message } => bail!("{message}"),
         response => Ok(response),
     }
@@ -1255,5 +1308,54 @@ mod profile_tests {
             assert_eq!(serde_json::to_value(Session::from(session))?, record);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use std::{os::unix::net::UnixListener, time::Duration};
+
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        (dir, path)
+    }
+
+    #[test]
+    fn connect_waits_for_a_socket_that_starts_listening() {
+        let (_dir, path) = scratch();
+        // A bound but not yet listening socket refuses connections, like a busy daemon.
+        std::fs::write(&path, b"").unwrap();
+        let later = path.clone();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::remove_file(&later).unwrap();
+            let listener = UnixListener::bind(&later).unwrap();
+            listener.accept().unwrap();
+        });
+        connect_to(&path, Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_fails_fast_without_a_socket() {
+        let (_dir, path) = scratch();
+        let start = std::time::Instant::now();
+        assert!(connect_to(&path, Duration::from_secs(5)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn reply_timeout_says_the_request_may_have_applied() {
+        let (_dir, path) = scratch();
+        let listener = UnixListener::bind(&path).unwrap();
+        let socket = UnixStream::connect(&path).unwrap();
+        let _held = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let error = reply::<Response>(&mut BufReader::new(socket)).unwrap_err();
+        assert!(error.to_string().contains("may still apply"), "{error}");
     }
 }

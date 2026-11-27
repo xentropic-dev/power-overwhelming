@@ -386,9 +386,26 @@ fn main() -> Result<()> {
         Some(Action::Agent { command }) => match command {
             AgentAction::Codex { args } => exec_agent("codex", args),
             AgentAction::Claude { args } => exec_agent("claude", args),
-            AgentAction::List { box_sel, all } => {
+            AgentAction::List {
+                box_sel,
+                all,
+                all_boxes,
+            } => {
                 client::ensure_daemon()?;
-                print_json(json!({"agents": protocol_agents(box_sel, all)?}))
+                let caller = (!all_boxes).then(caller_session).flatten();
+                let scoped = box_sel.is_none() && caller.is_some();
+                let agents = list_agents(box_sel, caller, all)?;
+                if scoped {
+                    let others = list_agents(None, None, all)?
+                        .len()
+                        .saturating_sub(agents.len());
+                    if others > 0 {
+                        eprintln!(
+                            "{others} more in other boxes; pass --all-boxes or --box to see them"
+                        );
+                    }
+                }
+                print_json(json!({"agents": agents}))
             }
             AgentAction::End { id, box_sel } => {
                 client::ensure_daemon()?;
@@ -488,6 +505,9 @@ enum AgentAction {
         /// Include exited and done agents.
         #[arg(long)]
         all: bool,
+        /// List agents in every box, not just the current one.
+        #[arg(long, conflicts_with = "box_sel")]
+        all_boxes: bool,
     },
     /// End an agent's terminal session, interrupting any attempt it still has open.
     End {
@@ -616,7 +636,8 @@ enum DagAction {
 struct DispatchArgs {
     run: String,
     task: String,
-    /// Coding agent profile ID, or `command` to run an executable directly.
+    /// Coding agent profile ID, or `command` to run an executable directly. Like any
+    /// provider, `command` needs `--allow-main-checkout` to run in the main checkout.
     #[arg(long)]
     provider: String,
     #[command(flatten)]
@@ -1190,7 +1211,7 @@ fn run_dag(command: DagAction) -> Result<()> {
     dag_reply(request, timeout)
 }
 
-const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
+const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
     match client::dag(DagRequest::ListBoxes, PROTOCOL_TIMEOUT)? {
@@ -1203,9 +1224,17 @@ fn protocol_agents(
     box_sel: Option<String>,
     include_finished: bool,
 ) -> Result<Vec<client::protocol::ManagedAgent>> {
+    list_agents(box_sel, caller_session(), include_finished)
+}
+
+fn list_agents(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<client::protocol::ManagedAgent>> {
     let request = DagRequest::ListAgents {
         box_sel,
-        caller: caller_session(),
+        caller,
         include_finished,
     };
     match client::dag(request, PROTOCOL_TIMEOUT)? {

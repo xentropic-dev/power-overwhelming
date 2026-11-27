@@ -14,7 +14,6 @@ use std::{
     io::BufReader,
     os::unix::{
         fs::{DirBuilderExt, OpenOptionsExt},
-        net::UnixStream,
         process::CommandExt,
     },
     path::PathBuf,
@@ -189,7 +188,7 @@ pub fn watch_box_icons(deliver: impl Fn(String) -> bool) {
 fn watch(request: &Request, deliver: impl Fn(Response) -> Result<bool>) {
     loop {
         let result = (|| -> Result<bool> {
-            let mut socket = UnixStream::connect(wire::socket_path())?;
+            let mut socket = wire::connect()?;
             socket.set_read_timeout(Some(Duration::from_secs(15)))?;
             wire::send(&mut socket, request)?;
             let mut reader = BufReader::new(socket);
@@ -235,7 +234,7 @@ fn subscribe(
     is_closed: &impl Fn() -> bool,
     deliver: &impl Fn(TerminalEvent) -> bool,
 ) -> Result<()> {
-    let mut socket = UnixStream::connect(wire::socket_path())?;
+    let mut socket = wire::connect()?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     wire::send(
         &mut socket,
@@ -362,19 +361,20 @@ use protocol::{DagRequest, DagResponse};
 /// Sends one DAG request. `timeout` bounds the reply, which matters for blocking waits.
 pub fn dag(request: DagRequest, timeout: Duration) -> Result<DagResponse> {
     use std::io::Write as _;
-    let mut socket = UnixStream::connect(wire::socket_path()).context("Connect to power daemon")?;
+    let mut socket = wire::connect()?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     wire::send(&mut socket, &Request::Dag { dag: request })?;
     socket.flush()?;
-    match wire::receive::<Response>(&mut BufReader::new(socket))?.context("Daemon disconnected")? {
+    match wire::reply::<Response>(&mut BufReader::new(socket))? {
         Response::Dag { dag } => Ok(*dag),
         Response::Error { message } => bail!("{message}"),
         _ => bail!("Unexpected daemon response"),
     }
 }
 
-const DAG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Generous, because a read timeout on an applied request would report a false failure.
+const DAG_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn domain_list<T: Into<U>, U>(values: Vec<T>) -> Vec<U> {
     values.into_iter().map(Into::into).collect()
@@ -525,7 +525,7 @@ pub fn attention() -> Result<Vec<BoxAttention>> {
 
 /// Streams run events until `deliver` returns false or the daemon goes away.
 pub fn watch_runs(box_sel: Option<String>, deliver: impl Fn(RunEvent) -> bool) -> Result<()> {
-    let mut socket = UnixStream::connect(wire::socket_path()).context("Connect to power daemon")?;
+    let mut socket = wire::connect()?;
     // The daemon sends keepalives every few seconds, so a long silence means it is gone.
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     wire::send(
