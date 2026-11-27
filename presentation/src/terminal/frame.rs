@@ -835,6 +835,14 @@ mod wrap_tests {
         terminal.scroll_viewport(ScrollViewport::Bottom);
         let bottom = frame(&mut renderer, &terminal);
         assert!(bottom.rows[0].links.is_empty());
+
+        // Punctuation on the last scanned cell must not hide the truncation.
+        let mut terminal = sized(10, 2);
+        let uri = format!("https://example.com/{};{}", "a".repeat(319), "a".repeat(80));
+        terminal.vt_write(format!("{uri}\r\nend").as_bytes());
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let top = frame(&mut RenderState::new().unwrap(), &terminal);
+        assert!(top.rows.iter().all(|row| row.links.is_empty()));
     }
 
     #[test]

@@ -354,7 +354,9 @@ pub(super) fn mark_links(rows: &mut [Row], prefix: (String, bool), suffix: (Stri
     }
     text.push_str(&suffix);
     for (range, target) in links(&text) {
-        if (!prefix_complete && range.start == 0) || (!suffix_complete && range.end == text.len()) {
+        if (!prefix_complete && range.start == 0)
+            || (!suffix_complete && untrimmed_end(&text, range.end) == text.len())
+        {
             continue;
         }
         let start = spots.partition_point(|(offset, ..)| *offset < range.start);
@@ -371,6 +373,14 @@ pub(super) fn mark_links(rows: &mut [Row], prefix: (String, bool), suffix: (Stri
             }
         }
     }
+}
+
+/// Where the token ends before trailing punctuation was trimmed from the link.
+fn untrimmed_end(text: &str, end: usize) -> usize {
+    text.len()
+        - text[end..]
+            .trim_start_matches(['.', ',', ':', ';', '!', '?'])
+            .len()
 }
 
 /// The first cell of each distinct link, scanning from the bottom row up, at most nine.
