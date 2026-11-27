@@ -279,18 +279,14 @@ fn packed_rgb(r: u8, g: u8, b: u8) -> u32 {
 /// Box drawing, blocks, braille, powerline and legacy computing sprites keep their authored
 /// colors even when that color has low contrast.
 fn preserves_graphics_color(text: &str) -> bool {
-    let mut chars = text.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) => {
-            ('\u{2500}'..='\u{259f}').contains(&c)
-                || ('\u{2800}'..='\u{28ff}').contains(&c)
-                || ('\u{e0b0}'..='\u{e0bf}').contains(&c)
-                || c == '\u{23fa}'
-                || ('\u{1fb00}'..='\u{1fbff}').contains(&c)
-                || ('\u{1cc00}'..='\u{1cebf}').contains(&c)
-        }
-        _ => false,
-    }
+    text.chars().next().is_some_and(|c| {
+        ('\u{2500}'..='\u{259f}').contains(&c)
+            || ('\u{2800}'..='\u{28ff}').contains(&c)
+            || ('\u{e0b0}'..='\u{e0d7}').contains(&c)
+            || c == '\u{23fa}'
+            || ('\u{1fb00}'..='\u{1fbff}').contains(&c)
+            || ('\u{1cc00}'..='\u{1cebf}').contains(&c)
+    })
 }
 
 /// `foreground`, or near-white / near-black when it would vanish into `background`.
@@ -363,6 +359,31 @@ mod tests {
             assert!(preserves_graphics_color(glyph), "{glyph}");
         }
         assert!(!preserves_graphics_color("A"));
+    }
+
+    fn low_contrast_cell(glyph: &str) -> Hsla {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(format!("\x1b[48;2;0;0;0m\x1b[38;2;16;16;16m{glyph}").as_bytes());
+        let frame = Frame::default()
+            .update_with(&mut RenderState::new().unwrap(), &terminal, 4.5)
+            .unwrap()
+            .unwrap();
+        frame.rows[0].cells[0].fg
+    }
+
+    #[test]
+    fn minimum_contrast_keeps_extended_powerline_colors() {
+        for glyph in ["\u{e0c0}", "\u{e0d7}"] {
+            assert_eq!(low_contrast_cell(glyph), Hsla::from(rgb(0x101010)));
+        }
+    }
+
+    #[test]
+    fn minimum_contrast_keeps_graphics_colors_with_combining_marks() {
+        assert_eq!(
+            low_contrast_cell("\u{2500}\u{0301}"),
+            Hsla::from(rgb(0x101010))
+        );
     }
     use ghostty_vt::terminal::Options;
     use std::sync::Arc;
