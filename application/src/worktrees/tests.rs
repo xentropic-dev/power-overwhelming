@@ -214,7 +214,10 @@ fn creates_at_a_requested_path() -> Result<()> {
     let requested = root.0.join("elsewhere/mine");
 
     dag.create_view_worktree("box-id", &view.id, "mine", Some(&requested))?;
-    assert_eq!(workspace.0.lock().unwrap().created, [requested.clone()]);
+    assert_eq!(
+        workspace.0.lock().unwrap().created,
+        std::slice::from_ref(&requested)
+    );
 
     fs::create_dir_all(&requested)?;
     let error = dag
