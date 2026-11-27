@@ -1277,6 +1277,7 @@ mod tests {
             coordinator: Coordinator::External { label: "x".into() },
             created_at: 1,
             archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         };
         assert_eq!(run_detail(&run), "Active · 0/0 done · run-id");

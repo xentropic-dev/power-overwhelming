@@ -407,6 +407,59 @@ pub fn set_box_icon(
     }
 }
 
+pub use wire::DaemonProcess;
+
+/// The daemon a restart would end, found through this caller's socket: its process and
+/// the agents it lists, or the error that kept it from listing them. `None` only when
+/// nothing listens there.
+#[allow(clippy::type_complexity)]
+pub fn restart_target(
+    timeout: Duration,
+) -> Result<Option<(DaemonProcess, Result<Vec<protocol::ManagedAgent>>)>> {
+    use std::io::Write as _;
+    let path = wire::socket_path();
+    let (mut socket, process) = match wire::probe(&path)? {
+        wire::Probe::Absent => return Ok(None),
+        wire::Probe::Listening(socket, process) => (socket, process),
+    };
+    let pid = process.pid;
+    let mut ask = || -> Result<Vec<protocol::ManagedAgent>> {
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let request = DagRequest::ListAgents {
+            box_sel: None,
+            caller: None,
+            include_finished: false,
+        };
+        wire::send(&mut socket, &Request::Dag { dag: request })?;
+        socket.flush()?;
+        match wire::reply::<Response>(&mut BufReader::new(&socket))? {
+            Response::Dag { dag } => match *dag {
+                DagResponse::Agents { agents } => Ok(agents),
+                _ => bail!("Unexpected daemon response"),
+            },
+            Response::Error { message } => bail!("{message}"),
+            _ => bail!("Unexpected daemon response"),
+        }
+    };
+    let agents = ask().with_context(|| {
+        format!(
+            "Could not list the workers of the daemon (pid {pid}) at {}",
+            path.display()
+        )
+    });
+    Ok(Some((process, agents)))
+}
+
+/// The daemon process listening on this caller's socket, or `None` when nothing listens
+/// there. Sends no request.
+pub fn daemon_process() -> Result<Option<DaemonProcess>> {
+    Ok(match wire::probe(&wire::socket_path())? {
+        wire::Probe::Absent => None,
+        wire::Probe::Listening(_, process) => Some(process),
+    })
+}
+
 pub fn list_agents(
     box_sel: Option<String>,
     caller: Option<String>,
@@ -458,6 +511,47 @@ pub fn archive_run(run: String, force: bool) -> Result<Run> {
 pub fn start_queued(run: String, task: String) -> Result<()> {
     match dag(DagRequest::StartQueued { run, task }, DAG_TIMEOUT)? {
         DagResponse::Dispatched { .. } => Ok(()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses a run's workers and stops dispatching from it.
+pub fn pause_run(run: String) -> Result<Run> {
+    match dag(DagRequest::PauseRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Resumes a paused run.
+pub fn resume_run(run: String) -> Result<Run> {
+    match dag(DagRequest::ResumeRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Stops one agent through the daemon's guarded use case, which ends only the agent's
+/// own session and refuses an agent sharing a shell session.
+pub fn stop_agent(agent: String) -> Result<ManagedAgent> {
+    match dag(DagRequest::StopAgent { agent }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses or resumes one agent's process tree.
+pub fn set_agent_paused(agent: String, paused: bool) -> Result<ManagedAgent> {
+    match dag(DagRequest::SetAgentPaused { agent, paused }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses every running agent except `keep` and the caller's own session.
+pub fn pause_all_except(keep: Vec<String>, caller: Option<String>) -> Result<Vec<ManagedAgent>> {
+    match dag(DagRequest::PauseAllExcept { keep, caller }, DAG_TIMEOUT)? {
+        DagResponse::Agents { agents } => Ok(agents.into_iter().map(Into::into).collect()),
         _ => bail!("Unexpected daemon response"),
     }
 }

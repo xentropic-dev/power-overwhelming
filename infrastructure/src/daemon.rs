@@ -3,10 +3,12 @@ use crate::{
     box_icons::IconFiles,
     boxes::BoxesFile,
     budget::{LocalWorkerBudget, ProcMemory},
+    cgroup::{self, WorkerScopes},
     dag_adapter::{self, DaemonDag},
     dag_store::SqliteDagStore,
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
+    scheduler::{self, TimerScheduler},
     talk_adapter::{self, DaemonTalk},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
@@ -24,12 +26,9 @@ use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
     io::BufReader,
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
-        },
+    os::unix::{
+        fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
     },
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
@@ -79,11 +78,15 @@ struct Server {
     talk_wake: mpsc::SyncSender<()>,
 }
 
+/// Runs the daemon. `finished_worker_grace` is how long a DAG worker runs after its
+/// terminal report before its session ends, or `None` to leave it running.
 pub fn serve(
     profiles: AgentProfiles,
     worktree_root: LocalWorktreeRoot,
+    finished_worker_grace: Option<Duration>,
     talk_policy: NoticePolicy,
     budget: LocalWorkerBudget,
+    stall_after: Option<Duration>,
 ) -> Result<()> {
     let socket = wire::socket_path();
     let parent = socket
@@ -125,6 +128,7 @@ pub fn serve(
     let foreground_dag = terminal_dag.clone();
     let scheme = Arc::new(RwLock::new(theme::default_scheme()));
     let profiles = Arc::new(profiles);
+    let scopes = worker_scopes();
     let (talk_wake, talk_activity) = mpsc::sync_channel(1);
     let application = Arc::new(Application::new(
         artifacts,
@@ -135,9 +139,9 @@ pub fn serve(
             scheme: scheme.clone(),
             profiles: profiles.clone(),
             talk_wake: talk_wake.clone(),
-            on_exit: Arc::new(move |session, detail| {
+            on_exit: Arc::new(move |session, detail, complete| {
                 if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
-                    && let Err(error) = dag.session_exited(session, detail)
+                    && let Err(error) = dag.session_exited(session, detail, complete)
                 {
                     eprintln!("Could not record exit for terminal {session}. {error:#}");
                 }
@@ -162,20 +166,32 @@ pub fn serve(
                 }
             }),
             shutting_down: shutting_down.clone(),
+            scopes,
         },
         profiles,
         || uuid::Uuid::new_v4().to_string(),
     ));
-    let dag = Arc::new(
-        DaemonDag::new(
-            application.clone(),
-            store.clone(),
-            BoxesFile,
-            IconFiles::open()?,
-        )
-        .with_worktree_root(worktree_root)
-        .with_worker_budget(budget, ProcMemory),
-    );
+    let mut dag = DaemonDag::new(
+        application.clone(),
+        store.clone(),
+        BoxesFile,
+        IconFiles::open()?,
+    )
+    .with_worktree_root(worktree_root)
+    .with_worker_budget(budget, ProcMemory);
+    if let Some(grace) = finished_worker_grace {
+        // Teardowns never wait behind the store writes that follow them.
+        let teardown = TimerScheduler::start("power-teardown", scheduler::DEFAULT_CAPACITY)?;
+        let persistence = TimerScheduler::start("power-forget", scheduler::DEFAULT_CAPACITY)?;
+        dag = dag.with_finished_worker_cleanup(grace, Arc::new(teardown), Arc::new(persistence));
+    }
+    if let Some(after) = stall_after {
+        dag = dag.with_stall_check(
+            after,
+            crate::stall_probe::LocalWorkerProbe::new(application.clone()),
+        );
+    }
+    let dag = dag.shared();
     terminal_application
         .set(Arc::downgrade(&application))
         .expect("connect terminal callbacks to the application once");
@@ -209,6 +225,7 @@ pub fn serve(
     let talk = talk_adapter::start(application.clone(), store, talk_policy, talk_activity);
     handle_shutdown(application.clone(), shutting_down)?;
     start_queue(dag.clone(), &listener);
+    start_stall_checks(dag.clone());
     // Lets a test hold startup open, as if a later session were still restoring.
     delay_for_tests("POWER_TEST_RESTORE_DELAY_MS");
     startup.open(Arc::new(Server {
@@ -256,6 +273,58 @@ fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
             }
         }
     });
+}
+
+/// Flags idle workers whose builds and tests are not running, so a coordinator sees
+/// them without polling transcripts.
+fn start_stall_checks(dag: Arc<DaemonDag>) {
+    let Some(interval) = dag.stall_interval() else {
+        return;
+    };
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval);
+            match dag.check_stalls() {
+                Ok(stalled) => {
+                    for attempt in stalled {
+                        eprintln!("Attempt {attempt} looks stalled.");
+                    }
+                }
+                Err(error) => eprintln!("Could not check for stalled DAG workers. {error:#}"),
+            }
+        }
+    });
+}
+
+/// Finds how this system lets Power own workers, and logs it. Without cgroup
+/// ownership, Power falls back to process discovery.
+fn worker_scopes() -> Option<Arc<WorkerScopes>> {
+    if std::env::var_os(cgroup::DISABLE_ENV).is_some_and(|value| value == "0") {
+        eprintln!(
+            "WARNING: {}=0, so workers run without cgroup ownership. Each runs under a \
+             subreaper that ends everything it started.",
+            cgroup::DISABLE_ENV
+        );
+        return None;
+    }
+    let slice = std::env::var(cgroup::SLICE_ENV).unwrap_or_else(|_| cgroup::DEFAULT_SLICE.into());
+    match WorkerScopes::detect(&slice) {
+        Ok(scopes) => {
+            eprintln!(
+                "Each worker runs in its own systemd user scope in {}, whose cgroup owns every process it starts.",
+                scopes.slice()
+            );
+            Some(Arc::new(scopes))
+        }
+        Err(error) => {
+            eprintln!(
+                "WARNING: workers run without cgroup ownership ({error:#}). Each runs under a \
+                 subreaper instead, which adopts and ends everything it started, though it \
+                 cannot freeze them."
+            );
+            None
+        }
+    }
 }
 
 /// Bounds the final save so a reboot is not held up by a stuck terminal.
@@ -528,7 +597,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             let value = (!value.is_empty()).then(|| value.to_owned());
             let (send, receive) = mpsc::sync_channel(1);
             application.terminal(&session)?.send(Command::SetMetadata {
-                pid: peer_pid(socket)?,
+                pid: wire::peer_pid(socket)?,
                 field,
                 value,
                 reply: send,
@@ -555,7 +624,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             application
                 .terminal(&session)?
                 .send(Command::SetConversation {
-                    pid: peer_pid(socket)?,
+                    pid: wire::peer_pid(socket)?,
                     agent: Agent::Coding(agent.into()),
                     conversation,
                     reply: send,
@@ -630,7 +699,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             })
         }
         Request::End { session } => {
-            application.end_session(&session)?;
+            server.dag.end_session(&session)?;
             Ok(Response::Ok)
         }
         Request::RecentArtifacts { sessions, limit } => Ok(Response::RecentArtifacts {
@@ -657,28 +726,4 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
         }
         Request::Subscribe { .. } => unreachable!("Subscriptions use the streaming handler"),
     }
-}
-
-fn peer_pid(socket: &UnixStream) -> Result<u32> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Linux supplies the credentials of the process that connected to this socket.
-    let result = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    ensure!(
-        length as usize == std::mem::size_of::<libc::ucred>(),
-        "Missing peer credentials"
-    );
-    let credentials = unsafe { credentials.assume_init() };
-    Ok(credentials.pid.try_into()?)
 }

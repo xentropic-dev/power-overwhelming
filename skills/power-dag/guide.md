@@ -71,6 +71,8 @@ The JSON output has the updated `task` and a `delivery`: `none` when nothing is 
 
 To set aside a run you have abandoned, run `power dag archive "$RUN"`. Archived runs leave `power dag list` and the run picker until `power dag unarchive "$RUN"`, but `power dag show` still loads them. Power refuses to archive a run with open attempts so live workers stay visible; pass `--force` only when the user confirms those workers can be hidden.
 
+To take load off the machine without losing work, `power dag pause "$RUN"` pauses every active worker of the run and stops dispatching from it; its tasks show `paused`, which is not working. `power dag resume "$RUN"` continues them. Never treat a paused worker as making progress.
+
 When retrying, Power reuses the task's Power-created worktree and branch by default. See the recovery reference for retry commands. To preview which Power-created worktrees can be removed, run `power worktree prune --dry-run`. Outside Power, also select a box with `--box "$BOX"` or use `--all`.
 
 Use `power dag show "$RUN"` to read each attempt's `artifacts` (`id`, `title`, `link`) in publish order, newest last. In the DAG view (Ctrl+B then `d`), the selected node's Artifacts list shows the current attempt's artifacts. Open a listed artifact or its `pwr://artifact/<id>` link in the preview pane.

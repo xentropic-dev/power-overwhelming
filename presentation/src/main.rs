@@ -56,6 +56,27 @@ struct Cli {
 enum Action {
     Gui,
     Daemon,
+    /// Check that restarting the daemon would not kill DAG workers mid-task. Lists the
+    /// open attempts and asks to confirm, or fails when it cannot ask or the daemon does
+    /// not answer. Prints the PID of the daemon it cleared, which is the only one to
+    /// restart, or nothing when no daemon listens. Run it before anything that restarts
+    /// the daemon.
+    RestartCheck {
+        /// Allow the restart even with workers mid-task or a daemon that does not answer.
+        #[arg(long)]
+        force: bool,
+        /// Only print the PID of the daemon listening on this socket, without checking.
+        #[arg(long, conflicts_with_all = ["force", "stop"])]
+        target: bool,
+        /// Once cleared, stop that daemon: SIGTERM, then SIGKILL after 5 seconds. The
+        /// signals go through a handle on the process that was checked, so they never
+        /// reach another process that reused its PID.
+        #[arg(long)]
+        stop: bool,
+        /// With --stop, leave the daemon alone when it already runs this executable.
+        #[arg(long, requires = "stop", value_name = "PATH")]
+        unless_exe: Option<PathBuf>,
+    },
     Session {
         #[command(subcommand)]
         command: SessionAction,
@@ -74,6 +95,13 @@ enum Action {
     ShellInit {
         #[arg(value_parser = ["bash", "zsh", "fish"])]
         shell: String,
+    },
+    /// Runs a worker under a subreaper that ends everything it starts. The daemon
+    /// uses it without cgroup ownership.
+    #[command(hide = true)]
+    Reap {
+        #[arg(last = true)]
+        argv: Vec<OsString>,
     },
     #[command(hide = true)]
     ExecAgent {
@@ -259,11 +287,26 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
+            finished_worker_grace(),
             config::load_talk_policy(settings::Settings::defaults()).unwrap_or_else(|error| {
                 eprintln!("Could not load talk settings. {error:#}");
                 domain::talk::NoticePolicy::default()
             }),
             LocalWorkerBudget::new(settings::Settings::defaults()),
+            config::load_stall_after(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load dag.stall_after. {error:#}");
+                Some(application::dag::STALL_AFTER)
+            }),
+        ),
+        Some(Action::RestartCheck {
+            force,
+            target,
+            stop,
+            unless_exe,
+        }) => restart_check(
+            force || std::env::var_os("POWER_FORCE_RESTART").is_some_and(|value| value == "1"),
+            target,
+            stop.then_some(unless_exe),
         ),
         Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {
@@ -361,6 +404,7 @@ fn main() -> Result<()> {
             client::ensure_daemon()?;
             print_json(json!({"boxes": protocol_boxes()?}))
         }
+        Some(Action::Reap { argv }) => match infrastructure::reaper::run(argv)? {},
         Some(Action::ExecAgent { id, args }) => exec_agent(&id, args),
         Some(Action::Codex { args }) => exec_agent("codex", args),
         Some(Action::Claude { args }) => exec_agent("claude", args),
@@ -407,16 +451,30 @@ fn main() -> Result<()> {
                 }
                 print_json(json!({"agents": agents}))
             }
-            AgentAction::End { id, box_sel } => {
+            AgentAction::Pause { ids, all_except } => {
+                client::ensure_daemon()?;
+                if all_except {
+                    let request = DagRequest::PauseAllExcept {
+                        keep: ids,
+                        caller: caller_session(),
+                    };
+                    return dag_reply(request, Duration::from_secs(30));
+                }
+                set_paused(ids, true)
+            }
+            AgentAction::Resume { ids } => {
+                client::ensure_daemon()?;
+                set_paused(ids, false)
+            }
+            AgentAction::End { id, box_sel } | AgentAction::Stop { id, box_sel } => {
                 client::ensure_daemon()?;
                 let agent = protocol_agents(box_sel, true)?
                     .into_iter()
                     .find(|agent| agent.id == id)
                     .with_context(|| format!("No agent {id} in this box."))?;
-                let session = agent
-                    .session
-                    .with_context(|| format!("Agent {id} has no terminal session."))?;
-                client::end_session(session)
+                // The daemon ends only the agent's own session, and refuses an agent
+                // that shares a shell session with the shell's other jobs.
+                client::stop_agent(agent.id).map(drop)
             }
             AgentAction::Start {
                 box_sel,
@@ -473,6 +531,13 @@ fn configured_agents() -> AgentProfiles {
     })
 }
 
+fn finished_worker_grace() -> Option<std::time::Duration> {
+    config::load_finished_worker_grace(settings::Settings::defaults()).unwrap_or_else(|error| {
+        eprintln!("Could not load dag settings. {error:#}");
+        Some(application::dag::FINISHED_WORKER_GRACE)
+    })
+}
+
 fn exec_agent(id: &str, args: Vec<OsString>) -> Result<()> {
     let profiles = configured_agents();
     shell::exec_agent(profiles.resolve(&id.into())?, args)
@@ -508,6 +573,27 @@ enum AgentAction {
         /// List agents in every box, not just the current one.
         #[arg(long, conflicts_with = "box_sel")]
         all_boxes: bool,
+    },
+    /// Pause an agent's whole process tree (SIGSTOP). Only its own processes are touched.
+    Pause {
+        /// Agents to pause. With --all-except, the agents to leave running.
+        #[arg(required_unless_present = "all_except")]
+        ids: Vec<String>,
+        /// Pause every running agent except the ones named, and the caller's own.
+        #[arg(long)]
+        all_except: bool,
+    },
+    /// Resume a paused agent's process tree.
+    Resume {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Stop an agent cleanly: end its terminal session and interrupt its open attempt,
+    /// which can then be dispatched again with --retry.
+    Stop {
+        id: String,
+        #[arg(long = "box")]
+        box_sel: Option<String>,
     },
     /// End an agent's terminal session, interrupting any attempt it still has open.
     End {
@@ -576,6 +662,14 @@ enum DagAction {
     },
     /// Return an archived run to default listings.
     Unarchive {
+        run: String,
+    },
+    /// Pause every active worker of a run and stop dispatching from it.
+    Pause {
+        run: String,
+    },
+    /// Resume a paused run's workers and let it dispatch again.
+    Resume {
         run: String,
     },
     AddTask {
@@ -962,6 +1056,7 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
             json!({"link": domain::link::dag_uri(&run.id), "run": run})
         }
         DagResponse::Run { run } => json!({"run": run}),
+        DagResponse::Agents { agents } => json!({"agents": agents}),
         DagResponse::Runs { runs } => {
             let links: serde_json::Map<String, Value> = runs
                 .iter()
@@ -1118,6 +1213,8 @@ fn run_dag(command: DagAction) -> Result<()> {
         DagAction::Show { run } => DagRequest::GetRun { run },
         DagAction::Archive { run, force } => DagRequest::ArchiveRun { run, force },
         DagAction::Unarchive { run } => DagRequest::UnarchiveRun { run },
+        DagAction::Pause { run } => DagRequest::PauseRun { run },
+        DagAction::Resume { run } => DagRequest::ResumeRun { run },
         DagAction::AddTask {
             run,
             id,
@@ -1243,6 +1340,7 @@ fn run_dag(command: DagAction) -> Result<()> {
                     InputResolved,
                     AttemptInterrupted,
                     AttemptResumed,
+                    AttemptStalled,
                     TaskReady,
                     QueuedDispatchFailed,
                     TaskEdited,
@@ -1272,6 +1370,148 @@ fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
         _ => anyhow::bail!("Unexpected daemon response"),
     }
 }
+
+/// Pauses or resumes each agent and prints them.
+fn set_paused(ids: Vec<String>, paused: bool) -> Result<()> {
+    let mut agents = Vec::new();
+    for agent in ids {
+        match client::dag(
+            DagRequest::SetAgentPaused { agent, paused },
+            Duration::from_secs(10),
+        )? {
+            DagResponse::Agent { agent } => agents.push(agent),
+            _ => anyhow::bail!("Unexpected daemon response"),
+        }
+    }
+    print_json(json!({"agents": agents}))
+}
+
+/// Never starts a daemon: with none running there is nothing to interrupt. On success it
+/// prints the PID of the daemon it checked, the one a restart may end, or nothing when
+/// none listens. It fails closed: a daemon that cannot be asked for its workers is not
+/// cleared for a restart unless forced. Forced, it only identifies the daemon and never
+/// waits on a worker list. With `stop`, it then stops the daemon it cleared, unless that
+/// already runs the given executable.
+fn restart_check(force: bool, target_only: bool, stop: Option<Option<PathBuf>>) -> Result<()> {
+    use client::protocol::AgentStatus;
+    use std::io::IsTerminal as _;
+    let finish = |process: client::DaemonProcess| -> Result<()> {
+        let pid = process.pid;
+        let Some(unless) = &stop else {
+            println!("{pid}");
+            return Ok(());
+        };
+        if let Some(exe) = unless
+            && same_file(&format!("/proc/{pid}/exe"), exe)
+        {
+            eprintln!("Daemon (pid {pid}) already runs {}", exe.display());
+            return Ok(());
+        }
+        println!("{pid}");
+        eprintln!("Stopping daemon (pid {pid})");
+        process.stop(Duration::from_secs(5))
+    };
+    // An up-to-date daemon is left alone before any worker check.
+    if let Some(Some(exe)) = &stop
+        && !target_only
+        && let Some(process) =
+            client::daemon_process().context("Could not identify the daemon to restart")?
+        && same_file(&format!("/proc/{}/exe", process.pid), exe)
+    {
+        eprintln!(
+            "Daemon (pid {}) already runs {}",
+            process.pid,
+            exe.display()
+        );
+        return Ok(());
+    }
+    if target_only || force {
+        let Some(process) =
+            client::daemon_process().context("Could not identify the daemon to restart")?
+        else {
+            return Ok(());
+        };
+        if force && !target_only {
+            eprintln!("Skipping the worker check (--force).");
+        }
+        return if target_only {
+            println!("{}", process.pid);
+            Ok(())
+        } else {
+            finish(process)
+        };
+    }
+    let target = client::restart_target(RESTART_CHECK_TIMEOUT).map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}\nRestart cancelled: the daemon may have workers mid-task. Set \
+             POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        )
+    })?;
+    let Some((process, agents)) = target else {
+        return Ok(());
+    };
+    let pid = process.pid;
+    let agents = agents.map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}\nRestart cancelled: it may have workers mid-task. Wait until it \
+             answers, or set POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        )
+    })?;
+    let open: Vec<_> = agents
+        .iter()
+        .filter(|agent| {
+            agent.run.is_some()
+                && matches!(
+                    agent.status,
+                    AgentStatus::Working | AgentStatus::NeedsInput | AgentStatus::Paused
+                )
+        })
+        .collect();
+    if open.is_empty() {
+        return finish(process);
+    }
+    eprintln!(
+        "{} DAG worker{} mid-task on the daemon (pid {pid}). Restarting it kills every \
+         command they run, such as builds and tests:",
+        open.len(),
+        if open.len() == 1 { " is" } else { "s are" }
+    );
+    for agent in &open {
+        eprintln!(
+            "  {} {}/{} ({}) {}",
+            agent.id,
+            agent.run.as_deref().unwrap_or("-"),
+            agent.task.as_deref().unwrap_or("-"),
+            serde_json::to_value(agent.status)?
+                .as_str()
+                .unwrap_or_default(),
+            agent.label
+        );
+    }
+    if std::io::stdin().is_terminal() {
+        eprint!("Restart anyway? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if matches!(answer.trim(), "y" | "Y" | "yes") {
+            return finish(process);
+        }
+    }
+    anyhow::bail!(
+        "Restart cancelled. Wait for these workers to report, or set POWER_FORCE_RESTART=1 \
+         (or pass --force) to restart anyway"
+    )
+}
+
+/// Whether two paths name the same bytes.
+fn same_file(a: &str, b: &std::path::Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// How long `restart-check` waits for the daemon to list its workers.
+const RESTART_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn protocol_agents(
     box_sel: Option<String>,

@@ -3,27 +3,24 @@ description = "Build the optimized Power binary"
 run = "mise exec zig@0.17.1 -- cargo build --release --locked"
 
 [tasks.dev]
-description = "Rebuild Power, restart its daemon, and launch the GUI"
+description = "Rebuild Power, restart its daemon, and launch the GUI (POWER_FORCE_RESTART=1 skips the worker check)"
 depends = ["release"]
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 # SIGTERM lets the daemon save its sessions. Running processes still end, including the tab
 # this may run in, and the new daemon recreates each session and resumes its agent.
-pattern='(^|/)power daemon$'
-if pkill -f "$pattern"; then
-  for _ in $(seq 50); do
-    pgrep -f "$pattern" >/dev/null || break
-    sleep 0.1
-  done
-  pkill -9 -f "$pattern" || true
-fi
+# The check asks the daemon on this caller's socket (POWER_SOCKET or the default). It
+# refuses, or asks, while DAG workers are mid-task, and refuses when that daemon does not
+# answer. Then it stops that daemon through a handle on the process it checked, so the
+# signals never reach a process that reused its PID.
+./target/release/power restart-check --stop >/dev/null
 # The GUI starts a fresh daemon from this binary when none is listening.
 exec ./target/release/power
 """
 
 [tasks.install]
-description = "Install Power into ~/.local/bin and restart an outdated daemon"
+description = "Install Power into ~/.local/bin and restart an outdated daemon (POWER_FORCE_RESTART=1 skips the worker check)"
 depends = ["release"]
 run = """
 #!/usr/bin/env bash
@@ -60,27 +57,20 @@ if command -v update-desktop-database >/dev/null; then
 fi
 echo "Installed $apps_dir/power.desktop"
 
-# The daemon and client share one binary. Restart only a daemon running different bytes.
-# Restarting ends every session it hosts, including the tab this may run in.
-pattern='(^|/)power daemon$'
-stale=()
-for pid in $(pgrep -f "$pattern" || true); do
-  cmp -s "/proc/$pid/exe" "$dest" || stale+=("$pid")
-done
-if [[ -z "${stale[*]-}" ]]; then
-  pgrep -f "$pattern" >/dev/null && echo "Daemon already up to date"
-  exit 0
+# The daemon and client share one binary. Restart only the daemon on this caller's socket
+# (POWER_SOCKET or the default), and only when it runs different bytes. Restarting ends
+# every session it hosts, including the tab this may run in.
+# Refuses, or asks, while DAG workers are mid-task, and refuses when the daemon does not
+# answer. It stops the daemon it checked, through a handle on that process, unless it
+# already runs the installed bytes.
+# It prints the PID it stopped, or nothing when none listens or it is up to date.
+if ! stopped="$("$dest" restart-check --stop --unless-exe "$dest")"; then
+  echo "Installed, but left the running daemon alone. It restarts from $dest next time." >&2
+  exit 1
 fi
-echo "Restarting daemon (pid ${stale[*]})"
-kill "${stale[@]}" 2>/dev/null || true
-for _ in $(seq 50); do
-  alive=0
-  for pid in "${stale[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
-  ((alive)) || break
-  sleep 0.1
-done
-kill -9 "${stale[@]}" 2>/dev/null || true
-# Any session command starts a detached daemon from the installed binary.
-"$dest" session list >/dev/null
-echo "Daemon restarted from $dest"
+if [[ -n "$stopped" ]]; then
+  # Any session command starts a detached daemon from the installed binary.
+  "$dest" session list >/dev/null
+  echo "Daemon restarted from $dest"
+fi
 """

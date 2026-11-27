@@ -55,7 +55,10 @@ pub enum Command {
     AgentExpand,
     ToggleFinished,
     EndWorker,
+    PauseAgent,
+    PauseAllExcept,
     ArchiveRun,
+    PauseRun,
     DagUp,
     DagDown,
     DagLeft,
@@ -71,6 +74,8 @@ pub enum Command {
     TerminalZoomIn,
     TerminalZoomOut,
     TerminalZoomReset,
+    TerminalCopy,
+    TerminalPaste,
     PreviewPrevious,
     PreviewNext,
     PreviewClose,
@@ -111,6 +116,8 @@ pub enum Scope {
     Preview,
     /// While links on screen show number hints. Digits 1–9 always open a hint.
     Hints,
+    /// While a terminal has focus and no prefix is pending. Other keys go to the program.
+    Terminal,
 }
 
 impl Scope {
@@ -127,6 +134,7 @@ impl Scope {
             Self::Dag => "dag",
             Self::Preview => "preview",
             Self::Hints => "hints",
+            Self::Terminal => "terminal",
         }
     }
 }
@@ -246,7 +254,10 @@ const TABLE: &[Entry] = &[
     entry(S::Talk, "reply", C::TalkReply, &["ctrl-r"], "Reply in the selected thread"),
     entry(S::AgentTree, "end", C::EndWorker, &["ctrl-x"], "End the selected worker's terminal session"),
     entry(S::Runs, "show_finished", C::ToggleFinished, &["ctrl-f"], "Show or hide completed and archived runs"),
+    entry(S::AgentTree, "pause", C::PauseAgent, &["ctrl-z"], "Pause or resume the selected agent's processes"),
+    entry(S::AgentTree, "pause_all_except", C::PauseAllExcept, &["ctrl-shift-z"], "Emergency: pause every other agent, keeping the selected one and this terminal's agent running"),
     entry(S::Runs, "archive", C::ArchiveRun, &["ctrl-x"], "Archive or unarchive the selected run"),
+    entry(S::Runs, "pause", C::PauseRun, &["ctrl-z"], "Pause or resume the selected run's workers and dispatching"),
     entry(S::Dag, "up", C::DagUp, &["up", "k"], "Select task above"),
     entry(S::Dag, "down", C::DagDown, &["down", "j"], "Select task below"),
     entry(S::Dag, "left", C::DagLeft, &["left", "h"], "Select task to the left"),
@@ -271,6 +282,8 @@ const TABLE: &[Entry] = &[
     entry(S::Preview, "exit", C::PreviewExit, &["tab"], "Back to the terminal"),
     entry(S::Hints, "search", C::HintSearch, &["s"], "Search links and published artifacts"),
     entry(S::Hints, "cancel", C::HintCancel, &["escape"], "Hide the numbers"),
+    entry(S::Terminal, "copy", C::TerminalCopy, &["ctrl-shift-c"], "Copy the selection"),
+    entry(S::Terminal, "paste", C::TerminalPaste, &["ctrl-shift-v"], "Paste, bracketed if the program asks"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -528,6 +541,7 @@ impl Keymap {
                 Scope::Runs => format!("In the run picker: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
+                Scope::Terminal => format!("In the terminal: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
                     format!("{hints} {keys}")
                 }
@@ -572,6 +586,38 @@ mod tests {
         ] {
             assert_eq!(keymap.command(Scope::Preview, &stroke(key)), Some(command));
         }
+    }
+
+    #[test]
+    fn terminal_copy_and_paste_are_commands() {
+        let keymap = Keymap::default();
+        assert_eq!(
+            keymap.command(Scope::Terminal, &stroke("ctrl-shift-c")),
+            Some(C::TerminalCopy)
+        );
+        assert_eq!(
+            keymap.command(Scope::Terminal, &stroke("ctrl-shift-v")),
+            Some(C::TerminalPaste)
+        );
+        // Plain Ctrl+C and Ctrl+V stay with the program.
+        assert_eq!(keymap.command(Scope::Terminal, &stroke("ctrl-c")), None);
+        assert_eq!(keymap.command(Scope::Terminal, &stroke("ctrl-v")), None);
+        let help = keymap.help();
+        assert!(
+            help.iter()
+                .any(|shortcut| shortcut.description == "Copy the selection"
+                    && shortcut.binding == "In the terminal: Ctrl+Shift+C")
+        );
+        let custom =
+            Keymap::from_config(&json!({ "terminal": { "paste": "shift-insert" } })).unwrap();
+        assert_eq!(
+            custom.command(Scope::Terminal, &stroke("shift-insert")),
+            Some(C::TerminalPaste)
+        );
+        assert_eq!(
+            custom.command(Scope::Terminal, &stroke("ctrl-shift-v")),
+            None
+        );
     }
 
     #[test]
@@ -625,6 +671,9 @@ mod tests {
             (Scope::AgentTree, "ctrl-x", C::EndWorker),
             (Scope::Runs, "ctrl-f", C::ToggleFinished),
             (Scope::Runs, "ctrl-x", C::ArchiveRun),
+            (Scope::AgentTree, "ctrl-z", C::PauseAgent),
+            (Scope::AgentTree, "ctrl-shift-z", C::PauseAllExcept),
+            (Scope::Runs, "ctrl-z", C::PauseRun),
             (Scope::Runs, "enter", C::PickerSelect),
             (Scope::Dag, "up", C::DagUp),
             (Scope::Dag, "k", C::DagUp),

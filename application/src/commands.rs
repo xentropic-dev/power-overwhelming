@@ -118,13 +118,50 @@ impl<T: TerminalRuntime> Application<T> {
         Ok(session)
     }
 
-    /// Ends a session and forgets it, so it is not restored after a restart.
+    /// Starts ending a session's processes without forgetting its record or its
+    /// place in the session list, so it never waits on the session store or on a
+    /// launch that holds the session list across a store write.
+    pub fn stop_terminal(&self, terminal: &T::Handle) -> Result<()> {
+        if !self.runtime.is_running(terminal) {
+            return Ok(());
+        }
+        self.runtime.end(terminal.clone())
+    }
+
+    /// Pauses or resumes every process of a running session.
+    pub fn set_session_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let terminal = self.terminal(id)?;
+        ensure!(
+            self.runtime.is_running(&terminal),
+            "Terminal session has exited"
+        );
+        self.runtime.pause(&terminal, paused)
+    }
+
+    /// Ends a session and forgets it, so it is not restored after a restart. The
+    /// session ends even when forgetting its record fails, and a retry forgets the
+    /// record of a session whose terminal is already gone.
     pub fn end_session(&self, id: &str) -> Result<()> {
         let live = self.sessions.lock().unwrap().remove(id);
-        // Remove the record even when the terminal is already gone.
-        self.records.remove(id)?;
-        self.runtime
-            .end(live.context("Terminal session is unavailable")?.terminal)
+        let ended = live
+            .context("Terminal session is unavailable")
+            .and_then(|live| self.runtime.end(live.terminal));
+        let forgotten = self
+            .records
+            .remove(id)
+            .context("Could not forget the ended session");
+        // A record that could not be forgotten is what a retry must fix.
+        forgotten.and(ended)
+    }
+
+    /// Starts ending a session's processes and keeps its record, so a restart can
+    /// still find and reclaim what runs of it until its exit is confirmed. Returns
+    /// false when no live terminal holds the session any more.
+    pub fn stop_session(&self, id: &str) -> Result<bool> {
+        let Some(live) = self.sessions.lock().unwrap().remove(id) else {
+            return Ok(false);
+        };
+        self.runtime.end(live.terminal).map(|()| true)
     }
 
     /// Saves the foreground state a restore resumes from.

@@ -14,6 +14,24 @@ pub struct RestoredSession {
     pub prompted: bool,
 }
 
+/// What `restore_sessions_deferring` did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Restore {
+    pub restored: Vec<RestoredSession>,
+    /// Sessions left unrestored because what an earlier daemon left of them still runs.
+    pub deferred: Vec<String>,
+}
+
+/// What the caller of `restore_sessions_with` wants for one saved session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RestoreChoice {
+    /// Relaunch it. A coding agent that resumes its conversation also receives this
+    /// continuation prompt, passed the way a launch passes the initial prompt.
+    Resume(Option<String>),
+    /// Forget the record without relaunching. The reason is logged.
+    Forget(&'static str),
+}
+
 /// What to do with one saved session on daemon start.
 enum Plan {
     Launch(SessionOptions),
@@ -27,22 +45,57 @@ impl<T: TerminalRuntime> Application<T> {
     /// restart can retry it, or the user can close its tab to forget it.
     pub fn restore_sessions(&self) -> Result<Vec<String>> {
         Ok(self
-            .restore_sessions_with(|_| None)?
+            .restore_sessions_with(|_| RestoreChoice::Resume(None))?
             .into_iter()
             .map(|restored| restored.id)
             .collect())
     }
 
-    /// Restores like `restore_sessions`. A coding agent that resumes its conversation
-    /// also receives the prompt `continuation` returns for its session ID, passed the
-    /// way a launch passes the initial prompt. A fresh fallback start never receives it.
+    /// Restores like `restore_sessions`, asking `choose` about each session ID first.
+    /// A forgotten session is never relaunched. A fresh fallback start never receives
+    /// the continuation prompt.
     pub fn restore_sessions_with(
         &self,
-        continuation: impl Fn(&str) -> Option<String>,
+        choose: impl Fn(&str) -> RestoreChoice,
     ) -> Result<Vec<RestoredSession>> {
+        Ok(self.restore_sessions_deferring(choose)?.restored)
+    }
+
+    /// Restores like `restore_sessions_with`, and also returns the sessions whose
+    /// earlier processes could not all be ended. Those keep their records and are
+    /// neither relaunched nor forgotten, so a replacement never runs beside them. A
+    /// later `reclaim` that succeeds lets them go.
+    pub fn restore_sessions_deferring(
+        &self,
+        choose: impl Fn(&str) -> RestoreChoice,
+    ) -> Result<Restore> {
         let mut restored = Vec::new();
+        let mut deferred = Vec::new();
         for record in self.records.list()? {
-            let options = match self.restore_plan(&record, &continuation) {
+            // Anything an earlier daemon left of the session ends first, whether it
+            // is relaunched or forgotten, so a finished worker's teardown that the
+            // restart interrupted still completes.
+            let reclaimed = self.runtime.reclaim(&record.id);
+            if let Err(error) = &reclaimed {
+                eprintln!(
+                    "Could not end what an earlier daemon left of session {}. {error:#}",
+                    record.id
+                );
+            }
+            if reclaimed.is_err() {
+                // The record is how a later start or retry finds what still runs.
+                eprintln!(
+                    "Keeping session {} unrestored until what still runs of it ends.",
+                    record.id
+                );
+                deferred.push(record.id);
+                continue;
+            }
+            let plan = match choose(&record.id) {
+                RestoreChoice::Resume(continuation) => self.restore_plan(&record, continuation),
+                RestoreChoice::Forget(reason) => Ok(Plan::Drop(reason)),
+            };
+            let options = match plan {
                 Ok(Plan::Launch(options)) => options,
                 Ok(Plan::Drop(reason)) => {
                     eprintln!("Not restoring session {}: {reason}.", record.id);
@@ -70,14 +123,10 @@ impl<T: TerminalRuntime> Application<T> {
                 Err(error) => eprintln!("Could not restore session {}. {error:#}", record.id),
             }
         }
-        Ok(restored)
+        Ok(Restore { restored, deferred })
     }
 
-    fn restore_plan(
-        &self,
-        record: &SessionRecord,
-        continuation: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<Plan> {
+    fn restore_plan(&self, record: &SessionRecord, continuation: Option<String>) -> Result<Plan> {
         if !record.worktree.is_dir() {
             return Ok(Plan::Drop("its worktree no longer exists"));
         }
@@ -101,7 +150,7 @@ impl<T: TerminalRuntime> Application<T> {
                     fresh.extend(args.iter().cloned());
                     options.args = resume;
                     options.fallback_args = Some(fresh);
-                    options.initial_prompt = continuation(&record.id).map(Into::into);
+                    options.initial_prompt = continuation.map(Into::into);
                 }
                 options.args.extend(args);
             }
@@ -155,6 +204,7 @@ fn restart_args(
 
 #[cfg(test)]
 mod tests {
+    use super::RestoreChoice;
     use crate::{
         Application, ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact,
         ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession, TerminalRuntime,
@@ -521,7 +571,7 @@ mod tests {
         store.save(&worker)?;
         let (application, starts) = app(store);
 
-        application.restore_sessions_with(|_| Some("continue".into()))?;
+        application.restore_sessions_with(|_| RestoreChoice::Resume(Some("continue".into())))?;
 
         let starts = starts.0.lock().unwrap();
         let (_, options) = &starts[0];
@@ -555,8 +605,9 @@ mod tests {
         }
         let (application, starts) = app(store.clone());
 
-        let restored = application
-            .restore_sessions_with(|id| (id != "idle").then(|| format!("continue {id}")))?;
+        let restored = application.restore_sessions_with(|id| {
+            RestoreChoice::Resume((id != "idle").then(|| format!("continue {id}")))
+        })?;
 
         let prompted: Vec<_> = restored
             .iter()
@@ -587,6 +638,32 @@ mod tests {
             !format!("{:?}", store.list()?).contains("continue"),
             "the continuation prompt must never be persisted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn restore_forgets_sessions_the_caller_rejects_without_launching_them() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        for id in ["finished", "active"] {
+            store.save(&record(id, root, coding("claude"), &[]))?;
+        }
+        let (application, starts) = app(store.clone());
+
+        let restored = application.restore_sessions_with(|id| match id {
+            "finished" => RestoreChoice::Forget("its attempt finished"),
+            _ => RestoreChoice::Resume(None),
+        })?;
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, "active");
+        let starts = starts.0.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].0.id, "active");
+        let kept: Vec<_> = store.list()?.into_iter().map(|record| record.id).collect();
+        assert_eq!(kept, ["active"]);
+        assert!(application.terminal("finished").is_err());
         Ok(())
     }
 

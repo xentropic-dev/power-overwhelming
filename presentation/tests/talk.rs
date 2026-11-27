@@ -58,6 +58,37 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        // Ends whatever this daemon's workers left in their own slice.
+        if let Some(slice) = SLICES.lock().unwrap().remove(&self.0.id()) {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", &slice])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Each daemon's private worker slice, by daemon PID, so its scopes stay out of
+/// `app-power.slice` and are stopped with it.
+static SLICES: std::sync::Mutex<std::collections::BTreeMap<u32, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A worker slice named after the fixture's root, apart from every other test's.
+fn test_slice(root: &Path) -> String {
+    let name: String = root
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("app-powertalk{name}.slice")
+}
+
+impl Daemon {
+    /// Starts `command`, a `power daemon`, and remembers its slice for teardown.
+    fn spawn(command: &mut Command, root: &Path) -> Child {
+        let child = command.spawn().unwrap();
+        SLICES.lock().unwrap().insert(child.id(), test_slice(root));
+        child
     }
 }
 
@@ -288,6 +319,7 @@ fn power(path: &Path, caller: Option<&ManagedAgent>) -> Command {
         .env("XDG_CONFIG_HOME", path.join("config"))
         .env("SHELL", "/bin/sh")
         .env("TALK_TEST_ROOT", path)
+        .env("POWER_WORKER_SLICE", test_slice(path))
         .env_remove("POWER_BIN")
         .env_remove("POWER_PLUGIN_DIR");
     for env in [
@@ -307,13 +339,10 @@ fn power(path: &Path, caller: Option<&ManagedAgent>) -> Command {
 }
 
 fn start(path: &Path) -> Daemon {
-    let mut daemon = Daemon(
-        power(path, None)
-            .arg("daemon")
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut daemon = Daemon(Daemon::spawn(
+        power(path, None).arg("daemon").stdin(Stdio::null()),
+        path,
+    ));
     poll("test daemon socket", || {
         assert!(daemon.0.try_wait().unwrap().is_none(), "Test daemon exited");
         UnixStream::connect(path.join("power.sock")).ok()
@@ -1195,14 +1224,13 @@ fn a_turn_end_reported_while_the_daemon_still_restores_clears_the_hold() {
     // then stays open as if a later session were still restoring, while this worker
     // finishes the continuation turn and reports its end.
     let mut daemon = power(&path, None);
-    sandbox.daemon = Some(Daemon(
+    sandbox.daemon = Some(Daemon(Daemon::spawn(
         daemon
             .env("POWER_TEST_RESTORE_DELAY_MS", "1500")
             .arg("daemon")
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    ));
+            .stdin(Stdio::null()),
+        &path,
+    )));
     poll("restored worker's continuation turn", || {
         (file(&path, "turn-b").lines().count() == 2 && path.join("ready-b").exists()).then_some(())
     });
@@ -1324,6 +1352,82 @@ fn peers_message_agents_and_runs_in_other_boxes_and_coordinators_keep_the_log() 
         path.join("ready-remote-coordinator").exists().then_some(())
     });
     assert_eq!(log(&coordinator).len(), 20);
+}
+
+#[test]
+fn a_coding_agent_in_a_shell_tab_is_never_paused_or_stopped_with_the_shell_and_its_jobs() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let recipient = sandbox.launch("b", BOX);
+    let shell = success(
+        power(path, None)
+            .args(["session", "start", "shell"])
+            .arg(path.join("a"))
+            .output()
+            .unwrap(),
+    );
+    let shell = shell.trim().to_owned();
+    // A background job of the shell, then the coding agent in its foreground. The job
+    // shares the shell's session but is not the agent's descendant.
+    let job = format!(
+        "sleep 600 & echo $! > {}\r",
+        path.join("sibling.pid").display()
+    );
+    type_into(path, &shell, job.as_bytes());
+    let sibling: String = poll("sibling job", || {
+        let pid = file(path, "sibling.pid").trim().to_owned();
+        (!pid.is_empty()).then_some(pid)
+    });
+    let line = format!("{} {}\r", path.join("sender.sh").display(), recipient.id);
+    type_into(path, &shell, line.as_bytes());
+    poll("sender launch", || {
+        path.join("launched").exists().then_some(())
+    });
+    let sent: Value = serde_json::from_str(&file(path, "sent-launch.json")).unwrap();
+    let agent = sent["messages"][0]["sender"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stopped = || {
+        fs::read_to_string(format!("/proc/{sibling}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next())
+            == Some('T')
+    };
+
+    for args in [
+        vec!["agent", "pause", agent.as_str()],
+        vec!["agent", "stop", agent.as_str(), "--box", BOX],
+    ] {
+        let refused = power(path, None).args(&args).output().unwrap();
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("foreground"),
+            "{refused:?}"
+        );
+    }
+    // The emergency pause skips it too.
+    success(
+        power(path, Some(&recipient))
+            .args(["agent", "pause", "--all-except"])
+            .output()
+            .unwrap(),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert!(!stopped(), "the shell's sibling job was paused");
+    assert!(
+        fs::metadata(format!("/proc/{sibling}")).is_ok(),
+        "the shell's sibling job was ended"
+    );
+    let sessions = success(
+        power(path, None)
+            .args(["session", "list"])
+            .output()
+            .unwrap(),
+    );
+    assert!(sessions.contains(&shell), "{sessions}");
+    let _ = Command::new("kill").arg(&sibling).status();
+    fs::write(path.join("release-sender"), "").unwrap();
 }
 
 #[test]

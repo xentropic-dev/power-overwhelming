@@ -445,7 +445,7 @@ fn rasterizer_glyph_x(cell_width: f32, face_width: f32, coretext: bool) -> f32 {
 mod tests {
     use super::*;
 
-    const JETBRAINS_MONO: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Variable.ttf");
+    const JETBRAINS_MONO: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
 
     fn jetbrains_mono() -> FaceMetrics {
         FaceMetrics::from_face(&ttf_parser::Face::parse(JETBRAINS_MONO, 0).unwrap())

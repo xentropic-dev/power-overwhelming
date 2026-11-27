@@ -18,6 +18,7 @@ fn agent(id: &str, box_id: &str, task: Option<&str>, status: AgentStatus) -> Man
         } else {
             AgentState::Running
         },
+        paused: false,
         status,
         label: id.into(),
         created_at: 0,

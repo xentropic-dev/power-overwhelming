@@ -13,7 +13,9 @@ use crate::{
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
     talk_dialog::{TalkDialog, Target as TalkTarget},
-    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView, load_bundled_fonts},
+    terminal::{
+        AgentChanged, BarContextChanged, InputHold, OpenLink, TerminalView, load_bundled_fonts,
+    },
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
@@ -103,26 +105,28 @@ enum EndWorker {
     NoSession,
     /// The worker is still busy; the next press of the key ends it.
     Confirm(String),
-    End(String),
+    /// Stop this agent through `DagRequest::StopAgent`, the guarded use case behind
+    /// `power agent stop`, never by ending its session, which may be a shell's.
+    Stop(String),
 }
 
 /// A still-working worker needs a second press, so a stray key never cuts it off.
 fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndWorker {
-    let Some(session) = agent.session.clone() else {
+    if agent.session.is_none() {
         return EndWorker::NoSession;
-    };
+    }
     if armed == Some(agent.id.as_str()) {
-        return EndWorker::End(session);
+        return EndWorker::Stop(agent.id.clone());
     }
     match agent.status {
-        AgentStatus::Working | AgentStatus::NeedsInput => EndWorker::Confirm(format!(
-            "Worker is still working — press {key} again to end it."
-        )),
+        AgentStatus::Working | AgentStatus::Paused | AgentStatus::NeedsInput => EndWorker::Confirm(
+            format!("Worker is still working — press {key} again to end it."),
+        ),
         // Idle agents are interactive sessions such as coordinators, not finished workers.
         AgentStatus::Idle => EndWorker::Confirm(format!(
             "This agent has no task and may be in use — press {key} again to end its session."
         )),
-        _ => EndWorker::End(session),
+        _ => EndWorker::Stop(agent.id.clone()),
     }
 }
 
@@ -270,11 +274,14 @@ struct Workspace {
     preview_focus: FocusHandle,
     /// The terminal showing numbered link hints, if any.
     hinting: Option<Entity<TerminalView>>,
+    /// Set while a prefix is pending or hints are up, so terminals drop input-method text.
+    input_hold: InputHold,
     _bar_config: Subscription,
 }
 
 pub fn run() {
     Application::new().run(|cx| {
+        crate::terminal::bench::start();
         load_bundled_fonts(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -382,6 +389,7 @@ impl Workspace {
             launching: false,
             focus,
             prefix: None,
+            input_hold: InputHold::default(),
             picker: None,
             dag: None,
             dag_refresh,
@@ -681,10 +689,23 @@ impl Workspace {
             cx.notify();
         });
         self.hinting = Some(tab.view.clone());
+        self.sync_input_hold();
+    }
+
+    fn set_prefix(&mut self, prefix: Option<Prefix>) {
+        self.prefix = prefix;
+        self.sync_input_hold();
+    }
+
+    /// Power reads the keyboard while a prefix is pending or hints are up.
+    fn sync_input_hold(&self) {
+        self.input_hold
+            .set(self.prefix.is_some() || self.hinting.is_some());
     }
 
     fn end_hints(&mut self, cx: &mut Context<Self>) -> Option<Entity<TerminalView>> {
         let view = self.hinting.take()?;
+        self.sync_input_hold();
         view.update(cx, |view, cx| {
             view.clear_hints();
             cx.notify();
@@ -1186,7 +1207,8 @@ impl Workspace {
         };
         let scheme = cx.global::<DesktopScheme>().0;
         let settings = self.zoomed_terminal_settings();
-        let view = cx.new(|cx| TerminalView::new(session, scheme, settings, window, cx));
+        let hold = self.input_hold.clone();
+        let view = cx.new(|cx| TerminalView::new(session, scheme, settings, hold, window, cx));
         let links = cx.subscribe_in(&view, window, |app, source, link: &OpenLink, window, cx| {
             let id = source.read(cx).session.id.clone();
             app.resolve(id, link.0.clone(), false, window, cx);
@@ -1417,7 +1439,7 @@ impl Workspace {
         let id = self.next_id();
         let focus = cx.focus_handle();
         focus.focus(window);
-        self.prefix = None;
+        self.set_prefix(None);
         self.dag = None;
         self.picker = Some(Picker::new(id, kind, focus, rows));
         cx.notify();
@@ -1773,7 +1795,116 @@ impl Workspace {
         let _ = self.talk_refresh.try_send(());
     }
 
-    /// Ends the agent tree's selected worker through the same path as ending its tab.
+    /// Pauses the agent tree's selected agent, or resumes it when it is paused.
+    fn toggle_selected_pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let Some(Choice::Agent(id)) = picker.selection() else {
+            return;
+        };
+        let Kind::Agents { tree, .. } = &picker.kind else {
+            return;
+        };
+        let Some(agent) = tree.agent(&id) else {
+            return;
+        };
+        let paused = !agent.paused;
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::set_agent_paused(id, paused) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                let action = if paused { "pause" } else { "resume" };
+                picker.message = result
+                    .err()
+                    .map(|error| format!("Could not {action} agent. {error:#}"));
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The emergency stop: pauses every running agent except the selected one and the
+    /// agent of the active terminal, through the same use case as
+    /// `power agent pause --all-except`.
+    fn pause_all_except_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let caller = self.active_view();
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let keep = match picker.selection() {
+            Some(Choice::Agent(id)) => vec![id],
+            _ => Vec::new(),
+        };
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::pause_all_except(keep, caller) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                picker.message = Some(match result {
+                    Ok(paused) => format!(
+                        "Paused {} agent{}.",
+                        paused.len(),
+                        if paused.len() == 1 { "" } else { "s" }
+                    ),
+                    Err(error) => format!("Could not pause agents. {error:#}"),
+                });
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_run_pause(
+        &mut self,
+        picker: u64,
+        run: String,
+        paused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            if paused {
+                client::resume_run(run)
+            } else {
+                client::pause_run(run)
+            }
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker) else {
+                    return;
+                };
+                let action = if paused { "resume" } else { "pause" };
+                picker.run_notice = result
+                    .err()
+                    .map(|error| format!("Could not {action} run. {error:#}"));
+                picker.message = picker.run_notice.clone();
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Stops the agent tree's selected worker through the same guarded use case as
+    /// `power agent stop`, so it never ends a shell session the agent only runs in.
     fn end_selected_worker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.keymap.first(Scope::AgentTree, Command::EndWorker);
         let Some(picker) = &mut self.picker else {
@@ -1790,7 +1921,7 @@ impl Workspace {
         };
         let step = end_worker_step(agent, picker.armed_end.as_deref(), &key);
         picker.armed_end = None;
-        let session = match step {
+        let agent = match step {
             EndWorker::NoSession => {
                 self.show_error("This worker has no terminal session.", cx);
                 return;
@@ -1801,10 +1932,43 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-            EndWorker::End(session) => session,
+            EndWorker::Stop(agent) => agent,
         };
         picker.message = None;
-        self.end_session(session, window, cx);
+        let picker_id = picker.id;
+        let session = tree.agent(&id).and_then(|agent| agent.session.clone());
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::stop_agent(agent) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                // A stopped session is forgotten by the daemon and cannot be reattached,
+                // so its tab and saved view go with it, as when a tab's session ends.
+                if result.is_ok()
+                    && let Some(session) = &session
+                {
+                    this.terminals.remove(session);
+                    this.sessions.remove(session);
+                    for entry in &mut this.layout.boxes {
+                        if let Some(index) =
+                            entry.views.iter().position(|view| &view.session == session)
+                        {
+                            entry.remove_view(index);
+                        }
+                    }
+                    this.save();
+                }
+                let _ = this.dag_refresh.try_send(());
+                if let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id) {
+                    picker.message = result
+                        .err()
+                        .map(|error| format!("Could not stop agent. {error:#}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_worker(
@@ -2541,6 +2705,26 @@ impl Workspace {
                         self.end_selected_worker(window, cx);
                     }
                 }
+                Some(Command::PauseAgent) => {
+                    if !event.is_held && !picker.waiting {
+                        self.toggle_selected_pause(window, cx);
+                    }
+                }
+                Some(Command::PauseAllExcept) => {
+                    if !event.is_held && !picker.waiting {
+                        self.pause_all_except_selected(window, cx);
+                    }
+                }
+                Some(Command::PauseRun) => {
+                    if !event.is_held
+                        && !picker.waiting
+                        && let Some(run) = picker.selected_run()
+                    {
+                        let (picker_id, run, paused) =
+                            (picker.id, run.id.clone(), run.paused_at.is_some());
+                        self.toggle_run_pause(picker_id, run, paused, window, cx);
+                    }
+                }
                 Some(Command::ArchiveRun) => {
                     if !picker.waiting
                         && let Some(run) = picker.selected_run()
@@ -2581,12 +2765,12 @@ impl Workspace {
         };
         if let Some(incoming) = incoming {
             if !event.is_held && self.prefix == Some(incoming) {
-                self.prefix = None;
+                self.set_prefix(None);
                 cx.notify();
                 return;
             }
             if !event.is_held {
-                self.prefix = Some(incoming);
+                self.set_prefix(Some(incoming));
                 cx.notify();
             }
             cx.stop_propagation();
@@ -2601,9 +2785,24 @@ impl Workspace {
             return;
         }
 
-        let Some(prefix) = self.prefix.take() else {
+        if self.prefix.is_none()
+            && let Some(command) = self.keymap.command(Scope::Terminal, stroke)
+            && let Some(tab) = self.active_view().and_then(|id| self.terminals.get(&id))
+            && tab.view.read(cx).focus.is_focused(window)
+        {
+            cx.stop_propagation();
+            tab.view.update(cx, |view, cx| match command {
+                Command::TerminalCopy if !event.is_held => view.copy(cx),
+                Command::TerminalPaste => view.paste(cx),
+                _ => {}
+            });
+            return;
+        }
+
+        let Some(prefix) = self.prefix else {
             return;
         };
+        self.set_prefix(None);
         cx.stop_propagation();
         cx.notify();
         if event.is_held {
@@ -3041,6 +3240,7 @@ fn attention_fill(colors: &Colors, strength: u32) -> u32 {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::terminal::bench::count(&crate::terminal::bench::WINDOW);
         let colors = colors(cx);
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
@@ -3332,6 +3532,7 @@ mod tests {
             task: None,
             attempt: None,
             state: AgentState::Running,
+            paused: false,
             status: AgentStatus::Working,
             label: "worker".into(),
             created_at: 0,
@@ -3341,7 +3542,7 @@ mod tests {
             EndWorker::NoSession
         );
         agent.session = Some("session".into());
-        let end = EndWorker::End("session".into());
+        let end = EndWorker::Stop("worker".into());
         for status in [AgentStatus::Working, AgentStatus::NeedsInput] {
             agent.status = status;
             assert_eq!(
@@ -3398,6 +3599,7 @@ mod tests {
             },
             created_at: 0,
             archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         };
         assert_eq!(running_progress(&run), None);

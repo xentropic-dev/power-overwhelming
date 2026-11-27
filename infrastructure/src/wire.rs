@@ -263,6 +263,198 @@ fn connect_to(path: &std::path::Path, patience: std::time::Duration) -> Result<U
     }
 }
 
+fn peer_credentials(socket: &UnixStream) -> Result<libc::ucred> {
+    use std::os::fd::AsRawFd as _;
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Linux supplies the credentials of the process that connected to, or listened on,
+    // this socket.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    anyhow::ensure!(
+        length as usize == std::mem::size_of::<libc::ucred>(),
+        "Missing peer credentials"
+    );
+    Ok(unsafe { credentials.assume_init() })
+}
+
+/// The PID of the process on the other end of a connected socket. Fails when the peer
+/// has no PID in this namespace: Linux then reports 0, which `kill` would read as the
+/// caller's own process group.
+pub(crate) fn peer_pid(socket: &UnixStream) -> Result<u32> {
+    let pid = peer_credentials(socket)?.pid;
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .with_context(|| {
+            format!("The peer's PID is unknown here (got {pid}), so it cannot be identified")
+        })
+}
+
+/// A daemon process, held by a pidfd so a signal reaches only it: once it exits, its
+/// PID may be reused, but the pidfd never refers to another process.
+pub struct DaemonProcess {
+    pub pid: u32,
+    /// When it started, in clock ticks since boot.
+    started: u64,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl DaemonProcess {
+    /// The process listening at the other end of `socket`.
+    fn of_peer(socket: &UnixStream) -> Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let pid = peer_pid(socket)?;
+        // SO_PEERPIDFD (Linux 6.5) names the peer itself. Older kernels open the PID,
+        // which is checked below against the peer's credentials and start time.
+        let mut raw: libc::c_int = -1;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let peer = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&mut raw as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        let started = start_time(pid).context("Read the daemon's start time")?;
+        let pidfd = if peer == 0 && raw >= 0 {
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+        } else {
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("Open the daemon process (pid {pid})"));
+            }
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as libc::c_int) }
+        };
+        let process = Self {
+            pid,
+            started,
+            pidfd,
+        };
+        anyhow::ensure!(
+            peer_pid(socket)? == pid && process.is_same(),
+            "The daemon (pid {pid}) changed while it was being identified"
+        );
+        Ok(process)
+    }
+
+    /// Whether the PID still names the process this was opened for.
+    pub fn is_same(&self) -> bool {
+        self.alive() && start_time(self.pid).ok() == Some(self.started)
+    }
+
+    /// Whether it has not exited.
+    pub fn alive(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let mut poll = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // A pidfd turns readable once its process exits.
+        let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+        ready == 0
+    }
+
+    /// Sends `signal` to this process only. `Ok(false)` when it had already exited.
+    pub fn signal(&self, signal: libc::c_int) -> Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        Err(error).with_context(|| format!("Signal the daemon (pid {})", self.pid))
+    }
+
+    /// Asks it to exit with SIGTERM, then sends SIGKILL if it still runs after `grace`.
+    /// Signals nothing once it has exited.
+    pub fn stop(&self, grace: std::time::Duration) -> Result<()> {
+        anyhow::ensure!(
+            self.is_same(),
+            "The daemon (pid {}) is no longer the one that was checked",
+            self.pid
+        );
+        if !self.signal(libc::SIGTERM)? {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            if !self.alive() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        self.signal(libc::SIGKILL)?;
+        Ok(())
+    }
+}
+
+/// When `pid` started, in clock ticks since boot.
+fn start_time(pid: u32) -> Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let (_, tail) = stat.rsplit_once(')').context("Malformed stat")?;
+    // proc_pid_stat(5): starttime is the 20th field after the name.
+    tail.split_whitespace()
+        .nth(19)
+        .context("Malformed stat")?
+        .parse()
+        .context("Malformed stat")
+}
+
+/// What connecting to the daemon socket found.
+pub enum Probe {
+    /// Nothing listens: the socket file is missing, or refuses connections.
+    Absent,
+    /// A daemon accepted, and this is its process.
+    Listening(UnixStream, DaemonProcess),
+}
+
+/// Connects to the daemon at `path` once. Only a definite "nothing listens" is
+/// `Absent`. Any other failure, such as a permission error, is an error.
+pub fn probe(path: &std::path::Path) -> Result<Probe> {
+    use std::io::ErrorKind;
+    match UnixStream::connect(path) {
+        Ok(socket) => {
+            let process = DaemonProcess::of_peer(&socket).context("Identify the daemon")?;
+            Ok(Probe::Listening(socket, process))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(Probe::Absent)
+        }
+        Err(error) => Err(error).with_context(|| format!("Connect to {}", path.display())),
+    }
+}
+
 fn is_busy(error: &std::io::Error, path: &std::path::Path) -> bool {
     use std::io::ErrorKind;
     match error.kind() {
@@ -454,6 +646,7 @@ pub enum AgentState {
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Working,
+    Paused,
     NeedsInput,
     Done,
     Failed,
@@ -481,6 +674,9 @@ pub struct ManagedAgent {
     pub task: Option<String>,
     pub attempt: Option<String>,
     pub state: AgentState,
+    /// Whether its processes are paused.
+    #[serde(default)]
+    pub paused: bool,
     #[serde(default)]
     pub status: AgentStatus,
     /// Short label, the task title for DAG workers.
@@ -507,6 +703,8 @@ pub enum TaskState {
     /// Dispatched while the worker budget was full. Power starts it when capacity frees up.
     Queued,
     Working,
+    /// Its attempt is open and its worker is paused.
+    Paused,
     NeedsInput,
     Completed,
     Failed,
@@ -543,6 +741,12 @@ pub struct Attempt {
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Whether the attempt's worker is paused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused: bool,
+    /// Whether the attempt's worker looks stalled: idle, with no build or test running.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stalled: bool,
     /// Artifacts published from the attempt's session, in publish order, newest last.
     #[serde(default)]
     pub artifacts: Vec<AttemptArtifact>,
@@ -595,6 +799,9 @@ pub struct Run {
     /// Unix seconds, while the run is archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<u64>,
+    /// Unix seconds, while the run is paused and dispatches nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<u64>,
     /// Derived by the daemon from the task states, or `archived` while archived.
     #[serde(default)]
     pub status: RunStatus,
@@ -638,10 +845,15 @@ pub enum RunEventKind {
     AttemptInterrupted,
     /// A daemon restart resumed the worker's session, and the worker was told to continue.
     AttemptResumed,
+    /// The worker has been idle past the stall threshold with nothing it started working.
+    AttemptStalled,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
     RunArchived,
     RunUnarchived,
+    /// The run's workers were paused, and it dispatches nothing until it resumes.
+    RunPaused,
+    RunResumed,
     /// A dispatch waits for the worker budget. The summary says which limit held it.
     TaskQueued,
     /// A queued dispatch could not be started. The summary has the error.
@@ -906,6 +1118,28 @@ pub enum DagRequest {
     UnarchiveRun {
         run: String,
     },
+    /// Pauses every running worker of the run and stops dispatching from it.
+    PauseRun {
+        run: String,
+    },
+    /// Resumes the run's paused workers and lets it dispatch again.
+    ResumeRun {
+        run: String,
+    },
+    /// Pauses or resumes one agent's whole process tree.
+    SetAgentPaused {
+        agent: String,
+        paused: bool,
+    },
+    /// Ends an agent's own terminal session, interrupting its open attempt.
+    StopAgent {
+        agent: String,
+    },
+    /// Pauses every running agent except `keep` and the caller's own session.
+    PauseAllExcept {
+        keep: Vec<String>,
+        caller: Option<String>,
+    },
     /// Adds tasks atomically. References may point at tasks in this batch or already in the
     /// run. Unknown references, duplicate IDs, and cycles reject the whole batch.
     AddTasks {
@@ -1137,6 +1371,7 @@ mod dag_dto {
     enum_dto!(AgentState { Running, Exited });
     enum_dto!(AgentStatus {
         Working,
+        Paused,
         NeedsInput,
         Done,
         Failed,
@@ -1149,6 +1384,7 @@ mod dag_dto {
         Ready,
         Queued,
         Working,
+        Paused,
         NeedsInput,
         Completed,
         Failed,
@@ -1179,9 +1415,12 @@ mod dag_dto {
         InputResolved,
         AttemptInterrupted,
         AttemptResumed,
+        AttemptStalled,
         StaleReport,
         RunArchived,
         RunUnarchived,
+        RunPaused,
+        RunResumed,
         TaskQueued,
         QueuedDispatchFailed,
         TaskEdited,
@@ -1207,6 +1446,7 @@ mod dag_dto {
         task,
         attempt,
         state,
+        paused,
         status,
         label,
         created_at,
@@ -1225,6 +1465,8 @@ mod dag_dto {
         detail,
         started_at,
         ended_at,
+        paused,
+        stalled,
     } lists { artifacts });
     impl From<dag::AttemptArtifact> for AttemptArtifact {
         fn from(value: dag::AttemptArtifact) -> Self {
@@ -1266,6 +1508,7 @@ mod dag_dto {
                 coordinator: value.coordinator.into(),
                 created_at: value.created_at,
                 archived_at: value.archived_at,
+                paused_at: value.paused_at,
                 tasks: value.tasks.into_iter().map(Into::into).collect(),
             }
         }
@@ -1280,6 +1523,7 @@ mod dag_dto {
                 coordinator: value.coordinator.into(),
                 created_at: value.created_at,
                 archived_at: value.archived_at,
+                paused_at: value.paused_at,
                 tasks: value.tasks.into_iter().map(Into::into).collect(),
             }
         }
@@ -1376,6 +1620,38 @@ mod connect_tests {
         });
         connect_to(&path, Duration::from_secs(5)).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_daemon_process_signals_only_while_it_is_the_one_identified() {
+        let (_dir, path) = scratch();
+        // A child listens, so the peer is a process this test may signal.
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket,sys,time;s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1]);\
+                 s.listen();time.sleep(60)",
+            ])
+            .arg(&path)
+            .spawn()
+            .unwrap();
+        while !path.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let Probe::Listening(_socket, process) = probe(&path).unwrap() else {
+            panic!("nothing listened")
+        };
+        assert_eq!(process.pid, child.id());
+        assert!(process.is_same());
+        process.stop(Duration::from_secs(5)).unwrap();
+        child.wait().unwrap();
+        // It has exited and been reaped, so its PID may name another process. Neither
+        // signal nor stop reaches anything.
+        assert!(!process.alive());
+        assert!(!process.is_same());
+        assert!(!process.signal(libc::SIGKILL).unwrap());
+        assert!(process.stop(Duration::from_secs(1)).is_err());
     }
 
     #[test]

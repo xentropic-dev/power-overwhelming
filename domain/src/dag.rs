@@ -24,6 +24,8 @@ pub enum TaskState {
     /// Dispatched while the worker budget was full. Power starts it when capacity frees up.
     Queued,
     Working,
+    /// Its attempt is open and its worker is paused.
+    Paused,
     NeedsInput,
     Completed,
     Failed,
@@ -114,6 +116,8 @@ pub enum AgentState {
 pub enum AgentStatus {
     /// Its attempt is active.
     Working,
+    /// Its processes are paused, whatever its attempt.
+    Paused,
     NeedsInput,
     /// Its attempt succeeded and its session is still alive.
     Done,
@@ -130,9 +134,10 @@ impl AgentStatus {
         matches!(self, Self::Exited | Self::Done)
     }
 
-    pub fn derive(state: AgentState, attempt: Option<AttemptState>) -> Self {
+    pub fn derive(state: AgentState, paused: bool, attempt: Option<AttemptState>) -> Self {
         match (state, attempt) {
             (AgentState::Exited, _) => Self::Exited,
+            (AgentState::Running, _) if paused => Self::Paused,
             (AgentState::Running, None) => Self::Idle,
             (AgentState::Running, Some(AttemptState::Active)) => Self::Working,
             (AgentState::Running, Some(AttemptState::NeedsInput)) => Self::NeedsInput,
@@ -146,6 +151,7 @@ impl AgentStatus {
     pub fn label(self) -> &'static str {
         match self {
             Self::Working => "working",
+            Self::Paused => "paused",
             Self::NeedsInput => "needs input",
             Self::Done => "done",
             Self::Failed => "failed",
@@ -172,7 +178,9 @@ pub struct ManagedAgent {
     pub task: Option<String>,
     pub attempt: Option<String>,
     pub state: AgentState,
-    /// Derived from `state` and the attempt's state when read; never persisted.
+    /// Its processes are paused (see `power agent pause`).
+    pub paused: bool,
+    /// Derived from `state`, `paused` and the attempt's state when read; never persisted.
     pub status: AgentStatus,
     /// Short label, the task title for DAG workers.
     pub label: String,
@@ -220,6 +228,11 @@ pub struct Attempt {
     pub detail: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
+    /// Whether the attempt's worker is paused. Derived from its agent when a run is read.
+    pub paused: bool,
+    /// Whether the attempt's worker looks stalled: idle, with no build or test running.
+    /// Derived by the daemon's stall check when a run is read; never persisted.
+    pub stalled: bool,
     /// Artifacts published from the attempt's session, in publish order, newest last.
     /// Derived from the artifact store when a run is read; never persisted with the run.
     pub artifacts: Vec<AttemptArtifact>,
@@ -276,6 +289,9 @@ pub struct Run {
     pub created_at: u64,
     /// Unix seconds, while the run is archived.
     pub archived_at: Option<u64>,
+    /// Unix seconds, while the run is paused: its workers are paused and nothing is
+    /// dispatched from it.
+    pub paused_at: Option<u64>,
     /// In insertion order.
     pub tasks: Vec<Task>,
 }
@@ -295,10 +311,16 @@ pub enum RunEventKind {
     AttemptInterrupted,
     /// A daemon restart resumed the worker's session, and the worker was told to continue.
     AttemptResumed,
+    /// The worker's agent has been idle past the stall threshold, and nothing it
+    /// started is doing work. Recorded once per idle period.
+    AttemptStalled,
     /// A report from an attempt that is no longer current. Recorded, not applied.
     StaleReport,
     RunArchived,
     RunUnarchived,
+    /// The run's workers were paused, and nothing is dispatched from it until it resumes.
+    RunPaused,
+    RunResumed,
     /// A dispatch waits for the worker budget. The summary says which limit held it.
     TaskQueued,
     /// A queued dispatch could not be started. The summary has the error.
@@ -465,6 +487,13 @@ impl Run {
             if task.queued_at.is_some() && !task.state_is_open() {
                 task.state = TaskState::Queued;
             }
+            // Paused shows over either open attempt state. The attempt keeps its own
+            // state, so a resume shows `needs-input` again for a worker still blocked.
+            if matches!(task.state, TaskState::Working | TaskState::NeedsInput)
+                && task.attempts.last().is_some_and(|attempt| attempt.paused)
+            {
+                task.state = TaskState::Paused;
+            }
         }
     }
 
@@ -495,7 +524,10 @@ impl Run {
 
 impl Task {
     fn state_is_open(&self) -> bool {
-        matches!(self.state, TaskState::Working | TaskState::NeedsInput)
+        matches!(
+            self.state,
+            TaskState::Working | TaskState::Paused | TaskState::NeedsInput
+        )
     }
 }
 
@@ -505,7 +537,11 @@ pub fn run_status(states: impl IntoIterator<Item = TaskState>) -> RunStatus {
     for state in states {
         any = true;
         match state {
-            TaskState::Ready | TaskState::Queued | TaskState::Working | TaskState::NeedsInput => {
+            TaskState::Ready
+            | TaskState::Queued
+            | TaskState::Working
+            | TaskState::Paused
+            | TaskState::NeedsInput => {
                 return RunStatus::Active;
             }
             TaskState::Completed => {}
@@ -542,7 +578,9 @@ pub fn task_edit(state: TaskState) -> TaskEdit {
     match state {
         // A queued dispatch reads the task when it starts, so it gets the edit too.
         T::Waiting | T::Ready | T::Queued | T::Failed | T::Interrupted => TaskEdit::Store,
-        T::Working | T::NeedsInput => TaskEdit::StoreAndNotify,
+        // A paused worker keeps its session. The message waits in its inbox and is
+        // the first thing it reads after the resume.
+        T::Working | T::NeedsInput | T::Paused => TaskEdit::StoreAndNotify,
         T::Completed => TaskEdit::Refused,
     }
 }
@@ -719,6 +757,7 @@ mod tests {
             task: None,
             attempt: None,
             state: AgentState::Running,
+            paused: false,
             status: AgentStatus::Working,
             label: "claude".into(),
             created_at: 0,
@@ -793,6 +832,7 @@ mod tests {
             coordinator: Coordinator::External { label: "x".into() },
             created_at: 1,
             archived_at: None,
+            paused_at: None,
             tasks: vec![Task {
                 id: "a".into(),
                 title: "a".into(),
@@ -808,6 +848,65 @@ mod tests {
         assert_eq!(run.tasks[0].state, TaskState::Queued);
         assert_eq!(run.status(), RunStatus::Active);
         assert!(!can_dispatch(TaskState::Queued, true));
+    }
+
+    #[test]
+    fn a_paused_worker_shows_paused_over_needs_input_and_needs_input_again_on_resume() {
+        let attempt = |state, paused| Attempt {
+            id: "attempt".into(),
+            number: 1,
+            agent: "agent".into(),
+            session: Some("session".into()),
+            worktree: ".".into(),
+            provider: Provider::Command,
+            model: None,
+            state,
+            summary: None,
+            blocker: Some("Which database?".into()),
+            detail: None,
+            started_at: 1,
+            ended_at: None,
+            paused,
+            stalled: false,
+            artifacts: Vec::new(),
+        };
+        let run_with = |state, paused| {
+            let mut run = Run {
+                id: "run".into(),
+                box_id: "box".into(),
+                title: "Run".into(),
+                coordinator: Coordinator::External { label: "x".into() },
+                created_at: 1,
+                archived_at: None,
+                paused_at: None,
+                tasks: vec![Task {
+                    id: "a".into(),
+                    title: "a".into(),
+                    instructions: String::new(),
+                    deps: Vec::new(),
+                    state: TaskState::Waiting,
+                    queued_at: None,
+                    current_attempt: None,
+                    attempts: vec![attempt(state, paused)],
+                }],
+            };
+            run.derive_task_states();
+            run
+        };
+        for state in [AttemptState::Active, AttemptState::NeedsInput] {
+            let paused = run_with(state, true);
+            assert_eq!(paused.tasks[0].state, TaskState::Paused, "{state:?}");
+            assert_eq!(paused.tasks[0].attempts[0].state, state);
+        }
+        let resumed = run_with(AttemptState::NeedsInput, false);
+        assert_eq!(resumed.tasks[0].state, TaskState::NeedsInput);
+        assert_eq!(
+            resumed.tasks[0].attempts[0].blocker.as_deref(),
+            Some("Which database?")
+        );
+        // A closed attempt is never shown paused.
+        let done = run_with(AttemptState::Succeeded, true);
+        assert_eq!(done.tasks[0].state, TaskState::Completed);
     }
 
     fn task(id: &str, deps: &[&str]) -> TaskSpec {
@@ -891,7 +990,7 @@ mod tests {
         for state in [T::Waiting, T::Ready, T::Queued, T::Failed, T::Interrupted] {
             assert_eq!(task_edit(state), TaskEdit::Store, "{state:?}");
         }
-        for state in [T::Working, T::NeedsInput] {
+        for state in [T::Working, T::NeedsInput, T::Paused] {
             assert_eq!(task_edit(state), TaskEdit::StoreAndNotify, "{state:?}");
         }
         assert_eq!(task_edit(T::Completed), TaskEdit::Refused);
@@ -938,6 +1037,22 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_worker_shows_paused_and_keeps_its_run_active() {
+        use AttemptState as A;
+        assert_eq!(
+            AgentStatus::derive(AgentState::Running, true, Some(A::Active)),
+            AgentStatus::Paused
+        );
+        assert_eq!(
+            AgentStatus::derive(AgentState::Exited, true, Some(A::Active)),
+            AgentStatus::Exited
+        );
+        assert_eq!(AgentStatus::Paused.label(), "paused");
+        assert!(!AgentStatus::Paused.is_finished());
+        assert_eq!(run_status([TaskState::Paused]), RunStatus::Active);
+    }
+
+    #[test]
     fn run_status_follows_task_states() {
         use RunStatus as R;
         use TaskState as T;
@@ -961,6 +1076,7 @@ mod tests {
             coordinator: Coordinator::External { label: "x".into() },
             created_at: 1,
             archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         };
         assert_eq!(run.status(), RunStatus::Active);

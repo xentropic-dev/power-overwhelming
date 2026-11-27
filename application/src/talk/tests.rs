@@ -33,6 +33,7 @@ fn agent(id: &str, status: AgentStatus) -> ManagedAgent {
         task: Some(id.into()),
         attempt: Some(id.into()),
         state: AgentState::Running,
+        paused: false,
         status,
         label: id.into(),
         created_at: 0,

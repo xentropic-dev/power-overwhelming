@@ -611,6 +611,13 @@ impl DagView {
                 let action = action.clone();
                 let origin = self.graph.positions[index].origin() * scale + offset;
                 let (label, tint) = task_style(colors, task.state);
+                let stalled = task.state == TaskState::Working
+                    && current_attempt(task).is_some_and(|attempt| {
+                        attempt.stalled
+                            && attempt.state == infrastructure::client::AttemptState::Active
+                    });
+                let label = if stalled { "Working · stalled" } else { label };
+                let tint = if stalled { colors.indexed[3] } else { tint };
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
                 let model = current_attempt(task).and_then(|attempt| attempt.model.clone());
@@ -777,6 +784,14 @@ fn details(
                 ("Result", attempt.summary.clone()),
                 ("Blocker", attempt.blocker.clone()),
                 ("Interruption", attempt.detail.clone()),
+                (
+                    "Stalled",
+                    (attempt.stalled
+                        && attempt.state == infrastructure::client::AttemptState::Active)
+                        .then(|| {
+                            "Idle with no build or test running. Check the worker.".to_string()
+                        }),
+                ),
             ]
             .into_iter()
             .filter_map(|(label, value)| Some((label, value?))),
@@ -874,6 +889,7 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
         TaskState::Ready => ("Ready", colors.indexed[6]),
         TaskState::Queued => ("Queued", colors.indexed[4]),
         TaskState::Working => ("Working", colors.accent),
+        TaskState::Paused => ("Paused", colors.indexed[4]),
         TaskState::NeedsInput => ("Needs input", colors.indexed[3]),
         TaskState::Completed => ("Completed", colors.indexed[2]),
         TaskState::Failed => ("Failed", colors.error),
@@ -907,6 +923,8 @@ mod tests {
             detail: None,
             started_at: 0,
             ended_at: None,
+            paused: false,
+            stalled: false,
             artifacts: titles
                 .iter()
                 .map(|title| AttemptArtifact {
