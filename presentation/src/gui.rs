@@ -693,6 +693,11 @@ impl Workspace {
         self.open_initial_view(window, cx);
     }
 
+    /// Names the window after the selected terminal's title, or the app when it has none.
+    fn sync_window_title(&self, window: &mut Window) {
+        window.set_window_title(&window_title(&self.layout, &self.terminal_titles));
+    }
+
     fn active_view(&self) -> Option<String> {
         self.active_box()?.active_view.clone()
     }
@@ -1422,14 +1427,7 @@ impl Workspace {
                 } else {
                     app.terminal_titles.insert(id.clone(), changed.0.clone());
                 }
-                if app.active_view().as_deref() == Some(&id) {
-                    let title = if changed.0.is_empty() {
-                        "Power Overwhelming".to_owned()
-                    } else {
-                        format!("{} — Power Overwhelming", changed.0)
-                    };
-                    window.set_window_title(&title);
-                }
+                app.sync_window_title(window);
                 cx.notify();
             },
         );
@@ -1439,6 +1437,19 @@ impl Workspace {
             cx.notify();
         });
         let notification = cx.subscribe(&view, |app, _, note: &TerminalNotification, cx| {
+            let (title, body) = (note.title.clone(), note.body.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    let title = if title.is_empty() {
+                        "Power Overwhelming"
+                    } else {
+                        &title
+                    };
+                    if let Err(error) = infrastructure::notify::desktop_notification(title, &body) {
+                        eprintln!("Could not show desktop notification. {error:#}");
+                    }
+                })
+                .detach();
             let message = if note.title.is_empty() {
                 note.body.clone()
             } else if note.body.is_empty() {
@@ -1480,6 +1491,7 @@ impl Workspace {
         if self.hinting.is_some() {
             self.end_hints(cx);
         }
+        self.sync_window_title(window);
         if let Some(talk) = &self.talk {
             talk.focus(window);
         } else if let Some(dag) = &self.dag {
@@ -1502,6 +1514,8 @@ impl Workspace {
             if let Some(tab) = self.terminals.get(&id) {
                 tab.view.read(cx).focus.focus(window);
             }
+            // Every route to a terminal (its tab, its box, a closed neighbour) lands here.
+            acknowledge_bell(&self.layout, &mut self.terminal_bells);
         } else {
             self.focus.focus(window);
         }
@@ -1620,6 +1634,7 @@ impl Workspace {
         if self.layout.active_box.is_some() {
             self.restore_focus(window, cx);
         } else {
+            self.sync_window_title(window);
             self.sync_status_bar(cx);
             self.pick_boxes(window, cx);
         }
@@ -1638,8 +1653,7 @@ impl Workspace {
                 None
             }
         };
-        if let Some(active) = selected {
-            self.terminal_bells.remove(&active);
+        if selected.is_some() {
             self.picker = None;
             self.dag = None;
             self.save();
@@ -3812,12 +3826,100 @@ fn random_seed() -> u64 {
         .finish()
 }
 
+fn window_title(layout: &Layout, titles: &HashMap<String, String>) -> String {
+    let title = layout
+        .boxes
+        .iter()
+        .find(|entry| Some(&entry.id) == layout.active_box.as_ref())
+        .and_then(|entry| entry.active_view.as_ref())
+        .and_then(|session| titles.get(session));
+    match title {
+        Some(title) => format!("{title} — Power Overwhelming"),
+        None => "Power Overwhelming".to_owned(),
+    }
+}
+
+/// The selected terminal has been seen, so its bell no longer needs attention.
+fn acknowledge_bell(layout: &Layout, bells: &mut HashSet<String>) {
+    if let Some(session) = layout
+        .boxes
+        .iter()
+        .find(|entry| Some(&entry.id) == layout.active_box.as_ref())
+        .and_then(|entry| entry.active_view.as_ref())
+    {
+        bells.remove(session);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AgentStatus, Coordinator, EndWorker, LinkAction, ManagedAgent, Run, Task, empty_message,
         end_worker_step, link_action, running_progress,
     };
+    use super::{acknowledge_bell, window_title};
+    use infrastructure::boxes::{Layout, SavedBox, SavedView};
+    use std::collections::{HashMap, HashSet};
+
+    fn saved_box(id: &str, sessions: &[&str], active: &str) -> SavedBox {
+        SavedBox {
+            id: id.into(),
+            repository: "/repo".into(),
+            checkout: "/repo".into(),
+            shortcut: Some(1),
+            views: sessions
+                .iter()
+                .map(|session| SavedView {
+                    session: (*session).into(),
+                    worktree: "/repo".into(),
+                })
+                .collect(),
+            active_view: Some(active.into()),
+            previous_view: None,
+        }
+    }
+
+    #[test]
+    fn the_window_title_follows_the_selected_terminal() {
+        let mut layout = Layout {
+            boxes: vec![saved_box("one", &["alpha", "beta"], "alpha")],
+            active_box: Some("one".into()),
+            ..Layout::default()
+        };
+        let titles = HashMap::from([
+            ("alpha".to_owned(), "Alpha".to_owned()),
+            ("beta".to_owned(), "Beta".to_owned()),
+        ]);
+        assert_eq!(window_title(&layout, &titles), "Alpha — Power Overwhelming");
+        layout.boxes[0].active_view = Some("beta".into());
+        assert_eq!(window_title(&layout, &titles), "Beta — Power Overwhelming");
+        // Back to the named first tab with no new title output.
+        layout.boxes[0].active_view = Some("alpha".into());
+        assert_eq!(window_title(&layout, &titles), "Alpha — Power Overwhelming");
+        layout.boxes[0].active_view = None;
+        assert_eq!(window_title(&layout, &titles), "Power Overwhelming");
+        layout.active_box = None;
+        assert_eq!(window_title(&layout, &titles), "Power Overwhelming");
+    }
+
+    #[test]
+    fn visiting_a_ringing_terminal_through_its_box_clears_the_bell() {
+        let mut layout = Layout {
+            boxes: vec![
+                saved_box("one", &["alpha"], "alpha"),
+                saved_box("two", &["beta", "gamma"], "gamma"),
+            ],
+            active_box: Some("one".into()),
+            ..Layout::default()
+        };
+        let mut bells = HashSet::from(["gamma".to_owned(), "beta".to_owned()]);
+        acknowledge_bell(&layout, &mut bells);
+        assert_eq!(bells.len(), 2);
+        // Opening box two restores its saved terminal without going through its tab.
+        layout.active_box = Some("two".into());
+        acknowledge_bell(&layout, &mut bells);
+        assert_eq!(bells, HashSet::from(["beta".to_owned()]));
+    }
     use domain::dag::{AgentState, Provider, TaskState};
 
     #[test]

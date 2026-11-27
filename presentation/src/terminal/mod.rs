@@ -4,6 +4,7 @@
 pub(crate) mod bench;
 mod frame;
 mod grid;
+mod hold;
 mod ime;
 mod input;
 mod keys;
@@ -168,6 +169,9 @@ pub struct TerminalView {
     status: Option<String>,
     render_held: bool,
     render_hold_generation: u64,
+    /// The frame captured inside `vt_write` when synchronized output last began.
+    held_frame: hold::Captured,
+    contrast: Rc<std::cell::Cell<f32>>,
     mouse: mouse::Encoder,
     /// Keys, input methods and focus as the program hears them.
     typing: Typing,
@@ -240,13 +244,9 @@ impl TerminalView {
         scheme
             .apply_to(&mut terminal)
             .expect("apply bundled terminal palette");
-        terminal.set_clipboard_write_policy(match settings.clipboard_write {
-            crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
-            crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
-        });
-        terminal
-            .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
-            .expect("set terminal clipboard size limit");
+        let held_frame = hold::Captured::default();
+        let contrast = Rc::new(std::cell::Cell::new(settings.minimum_contrast));
+        configure(&mut terminal, &settings, &held_frame, &contrast);
         Self {
             session,
             focus,
@@ -271,6 +271,8 @@ impl TerminalView {
             status: None,
             render_held: false,
             render_hold_generation: 0,
+            held_frame,
+            contrast,
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             typing: Typing::new(hold),
             commands,
@@ -298,10 +300,8 @@ impl TerminalView {
         self.paint_revision += 1;
         self.font = terminal_font(&settings, cx);
         self.terminal
-            .set_clipboard_write_policy(match settings.clipboard_write {
-                crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
-                crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
-            });
+            .set_clipboard_write_policy(clipboard_policy(&settings));
+        self.contrast.set(settings.minimum_contrast);
         self.settings = settings;
         if !self.exited {
             let metrics = cell_metrics(cx.text_system(), &self.font, self.grid.metrics.scale);
@@ -412,30 +412,16 @@ impl TerminalView {
                     cx.emit(TerminalTitleChanged(title));
                 }
                 VtEvent::ClipboardWrite(write) => {
-                    let total_size = write
-                        .contents
-                        .iter()
-                        .try_fold(0usize, |size, content| size.checked_add(content.data.len()));
-                    if !matches!(total_size, Some(size) if size <= MAX_CLIPBOARD_WRITE) {
-                        continue;
-                    }
-                    let Some(content) = write.contents.iter().find(|content| {
-                        content.mime.split(';').next().is_some_and(|media_type| {
-                            media_type.trim().eq_ignore_ascii_case("text/plain")
-                        })
-                    }) else {
-                        continue;
-                    };
-                    let Ok(text) = std::str::from_utf8(&content.data) else {
+                    let Some(text) = clipboard_text(&write.contents) else {
                         continue;
                     };
                     match write.location {
                         ClipboardLocation::Standard => {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
                         }
                         ClipboardLocation::Primary | ClipboardLocation::Selection => {
                             #[cfg(target_os = "linux")]
-                            cx.write_to_primary(ClipboardItem::new_string(text.to_owned()));
+                            cx.write_to_primary(ClipboardItem::new_string(text));
                             #[cfg(not(target_os = "linux"))]
                             let _ = text;
                         }
@@ -445,6 +431,13 @@ impl TerminalView {
                     cx.emit(TerminalNotification { title, body });
                 }
                 VtEvent::RenderHold(held) => {
+                    if held && let Some((renderer, frame)) = self.held_frame.borrow_mut().take() {
+                        // Show the screen as it stood when the hold began, which may be
+                        // newer than the last paint.
+                        self.renderer = renderer;
+                        self.frame = Rc::new(frame);
+                        cx.notify();
+                    }
                     self.render_held = held;
                     self.render_hold_generation = self.render_hold_generation.wrapping_add(1);
                     if held {
@@ -525,13 +518,7 @@ impl TerminalView {
     }
 
     fn configure_terminal(&self, terminal: &mut Terminal) {
-        terminal.set_clipboard_write_policy(match self.settings.clipboard_write {
-            crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
-            crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
-        });
-        terminal
-            .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
-            .expect("set terminal clipboard size limit");
+        configure(terminal, &self.settings, &self.held_frame, &self.contrast);
     }
 
     /// Records the grid's bounds, inside the padding, and resizes the PTY to the cells that
@@ -545,9 +532,119 @@ impl TerminalView {
     }
 }
 
+/// The text a clipboard write puts on the clipboard. An empty content list clears it (OSC 52
+/// with no data, as Ghostty reports and herdr-app applies). Only UTF-8 `text/plain` within
+/// the size limit is written; anything else leaves the clipboard alone.
+fn clipboard_text(contents: &[terminal::ClipboardContent]) -> Option<String> {
+    if contents.is_empty() {
+        return Some(String::new());
+    }
+    let size = contents
+        .iter()
+        .try_fold(0usize, |size, content| size.checked_add(content.data.len()))?;
+    if size > MAX_CLIPBOARD_WRITE {
+        return None;
+    }
+    let content = contents.iter().find(|content| {
+        content
+            .mime
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/plain"))
+    })?;
+    String::from_utf8(content.data.clone()).ok()
+}
+
+fn clipboard_policy(settings: &TerminalSettings) -> terminal::ClipboardWritePolicy {
+    match settings.clipboard_write {
+        crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
+        crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
+    }
+}
+
+fn configure(
+    terminal: &mut Terminal,
+    settings: &TerminalSettings,
+    held_frame: &hold::Captured,
+    contrast: &Rc<std::cell::Cell<f32>>,
+) {
+    terminal.set_clipboard_write_policy(clipboard_policy(settings));
+    terminal
+        .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
+        .expect("set terminal clipboard size limit");
+    hold::install(terminal, held_frame.clone(), contrast.clone());
+}
+
 #[cfg(test)]
 mod event_tests {
-    use super::shown_title;
+    use super::{MAX_CLIPBOARD_WRITE, clipboard_text, shown_title};
+    use base64::Engine;
+    use ghostty_vt::{
+        Terminal,
+        terminal::{ClipboardLocation, ClipboardWritePolicy, Event, Options},
+    };
+
+    /// What each OSC 52 write in `data` would put on the clipboard under `policy`.
+    fn clipboard(policy: ClipboardWritePolicy, data: &[u8]) -> Vec<(ClipboardLocation, String)> {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.set_clipboard_write_policy(policy);
+        terminal
+            .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
+            .unwrap();
+        terminal.vt_write(data);
+        terminal
+            .events()
+            .filter_map(|event| match event {
+                Event::ClipboardWrite(write) => {
+                    Some((write.location, clipboard_text(&write.contents)?))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn osc52(target: &str, data: &[u8]) -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+        format!("\x1b]52;{target};{encoded}\x07").into_bytes()
+    }
+
+    #[test]
+    fn osc52_writes_text_only_when_allowed() {
+        let write = osc52("c", "héllo".as_bytes());
+        assert_eq!(
+            clipboard(ClipboardWritePolicy::Allow, &write),
+            [(ClipboardLocation::Standard, "héllo".to_owned())]
+        );
+        assert!(clipboard(ClipboardWritePolicy::Deny, &write).is_empty());
+        assert_eq!(
+            clipboard(ClipboardWritePolicy::Allow, &osc52("p", b"sel")),
+            [(ClipboardLocation::Primary, "sel".to_owned())]
+        );
+    }
+
+    #[test]
+    fn osc52_with_no_data_clears_only_when_allowed() {
+        assert_eq!(
+            clipboard(ClipboardWritePolicy::Allow, b"\x1b]52;c;\x07"),
+            [(ClipboardLocation::Standard, String::new())]
+        );
+        assert!(clipboard(ClipboardWritePolicy::Deny, b"\x1b]52;c;\x07").is_empty());
+    }
+
+    #[test]
+    fn osc52_ignores_text_that_is_not_utf8() {
+        assert!(clipboard(ClipboardWritePolicy::Allow, &osc52("c", b"\xff\xfe")).is_empty());
+    }
+
+    #[test]
+    fn osc52_accepts_one_mebibyte_and_drops_anything_larger() {
+        let at_limit = vec![b'a'; MAX_CLIPBOARD_WRITE];
+        let written = clipboard(ClipboardWritePolicy::Allow, &osc52("c", &at_limit));
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].1.len(), MAX_CLIPBOARD_WRITE);
+        let over = vec![b'a'; MAX_CLIPBOARD_WRITE + 1];
+        assert!(clipboard(ClipboardWritePolicy::Allow, &osc52("c", &over)).is_empty());
+    }
 
     #[test]
     fn titles_drop_agent_spinner_frames() {
