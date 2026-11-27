@@ -238,7 +238,9 @@ pub struct Attempt {
     pub artifacts: Vec<AttemptArtifact>,
     /// Whether the dispatch named an existing worktree with `--worktree`, rather than
     /// creating or reusing a Power-managed one. A retry Power starts keeps that mode.
-    pub explicit_worktree: bool,
+    /// `None` for an attempt stored before Power recorded the mode, which a retry
+    /// treats as explicit, so it keeps the worktree the attempt ran in.
+    pub explicit_worktree: Option<bool>,
 }
 
 /// An artifact published from an attempt's session.
@@ -840,7 +842,7 @@ mod tests {
             ended_at: None,
             paused,
             stalled: false,
-            explicit_worktree: false,
+            explicit_worktree: Some(false),
             artifacts: Vec::new(),
         };
         let run_with = |state, paused| {

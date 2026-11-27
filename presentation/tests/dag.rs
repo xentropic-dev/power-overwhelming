@@ -2695,6 +2695,101 @@ fn a_restart_never_replays_command_workers_and_drains_the_queue_within_the_budge
 }
 
 #[test]
+fn a_restart_restores_coding_workers_within_the_budget_and_queues_the_rest() {
+    // Coding-agent workers are safe to relaunch, unlike a command's argv. Four persisted
+    // workers meet a budget of two: two restore, two queue, and each queued retry starts
+    // as a restored worker reports.
+    let mut fixture = Fixture::with_configure(|root| {
+        let program = root.join("fixture-agent");
+        fs::write(
+            &program,
+            "#!/bin/sh\nexec /bin/sh \"${POWER_SOCKET%/*}/worker.sh\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        write_config(
+            root,
+            &format!(
+                "dag.max_active_workers = 2\n\
+                 agents[\"fixture-agent\"] = {{ command = {:?}, injection = {{ kind = \"none\" }} }}\n",
+                program.to_str().unwrap()
+            ),
+        );
+    });
+    let run = fixture.create_run().id;
+    let ids = ["one", "two", "three", "four"];
+    let worktree = fixture.worktrees[0].clone();
+    for id in ids {
+        fixture.add_task(&run, id);
+        // Over the budget on purpose, so four workers persist across the restart.
+        dispatched(output(
+            power(fixture.root())
+                .args(["dag", "dispatch", &run, id, "--provider", "fixture-agent"])
+                .arg("--worktree")
+                .arg(&worktree)
+                .args(["--over-budget", "--"])
+                .arg(fixture.root().join("power.sock"))
+                .arg(fixture.root().join("state"))
+                .arg(&worktree)
+                .args(["success", &format!("{id}.go"), &format!("{id} done")]),
+        ));
+        fixture.wait_for_worker(&format!("{id}.go"));
+    }
+    for id in ids {
+        fs::remove_file(fixture.root().join(format!("{id}.go.started"))).unwrap();
+    }
+
+    fixture.restart();
+
+    let (restored, queued) = poll("two restored and two queued workers", || {
+        let snapshot = fixture.show(&run);
+        let with = |state| -> Vec<String> {
+            ids.iter()
+                .filter(|id| task(&snapshot, id).state == state)
+                .map(|id| (*id).to_owned())
+                .collect()
+        };
+        let (working, queued) = (with(TaskState::Working), with(TaskState::Queued));
+        (working.len() == 2 && queued.len() == 2).then_some((working, queued))
+    });
+    for id in &restored {
+        // The same attempt continues in a relaunched worker.
+        assert_eq!(task(&fixture.show(&run), id).attempts.len(), 1, "{id}");
+        fixture.wait_for_worker(&format!("{id}.go"));
+    }
+    for id in &queued {
+        let attempts = task(&fixture.show(&run), id).attempts.clone();
+        assert_eq!(attempts.len(), 1, "{id}");
+        assert_eq!(attempts[0].state, AttemptState::Interrupted, "{id}");
+    }
+    thread::sleep(Duration::from_millis(300));
+    for id in &queued {
+        assert_eq!(
+            task(&fixture.show(&run), id).state,
+            TaskState::Queued,
+            "a queued retry started over the budget"
+        );
+        assert!(!fixture.root().join(format!("{id}.go.started")).exists());
+    }
+    let kinds = fixture.events(&run, 0, &["task_queued"]).events;
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+
+    // Each report frees a slot for one queued retry.
+    for (done, next) in restored.iter().zip(&queued) {
+        fixture.release(&format!("{done}.go"));
+        fixture.wait_for_state(&run, done, TaskState::Completed);
+        let retry = fixture.wait_for_state(&run, next, TaskState::Working);
+        assert_eq!(retry.attempts.len(), 2, "{next}");
+        fixture.wait_for_worker(&format!("{next}.go"));
+    }
+    for id in &queued {
+        fixture.release(&format!("{id}.go"));
+        let done = fixture.wait_for_state(&run, id, TaskState::Completed);
+        assert_eq!(done.attempts.len(), 2, "{id}");
+    }
+}
+
+#[test]
 fn a_persisted_queued_worker_that_reports_at_once_starts_after_the_socket_listens() {
     let mut fixture = Fixture::with_configure(|root| {
         write_config(root, "dag.max_active_workers = 1\n");

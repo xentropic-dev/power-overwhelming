@@ -750,9 +750,14 @@ pub struct Attempt {
     /// Artifacts published from the attempt's session, in publish order, newest last.
     #[serde(default)]
     pub artifacts: Vec<AttemptArtifact>,
-    /// Whether the dispatch named an existing worktree with `--worktree`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub explicit_worktree: bool,
+    /// Whether the dispatch named an existing worktree with `--worktree`. Absent when
+    /// it did not, or when the attempt predates the record.
+    #[serde(default, skip_serializing_if = "not_explicit")]
+    pub explicit_worktree: Option<bool>,
+}
+
+fn not_explicit(explicit: &Option<bool>) -> bool {
+    *explicit != Some(true)
 }
 
 /// An artifact published from an attempt's session.

@@ -303,7 +303,7 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 ended_at: None,
                 paused: false,
                 stalled: false,
-                explicit_worktree: false,
+                explicit_worktree: Some(false),
                 artifacts: Vec::new(),
             },
         )

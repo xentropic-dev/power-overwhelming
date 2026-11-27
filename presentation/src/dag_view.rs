@@ -911,7 +911,7 @@ mod tests {
             ended_at: None,
             paused: false,
             stalled: false,
-            explicit_worktree: false,
+            explicit_worktree: Some(false),
             artifacts: titles
                 .iter()
                 .map(|title| AttemptArtifact {

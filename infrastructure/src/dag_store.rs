@@ -148,10 +148,10 @@ impl SqliteDagStore {
         )?;
         if !has_explicit_worktree {
             // Whether the dispatch named its worktree with `--worktree`, so a retry Power
-            // queues keeps the dispatch's worktree mode. Older attempts infer it from the
-            // managed-worktree registry, as before.
+            // queues keeps the dispatch's worktree mode. Older attempts stay NULL, since
+            // their mode is unknown, and a retry keeps the worktree they ran in.
             db.execute(
-                "ALTER TABLE attempts ADD COLUMN explicit_worktree INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE attempts ADD COLUMN explicit_worktree INTEGER",
                 [],
             )?;
         }
@@ -897,6 +897,9 @@ mod tests {
             ]) {
                 assert_eq!(attempt.provider, expected);
                 assert_eq!(attempt.model, None);
+                // Stored before the worktree mode was, so the mode is unknown rather
+                // than managed.
+                assert_eq!(attempt.explicit_worktree, None);
                 let agent = db.agent(&attempt.agent)?;
                 assert_eq!(agent.provider, expected);
                 assert_eq!(agent.model, None);
