@@ -286,14 +286,14 @@ fn relink(rows: Vec<(Rc<Row>, bool)>, terminal: &Terminal) -> Vec<Rc<Row>> {
             let prefix = if past_top {
                 wrap_prefix(terminal, width)
             } else {
-                String::new()
+                (String::new(), true)
             };
             let suffix = if past_bottom {
                 wrap_suffix(terminal, (end - 1) as u32, width)
             } else {
-                String::new()
+                (String::new(), true)
             };
-            mark_links(&mut owned, &prefix, &suffix);
+            mark_links(&mut owned, prefix, suffix);
             for (mut row, (kept, _)) in owned.into_iter().zip(group) {
                 row.index_links();
                 if row.same_links(kept) {
@@ -347,44 +347,54 @@ impl Row {
 // Bound how much scrollback a single viewport edge can add to a logical line.
 const WRAP_REACH: u32 = 32;
 
-fn wrap_prefix(terminal: &Terminal, width: u16) -> String {
+/// Scrollback text before the viewport and whether it reaches the logical line's start.
+fn wrap_prefix(terminal: &Terminal, width: u16) -> (String, bool) {
     let Some(top) = screen_y(terminal, 0) else {
-        return String::new();
+        return (String::new(), true);
     };
     let mut lines = Vec::new();
+    let mut complete = top < WRAP_REACH;
     for y in (top.saturating_sub(WRAP_REACH)..top).rev() {
         let Some((row, text)) = screen_line(terminal, y, width) else {
+            complete = true;
             break;
         };
         if !row.is_wrapped().unwrap_or(false) {
+            complete = true;
             break;
         }
         lines.push(text);
         if !row.is_wrap_continuation().unwrap_or(false) {
+            complete = true;
             break;
         }
     }
-    lines.into_iter().rev().collect()
+    (lines.into_iter().rev().collect(), complete)
 }
 
-fn wrap_suffix(terminal: &Terminal, last_visible: u32, width: u16) -> String {
+/// Text after the viewport and whether it reaches the logical line's end.
+fn wrap_suffix(terminal: &Terminal, last_visible: u32, width: u16) -> (String, bool) {
     let Some(bottom) = screen_y(terminal, last_visible) else {
-        return String::new();
+        return (String::new(), true);
     };
     let mut suffix = String::new();
+    let mut complete = false;
     for y in bottom + 1..=bottom.saturating_add(WRAP_REACH) {
         let Some((row, text)) = screen_line(terminal, y, width) else {
+            complete = true;
             break;
         };
         if !row.is_wrap_continuation().unwrap_or(false) {
+            complete = true;
             break;
         }
         suffix.push_str(&text);
         if !row.is_wrapped().unwrap_or(false) {
+            complete = true;
             break;
         }
     }
-    suffix
+    (suffix, complete)
 }
 
 fn screen_y(terminal: &Terminal, viewport_y: u32) -> Option<u32> {
@@ -682,6 +692,20 @@ mod wrap_tests {
             let frame = frame(&mut renderer, &terminal);
             assert_eq!(frame.rows[0].cells[0].link.as_deref(), Some(uri));
         }
+    }
+
+    #[test]
+    fn urls_running_past_the_scan_reach_stay_inert() {
+        let mut terminal = sized(10, 2);
+        let uri = format!("https://example.com/{}", "a".repeat(10 * 40));
+        terminal.vt_write(format!("{uri}\r\nend").as_bytes());
+        let mut renderer = RenderState::new().unwrap();
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let top = frame(&mut renderer, &terminal);
+        assert!(top.rows.iter().all(|row| row.links.is_empty()));
+        terminal.scroll_viewport(ScrollViewport::Bottom);
+        let bottom = frame(&mut renderer, &terminal);
+        assert!(bottom.rows[0].links.is_empty());
     }
 
     #[test]

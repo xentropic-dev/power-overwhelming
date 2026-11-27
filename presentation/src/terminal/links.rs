@@ -314,12 +314,32 @@ fn web_token(text: &str) -> &str {
             None
         })
         .unwrap_or(text.len());
-    &text[..end]
+    let token = &text[..end];
+    // A known link that starts right after punctuation is its own link, not part of this URL.
+    let split = token
+        .char_indices()
+        .skip(1)
+        .find(|&(index, _)| {
+            let rest = &token[index..];
+            let after_punctuation = token[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_punctuation());
+            after_punctuation
+                && (rest.starts_with("pwr://")
+                    || WEB_SCHEME.find(rest).is_some_and(|m| m.start() == 0))
+        })
+        .map_or(token.len(), |(index, _)| index);
+    &token[..split]
 }
 
 /// Detect text links along one logical line and apply them only to its visible rows.
-pub(super) fn mark_links(rows: &mut [Row], prefix: &str, suffix: &str) {
-    let mut text = String::from(prefix);
+/// Each edge carries off-screen text and whether it reaches the line's end, links that
+/// touch an incomplete edge may be truncated, so they stay inert.
+pub(super) fn mark_links(rows: &mut [Row], prefix: (String, bool), suffix: (String, bool)) {
+    let (prefix, prefix_complete) = prefix;
+    let (suffix, suffix_complete) = suffix;
+    let mut text = prefix;
     let mut spots = Vec::new();
     for (row, line) in rows.iter().enumerate() {
         for (column, cell) in line.cells.iter().enumerate() {
@@ -332,8 +352,11 @@ pub(super) fn mark_links(rows: &mut [Row], prefix: &str, suffix: &str) {
             text.push_str(&cell.text);
         }
     }
-    text.push_str(suffix);
+    text.push_str(&suffix);
     for (range, target) in links(&text) {
+        if (!prefix_complete && range.start == 0) || (!suffix_complete && range.end == text.len()) {
+            continue;
+        }
         let start = spots.partition_point(|(offset, ..)| *offset < range.start);
         let end = spots.partition_point(|(offset, ..)| *offset < range.end);
         let link: Arc<str> = Arc::from(target);
@@ -426,6 +449,16 @@ mod tests {
             links("[Read this](https://example.org/A_(topic))")[0].1,
             "https://example.org/A_(topic)"
         );
+    }
+
+    #[test]
+    fn keeps_a_dag_link_after_a_loopback_url_separate() {
+        let text = "http://localhost:3000/app;pwr://dag/build";
+        let detected: Vec<_> = links(text).into_iter().map(|(_, target)| target).collect();
+        assert_eq!(detected, ["http://localhost:3000/app", "pwr://dag/build"]);
+        let text = "https://a.test/x,https://b.test/y";
+        let detected: Vec<_> = links(text).into_iter().map(|(_, target)| target).collect();
+        assert_eq!(detected, ["https://a.test/x", "https://b.test/y"]);
     }
 
     #[test]
