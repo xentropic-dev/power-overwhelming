@@ -188,10 +188,10 @@ impl TalkReader for TalkDb<'_> {
         let runs = self
             .0
             .prepare(
-                "SELECT id, box_id, title, coordinator, created_at, archived_at,
+                "SELECT id, box_id, title, coordinator, created_at, archived_at, paused_at,
                         coordinator_session FROM runs",
             )?
-            .query_map([], |row| Ok((run_from_row(row)?, row.get(6)?)))?
+            .query_map([], |row| Ok((run_from_row(row)?, row.get(7)?)))?
             .map(|row| {
                 let (run, coordinator_session) = row?;
                 Ok(RunRef {

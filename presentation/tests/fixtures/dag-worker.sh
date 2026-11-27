@@ -89,6 +89,18 @@ case "$1" in
         report success "$3"
         exec sleep 600
         ;;
+    pausable)
+        # A parent and its child that each append a tick every tenth of a second,
+        # so a pause shows as no new ticks, until the marker reports success.
+        tick() { while :; do echo "$1" >> "$fixture_dir/$2.ticks"; sleep 0.1; done; }
+        tick child "$3" &
+        child=$!
+        printf '%s %s\n' "$$" "$child" > "$fixture_dir/$3.tmp"
+        mv "$fixture_dir/$3.tmp" "$fixture_dir/$3"
+        until test -f "$fixture_dir/$2"; do echo parent >> "$fixture_dir/$3.ticks"; sleep 0.1; done
+        report success "Ran to the end"
+        kill "$child"
+        ;;
     graced)
         # Reports success, then marks each tenth of a second it still runs.
         wait_for_marker "$2"

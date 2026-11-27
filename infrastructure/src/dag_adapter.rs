@@ -81,6 +81,18 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::ArchiveRun { run, force } => Reply::Run {
             run: application.archive_run(&run, force)?.into(),
         },
+        DagRequest::PauseRun { run } => Reply::Run {
+            run: application.pause_run(&run)?.into(),
+        },
+        DagRequest::ResumeRun { run } => Reply::Run {
+            run: application.resume_run(&run)?.into(),
+        },
+        DagRequest::SetAgentPaused { agent, paused } => Reply::Agent {
+            agent: application.set_agent_paused(&agent, paused)?.into(),
+        },
+        DagRequest::PauseAllExcept { keep, caller } => Reply::Agents {
+            agents: convert(application.pause_all_except(&keep, caller.as_deref())?),
+        },
         DagRequest::UnarchiveRun { run } => Reply::Run {
             run: application.unarchive_run(&run)?.into(),
         },

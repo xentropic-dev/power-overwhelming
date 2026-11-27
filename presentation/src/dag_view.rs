@@ -860,6 +860,7 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
         TaskState::Ready => ("Ready", colors.indexed[6]),
         TaskState::Queued => ("Queued", colors.indexed[4]),
         TaskState::Working => ("Working", colors.accent),
+        TaskState::Paused => ("Paused", colors.indexed[4]),
         TaskState::NeedsInput => ("Needs input", colors.indexed[3]),
         TaskState::Completed => ("Completed", colors.indexed[2]),
         TaskState::Failed => ("Failed", colors.error),
@@ -893,6 +894,7 @@ mod tests {
             detail: None,
             started_at: 0,
             ended_at: None,
+            paused: false,
             artifacts: titles
                 .iter()
                 .map(|title| AttemptArtifact {

@@ -49,7 +49,7 @@ impl MemoryDb {
             .filter(|attempt| attempt.agent == agent.id)
             .max_by_key(|attempt| (attempt.number, attempt.started_at))
             .map(|attempt| attempt.state);
-        agent.status = AgentStatus::derive(agent.state, attempt);
+        agent.status = AgentStatus::derive(agent.state, agent.paused, attempt);
         agent
     }
 }
@@ -318,6 +318,32 @@ impl DagTransaction for MemoryDb {
             .context("Unknown agent")?;
         agent.state = AgentState::Exited;
         agent.session = None;
+        Ok(())
+    }
+
+    fn set_agent_paused(&self, id: &str, paused: bool) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == id)
+            .context("Unknown agent")?
+            .paused = paused;
+        Ok(())
+    }
+
+    fn set_run_paused(&self, id: &str, paused_at: Option<u64>) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .runs
+            .iter_mut()
+            .find(|run| run.id == id)
+            .context("Unknown run")?
+            .paused_at = paused_at;
+        Ok(())
+    }
+
+    fn adopt_coordinated_runs(&self, _session: &str, _agent: &str) -> Result<()> {
         Ok(())
     }
 
@@ -2448,6 +2474,7 @@ fn runs_sort_active_then_stalled_then_completed_newest_first() {
         },
         created_at,
         archived_at: None,
+        paused_at: None,
         tasks: states
             .iter()
             .enumerate()
@@ -2614,6 +2641,7 @@ fn live_agents_keep_finished_ancestors_of_shown_agents() {
         task: None,
         attempt: None,
         state: AgentState::Running,
+        paused: false,
         status,
         label: id.into(),
         created_at: 0,

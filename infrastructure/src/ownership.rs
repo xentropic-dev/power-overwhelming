@@ -4,10 +4,13 @@
 
 use crate::{
     cgroup::Scope,
-    process_tree::{Pinned, ProcessTree, TreeSignal},
+    process_tree::{Pinned, ProcessTree, Sent, TreeSignal},
 };
 use std::{
-    sync::{Condvar, Mutex, MutexGuard},
+    sync::{
+        Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -77,36 +80,37 @@ impl Owner {
         }
     }
 
-    /// Pauses every process. A cgroup freezes them, which they cannot notice; the
-    /// fallback sends SIGSTOP.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pausing a worker comes with #79")
-    )]
-    pub(crate) fn pause(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Scope { scope, .. } => scope.freeze(),
-            Self::Reaper(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
-            Self::Tree(tree) => {
-                tree.signal(TreeSignal::Stop);
-                Ok(())
-            }
-        }
+    /// Pauses every process with SIGSTOP, so each shows as stopped (state T) and a
+    /// coordinator or `ps` sees it is not working. With a cgroup only the scope's
+    /// members are signalled, and the fallbacks signal only the tree they own.
+    pub(crate) fn pause(&mut self, marker: Option<&str>) -> usize {
+        self.send(TreeSignal::Stop, marker)
     }
 
-    /// Resumes a paused worker.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "resuming a worker comes with #79")
-    )]
-    pub(crate) fn resume(&mut self) -> std::io::Result<()> {
+    /// Resumes a paused worker with SIGCONT.
+    pub(crate) fn resume(&mut self, marker: Option<&str>) -> usize {
+        self.send(TreeSignal::Continue, marker)
+    }
+
+    fn send(&mut self, signal: TreeSignal, marker: Option<&str>) -> usize {
+        let number = match signal {
+            TreeSignal::Stop => libc::SIGSTOP,
+            _ => libc::SIGCONT,
+        };
         match self {
-            Self::Scope { scope, .. } => scope.thaw(),
-            Self::Reaper(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
-            Self::Tree(tree) => {
-                tree.signal(TreeSignal::Continue);
-                Ok(())
+            Self::Scope { root, scope } => {
+                // The root may still be systemd-run, outside the scope.
+                let root = usize::from(!root.exited() && root.signal(number) == Sent::Delivered);
+                root + scope.signal_all(number)
             }
+            // The reaper and everything it adopted carry the owner marker.
+            Self::Reaper(reaper) => {
+                if reaper.exited() {
+                    return 0;
+                }
+                ProcessTree::pin(reaper.pid(), marker.map(str::to_owned)).signal(signal)
+            }
+            Self::Tree(tree) => tree.signal(signal),
         }
     }
 }
@@ -136,10 +140,13 @@ fn end_reaper(reaper: &Pinned, limit: Duration) -> Result<(), String> {
 /// its processes. Its lock also serializes a teardown with a relaunch, so an end
 /// either comes first and prevents the relaunch, or comes after it and ends the
 /// relaunched process.
+/// It also carries whether the session should be paused, which the owning thread
+/// applies to whatever process tree it owns at the time, a relaunch included.
 #[derive(Default)]
 pub(crate) struct Stop {
     requested: Mutex<bool>,
     changed: Condvar,
+    paused: AtomicBool,
 }
 
 impl Stop {
@@ -148,16 +155,30 @@ impl Stop {
         self.changed.notify_all();
     }
 
+    /// Asks the owning thread to pause or resume the session's processes.
+    pub(crate) fn set_paused(&self, paused: bool) {
+        let _requested = self.requested.lock().unwrap();
+        self.paused.store(paused, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
     pub(crate) fn requested(&self) -> bool {
         *self.requested.lock().unwrap()
     }
 
-    /// Waits up to `timeout` for a request and says whether there is one.
-    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+    /// Waits up to `timeout` for an end request, or for the pause wish to differ
+    /// from `applied`, and says whether an end is requested.
+    pub(crate) fn wait(&self, timeout: Duration, applied: bool) -> bool {
         let requested = self.requested.lock().unwrap();
         *self
             .changed
-            .wait_timeout_while(requested, timeout, |requested| !*requested)
+            .wait_timeout_while(requested, timeout, |requested| {
+                !*requested && self.paused.load(Ordering::Acquire) == applied
+            })
             .unwrap()
             .0
     }
@@ -198,23 +219,58 @@ mod tests {
             assert!(Instant::now() < deadline, "the scope never started");
             thread::sleep(Duration::from_millis(20));
         }
-        let settle = |frozen: bool| {
+        let states = || -> Vec<char> {
+            check_pids(&check)
+                .iter()
+                .filter_map(|pid| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+                .filter_map(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next())
+                .collect()
+        };
+        let settle = |stopped: bool| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while check.frozen() != frozen {
-                assert!(Instant::now() < deadline, "the scope never settled");
+            loop {
+                let states = states();
+                if states.len() >= 2 && states.iter().all(|state| (*state == 'T') == stopped) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the scope never settled: {states:?}"
+                );
                 thread::sleep(Duration::from_millis(20));
             }
         };
-        owner.pause().unwrap();
+        let sleeping = || {
+            let pids = check_pids(&check);
+            pids.len() == 2
+                && pids.iter().all(|pid| {
+                    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                        .is_ok_and(|comm| comm.trim() == "sleep")
+                })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sleeping() {
+            assert!(Instant::now() < deadline, "the sleeps never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(owner.pause(None) >= 2);
         settle(true);
         assert!(!owner.root_exited());
-        owner.resume().unwrap();
+        owner.resume(None);
         settle(false);
-        owner.pause().unwrap();
+        owner.pause(None);
         settle(true);
         owner.terminate(Duration::from_millis(300)).unwrap();
         assert!(!check.populated());
         assert!(owner.root_exited());
         child.wait().unwrap();
+    }
+
+    fn check_pids(scope: &crate::cgroup::Scope) -> Vec<u32> {
+        std::fs::read_to_string(scope.path().join("cgroup.procs"))
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|pid| pid.parse().ok())
+            .collect()
     }
 }

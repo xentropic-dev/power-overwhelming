@@ -462,6 +462,30 @@ pub fn start_queued(run: String, task: String) -> Result<()> {
     }
 }
 
+/// Pauses a run's workers and stops dispatching from it.
+pub fn pause_run(run: String) -> Result<Run> {
+    match dag(DagRequest::PauseRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Resumes a paused run.
+pub fn resume_run(run: String) -> Result<Run> {
+    match dag(DagRequest::ResumeRun { run }, DAG_TIMEOUT)? {
+        DagResponse::Run { run } => Ok(run.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Pauses or resumes one agent's process tree.
+pub fn set_agent_paused(agent: String, paused: bool) -> Result<ManagedAgent> {
+    match dag(DagRequest::SetAgentPaused { agent, paused }, DAG_TIMEOUT)? {
+        DagResponse::Agent { agent } => Ok(agent.into()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
 pub fn unarchive_run(run: String) -> Result<Run> {
     match dag(DagRequest::UnarchiveRun { run }, DAG_TIMEOUT)? {
         DagResponse::Run { run } => Ok(run.into()),

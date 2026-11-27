@@ -63,6 +63,13 @@ pub trait DagTransaction: DagReader {
     /// Marks the agent exited and releases its session, so the session can host another
     /// identity. Its messages stay readable under its ID.
     fn retire_agent(&self, id: &str) -> Result<()>;
+    fn set_agent_paused(&self, id: &str, paused: bool) -> Result<()>;
+    /// Sets or clears the time the run was paused.
+    fn set_run_paused(&self, id: &str, paused_at: Option<u64>) -> Result<()>;
+    /// Makes `agent` the coordinator of every run whose coordinating agent held
+    /// `session` when the run was created, so a coordinator that registers again
+    /// under a new ID, as after a restart, still coordinates its runs.
+    fn adopt_coordinated_runs(&self, session: &str, agent: &str) -> Result<()>;
     fn set_agent_model(&self, id: &str, model: Option<&str>) -> Result<()>;
     fn insert_run(&self, run: &Run) -> Result<()>;
     /// Sets or clears the run's archive time.
@@ -617,6 +624,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 coordinator,
                 created_at: now(),
                 archived_at: None,
+                paused_at: None,
                 tasks: Vec::new(),
             };
             db.insert_run(&run)?;
@@ -646,6 +654,118 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             db.event(id, RunEventKind::RunArchived, None, None, None)?;
             run.archived_at = Some(archived_at);
             Ok(run)
+        })
+    }
+
+    /// Pauses or resumes one agent's whole process tree, and nothing outside it. This
+    /// is the one place an agent's paused state changes, so the agent tree, the DAG
+    /// view and the processes always agree. Pausing a paused agent is a no-op.
+    pub fn set_agent_paused(&self, id: &str, paused: bool) -> Result<ManagedAgent> {
+        self.write(|db| {
+            let mut agent = db.agent(id)?;
+            ensure!(
+                agent.state == AgentState::Running,
+                "Agent {id:?} has exited"
+            );
+            let session = agent
+                .session
+                .clone()
+                .with_context(|| format!("Agent {id:?} has no terminal session"))?;
+            if agent.paused == paused {
+                return Ok(agent);
+            }
+            // Inside the transaction, so a terminal that cannot pause leaves the record
+            // unchanged. The terminal only records the wish, so this never blocks.
+            self.application.set_session_paused(&session, paused)?;
+            db.set_agent_paused(id, paused)?;
+            agent = db.agent(id)?;
+            Ok(agent)
+        })
+    }
+
+    /// Pauses every running agent with a session except those in `keep` and the
+    /// caller's own, which runs this request. Returns the agents it paused.
+    pub fn pause_all_except(
+        &self,
+        keep: &[String],
+        caller: Option<&str>,
+    ) -> Result<Vec<ManagedAgent>> {
+        let agents = self.store.read(|db| db.list_agents(None))?;
+        for id in keep {
+            ensure!(
+                agents.iter().any(|agent| &agent.id == id),
+                "Unknown agent {id:?}"
+            );
+        }
+        let mut paused = Vec::new();
+        for agent in agents {
+            if agent.state != AgentState::Running
+                || agent.paused
+                || keep.contains(&agent.id)
+                || agent.session.is_none()
+                || agent.session.as_deref() == caller
+            {
+                continue;
+            }
+            match self.set_agent_paused(&agent.id, true) {
+                Ok(agent) => paused.push(agent),
+                Err(error) => eprintln!("Could not pause agent {}. {error:#}", agent.id),
+            }
+        }
+        Ok(paused)
+    }
+
+    /// Pauses every running worker of the run and stops dispatching from it, queued
+    /// dispatches included, until it resumes.
+    pub fn pause_run(&self, id: &str) -> Result<Run> {
+        self.write(|db| {
+            let run = load_run(db, id)?;
+            if run.paused_at.is_none() {
+                db.set_run_paused(id, Some(now()))?;
+                db.event(id, RunEventKind::RunPaused, None, None, None)?;
+            }
+            Ok(())
+        })?;
+        for agent in self.run_workers(id)? {
+            if !agent.paused
+                && let Err(error) = self.set_agent_paused(&agent.id, true)
+            {
+                eprintln!("Could not pause worker {}. {error:#}", agent.id);
+            }
+        }
+        self.run(id)
+    }
+
+    /// Resumes the run's paused workers and lets it dispatch again.
+    pub fn resume_run(&self, id: &str) -> Result<Run> {
+        for agent in self.run_workers(id)? {
+            if agent.paused
+                && let Err(error) = self.set_agent_paused(&agent.id, false)
+            {
+                eprintln!("Could not resume worker {}. {error:#}", agent.id);
+            }
+        }
+        self.write(|db| {
+            let run = load_run(db, id)?;
+            if run.paused_at.is_some() {
+                db.set_run_paused(id, None)?;
+                db.event(id, RunEventKind::RunResumed, None, None, None)?;
+            }
+            Ok(())
+        })?;
+        self.run(id)
+    }
+
+    /// The run's running workers that have a session.
+    fn run_workers(&self, run: &str) -> Result<Vec<ManagedAgent>> {
+        self.store.read(|db| {
+            let box_id = db.run_box(run)?;
+            Ok(db
+                .list_agents(Some(&box_id))?
+                .into_iter()
+                .filter(|agent| agent.run.as_deref() == Some(run))
+                .filter(|agent| agent.state == AgentState::Running && agent.session.is_some())
+                .collect())
         })
     }
 
@@ -817,6 +937,17 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 }));
             }
             let from_queue = claim.is_some() && command.budget == BudgetMode::Queue;
+            if run.paused_at.is_some() {
+                if from_queue {
+                    return Ok(Ok(DispatchOutcome::Queued {
+                        reason: "the run is paused".into(),
+                    }));
+                }
+                bail!(
+                    "Run {:?} is paused. Resume it with `power dag resume` first",
+                    run.id
+                );
+            }
             if from_queue && run.archived_at.is_some() {
                 // An archived run starts no workers until it is unarchived.
                 return Ok(Ok(DispatchOutcome::Queued {
@@ -1356,10 +1487,43 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .collect();
         let restored: Vec<_> = restored.into_iter().map(|session| session.id).collect();
         self.reconcile_with(&restored, &deferred, &resumed)?;
+        self.reapply_pauses(&restored)?;
         for session in deferred {
             self.schedule_reclaim(session);
         }
         Ok(restored)
+    }
+
+    /// A restored session starts running again, so an agent that was paused before
+    /// the restart is paused again, and one whose session was not restored is no
+    /// longer paused.
+    fn reapply_pauses(&self, restored: &[String]) -> Result<()> {
+        let paused: Vec<_> = self.store.read(|db| {
+            Ok(db
+                .list_agents(None)?
+                .into_iter()
+                .filter(|agent| agent.paused)
+                .collect())
+        })?;
+        for agent in paused {
+            let session = agent
+                .session
+                .as_deref()
+                .filter(|session| restored.iter().any(|id| id == session))
+                .filter(|_| agent.state == AgentState::Running);
+            let kept = session.is_some_and(|session| {
+                self.application
+                    .set_session_paused(session, true)
+                    .inspect_err(|error| {
+                        eprintln!("Could not pause restored agent {}. {error:#}", agent.id)
+                    })
+                    .is_ok()
+            });
+            if !kept {
+                self.write(|db| db.set_agent_paused(&agent.id, false))?;
+            }
+        }
+        Ok(())
     }
 
     /// Interrupts attempts and stops agents whose session did not survive a restart.
@@ -1589,8 +1753,9 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             session.agent.name().into(),
         );
         agent.model = model;
-        agent.session = Some(session.id);
+        agent.session = Some(session.id.clone());
         db.insert_agent(&agent)?;
+        db.adopt_coordinated_runs(&session.id, &agent.id)?;
         Ok(agent)
     }
 
@@ -1760,6 +1925,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             task: None,
             attempt: None,
             state: AgentState::Running,
+            paused: false,
             status: AgentStatus::Idle,
             created_at: now(),
         }
@@ -1790,6 +1956,7 @@ fn insert_dispatch_attempt(
         detail: None,
         started_at: agent.created_at,
         ended_at: error.map(|_| now()),
+        paused: false,
         artifacts: Vec::new(),
     };
     db.insert_agent(agent)?;

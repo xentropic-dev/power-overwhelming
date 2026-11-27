@@ -1577,6 +1577,153 @@ fn agent_end_interrupts_a_working_worker() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("No agent no-such-agent"));
 }
 
+/// The process's state letter from `/proc/<pid>/stat`, such as `S` or `T`.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+fn wait_for_states(pids: &[u32], stopped: bool) {
+    poll(&format!("{pids:?} to be stopped: {stopped}"), || {
+        pids.iter()
+            .all(|pid| process_state(*pid).is_some_and(|state| (state == 'T') == stopped))
+            .then_some(())
+    });
+}
+
+fn ticks(fixture: &Fixture, name: &str) -> usize {
+    fs::read_to_string(fixture.root().join(format!("{name}.ticks")))
+        .map_or(0, |ticks| ticks.lines().count())
+}
+
+fn agent_status(fixture: &Fixture, agent: &str) -> Value {
+    json!(
+        fixture
+            .agents()
+            .into_iter()
+            .find(|listed| listed.id == agent)
+            .unwrap()
+            .status
+    )
+}
+
+/// Pauses, resumes and stops a parent and child worker, and checks that an
+/// unrelated process is never touched, even by `--all-except`.
+fn pause_resume_and_stop(fixture: &Fixture) {
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "pause-me");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "pause-me",
+        &fixture.worktrees[0],
+        false,
+        &["pausable", "pause-go", "pause-pids"],
+    ));
+    let pids = read_pids(&fixture.root().join("pause-pids"), 2);
+    let mut bystander = Command::new("sleep").arg("600").spawn().unwrap();
+    let bystander_pid = bystander.id();
+
+    assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+    wait_for_states(&pids, true);
+    assert_eq!(agent_status(fixture, &agent.id), "paused");
+    assert_eq!(
+        task(&fixture.show(&run), "pause-me").state,
+        TaskState::Paused
+    );
+    let frozen = ticks(fixture, "pause-pids");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        ticks(fixture, "pause-pids"),
+        frozen,
+        "a paused worker kept running"
+    );
+
+    assert_success(&fixture.command(&["agent", "resume", &agent.id]));
+    wait_for_states(&pids, false);
+    assert_eq!(agent_status(fixture, &agent.id), "working");
+    poll("both processes to tick again", || {
+        let ticks = fs::read_to_string(fixture.root().join("pause-pids.ticks")).unwrap();
+        let after: Vec<_> = ticks.lines().skip(frozen).collect();
+        (after.contains(&"parent") && after.contains(&"child")).then_some(())
+    });
+
+    // Every agent but none, which pauses the worker and leaves the bystander alone.
+    assert_success(&fixture.command(&["agent", "pause", "--all-except"]));
+    wait_for_states(&pids, true);
+    assert_ne!(process_state(bystander_pid), Some('T'));
+
+    // Stop ends the paused tree cleanly and leaves the attempt retryable.
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    let interrupted = fixture.wait_for_state(&run, "pause-me", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert_eq!(interrupted.attempts[0].state, AttemptState::Interrupted);
+    wait_for_exit_after(fixture, &agent.id, &pids);
+    assert!(process_running(bystander_pid));
+    bystander.kill().unwrap();
+    bystander.wait().unwrap();
+
+    let (retried, _) = dispatched(fixture.dispatch(
+        &run,
+        "pause-me",
+        &fixture.worktrees[0],
+        true,
+        &["success", "retry-go", "Retried"],
+    ));
+    assert_eq!(retried.number, 2);
+    fixture.release("retry-go");
+    fixture.wait_for_state(&run, "pause-me", TaskState::Completed);
+}
+
+#[test]
+fn pause_resume_and_stop_act_on_the_whole_worker_tree_only() {
+    pause_resume_and_stop(&with_grace("0.5"));
+}
+
+#[test]
+fn without_cgroups_pause_resume_and_stop_act_on_the_whole_worker_tree_only() {
+    pause_resume_and_stop(&Fixture::with_configure_env(
+        |root| write_config(root, "dag.end_finished_workers_after = 0.5\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    ));
+}
+
+#[test]
+fn a_paused_run_pauses_its_workers_and_dispatches_nothing_until_it_resumes() {
+    let fixture = Fixture::new();
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "working");
+    fixture.add_task(&run, "later");
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "working",
+        &fixture.worktrees[0],
+        false,
+        &["pausable", "run-go", "run-pids"],
+    ));
+    let pids = read_pids(&fixture.root().join("run-pids"), 2);
+
+    let paused = fixture.json(&["dag", "pause", &run]);
+    assert!(paused["run"]["paused_at"].is_u64(), "{paused}");
+    wait_for_states(&pids, true);
+    assert_eq!(agent_status(&fixture, &agent.id), "paused");
+    let refused = fixture.dispatch(
+        &run,
+        "later",
+        &fixture.worktrees[1],
+        false,
+        &["success", "x", "y"],
+    );
+    assert_rejected(&refused);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("paused"));
+
+    let resumed = fixture.json(&["dag", "resume", &run]);
+    assert!(resumed["run"].get("paused_at").is_none(), "{resumed}");
+    wait_for_states(&pids, false);
+    assert_eq!(agent_status(&fixture, &agent.id), "working");
+    fixture.release("run-go");
+    fixture.wait_for_state(&run, "working", TaskState::Completed);
+}
+
 /// Whether the process runs. A zombie has exited.
 fn process_running(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {

@@ -115,9 +115,9 @@ fn end_worker_step(agent: &ManagedAgent, armed: Option<&str>, key: &str) -> EndW
         return EndWorker::End(session);
     }
     match agent.status {
-        AgentStatus::Working | AgentStatus::NeedsInput => EndWorker::Confirm(format!(
-            "Worker is still working — press {key} again to end it."
-        )),
+        AgentStatus::Working | AgentStatus::Paused | AgentStatus::NeedsInput => EndWorker::Confirm(
+            format!("Worker is still working — press {key} again to end it."),
+        ),
         // Idle agents are interactive sessions such as coordinators, not finished workers.
         AgentStatus::Idle => EndWorker::Confirm(format!(
             "This agent has no task and may be in use — press {key} again to end its session."
@@ -1773,6 +1773,76 @@ impl Workspace {
         let _ = self.talk_refresh.try_send(());
     }
 
+    /// Pauses the agent tree's selected agent, or resumes it when it is paused.
+    fn toggle_selected_pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let Some(Choice::Agent(id)) = picker.selection() else {
+            return;
+        };
+        let Kind::Agents { tree, .. } = &picker.kind else {
+            return;
+        };
+        let Some(agent) = tree.agent(&id) else {
+            return;
+        };
+        let paused = !agent.paused;
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::set_agent_paused(id, paused) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                let action = if paused { "pause" } else { "resume" };
+                picker.message = result
+                    .err()
+                    .map(|error| format!("Could not {action} agent. {error:#}"));
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_run_pause(
+        &mut self,
+        picker: u64,
+        run: String,
+        paused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.background_executor().spawn(async move {
+            if paused {
+                client::resume_run(run)
+            } else {
+                client::pause_run(run)
+            }
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker) else {
+                    return;
+                };
+                let action = if paused { "resume" } else { "pause" };
+                picker.run_notice = result
+                    .err()
+                    .map(|error| format!("Could not {action} run. {error:#}"));
+                picker.message = picker.run_notice.clone();
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Ends the agent tree's selected worker through the same path as ending its tab.
     fn end_selected_worker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.keymap.first(Scope::AgentTree, Command::EndWorker);
@@ -2539,6 +2609,21 @@ impl Workspace {
                 Some(Command::EndWorker) => {
                     if !event.is_held && !picker.waiting {
                         self.end_selected_worker(window, cx);
+                    }
+                }
+                Some(Command::PauseAgent) => {
+                    if !event.is_held && !picker.waiting {
+                        self.toggle_selected_pause(window, cx);
+                    }
+                }
+                Some(Command::PauseRun) => {
+                    if !event.is_held
+                        && !picker.waiting
+                        && let Some(run) = picker.selected_run()
+                    {
+                        let (picker_id, run, paused) =
+                            (picker.id, run.id.clone(), run.paused_at.is_some());
+                        self.toggle_run_pause(picker_id, run, paused, window, cx);
                     }
                 }
                 Some(Command::ArchiveRun) => {
@@ -3332,6 +3417,7 @@ mod tests {
             task: None,
             attempt: None,
             state: AgentState::Running,
+            paused: false,
             status: AgentStatus::Working,
             label: "worker".into(),
             created_at: 0,
@@ -3398,6 +3484,7 @@ mod tests {
             },
             created_at: 0,
             archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         };
         assert_eq!(running_progress(&run), None);

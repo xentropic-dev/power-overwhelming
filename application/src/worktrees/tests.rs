@@ -280,6 +280,7 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
             },
             created_at: 0,
             archived_at: None,
+            paused_at: None,
             tasks: Vec::new(),
         })?;
         db.insert_tasks(&worktree.branch, &[spec("work", &[])])?;
@@ -300,6 +301,7 @@ fn add_attempt(dag: &TestDag, worktree: &ManagedWorktree, state: AttemptState) -
                 detail: None,
                 started_at: 0,
                 ended_at: None,
+                paused: false,
                 artifacts: Vec::new(),
             },
         )
@@ -433,7 +435,8 @@ fn add_agent(
             task: None,
             attempt: None,
             state,
-            status: domain::dag::AgentStatus::derive(state, None),
+            paused: false,
+            status: domain::dag::AgentStatus::derive(state, false, None),
             label: id.into(),
             created_at: 0,
         })

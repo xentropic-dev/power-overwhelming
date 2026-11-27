@@ -30,6 +30,8 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The slice that holds every worker scope, under the user manager's `app.slice`.
 pub(crate) const DEFAULT_SLICE: &str = "app-power.slice";
 /// Names another slice, so isolated tests never share the daemon's.
+/// How many passes `signal_all` makes for processes forked while it signals.
+const SIGNAL_ROUNDS: usize = 16;
 pub(crate) const SLICE_ENV: &str = "POWER_WORKER_SLICE";
 /// Set to `0` to run workers without cgroup ownership, under the subreaper fallback.
 pub(crate) const DISABLE_ENV: &str = "POWER_WORKER_CGROUPS";
@@ -436,10 +438,7 @@ impl Scope {
     }
 
     /// Pauses every process in the scope. They cannot catch or notice it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pausing a worker comes with #79")
-    )]
+    #[cfg(test)]
     pub(crate) fn freeze(&self) -> io::Result<()> {
         self.write("cgroup.freeze", "1")
     }
@@ -450,10 +449,7 @@ impl Scope {
     }
 
     /// Whether every process in the scope is frozen.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pausing a worker comes with #79")
-    )]
+    #[cfg(test)]
     pub(crate) fn frozen(&self) -> bool {
         self.event("frozen").ok().flatten().unwrap_or(false)
     }
@@ -518,6 +514,20 @@ impl Scope {
                 sent.insert(pid);
             }
         }
+    }
+
+    /// Sends `signal` to every process in the scope, including ones forked while it
+    /// is sent, and returns how many received it. Only scope members are signalled.
+    pub(crate) fn signal_all(&self, signal: libc::c_int) -> usize {
+        let mut sent = BTreeSet::new();
+        for _ in 0..SIGNAL_ROUNDS {
+            let before = sent.len();
+            self.signal(signal, &mut sent);
+            if sent.len() == before {
+                break;
+            }
+        }
+        sent.len()
     }
 
     /// Asks every process to exit, waits up to `grace` for the scope to empty, then
