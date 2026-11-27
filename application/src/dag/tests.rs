@@ -29,6 +29,7 @@ struct Records {
     events: Vec<RunEvent>,
     worktrees: Vec<ManagedWorktree>,
     queued: Vec<QueuedDispatch>,
+    stopping: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -213,6 +214,10 @@ impl DagReader for MemoryDb {
     fn queued_dispatches(&self) -> Result<Vec<QueuedDispatch>> {
         Ok(self.0.borrow().queued.clone())
     }
+
+    fn stopping_sessions(&self) -> Result<BTreeSet<String>> {
+        Ok(self.0.borrow().stopping.clone())
+    }
 }
 
 impl MemoryDb {
@@ -319,6 +324,14 @@ impl DagTransaction for MemoryDb {
         agent.state = AgentState::Exited;
         agent.session = None;
         Ok(())
+    }
+
+    fn insert_stopping(&self, session: &str) -> Result<bool> {
+        Ok(self.0.borrow_mut().stopping.insert(session.to_owned()))
+    }
+
+    fn remove_stopping(&self, session: &str) -> Result<bool> {
+        Ok(self.0.borrow_mut().stopping.remove(session))
     }
 
     fn set_agent_paused(&self, id: &str, paused: bool) -> Result<()> {
@@ -3298,5 +3311,120 @@ fn a_coding_agent_in_a_shell_foreground_is_never_paused_or_stopped() -> Result<(
     // Nor by the emergency pause, which skips what it cannot isolate.
     assert!(dag.pause_all_except(&[], None)?.is_empty());
     assert!(!terminal_paused(&dag, &shell.id)?);
+    Ok(())
+}
+
+#[test]
+fn a_second_stop_never_lifts_the_first_stops_fence() -> Result<()> {
+    let (dag, run) = setup()?;
+    let dag = dag.shared();
+    let started = dag.start(command(&run, false))?;
+    let session = started.agent.session.clone().unwrap();
+    dag.stop_agent(&started.agent.id)?;
+    // The first teardown is still under way when the stop is repeated.
+    dag.stop_agent(&started.agent.id)?;
+    let late = dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::Success,
+        "Reported after two stops",
+    )?;
+    assert!(!late.applied);
+    assert_eq!(late.reason.as_deref(), Some("agent is stopping"));
+    dag.session_exited(&session, "ended", true)?;
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Interrupted);
+    assert_eq!(attempt.detail.as_deref(), Some("stopped by Power"));
+    Ok(())
+}
+
+#[test]
+fn a_stopped_session_keeps_its_record_until_its_exit_is_confirmed() -> Result<()> {
+    let (dag, run) = setup()?;
+    let dag = dag.shared();
+    let started = dag.start(command(&run, false))?;
+    let session = started.agent.session.clone().unwrap();
+    dag.stop_agent(&started.agent.id)?;
+    assert_eq!(dag.application.records.list()?.len(), 1);
+    assert!(
+        dag.store
+            .read(|db| db.stopping_sessions())?
+            .contains(&session)
+    );
+    dag.session_exited(&session, "ended", true)?;
+    assert!(dag.application.records.list()?.is_empty());
+    assert!(dag.store.read(|db| db.stopping_sessions())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_crash_during_a_stop_holds_the_attempt_until_a_restart_reclaims_the_tree() -> Result<()> {
+    let (dag, run) = setup()?;
+    let dag = dag.shared();
+    let started = dag.start(command(&run, false))?;
+    let session = started.agent.session.clone().unwrap();
+    dag.stop_agent(&started.agent.id)?;
+    // The daemon dies before the exit is confirmed, and its successor cannot yet end
+    // what is left of the stopped tree.
+    dag.application.sessions.lock().unwrap().clear();
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(true, Ordering::Release);
+    let launches = dag.application.runtime.launches.lock().unwrap().len();
+    let restored = dag.restore()?;
+    assert!(restored.is_empty(), "{restored:?}");
+    assert_eq!(
+        dag.application.runtime.launches.lock().unwrap().len(),
+        launches
+    );
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Active, "{attempt:?}");
+    assert!(dag.start(command(&run, true)).is_err());
+    let late = dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::Success,
+        "Reported after the restart",
+    )?;
+    assert!(!late.applied);
+    assert_eq!(dag.application.records.list()?.len(), 1);
+
+    // Once the tree is gone, the stop completes and the task can run again.
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(false, Ordering::Release);
+    dag.retry_reclaim(session.clone());
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Interrupted);
+    assert_eq!(attempt.detail.as_deref(), Some("stopped by Power"));
+    assert!(dag.application.records.list()?.is_empty());
+    dag.start(command(&run, true))?;
+    Ok(())
+}
+
+#[test]
+fn a_restart_that_reclaims_a_stopped_tree_completes_the_stop() -> Result<()> {
+    let (dag, run) = setup()?;
+    let dag = dag.shared();
+    let started = dag.start(command(&run, false))?;
+    dag.stop_agent(&started.agent.id)?;
+    dag.application.sessions.lock().unwrap().clear();
+    let launches = dag.application.runtime.launches.lock().unwrap().len();
+    assert!(dag.restore()?.is_empty());
+    assert_eq!(
+        dag.application.runtime.launches.lock().unwrap().len(),
+        launches,
+        "a stopped session was relaunched"
+    );
+    let attempt = dag.run(&run)?.tasks[0].attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Interrupted);
+    assert_eq!(attempt.detail.as_deref(), Some("stopped by Power"));
+    assert!(dag.store.read(|db| db.stopping_sessions())?.is_empty());
+    assert!(dag.application.records.list()?.is_empty());
+    dag.start(command(&run, true))?;
     Ok(())
 }

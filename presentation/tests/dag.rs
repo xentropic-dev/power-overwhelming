@@ -2741,3 +2741,78 @@ fn without_cgroups_a_missing_program_fails_the_dispatch() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("doesn't exist"), "{stderr}");
 }
+
+#[test]
+fn a_repeated_stop_keeps_the_first_stops_fence() {
+    let fixture = Fixture::with_configure_env(|_| {}, &[("POWER_WORKER_CGROUPS", "0")]);
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "twice");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "twice",
+        &fixture.worktrees[0],
+        false,
+        &["term-ignoring", "twice-go", "twice-pid"],
+    ));
+    let pids = read_pids(&fixture.root().join("twice-pid"), 1);
+    assert_success(&fixture.command(&["agent", "pause", &agent.id]));
+    wait_for_states(&pids, true);
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    // The second stop arrives while the first teardown still runs.
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    fixture.release("twice-go");
+    let reported = fixture.root().join("twice-pid.reported");
+    poll("the stubborn worker to report", || {
+        reported.is_file().then_some(())
+    });
+    let reply = fs::read_to_string(fixture.root().join("twice-pid.report")).unwrap();
+    assert!(reply.contains("\"applied\":false"), "{reply}");
+    wait_for_exit_after(&fixture, &agent.id, &pids);
+    let interrupted = fixture.wait_for_state(&run, "twice", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert!(interrupted.attempts[0].summary.is_none());
+}
+
+#[test]
+fn a_daemon_crash_during_a_stop_holds_the_retry_until_the_old_tree_is_gone() {
+    let mut fixture = Fixture::with_configure_env(
+        |root| write_config(root, "dag.max_active_workers = 1\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    );
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "crash");
+    let (attempt, agent) = dispatched(fixture.dispatch(
+        &run,
+        "crash",
+        &fixture.worktrees[0],
+        false,
+        &["term-ignoring", "crash-go", "crash-pid"],
+    ));
+    let pids = read_pids(&fixture.root().join("crash-pid"), 1);
+    assert_success(&fixture.command(&["agent", "stop", &agent.id, "--box", BOX_ID]));
+    assert!(pids.iter().all(|pid| process_running(*pid)));
+    // SIGKILL before the teardown confirms the exit.
+    fixture.restart();
+    // The restart reclaims the stopped tree before the attempt or its slot is freed.
+    let interrupted = fixture.wait_for_state(&run, "crash", TaskState::Interrupted);
+    assert_eq!(interrupted.attempts[0].id, attempt.id);
+    assert!(
+        pids.iter().all(|pid| !process_running(*pid)),
+        "the attempt was released while the old tree still ran"
+    );
+    fixture.release("crash-go");
+    let (retry, _) = dispatched(fixture.dispatch(
+        &run,
+        "crash",
+        &fixture.worktrees[0],
+        true,
+        &["success", "crash-retry", "Retried after the crash"],
+    ));
+    assert_eq!(retry.number, 2);
+    fixture.release("crash-retry");
+    fixture.wait_for_state(&run, "crash", TaskState::Completed);
+    assert!(
+        !fixture.root().join("crash-pid.reported").exists(),
+        "the stopped worker outlived the restart"
+    );
+}

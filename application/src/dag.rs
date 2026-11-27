@@ -48,6 +48,10 @@ pub trait DagReader {
     fn find_worktree_by_path(&self, path: &Path) -> Result<Option<ManagedWorktree>>;
     /// Dispatches waiting for the worker budget, oldest first.
     fn queued_dispatches(&self) -> Result<Vec<QueuedDispatch>>;
+    /// Sessions whose stop was accepted but whose process tree is not yet confirmed
+    /// gone. The fence outlives the daemon, so a restart keeps refusing reports and
+    /// holding the attempt open until a reclaim confirms the exit.
+    fn stopping_sessions(&self) -> Result<BTreeSet<String>>;
     /// The task's queued dispatch, if any.
     fn queued_dispatch(&self, run: &str, task: &str) -> Result<Option<QueuedDispatch>> {
         Ok(self
@@ -64,6 +68,10 @@ pub trait DagTransaction: DagReader {
     /// identity. Its messages stay readable under its ID.
     fn retire_agent(&self, id: &str) -> Result<()>;
     fn set_agent_paused(&self, id: &str, paused: bool) -> Result<()>;
+    /// Persists a stop fence for `session`. Returns false when one already exists.
+    fn insert_stopping(&self, session: &str) -> Result<bool>;
+    /// Lifts the stop fence of `session`. Returns whether one existed.
+    fn remove_stopping(&self, session: &str) -> Result<bool>;
     /// Sets or clears the time the run was paused.
     fn set_run_paused(&self, id: &str, paused_at: Option<u64>) -> Result<()>;
     /// Makes `agent` the coordinator of every run whose coordinating agent held
@@ -253,10 +261,6 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     /// Serializes run pauses and resumes, so a run's flag and its workers' pauses
     /// change together and two transitions never interleave.
     run_transitions: Mutex<()>,
-    /// Sessions whose stop has begun but whose process tree has not been confirmed
-    /// gone. Their open attempts refuse reports, stay open so they cannot be retried
-    /// and keep their worker slot, and are interrupted once the exit is confirmed.
-    stopping: Mutex<BTreeSet<String>>,
 }
 
 /// Ends finished workers. Due teardowns and the record writes that follow them run
@@ -302,7 +306,6 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
             run_transitions: Mutex::new(()),
-            stopping: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -704,18 +707,39 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// was stopped from. The attempt stays open, so it cannot be retried and keeps its
     /// worker slot, until the exit of its whole process tree is confirmed. Only then is
     /// it interrupted and free to be dispatched again in the same worktree.
-    pub fn stop_agent(&self, id: &str) -> Result<ManagedAgent> {
+    ///
+    /// The stop fence is durable. It is persisted before teardown starts, and the
+    /// session record stays until the exit is confirmed, so a daemon that crashes
+    /// mid-teardown still finds and reclaims the old tree on its next start before the
+    /// attempt, its slot or its worktree are released. A second stop while one is under
+    /// way changes nothing.
+    pub fn stop_agent(&self, id: &str) -> Result<ManagedAgent>
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
         let agent = self.store.read(|db| db.agent(id))?;
         let session = self.isolated_session(&agent)?;
         // Marked inside a store write, so a report either lands before the stop or
         // sees the mark.
-        self.write(|_| {
-            self.stopping.lock().unwrap().insert(session.clone());
-            Ok(())
-        })?;
-        if let Err(error) = self.application.end_session(&session) {
-            self.stopping.lock().unwrap().remove(&session);
-            return Err(error);
+        if !self.write(|db| db.insert_stopping(&session))? {
+            // A stop is already under way. Its fence stays until its exit is confirmed.
+            return Ok(agent);
+        }
+        match self.application.stop_session(&session) {
+            Ok(true) => {}
+            Ok(false) => {
+                // No live terminal holds the session, but something of it may still
+                // run. The fence stays until a reclaim confirms it is gone.
+                self.schedule_reclaim(session);
+            }
+            Err(error) => {
+                // The runtime refused the teardown, so nothing of it started.
+                self.write(|db| db.remove_stopping(&session))?;
+                return Err(error);
+            }
         }
         Ok(agent)
     }
@@ -1303,7 +1327,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         T: 'static,
     {
         let (result, finished) = self.write(|db| {
-            let stopping = self.stopping.lock().unwrap().clone();
+            let stopping = db.stopping_sessions()?;
             report(db, run, task, attempt, status, summary, &stopping)
         })?;
         if let (Some(session), Some(cleanup)) = (finished, &self.finished_cleanup) {
@@ -1385,20 +1409,21 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         B: 'static,
         I: 'static,
     {
-        let finished = self.write(|db| {
+        let (finished, stopped) = self.write(|db| {
             let Some(agent) = db.session_agent(session)? else {
-                return Ok(false);
+                return Ok((false, false));
             };
+            let mut stopped = false;
             if complete {
-                let stopped = self.stopping.lock().unwrap().remove(session);
+                stopped = db.remove_stopping(session)?;
                 let detail = if stopped { STOP_DETAIL } else { detail };
                 interrupt(db, Some(session), detail, &|_| false)?;
                 db.set_agent_exited(&agent.id)?;
-            } else if !self.stopping.lock().unwrap().contains(session) {
+            } else if !db.stopping_sessions()?.contains(session) {
                 // A stopped attempt stays open until the reclaim confirms the exit.
                 interrupt(db, Some(session), detail, &|_| false)?;
             }
-            Ok(agent.attempt.is_some())
+            Ok((agent.attempt.is_some(), stopped))
         })?;
         if !complete {
             eprintln!("Session {session} left processes running, so it stays for a reclaim.");
@@ -1408,8 +1433,11 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             self.schedule_reclaim(session.to_owned());
             return Ok(());
         }
-        if finished && self.finished_cleanup.is_some() {
+        if (finished || stopped) && self.finished_cleanup.is_some() {
             self.forget_ended(session.to_owned());
+        } else if stopped {
+            // A stopped session's record was kept only so a restart could reclaim it.
+            self.application.forget_session(session)?;
         }
         Ok(())
     }
@@ -1503,10 +1531,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     fn reclaimed(&self, session: &str) -> Result<()> {
         let finished = self.write(|db| {
             let Some(agent) = db.session_agent(session)? else {
-                self.stopping.lock().unwrap().remove(session);
+                db.remove_stopping(session)?;
                 return Ok(true);
             };
-            if self.stopping.lock().unwrap().remove(session) {
+            if db.remove_stopping(session)? {
                 interrupt(db, Some(session), STOP_DETAIL, &|_| false)?;
             }
             db.set_agent_exited(&agent.id)?;
@@ -1530,35 +1558,53 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         B: 'static,
         I: 'static,
     {
-        let (open, finished): (BTreeMap<String, OpenAttempt>, BTreeSet<String>) =
-            self.store.read(|db| {
-                let open: BTreeMap<_, _> = db
-                    .open_attempts(None)?
-                    .into_iter()
-                    .filter_map(|open| Some((open.attempt.session.clone()?, open)))
-                    .collect();
-                // A worker whose attempt is no longer open has nothing left to do.
-                let finished = db
-                    .list_agents(None)?
-                    .into_iter()
-                    .filter(|agent| agent.attempt.is_some())
-                    .filter_map(|agent| agent.session)
-                    .filter(|session| !open.contains_key(session))
-                    .collect();
-                Ok((open, finished))
-            })?;
+        let (open, finished, stopping): (
+            BTreeMap<String, OpenAttempt>,
+            BTreeSet<String>,
+            BTreeSet<String>,
+        ) = self.store.read(|db| {
+            let open: BTreeMap<_, _> = db
+                .open_attempts(None)?
+                .into_iter()
+                .filter_map(|open| Some((open.attempt.session.clone()?, open)))
+                .collect();
+            // A worker whose attempt is no longer open has nothing left to do.
+            let finished = db
+                .list_agents(None)?
+                .into_iter()
+                .filter(|agent| agent.attempt.is_some())
+                .filter_map(|agent| agent.session)
+                .filter(|session| !open.contains_key(session))
+                .collect();
+            Ok((open, finished, db.stopping_sessions()?))
+        })?;
         let active: BTreeMap<String, OpenAttempt> = open
             .into_iter()
             .filter(|(_, open)| open.attempt.state == AttemptState::Active)
             .collect();
         let restore = self.application.restore_sessions_deferring(|session| {
-            if finished.contains(session) {
+            if stopping.contains(session) {
+                RestoreChoice::Forget("it was stopped")
+            } else if finished.contains(session) {
                 RestoreChoice::Forget("its DAG attempt already finished")
             } else {
                 RestoreChoice::Resume(active.get(session).map(continuation_prompt))
             }
         })?;
         let (restored, deferred) = (restore.restored, restore.deferred);
+        // A stopped session that is not deferred had nothing left running, or no
+        // record left to find it by, so its stop is complete. A deferred one keeps its
+        // fence, its open attempt and its slot until a reclaim confirms the exit.
+        self.write(|db| {
+            for session in stopping
+                .iter()
+                .filter(|session| !deferred.contains(session))
+            {
+                db.remove_stopping(session)?;
+                interrupt(db, Some(session), STOP_DETAIL, &|_| false)?;
+            }
+            Ok(())
+        })?;
         let resumed: Vec<_> = restored
             .iter()
             .filter(|session| session.prompted)
@@ -1654,7 +1700,12 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .filter(|id| self.application.launched_agent(id) == Some(Agent::Shell))
             .collect();
         self.write(|db| {
-            interrupt(db, None, RESTART_DETAIL, &restored)?;
+            // A stopped session still fenced keeps its attempt open and its slot until
+            // a reclaim confirms its tree is gone.
+            let stopping = db.stopping_sessions()?;
+            interrupt(db, None, RESTART_DETAIL, &|session| {
+                restored(session) || session.is_some_and(|session| stopping.contains(session))
+            })?;
             for open in resumed {
                 db.event(
                     &open.run,

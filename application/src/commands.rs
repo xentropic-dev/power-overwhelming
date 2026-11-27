@@ -154,6 +154,16 @@ impl<T: TerminalRuntime> Application<T> {
         forgotten.and(ended)
     }
 
+    /// Starts ending a session's processes and keeps its record, so a restart can
+    /// still find and reclaim what runs of it until its exit is confirmed. Returns
+    /// false when no live terminal holds the session any more.
+    pub fn stop_session(&self, id: &str) -> Result<bool> {
+        let Some(live) = self.sessions.lock().unwrap().remove(id) else {
+            return Ok(false);
+        };
+        self.runtime.end(live.terminal).map(|()| true)
+    }
+
     /// Saves the foreground state a restore resumes from.
     pub fn record_foreground(
         &self,

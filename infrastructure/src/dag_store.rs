@@ -13,7 +13,7 @@ use domain::{
 use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::IntoDeserializer};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
@@ -83,6 +83,7 @@ impl SqliteDagStore {
                       AND creator_box IS NOT NULL AND creator_session IS NOT NULL)
                  )
              );
+             CREATE TABLE IF NOT EXISTS stopping_sessions (session TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS queued_dispatches (
                  id TEXT NOT NULL UNIQUE,
                  run_id TEXT NOT NULL, task_id TEXT NOT NULL, provider TEXT NOT NULL,
@@ -429,6 +430,16 @@ impl DagReader for DagDb<'_> {
         .map_err(Into::into)
     }
 
+    fn stopping_sessions(&self) -> Result<BTreeSet<String>> {
+        Ok(
+            rows(self.0, "SELECT session FROM stopping_sessions", [], |row| {
+                row.get(0)
+            })?
+            .into_iter()
+            .collect(),
+        )
+    }
+
     fn latest_seq(&self) -> Result<u64> {
         Ok(self
             .0
@@ -543,6 +554,20 @@ impl DagTransaction for DagDb<'_> {
             params![id, paused],
         )?;
         Ok(())
+    }
+
+    fn insert_stopping(&self, session: &str) -> Result<bool> {
+        Ok(self.0.execute(
+            "INSERT OR IGNORE INTO stopping_sessions (session) VALUES (?1)",
+            [session],
+        )? > 0)
+    }
+
+    fn remove_stopping(&self, session: &str) -> Result<bool> {
+        Ok(self.0.execute(
+            "DELETE FROM stopping_sessions WHERE session = ?1",
+            [session],
+        )? > 0)
     }
 
     fn set_run_paused(&self, id: &str, paused_at: Option<u64>) -> Result<()> {
