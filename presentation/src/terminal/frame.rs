@@ -1,13 +1,17 @@
 //! Row damage and reuse adapted from herdr-app `src/vt.rs`
 //! (https://github.com/ogulcancelik/herdr-app), licensed under Apache-2.0. Minimum
-//! contrast is adapted from the same file.
+//! contrast is adapted from the same file. Cursor style and wide-tail handling follow
+//! herdr-app `src/terminal.rs` (Apache-2.0).
 
 use super::links::{candidate, links};
 use super::paint::RowDrawing;
 use anyhow::Result;
 use ghostty_vt::{
     Terminal,
-    render::{CellIterator, Colors, Dirty, RenderState, RowId, RowIteration, RowIterator},
+    render::{
+        CellIterator, Colors, CursorVisualStyle, Dirty, RenderState, RowId, RowIteration,
+        RowIterator,
+    },
     screen::CellWide,
     style::{Style, StyleColor, Underline},
     terminal::{Point as VtPoint, PointCoordinate},
@@ -45,10 +49,17 @@ pub(super) struct Row {
     pub(super) drawing: RefCell<Option<Rc<RowDrawing>>>,
 }
 
+/// A visible cursor: its cell (the head of a wide cell) and DECSCUSR shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Cursor {
+    pub(super) position: CellPosition,
+    pub(super) style: CursorVisualStyle,
+}
+
 #[derive(Default)]
 pub(super) struct Frame {
     pub(super) rows: Vec<Rc<Row>>,
-    pub(super) cursor: Option<CellPosition>,
+    pub(super) cursor: Option<Cursor>,
     /// Where the cursor is, shown or hidden: input methods compose and place their candidate
     /// window there.
     pub(super) ime_cursor: Option<CellPosition>,
@@ -82,7 +93,16 @@ impl Frame {
             row: cursor.y.into(),
             column: cursor.x.into(),
         });
-        let cursor = ime_cursor.filter(|_| vt_cursor.visible);
+        let cursor = vt_cursor
+            .viewport
+            .filter(|_| vt_cursor.visible)
+            .map(|at| Cursor {
+                position: CellPosition {
+                    row: at.y.into(),
+                    column: usize::from(at.x).saturating_sub(usize::from(at.at_wide_tail)),
+                },
+                style: vt_cursor.visual_style,
+            });
         let colors = state.colors()?;
         let dirty = state.dirty()?;
         let cols = state.cols()?;
@@ -541,5 +561,27 @@ mod conceal_tests {
             .collect();
         assert!(text.starts_with("aSECRETz"));
         assert!(frame.rows[0].cells[1].style.invisible);
+    }
+
+    #[test]
+    fn cursor_tracks_decscusr_shape_and_wide_cell_head() {
+        use ghostty_vt::render::CursorVisualStyle;
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        let mut renderer = RenderState::new().unwrap();
+        let mut frame = Frame::default();
+        for (sequence, expected) in [
+            (b"\x1b[1 q".as_slice(), CursorVisualStyle::Block),
+            (b"\x1b[3 q".as_slice(), CursorVisualStyle::Underline),
+            (b"\x1b[5 q".as_slice(), CursorVisualStyle::Bar),
+        ] {
+            terminal.vt_write(sequence);
+            frame = frame.update(&mut renderer, &terminal).unwrap().unwrap();
+            assert_eq!(frame.cursor.unwrap().style, expected);
+        }
+        terminal.vt_write("\x1b[2 q中\x1b[D".as_bytes());
+        let frame = frame.update(&mut renderer, &terminal).unwrap().unwrap();
+        let cursor = frame.cursor.unwrap();
+        assert_eq!(cursor.position.column, 0);
+        assert_eq!(cursor.style, CursorVisualStyle::Block);
     }
 }
