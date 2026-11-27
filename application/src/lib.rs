@@ -192,6 +192,11 @@ impl<T: TerminalRuntime> Application<T> {
         self.records.remove(id)
     }
 
+    /// Whether a durable record of session `id` remains.
+    pub fn has_record(&self, id: &str) -> Result<bool> {
+        Ok(self.records.list()?.iter().any(|record| record.id == id))
+    }
+
     /// Drops session `id`'s terminal handle once its process has exited, keeping
     /// the durable record, so the session no longer looks live while what it left is
     /// reclaimed. A handle that still runs, such as a relaunch, stays.

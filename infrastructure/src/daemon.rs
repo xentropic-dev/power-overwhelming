@@ -672,7 +672,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             })
         }
         Request::End { session } => {
-            application.end_session(&session)?;
+            server.dag.end_session(&session)?;
             Ok(Response::Ok)
         }
         Request::RecentArtifacts { sessions, limit } => Ok(Response::RecentArtifacts {

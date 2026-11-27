@@ -791,6 +791,13 @@ fn application() -> Arc<Application<FakeTerminal>> {
 }
 
 fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeTerminal>> {
+    application_with(workspace, Arc::new(MemorySessions::default()))
+}
+
+fn application_with(
+    workspace: FakeWorkspace,
+    records: Arc<dyn SessionStore>,
+) -> Arc<Application<FakeTerminal>> {
     static ID: AtomicU64 = AtomicU64::new(0);
     let profiles = ["claude", "codex"]
         .into_iter()
@@ -814,7 +821,7 @@ fn application_with_workspace(workspace: FakeWorkspace) -> Arc<Application<FakeT
         .collect();
     Arc::new(Application::new(
         FakeArtifacts::default(),
-        Arc::new(MemorySessions::default()),
+        records,
         workspace,
         FakeTerminal::default(),
         Arc::new(FakeProfiles(profiles)),
@@ -3426,5 +3433,130 @@ fn a_restart_that_reclaims_a_stopped_tree_completes_the_stop() -> Result<()> {
     assert!(dag.store.read(|db| db.stopping_sessions())?.is_empty());
     assert!(dag.application.records.list()?.is_empty());
     dag.start(command(&run, true))?;
+    Ok(())
+}
+
+/// Refuses deletes while `fail` is set, as a session database with a transient
+/// write fault does.
+#[derive(Default)]
+struct FlakySessions {
+    records: MemorySessions,
+    fail: AtomicBool,
+}
+
+impl SessionStore for FlakySessions {
+    fn save(&self, record: &crate::SessionRecord) -> Result<()> {
+        self.records.save(record)
+    }
+
+    fn update_foreground(
+        &self,
+        id: &str,
+        foreground: &Agent,
+        conversation: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<()> {
+        self.records
+            .update_foreground(id, foreground, conversation, cwd)
+    }
+
+    fn remove(&self, id: &str) -> Result<()> {
+        if self.fail.load(Ordering::Acquire) {
+            bail!("disk I/O error");
+        }
+        self.records.remove(id)
+    }
+
+    fn list(&self) -> Result<Vec<crate::SessionRecord>> {
+        self.records.list()
+    }
+}
+
+#[test]
+fn ending_a_stopped_session_keeps_its_slot_until_its_exit_is_confirmed() -> Result<()> {
+    let memory = FakeMemory::default();
+    memory.0.store(u64::MAX, Ordering::Relaxed);
+    let budget = WorkerBudget {
+        max_active_workers: Some(1),
+        ..WorkerBudget::default()
+    };
+    let (dag, run) = budgeted(budget, &memory)?;
+    let dag = dag.shared();
+    let started = dag.start(task_dispatch(&run, "a", BudgetMode::Queue))?;
+    let session = started.agent.session.clone().unwrap();
+    dag.stop_agent(&started.agent.id)?;
+    // `session end` after the stop must not discard what finds the stopped tree.
+    dag.end_session(&session)?;
+    assert_eq!(dag.application.records.list()?.len(), 1);
+    // The daemon dies, and its successor cannot yet end the stopped tree.
+    dag.application.sessions.lock().unwrap().clear();
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(true, Ordering::Release);
+    assert!(dag.restore()?.is_empty());
+    let retry = || Dispatch {
+        retry: true,
+        ..task_dispatch(&run, "a", BudgetMode::Refuse)
+    };
+    assert!(dag.start(retry()).is_err(), "retried before the exit");
+    assert!(
+        dag.start(task_dispatch(&run, "b", BudgetMode::Refuse))
+            .is_err()
+    );
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(false, Ordering::Release);
+    dag.retry_reclaim(session);
+    assert!(dag.application.records.list()?.is_empty());
+    assert!(dag.store.read(|db| db.stopping_sessions())?.is_empty());
+    dag.start(retry())?;
+    Ok(())
+}
+
+#[test]
+fn a_stopped_agent_whose_record_was_not_deleted_is_never_relaunched() -> Result<()> {
+    let records = Arc::new(FlakySessions::default());
+    let dag = TestDag::new(
+        application_with(FakeWorkspace::default(), records.clone()),
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .shared();
+    let worktree = tempfile::tempdir()?;
+    let agent = dag.start_agent(start_agent(WorktreeRequest::Existing {
+        path: "/worktree".into(),
+        allow_main_checkout: false,
+    }))?;
+    let session = agent.session.clone().unwrap();
+    for mut record in records.list()? {
+        record.worktree = worktree.path().into();
+        records.save(&record)?;
+    }
+    dag.stop_agent(&agent.id)?;
+    // The exit is confirmed, but deleting the record fails, as a crash before the
+    // deletion would leave it.
+    records.fail.store(true, Ordering::Release);
+    assert!(dag.session_exited(&session, "ended", true).is_err());
+    assert_eq!(records.list()?.len(), 1);
+    assert!(
+        dag.store
+            .read(|db| db.stopping_sessions())?
+            .contains(&session)
+    );
+    // The restarted daemon, with the fault gone, forgets the stopped agent.
+    records.fail.store(false, Ordering::Release);
+    dag.application.sessions.lock().unwrap().clear();
+    let launches = dag.application.runtime.launches.lock().unwrap().len();
+    assert!(dag.restore()?.is_empty());
+    assert_eq!(
+        dag.application.runtime.launches.lock().unwrap().len(),
+        launches,
+        "a stopped agent was relaunched"
+    );
+    assert!(records.list()?.is_empty());
+    assert!(dag.store.read(|db| db.stopping_sessions())?.is_empty());
     Ok(())
 }

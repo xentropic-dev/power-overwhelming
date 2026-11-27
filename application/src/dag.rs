@@ -1415,7 +1415,9 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             };
             let mut stopped = false;
             if complete {
-                stopped = db.remove_stopping(session)?;
+                // The fence stays until the record is gone, so a crash in between
+                // can never relaunch the stopped session.
+                stopped = db.stopping_sessions()?.contains(session);
                 let detail = if stopped { STOP_DETAIL } else { detail };
                 interrupt(db, Some(session), detail, &|_| false)?;
                 db.set_agent_exited(&agent.id)?;
@@ -1437,7 +1439,40 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             self.forget_ended(session.to_owned());
         } else if stopped {
             // A stopped session's record was kept only so a restart could reclaim it.
-            self.application.forget_session(session)?;
+            self.complete_stop(session)?;
+        }
+        Ok(())
+    }
+
+    /// The last step of every stop, once its tree is confirmed gone: deletes the
+    /// session record, and only then lifts the fence. A crash or failed deletion in
+    /// between leaves the fence, so a restart forgets the record instead of
+    /// relaunching it.
+    fn complete_stop(&self, session: &str) -> Result<()> {
+        self.application.forget_session(session)?;
+        self.write(|db| db.remove_stopping(session))?;
+        Ok(())
+    }
+
+    /// Ends a session on request, as `session end` or closing its tab does. A session
+    /// under a stop keeps its record and fence, and ends through the stop's reclaim,
+    /// so its record is only deleted once its tree is confirmed gone.
+    pub fn end_session(&self, session: &str) -> Result<()>
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        if !self
+            .store
+            .read(|db| db.stopping_sessions())?
+            .contains(session)
+        {
+            return self.application.end_session(session);
+        }
+        if !self.application.stop_session(session)? {
+            self.schedule_reclaim(session.to_owned());
         }
         Ok(())
     }
@@ -1452,8 +1487,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         I: 'static,
     {
         let application = self.application.clone();
+        let dag = self.weak.lock().unwrap().clone();
         let forget = Box::new(move || {
-            if let Err(error) = application.forget_session(&session) {
+            let forgotten = match dag.upgrade() {
+                Some(dag) => dag.complete_stop(&session),
+                None => application.forget_session(&session),
+            };
+            if let Err(error) = forgotten {
                 eprintln!("Could not forget ended session {session}. {error:#}");
             }
         });
@@ -1530,18 +1570,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Records that nothing of `session` runs any more.
     fn reclaimed(&self, session: &str) -> Result<()> {
         let finished = self.write(|db| {
+            let stopping = db.stopping_sessions()?.contains(session);
             let Some(agent) = db.session_agent(session)? else {
-                db.remove_stopping(session)?;
                 return Ok(true);
             };
-            if db.remove_stopping(session)? {
+            if stopping {
                 interrupt(db, Some(session), STOP_DETAIL, &|_| false)?;
             }
             db.set_agent_exited(&agent.id)?;
-            Ok(db.open_attempts(Some(session))?.is_empty())
+            Ok(stopping || db.open_attempts(Some(session))?.is_empty())
         })?;
         if finished {
-            self.application.forget_session(session)?;
+            self.complete_stop(session)?;
         }
         Ok(())
     }
@@ -1591,17 +1631,36 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 RestoreChoice::Resume(active.get(session).map(continuation_prompt))
             }
         })?;
-        let (restored, deferred) = (restore.restored, restore.deferred);
-        // A stopped session that is not deferred had nothing left running, or no
-        // record left to find it by, so its stop is complete. A deferred one keeps its
-        // fence, its open attempt and its slot until a reclaim confirms the exit.
+        let (restored, mut deferred) = (restore.restored, restore.deferred);
+        // A stopped session that is not deferred has nothing left running, so its
+        // attempt ends. A fenced session with no record left is reclaimed by ID, so
+        // a lost record never hides what still runs. The fence lifts only once the
+        // record is gone. One whose record could not be deleted keeps its fence and
+        // finishes through a reclaim. A deferred one keeps its fence, its open
+        // attempt and its slot until a reclaim confirms the exit.
+        let mut unforgotten = Vec::new();
+        let mut still_running = Vec::new();
+        for session in stopping
+            .iter()
+            .filter(|session| !deferred.contains(session))
+        {
+            if self.application.has_record(session).unwrap_or(true) {
+                unforgotten.push(session.clone());
+            } else if let Err(error) = self.application.reclaim(session) {
+                eprintln!("Stopped session {session} still has processes running. {error:#}");
+                still_running.push(session.clone());
+            }
+        }
+        deferred.extend(still_running);
         self.write(|db| {
             for session in stopping
                 .iter()
                 .filter(|session| !deferred.contains(session))
             {
-                db.remove_stopping(session)?;
                 interrupt(db, Some(session), STOP_DETAIL, &|_| false)?;
+                if !unforgotten.contains(session) {
+                    db.remove_stopping(session)?;
+                }
             }
             Ok(())
         })?;
@@ -1614,6 +1673,9 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         self.reconcile_with(&restored, &deferred, &resumed)?;
         self.reapply_pauses(&restored)?;
         for session in deferred {
+            self.schedule_reclaim(session);
+        }
+        for session in unforgotten {
             self.schedule_reclaim(session);
         }
         Ok(restored)
