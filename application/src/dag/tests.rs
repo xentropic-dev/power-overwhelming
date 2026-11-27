@@ -3711,3 +3711,114 @@ fn an_attempt_that_reports_while_it_is_sampled_is_not_flagged_stalled() -> Resul
     *late.lock().unwrap() = None;
     Ok(())
 }
+
+#[test]
+fn restore_brings_back_the_budgets_worth_of_workers_and_queues_the_rest() -> Result<()> {
+    let application = application();
+    let caller = application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Coding("claude".into()),
+    })?;
+    let memory = FakeMemory::default();
+    memory.0.store(64 * domain::dag::GIB, Ordering::Relaxed);
+    let dag = TestDag::new(
+        application,
+        MemoryStore::default(),
+        FakeRegistry(vec![caller.id.clone()]),
+        FakeIcons::default(),
+    )
+    .with_worker_budget(
+        FixedBudget(WorkerBudget {
+            max_active_workers: Some(2),
+            ..WorkerBudget::default()
+        }),
+        memory,
+    );
+    let run = dag.create_run(
+        BoxSelection {
+            selector: None,
+            caller: Some(caller.id.clone()),
+        },
+        "Restart".into(),
+        None,
+    )?;
+    let tasks = ["a", "b", "c", "d", "blocked"];
+    dag.add_tasks(&run.id, &tasks.map(|id| spec(id, &[])))?;
+    let mut attempts = BTreeMap::new();
+    for task in tasks {
+        let started = dag.start(Dispatch {
+            task: task.into(),
+            provider: Provider::Agent("claude".into()),
+            args: Vec::new(),
+            caller: Some(caller.id.clone()),
+            budget: BudgetMode::Override,
+            ..command(&run.id, false)
+        })?;
+        attempts.insert(task, started);
+    }
+    dag.report(
+        &run.id,
+        "blocked",
+        &attempts["blocked"].attempt.id,
+        ReportStatus::NeedsInput,
+        "question",
+    )?;
+    let worktree = tempfile::tempdir()?;
+    for mut record in dag.application.records.list()? {
+        record.worktree = worktree.path().into();
+        dag.application.records.save(&record)?;
+    }
+
+    let restored = dag.restore()?;
+
+    // The worker waiting on input counts and stays, so one active worker fits.
+    let snapshot = dag.run(&run.id)?;
+    let in_state = |state: TaskState| {
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.state == state)
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(in_state(TaskState::NeedsInput), ["blocked"]);
+    let working = in_state(TaskState::Working);
+    assert_eq!(working.len(), 1, "{working:?}");
+    let queued = in_state(TaskState::Queued);
+    assert_eq!(queued.len(), 3, "{queued:?}");
+    assert!(restored.contains(&attempts["blocked"].agent.session.clone().unwrap()));
+    assert!(restored.contains(&attempts[working[0].as_str()].agent.session.clone().unwrap()));
+    for task in &queued {
+        let session = attempts[task.as_str()].agent.session.clone().unwrap();
+        assert!(
+            !restored.contains(&session),
+            "{task} was restored over budget"
+        );
+        let attempt = find_task(&snapshot, task)?.attempts.last().unwrap().clone();
+        assert_eq!(attempt.state, AttemptState::Interrupted);
+    }
+    assert_eq!(dag.start_queued()?, 0, "A queued task started over budget");
+
+    // A report frees a slot, and the queue starts a retry in the same worktree.
+    let working_attempt = attempts[working[0].as_str()].attempt.id.clone();
+    dag.report(
+        &run.id,
+        &working[0],
+        &working_attempt,
+        ReportStatus::Success,
+        "done",
+    )?;
+    assert_eq!(dag.start_queued()?, 1);
+    let snapshot = dag.run(&run.id)?;
+    let started: Vec<_> = snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Working)
+        .collect();
+    assert_eq!(started.len(), 1);
+    let retry = started[0].attempts.last().unwrap();
+    assert_eq!(retry.number, 2);
+    assert_eq!(retry.worktree, Path::new("/worktree"));
+    assert_eq!(retry.provider, Provider::Agent("claude".into()));
+    Ok(())
+}

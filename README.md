@@ -221,6 +221,8 @@ dag = {
 
 The defaults are 4 workers and 4 GiB.
 
+A daemon restart holds restored workers to the same budget. Workers waiting on input come back first and count. Active workers follow, most recently started first, while the budget has room. Each one past it has its attempt interrupted and its task queued to retry in the same worktree, so it starts like any queued dispatch once a worker reports. Command workers are never relaunched, so they take no slot.
+
 `power dag create` and `power dag show` return the run and a `pwr://dag/<run-id>` link. Coordinators share that link verbatim on its own line when they create or reopen a run. Click the link or open it with Ctrl+S then `o` to see the live graph.
 
 Press Ctrl+B then `d` to browse the active box's task graphs or Ctrl+B then `a` to open its agent tree. DAG cards and their details show the latest known model for each attempt. The agent tree displays models and matches them in search. Managed agents and their attempts retain their model after exit. Attach to a worker from either view without interrupting its work. An input request highlights the box and the worker's tab when attached. Answer in that worker's terminal. Its highlight clears when it reports that the request is resolved, and the box highlight clears when its last request is resolved.
