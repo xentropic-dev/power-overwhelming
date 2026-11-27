@@ -146,11 +146,16 @@ impl TerminalView {
     }
 
     /// Tells the program about a focus change if it turned focus reporting on. The terminal
-    /// counts as focused while its window is active and it holds keyboard focus.
-    pub(super) fn sync_focus(&mut self, window: &Window) {
+    /// counts as focused while its window is active and it holds keyboard focus. The cursor
+    /// follows the same state, so a change repaints it.
+    pub(super) fn sync_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
         let focused = window.is_window_active() && self.focus.is_focused(window);
+        let was = self.typing.focused();
         if let Some(bytes) = self.typing.set_focused(&self.terminal, focused) {
             self.send(bytes);
+        }
+        if was != focused {
+            cx.notify();
         }
     }
 

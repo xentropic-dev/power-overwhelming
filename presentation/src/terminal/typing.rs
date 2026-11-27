@@ -63,6 +63,11 @@ impl Typing {
         }
     }
 
+    /// Whether the window is active and the terminal holds keyboard focus.
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
     /// The composition to draw, if one is in progress and the terminal owns the keyboard.
     pub fn marked(&self) -> Option<&str> {
         self.marked.as_deref().filter(|_| !self.hold.is_held())
@@ -308,6 +313,19 @@ mod tests {
         assert_eq!(typing.installed(&restored, &again), None);
         assert_eq!(typing.set_focused(&again, false).unwrap(), b"\x1b[O");
         assert_eq!(typing.set_focused(&again, true).unwrap(), b"\x1b[I");
+    }
+
+    #[test]
+    fn window_deactivation_and_reactivation_track_the_cursor_focus() {
+        let t = terminal("");
+        let mut typing = Typing::new(InputHold::default());
+        typing.set_focused(&t, true);
+        assert!(typing.focused());
+        // The window goes inactive while the view keeps its focus handle.
+        typing.set_focused(&t, false);
+        assert!(!typing.focused());
+        typing.set_focused(&t, true);
+        assert!(typing.focused());
     }
 
     #[test]
