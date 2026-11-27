@@ -1,9 +1,10 @@
-use super::{OpenLink, TerminalView, grid::PtyGrid};
-use ghostty_vt::{
-    key::{self, Key},
-    mouse,
-    terminal::{Mode, ScrollViewport},
+use super::{
+    OpenLink, TerminalView,
+    grid::PtyGrid,
+    keys::{self, paste_for},
+    typing::KeyDown,
 };
+use ghostty_vt::{mouse, terminal::ScrollViewport};
 use gpui::*;
 use infrastructure::client::TerminalControl;
 
@@ -37,20 +38,32 @@ fn encoder_size(grid: &PtyGrid, pad: Pixels) -> mouse::EncoderSize {
 }
 
 impl TerminalView {
-    fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+    pub(super) fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         if bytes.is_empty() || self.exited {
             return;
         }
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
         let had_selection = self.selection.take().is_some();
         let had_pressed_link = self.pressed_link.take().is_some();
-        if let Err(error) = self.commands.try_send(TerminalControl::Input(bytes)) {
-            self.status = Some(format!("Could not send input. {error}"));
+        if !self.send(bytes) {
             cx.notify();
         }
         if self.refresh() || had_selection || had_pressed_link {
             cx.notify();
         }
+    }
+
+    /// Writes bytes to the program without touching the view: reports it asked for. False
+    /// when sending failed and the status changed.
+    pub(super) fn send(&mut self, bytes: Vec<u8>) -> bool {
+        if bytes.is_empty() || self.exited {
+            return true;
+        }
+        if let Err(error) = self.commands.try_send(TerminalControl::Input(bytes)) {
+            self.status = Some(format!("Could not send input. {error}"));
+            return false;
+        }
+        true
     }
 
     fn mouse_input(
@@ -71,7 +84,7 @@ impl TerminalView {
         event
             .set_action(action)
             .set_button(Some(button))
-            .set_mods(terminal_modifiers(modifiers));
+            .set_mods(keys::mods(modifiers));
         event.set_position(mouse::Position {
             x: f32::from(local.x) * metrics.scale,
             y: f32::from(local.y) * metrics.scale,
@@ -92,63 +105,56 @@ impl TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let stroke = &event.keystroke;
-        if stroke.modifiers.control && stroke.modifiers.shift {
-            match stroke.key.as_str() {
-                "c" => {
-                    if let Some(copied) = self.selected_text() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copied));
-                    }
-                    return;
-                }
-                "v" => {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                        let clean = text.replace(['\x1b', '\0'], "");
-                        let bytes = if self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false) {
-                            format!("\x1b[200~{clean}\x1b[201~").into_bytes()
-                        } else {
-                            clean.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
-                        };
-                        self.keyboard_input(bytes, cx);
-                    }
-                    return;
-                }
-                _ => {}
-            }
-        }
-        let Ok(mut encoded) = key::Event::new() else {
+        let composing = self.typing.marked().is_some();
+        let KeyDown::Send(bytes) =
+            self.typing
+                .key_down(&self.terminal, &event.keystroke, event.is_held)
+        else {
             return;
         };
-        let key = key_code(&stroke.key);
-        let first = stroke
-            .key
-            .chars()
-            .next()
-            .filter(|_| stroke.key.chars().count() == 1);
-        let text = stroke
-            .key_char
-            .clone()
-            .or_else(|| first.map(|value| value.to_string()));
-        encoded
-            .set_key(key)
-            .set_mods(terminal_modifiers(stroke.modifiers))
-            .set_action(if event.is_held {
-                key::Action::Repeat
-            } else {
-                key::Action::Press
-            });
-        if let Some(character) = first {
-            encoded.set_unshifted_codepoint(character);
+        // Handled here, so the platform doesn't also type the key's text through the input
+        // method handler.
+        cx.stop_propagation();
+        if composing && self.typing.marked().is_none() {
+            cx.notify();
         }
-        encoded.set_utf8(text);
-        self.encoder.set_options_from_terminal(&self.terminal);
-        let mut bytes = Vec::new();
-        if self.encoder.encode_to_vec(&encoded, &mut bytes).is_ok() {
+        self.keyboard_input(bytes, cx);
+    }
+
+    /// Releases reach programs that asked the Kitty protocol to report them, for keys whose
+    /// press this terminal sent; a press the app took as a shortcut releases nothing.
+    pub(super) fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(bytes) = self.typing.key_up(&self.terminal, &event.keystroke) {
+            cx.stop_propagation();
+            self.send(bytes);
+        }
+    }
+
+    /// Copies the selection to the clipboard.
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(copied) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(copied));
+        }
+    }
+
+    /// Types the clipboard's text in as a paste, bracketed if the program asked for it.
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let bytes = paste_for(&self.terminal, &text);
             self.keyboard_input(bytes, cx);
         }
     }
 
-    fn keyboard_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+    /// Tells the program about a focus change if it turned focus reporting on. The terminal
+    /// counts as focused while its window is active and it holds keyboard focus.
+    pub(super) fn sync_focus(&mut self, window: &Window) {
+        let focused = window.is_window_active() && self.focus.is_focused(window);
+        if let Some(bytes) = self.typing.set_focused(&self.terminal, focused) {
+            self.send(bytes);
+        }
+    }
+
+    pub(super) fn keyboard_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         if !bytes.is_empty() {
             self.typed_at = Some(std::time::Instant::now());
         }
@@ -329,93 +335,6 @@ pub(super) fn register_mouse_exit(pointer_owner: WeakEntity<TerminalView>, windo
             });
         }
     });
-}
-
-fn terminal_modifiers(modifiers: Modifiers) -> key::Mods {
-    let mut mods = key::Mods::empty();
-    mods.set(key::Mods::SHIFT, modifiers.shift);
-    mods.set(key::Mods::CTRL, modifiers.control);
-    mods.set(key::Mods::ALT, modifiers.alt);
-    mods.set(key::Mods::SUPER, modifiers.platform);
-    mods
-}
-
-fn key_code(key: &str) -> Key {
-    use Key::*;
-    match key {
-        "a" => A,
-        "b" => B,
-        "c" => C,
-        "d" => D,
-        "e" => E,
-        "f" => F,
-        "g" => G,
-        "h" => H,
-        "i" => I,
-        "j" => J,
-        "k" => K,
-        "l" => L,
-        "m" => M,
-        "n" => N,
-        "o" => O,
-        "p" => P,
-        "q" => Q,
-        "r" => R,
-        "s" => S,
-        "t" => T,
-        "u" => U,
-        "v" => V,
-        "w" => W,
-        "x" => X,
-        "y" => Y,
-        "z" => Z,
-        "0" => Digit0,
-        "1" => Digit1,
-        "2" => Digit2,
-        "3" => Digit3,
-        "4" => Digit4,
-        "5" => Digit5,
-        "6" => Digit6,
-        "7" => Digit7,
-        "8" => Digit8,
-        "9" => Digit9,
-        "-" => Minus,
-        "=" => Equal,
-        "[" => BracketLeft,
-        "]" => BracketRight,
-        "/" => Slash,
-        "." => Period,
-        "," => Comma,
-        ";" => Semicolon,
-        "space" => Space,
-        "enter" => Enter,
-        "backspace" => Backspace,
-        "tab" => Tab,
-        "escape" => Escape,
-        "left" => ArrowLeft,
-        "right" => ArrowRight,
-        "up" => ArrowUp,
-        "down" => ArrowDown,
-        "home" => Home,
-        "end" => End,
-        "pageup" => PageUp,
-        "pagedown" => PageDown,
-        "insert" => Insert,
-        "delete" => Delete,
-        "f1" => F1,
-        "f2" => F2,
-        "f3" => F3,
-        "f4" => F4,
-        "f5" => F5,
-        "f6" => F6,
-        "f7" => F7,
-        "f8" => F8,
-        "f9" => F9,
-        "f10" => F10,
-        "f11" => F11,
-        "f12" => F12,
-        _ => Unidentified,
-    }
 }
 
 #[cfg(test)]

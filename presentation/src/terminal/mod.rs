@@ -3,12 +3,15 @@
 pub(crate) mod bench;
 mod frame;
 mod grid;
+mod ime;
 mod input;
+mod keys;
 mod links;
 mod metrics;
 mod paint;
 mod runs;
 mod selection;
+mod typing;
 
 #[cfg(test)]
 pub(crate) use self::metrics::has_family;
@@ -17,10 +20,12 @@ pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
 use self::frame::{CellPosition, Frame};
 use self::grid::PtyGrid;
+pub use self::typing::InputHold;
+use self::typing::Typing;
 use crate::settings::TerminalSettings;
 use anyhow::{Result, bail};
 use domain::session::{Agent, Session};
-use ghostty_vt::{Terminal, key, mouse, render::RenderState, snapshot, terminal::Options};
+use ghostty_vt::{Terminal, mouse, render::RenderState, snapshot, terminal::Options};
 use gpui::*;
 use infrastructure::{
     client::{self, SessionMetadata, TerminalControl, TerminalEvent},
@@ -128,10 +133,12 @@ pub struct TerminalView {
     reporting_mouse: bool,
     exited: bool,
     status: Option<String>,
-    encoder: key::Encoder,
     mouse: mouse::Encoder,
+    /// Keys, input methods and focus as the program hears them.
+    typing: Typing,
     commands: async_channel::Sender<TerminalControl>,
     _follow: Task<()>,
+    _focus_changes: [Subscription; 3],
 }
 
 impl TerminalView {
@@ -139,6 +146,7 @@ impl TerminalView {
         session: Session,
         scheme: &'static Scheme,
         settings: TerminalSettings,
+        hold: InputHold,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -187,13 +195,19 @@ impl TerminalView {
                 }
             }
         });
+        let focus = cx.focus_handle();
+        let focus_changes = [
+            cx.on_focus(&focus, window, |view, window, _| view.sync_focus(window)),
+            cx.on_blur(&focus, window, |view, window, _| view.sync_focus(window)),
+            cx.observe_window_activation(window, |view, window, _| view.sync_focus(window)),
+        ];
         let mut terminal = Terminal::new(Options::default()).expect("allocate Ghostty terminal");
         scheme
             .apply_to(&mut terminal)
             .expect("apply bundled terminal palette");
         Self {
             session,
-            focus: cx.focus_handle(),
+            focus,
             metadata: SessionMetadata::default(),
             scheme,
             font: terminal_font(&settings, cx),
@@ -213,10 +227,11 @@ impl TerminalView {
             reporting_mouse: false,
             exited: false,
             status: None,
-            encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
+            typing: Typing::new(hold),
             commands,
             _follow: follow,
+            _focus_changes: focus_changes,
         }
     }
 
@@ -296,7 +311,10 @@ impl TerminalView {
                     self.scheme.apply_to(&mut terminal)?;
                     self.renderer = RenderState::new()?;
                     self.frame = Rc::default();
-                    self.terminal = terminal;
+                    let previous = std::mem::replace(&mut self.terminal, terminal);
+                    if let Some(bytes) = self.typing.installed(&previous, &self.terminal) {
+                        self.send(bytes);
+                    }
                     self.exited = exited;
                     self.status = None;
                     self.selection = None;

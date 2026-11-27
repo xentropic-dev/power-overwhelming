@@ -44,6 +44,9 @@ pub(super) struct Row {
 pub(super) struct Frame {
     pub(super) rows: Vec<Rc<Row>>,
     pub(super) cursor: Option<CellPosition>,
+    /// Where the cursor is, shown or hidden: input methods compose and place their candidate
+    /// window there.
+    pub(super) ime_cursor: Option<CellPosition>,
     pub(super) colors: Option<Colors>,
     cols: u16,
 }
@@ -58,13 +61,11 @@ impl Frame {
     ) -> Result<Option<Self>> {
         let state = renderer.update(terminal)?;
         let vt_cursor = state.cursor()?;
-        let cursor = vt_cursor
-            .viewport
-            .filter(|_| vt_cursor.visible)
-            .map(|cursor| CellPosition {
-                row: cursor.y.into(),
-                column: cursor.x.into(),
-            });
+        let ime_cursor = vt_cursor.viewport.map(|cursor| CellPosition {
+            row: cursor.y.into(),
+            column: cursor.x.into(),
+        });
+        let cursor = ime_cursor.filter(|_| vt_cursor.visible);
         let colors = state.colors()?;
         let dirty = state.dirty()?;
         let cols = state.cols()?;
@@ -72,12 +73,13 @@ impl Frame {
         let full =
             dirty == Dirty::Full || self.colors.as_ref() != Some(&colors) || self.cols != cols;
         if !full && dirty == Dirty::Clean && self.rows.len() == height {
-            if self.cursor == cursor {
+            if self.cursor == cursor && self.ime_cursor == ime_cursor {
                 return Ok(None);
             }
             return Ok(Some(Self {
                 rows: self.rows.clone(),
                 cursor,
+                ime_cursor,
                 colors: Some(colors),
                 cols,
             }));
@@ -117,6 +119,7 @@ impl Frame {
         Ok(Some(Self {
             rows,
             cursor,
+            ime_cursor,
             colors: Some(colors),
             cols,
         }))
