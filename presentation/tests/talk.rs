@@ -58,6 +58,37 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        // Ends whatever this daemon's workers left in their own slice.
+        if let Some(slice) = SLICES.lock().unwrap().remove(&self.0.id()) {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", &slice])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Each daemon's private worker slice, by daemon PID, so its scopes stay out of
+/// `app-power.slice` and are stopped with it.
+static SLICES: std::sync::Mutex<std::collections::BTreeMap<u32, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A worker slice named after the fixture's root, apart from every other test's.
+fn test_slice(root: &Path) -> String {
+    let name: String = root
+        .to_string_lossy()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("app-powertalk{name}.slice")
+}
+
+impl Daemon {
+    /// Starts `command`, a `power daemon`, and remembers its slice for teardown.
+    fn spawn(command: &mut Command, root: &Path) -> Child {
+        let child = command.spawn().unwrap();
+        SLICES.lock().unwrap().insert(child.id(), test_slice(root));
+        child
     }
 }
 
@@ -285,6 +316,7 @@ fn power(path: &Path, caller: Option<&ManagedAgent>) -> Command {
         .env("XDG_CONFIG_HOME", path.join("config"))
         .env("SHELL", "/bin/sh")
         .env("TALK_TEST_ROOT", path)
+        .env("POWER_WORKER_SLICE", test_slice(path))
         .env_remove("POWER_BIN")
         .env_remove("POWER_PLUGIN_DIR");
     for env in [
@@ -304,13 +336,10 @@ fn power(path: &Path, caller: Option<&ManagedAgent>) -> Command {
 }
 
 fn start(path: &Path) -> Daemon {
-    let mut daemon = Daemon(
-        power(path, None)
-            .arg("daemon")
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut daemon = Daemon(Daemon::spawn(
+        power(path, None).arg("daemon").stdin(Stdio::null()),
+        path,
+    ));
     poll("test daemon socket", || {
         assert!(daemon.0.try_wait().unwrap().is_none(), "Test daemon exited");
         UnixStream::connect(path.join("power.sock")).ok()
@@ -1192,14 +1221,13 @@ fn a_turn_end_reported_while_the_daemon_still_restores_clears_the_hold() {
     // then stays open as if a later session were still restoring, while this worker
     // finishes the continuation turn and reports its end.
     let mut daemon = power(&path, None);
-    sandbox.daemon = Some(Daemon(
+    sandbox.daemon = Some(Daemon(Daemon::spawn(
         daemon
             .env("POWER_TEST_RESTORE_DELAY_MS", "1500")
             .arg("daemon")
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    ));
+            .stdin(Stdio::null()),
+        &path,
+    )));
     poll("restored worker's continuation turn", || {
         (file(&path, "turn-b").lines().count() == 2 && path.join("ready-b").exists()).then_some(())
     });

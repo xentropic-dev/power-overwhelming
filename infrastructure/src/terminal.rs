@@ -283,15 +283,25 @@ impl TerminalRuntime for PtyRuntime {
         }
     }
 
+    /// Ends what any earlier launch of `session` left, whichever backend started it:
+    /// the scopes its ledger records, wherever they are, the scopes of this daemon's
+    /// slice, and fallback reapers, so a daemon that restarts with or without cgroup
+    /// ownership still finds what the earlier one started. Anything that cannot be
+    /// verified gone is an error, which defers the session.
     fn reclaim(&self, session: &str) -> Result<()> {
-        let ended = match &self.scopes {
-            Some(scopes) => scopes.reclaim(session, RECLAIM_TIMEOUT)?,
-            None => crate::reaper::reclaim(&format!("POWER_SESSION={session}"), RECLAIM_TIMEOUT)?,
-        };
-        if ended > 0 {
-            eprintln!("Ended {ended} scope(s) an earlier daemon left for session {session}.");
+        let state = state_directory()?;
+        let recorded = crate::owned::scopes(&state, session)?;
+        let mut ended = crate::cgroup::reclaim_paths(&recorded, RECLAIM_TIMEOUT)?;
+        if let Some(scopes) = &self.scopes {
+            ended += scopes.reclaim(session, RECLAIM_TIMEOUT)?;
         }
-        Ok(())
+        ended += crate::reaper::reclaim(&format!("POWER_SESSION={session}"), RECLAIM_TIMEOUT)?;
+        if ended > 0 {
+            eprintln!(
+                "Ended {ended} scope(s) or reaper(s) an earlier daemon left for session {session}."
+            );
+        }
+        crate::owned::forget(&state, session)
     }
 
     fn agent(&self, handle: &Self::Handle) -> Option<Agent> {
@@ -405,7 +415,7 @@ fn launch(
     };
     let contain = |command: &mut CommandBuilder| {
         if let Some(reaper) = &reaper {
-            crate::reaper::wrap(command, reaper);
+            crate::reaper::wrap(command, reaper)?;
         }
         runtime
             .scopes
@@ -413,7 +423,15 @@ fn launch(
             .map(|scopes| scopes.wrap(command, &session.id))
             .transpose()
     };
+    // Recorded before the launch, so a restart in either mode finds the scope.
+    let record = |scope: &Option<Scope>| -> Result<()> {
+        if let Some(scope) = scope {
+            crate::owned::record(&state_directory()?, &session.id, scope.path())?;
+        }
+        Ok(())
+    };
     let scope = contain(&mut process)?;
+    record(&scope)?;
     // The fresh start never repeats the initial prompt.
     let fallback = match (profile, &options.fallback_args) {
         (Some(profile), Some(args)) => {
@@ -428,6 +446,7 @@ fn launch(
                 profile.into(),
             );
             let scope = contain(&mut command)?;
+            record(&scope)?;
             let typed = crate::shell::first_message(profile, args, None, &installed)?;
             Some((command, scope, conversation, typed))
         }
@@ -564,6 +583,7 @@ fn launch(
         let result = wait_process(
             process,
             scope,
+            reaped,
             Some(owner),
             relaunch,
             PendingInput {
@@ -593,7 +613,18 @@ fn launch(
             },
         );
         let detail = match result {
-            Ok((status, Ok(()))) => format!("Worker process exited ({status})"),
+            Ok((status, Ok(()))) => {
+                // Nothing this launch recorded runs any more.
+                if let Err(error) = state_directory()
+                    .and_then(|state| crate::owned::forget(&state, &waiter_lifecycle.session))
+                {
+                    eprintln!(
+                        "Could not forget the scopes of {}. {error:#}",
+                        waiter_lifecycle.session
+                    );
+                }
+                format!("Worker process exited ({status})")
+            }
             Ok((status, Err(left))) => {
                 waiter_lifecycle.incomplete.store(true, Ordering::Release);
                 eprintln!(
@@ -758,6 +789,7 @@ struct Relaunch {
 fn wait_process(
     mut process: Child,
     scope: Option<Scope>,
+    reaped: bool,
     marker: Option<String>,
     mut relaunch: Option<Relaunch>,
     mut input: PendingInput<'_, impl Fn(Vec<u8>, u64)>,
@@ -768,7 +800,7 @@ fn wait_process(
     let own = |process: &Child, scope: Option<Scope>| {
         process
             .process_id()
-            .map(|pid| Owner::new(pid, scope, marker.clone()))
+            .map(|pid| Owner::new(pid, scope, reaped, marker.clone()))
     };
     let mut relaunched = Some(relaunched);
     let mut owner = own(&process, scope);
@@ -780,6 +812,12 @@ fn wait_process(
             let ended = owner
                 .as_mut()
                 .map_or(Ok(()), |owner| owner.terminate(END_GRACE));
+            if owner
+                .as_ref()
+                .is_some_and(|owner| !owner.releasable(&ended))
+            {
+                return Ok((keep_owning(process), ended));
+            }
             let _ = process.kill();
             return Ok((process.wait()?, ended));
         }
@@ -801,7 +839,11 @@ fn wait_process(
                 return Ok((status, ended));
             };
             if let Err(left) = &ended {
-                eprintln!("The failed resume left {left} running.");
+                // A fresh start would take over the owner, and its clean exit would
+                // then report the session complete while the failed resume's
+                // processes still run. Report the incomplete end instead.
+                eprintln!("The failed resume left {left} running, so no fresh start runs.");
+                return Ok((status, ended));
             }
             // Checked here, after the drain and at the spawn itself, with requests
             // held off until the spawn is done. An end that arrived first wins; one
@@ -848,6 +890,16 @@ fn wait_process(
         }
         stop.wait(Duration::from_millis(100));
     }
+}
+
+/// Leaves a reaper that has not confirmed its tree is gone running, since it still
+/// owns that tree, and reaps it once it exits. A later reclaim ends it through its
+/// owner marker. The status stands in for the one it has not reported yet.
+fn keep_owning(mut process: Child) -> portable_pty::ExitStatus {
+    thread::spawn(move || {
+        let _ = process.wait();
+    });
+    portable_pty::ExitStatus::with_exit_code(1)
 }
 
 /// Set once a session's process tree is gone, for everyone who reports its end.
@@ -1967,6 +2019,7 @@ mod tests {
         let (status, ended) = wait_process(
             process,
             Some(first_scope),
+            false,
             None,
             Some(relaunch),
             PendingInput {
@@ -2068,7 +2121,8 @@ mod tests {
         // drain, after the waiter has already chosen the fresh start.
         let started = Instant::now();
         let (_, reports, output, [_, fresh]) = wait_with_relaunch(
-            "echo resume; setsid -f sh -c \"trap '' TERM; exec sleep 600\" ; exit 1",
+            "echo resume; setsid -f sh -c \"trap '' TERM; touch /tmp/.power-drain-$$-ready; exec sleep 600\"; \
+             until test -f /tmp/.power-drain-$$-ready; do sleep 0.02; done; rm -f /tmp/.power-drain-$$-ready; exit 1",
             "echo fresh; sleep 600",
             RESUME_WINDOW,
             false,
@@ -2078,6 +2132,83 @@ mod tests {
         assert!(reports.is_empty(), "{reports:?}");
         assert!(!output.contains("fresh"), "{output:?}");
         assert!(!fresh.exists(), "the fresh start's scope was created");
+        Ok(())
+    }
+
+    #[test]
+    fn an_incomplete_resume_drain_never_spawns_a_fresh_process() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let test = crate::cgroup::tests::TestScopes::new();
+        let directory = tempfile::tempdir()?;
+        let ready = directory.path().join("ready");
+        let pair = native_pty_system().openpty(pty_size(Geometry::default()))?;
+        let shell = |script: &str| -> Result<(CommandBuilder, Scope)> {
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", script]);
+            let scope = test.scopes.wrap(&mut command, "stuck-resume-test")?;
+            Ok((command, scope))
+        };
+        // The resume leaves a helper that ignores SIGTERM, then waits until the test
+        // has made its scope's cgroup.kill fail before it exits.
+        let (first, first_scope) = shell(&format!(
+            "setsid -f sh -c \"trap '' TERM; exec sleep 600\"; touch {0}; \
+             until test -f {0}.go; do sleep 0.02; done; exit 1",
+            ready.display()
+        ))?;
+        let (fresh, fresh_scope) = shell("echo fresh; exit 0")?;
+        let check = Scope::at_path(first_scope.path());
+        let fresh_check = Scope::at_path(fresh_scope.path());
+        let process = pair.slave.spawn_command(first)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "the resume never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let kill = check.path().join("cgroup.kill");
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o444))?;
+        fs::write(directory.path().join("ready.go"), "")?;
+        let mut reports = Vec::new();
+        let result = wait_process(
+            process,
+            Some(first_scope),
+            false,
+            None,
+            Some(Relaunch {
+                command: fresh,
+                scope: Some(fresh_scope),
+                conversation: None,
+                stale_server: None,
+                slave: pair.slave,
+                deadline: Instant::now() + Duration::from_secs(60),
+                typed: None,
+            }),
+            PendingInput {
+                held: None,
+                ready: &InputReady::default(),
+                send: |_, _| {},
+            },
+            &Stop::default(),
+            &AtomicBool::new(false),
+            |pid, _| reports.push(pid),
+        );
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o644))?;
+        let (_, ended) = result?;
+        assert!(
+            ended.is_err(),
+            "an incomplete drain reported a complete end"
+        );
+        assert!(
+            reports.is_empty(),
+            "a fresh start replaced an incomplete drain"
+        );
+        assert!(!fresh_check.exists(), "the fresh start's scope was created");
+        assert!(check.populated(), "the failed resume's scope was not kept");
+        assert_eq!(
+            test.scopes
+                .reclaim("stuck-resume-test", Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
         Ok(())
     }
 
@@ -2133,6 +2264,7 @@ mod tests {
         let (_, ended) = wait_process(
             process,
             Some(scope),
+            false,
             Some("POWER_SESSION=root-exit-test".into()),
             None,
             PendingInput {
@@ -2179,6 +2311,7 @@ mod tests {
         let (_, ended) = wait_process(
             process,
             None,
+            false,
             Some(marker),
             None,
             PendingInput {

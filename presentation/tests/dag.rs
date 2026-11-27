@@ -1709,14 +1709,19 @@ fn dispatch_escape(fixture: &Fixture, run: &str, mode: &str) -> (Attempt, Manage
     let [root, helper] = read_pids(&fixture.root().join(pids), 2)[..] else {
         unreachable!()
     };
-    let environment = fs::read(format!("/proc/{helper}/environ")).unwrap();
+    // An "escape" worker exits at once, so its helper may already be ended here.
+    let Ok(environment) = fs::read(format!("/proc/{helper}/environ")) else {
+        return (attempt, agent, root, helper);
+    };
     assert!(
         !environment
             .windows(14)
             .any(|window| window == b"POWER_SESSION="),
         "the helper kept POWER_SESSION"
     );
-    let parent = fs::read_to_string(format!("/proc/{helper}/stat")).unwrap();
+    let Ok(parent) = fs::read_to_string(format!("/proc/{helper}/stat")) else {
+        return (attempt, agent, root, helper);
+    };
     let parent = parent
         .rsplit_once(')')
         .unwrap()
@@ -2284,4 +2289,105 @@ fn a_persisted_queued_worker_that_reports_at_once_starts_after_the_socket_listen
         Some("Reported at once")
     );
     assert_eq!(fixture.show(&run.id).tasks[0].state, TaskState::Interrupted);
+}
+
+#[test]
+fn an_incomplete_teardown_is_retried_by_the_live_daemon_once_the_fault_clears() {
+    // A short grace, then a teardown whose helper ignores SIGTERM and whose
+    // cgroup.kill fails, so the teardown ends incomplete without any restart.
+    let fixture = with_grace("1");
+    let run = fixture.create_run().id;
+    let (_, agent, _, helper) = dispatch_escape(&fixture, &run, "stubborn");
+    let session = agent.session.clone().unwrap();
+    let kills: Vec<_> = scope_dirs(fixture.root(), &session)
+        .into_iter()
+        .map(|scope| scope.join("cgroup.kill"))
+        .collect();
+    assert!(!kills.is_empty());
+    for kill in &kills {
+        fs::set_permissions(kill, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    fixture.wait_for_state(&run, "stubborn", TaskState::Completed);
+    // The grace, the end grace and the failing kills pass.
+    thread::sleep(Duration::from_secs(6));
+    assert!(
+        process_running(helper),
+        "the helper ended without cgroup.kill"
+    );
+    assert_eq!(agent_state(&fixture, &agent.id), "running");
+
+    for kill in &kills {
+        fs::set_permissions(kill, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    wait_for_exit_with_empty_scopes(&fixture, &agent.id, &session, &[helper]);
+    assert!(!process_running(helper), "{helper} survived the retry");
+}
+
+#[test]
+fn a_restart_without_cgroups_still_ends_what_a_scoped_worker_left() {
+    let mut fixture = with_grace("600");
+    let run = fixture.create_run().id;
+    let (_, agent, root, helper) = dispatch_escape(&fixture, &run, "escape-stay");
+    let session = agent.session.clone().unwrap();
+    fixture.wait_for_state(&run, "escape-stay", TaskState::Completed);
+    assert_eq!(populated_scopes(fixture.root(), &session).len(), 1);
+
+    fixture.restart_with(&[("POWER_WORKER_CGROUPS", "0")]);
+
+    wait_for_exit_with_empty_scopes(&fixture, &agent.id, &session, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived the restart");
+}
+
+#[test]
+fn a_restart_with_cgroups_still_ends_what_a_fallback_worker_left() {
+    let mut fixture = Fixture::with_configure_env(
+        |root| write_config(root, "dag.end_finished_workers_after = 600\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    );
+    let run = fixture.create_run().id;
+    let (_, agent, root, helper) = dispatch_escape(&fixture, &run, "escape-stay");
+    fixture.wait_for_state(&run, "escape-stay", TaskState::Completed);
+
+    fixture.restart_with(&[("POWER_WORKER_CGROUPS", "1")]);
+
+    wait_for_exit_after(&fixture, &agent.id, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived the restart");
+}
+
+#[test]
+fn without_cgroups_a_stubborn_detached_helper_ends_before_its_worker_is_exited() {
+    // The helper ignores SIGTERM and has neither POWER_SESSION nor its parent, so
+    // only the reaper that adopted it can end it.
+    let fixture = Fixture::with_configure_env(
+        |root| write_config(root, "dag.end_finished_workers_after = 0.5\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    );
+    let run = fixture.create_run().id;
+    let (_, agent, root, helper) = dispatch_escape(&fixture, &run, "stubborn");
+    wait_for_exit_after(&fixture, &agent.id, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived");
+}
+
+#[test]
+fn without_cgroups_a_missing_program_fails_the_dispatch() {
+    let fixture = Fixture::with_configure_env(|_| {}, &[("POWER_WORKER_CGROUPS", "0")]);
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "missing");
+    let output = output(
+        power(fixture.root())
+            .args([
+                "dag",
+                "dispatch",
+                &run,
+                "missing",
+                "--provider",
+                "command",
+                "--worktree",
+            ])
+            .arg(&fixture.worktrees[0])
+            .args(["--", "power-test-no-such-program"]),
+    );
+    assert!(!output.status.success(), "a missing program was dispatched");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("doesn't exist"), "{stderr}");
 }

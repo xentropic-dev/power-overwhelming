@@ -619,6 +619,10 @@ struct FakeTerminal {
     fail_start: AtomicBool,
     /// Reclaims fail while set, as when what an earlier daemon left cannot be ended.
     fail_reclaim: AtomicBool,
+    /// How long each reclaim takes, in milliseconds, as a scope slow to empty does.
+    reclaim_millis: AtomicU64,
+    /// Reclaims started so far.
+    reclaims: AtomicU64,
 }
 
 impl TerminalRuntime for FakeTerminal {
@@ -655,6 +659,10 @@ impl TerminalRuntime for FakeTerminal {
     }
 
     fn reclaim(&self, _: &str) -> Result<()> {
+        self.reclaims.fetch_add(1, Ordering::AcqRel);
+        thread::sleep(Duration::from_millis(
+            self.reclaim_millis.load(Ordering::Acquire),
+        ));
         ensure!(
             !self.fail_reclaim.load(Ordering::Acquire),
             "cgroup.kill: Read-only file system"
@@ -1778,16 +1786,22 @@ fn an_incomplete_exit_keeps_the_agent_running_and_the_record_until_a_reclaim_end
         .runtime
         .fail_reclaim
         .store(true, Ordering::Release);
+    // The terminal's process exits, as the runtime reports it: its handle stops
+    // running, and nothing edits the session map.
+    let handle = dag.application.terminal(&session)?;
+    handle.store(false, Ordering::Release);
     dag.session_exited(&session, "ended, but a helper still runs", false)?;
+    assert!(
+        dag.application.terminal(&session).is_err(),
+        "the exited terminal still looks live"
+    );
     let agent = || -> Result<ManagedAgent> {
         Ok(dag.store.read(|db| db.session_agent(&session))?.unwrap())
     };
     assert_eq!(agent()?.state, AgentState::Running);
     assert_eq!(dag.application.records.list()?.len(), 1);
 
-    // The live terminal is gone, as it is once its process exits. A failing reclaim
-    // keeps both; one that ends everything lets them go.
-    dag.application.sessions.lock().unwrap().remove(&session);
+    // A failing reclaim keeps both; one that ends everything lets them go.
     dag.retry_reclaim(session.clone());
     assert_eq!(agent()?.state, AgentState::Running);
     assert_eq!(dag.application.records.list()?.len(), 1);
@@ -2985,5 +2999,121 @@ fn a_queued_explicit_base_starts_on_the_commit_it_named_when_queued() -> Result<
         (branch.as_str(), base.as_str()),
         ("feature/queued", "commit-1")
     );
+    Ok(())
+}
+
+#[test]
+fn a_slow_reclaim_retry_and_its_blocked_write_never_delay_another_workers_teardown() -> Result<()> {
+    let records = Arc::new(BlockedSessions::default());
+    static ID: AtomicU64 = AtomicU64::new(0);
+    let application = Arc::new(Application::new(
+        FakeArtifacts::default(),
+        records.clone(),
+        FakeWorkspace::default(),
+        FakeTerminal::default(),
+        Arc::new(FakeProfiles(Vec::new())),
+        || format!("retry-{}", ID.fetch_add(1, Ordering::Relaxed)),
+    ));
+    let dag = TestDag::new(
+        application,
+        MemoryStore::default(),
+        FakeRegistry::default(),
+        FakeIcons::default(),
+    )
+    .with_finished_worker_cleanup(
+        Duration::from_millis(50),
+        SerialScheduler::start(),
+        SerialScheduler::start(),
+    )
+    .shared();
+    let run = external_run(&dag)?;
+    dag.add_tasks(&run, &[spec("second", &[])])?;
+    let runtime = &dag.application.runtime;
+
+    // The first worker ends incompletely, so a reclaim retry is due on the timer.
+    let first = dag.start(command(&run, false))?;
+    let first_session = first.agent.session.unwrap();
+    dag.report(
+        &run,
+        "work",
+        &first.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while dag.application.terminal_running(&first_session) {
+        assert!(Instant::now() < deadline, "the first teardown never ran");
+        thread::sleep(Duration::from_millis(10));
+    }
+    runtime.reclaim_millis.store(3000, Ordering::Release);
+    dag.session_exited(&first_session, "a helper still runs", false)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while runtime.reclaims.load(Ordering::Acquire) == 0 {
+        assert!(Instant::now() < deadline, "the retry never started");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // While that reclaim waits, and then while its record delete blocks, the second
+    // worker's teardown is still due on time.
+    let second = dag.start(Dispatch {
+        task: "second".into(),
+        ..command(&run, false)
+    })?;
+    let second_session = second.agent.session.unwrap();
+    let handle = dag.application.terminal(&second_session)?;
+    let reported = Instant::now();
+    dag.report(
+        &run,
+        "second",
+        &second.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    while handle.load(Ordering::Acquire) {
+        assert!(
+            reported.elapsed() < Duration::from_secs(2),
+            "a slow reclaim retry held up the next worker's teardown"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while records.waiting.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the retry never wrote its record"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let third = {
+        dag.add_tasks(&run, &[spec("third", &[])])?;
+        dag.start(Dispatch {
+            task: "third".into(),
+            ..command(&run, false)
+        })?
+    };
+    let handle = dag
+        .application
+        .terminal(third.agent.session.as_ref().unwrap())?;
+    let reported = Instant::now();
+    dag.report(
+        &run,
+        "third",
+        &third.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    while handle.load(Ordering::Acquire) {
+        assert!(
+            reported.elapsed() < Duration::from_secs(2),
+            "a retry's blocked record write held up the next worker's teardown"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    records.open();
+    let agent = dag
+        .store
+        .read(|db| db.session_agent(&first_session))?
+        .unwrap();
+    assert_eq!(agent.state, AgentState::Exited);
     Ok(())
 }

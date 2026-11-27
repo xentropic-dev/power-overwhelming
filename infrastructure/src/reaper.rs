@@ -12,11 +12,12 @@
 //! they are reaped. Grandchildren are reached as their parents die and they are
 //! reparented to the reaper.
 
+use crate::process_tree::Pinned;
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::BTreeMap,
     ffi::OsString,
     fs,
+    os::fd::OwnedFd,
     path::Path,
     process::Command,
     sync::{
@@ -184,9 +185,29 @@ pub(crate) fn program_of(reaper: u32) -> u32 {
     }
 }
 
-/// Makes `command` run under the reaper. `executable` is the power binary.
-pub(crate) fn wrap(command: &mut portable_pty::CommandBuilder, executable: &Path) {
+/// Makes `command` run under the reaper. `executable` is the power binary. The
+/// program is resolved first, as an unwrapped spawn would, so one that does not
+/// exist fails the launch here rather than later inside the reaper.
+pub(crate) fn wrap(command: &mut portable_pty::CommandBuilder, executable: &Path) -> Result<()> {
+    let program = command
+        .get_argv()
+        .first()
+        .cloned()
+        .context("The command has no program")?;
+    let path = command
+        .get_env("PATH")
+        .map(std::ffi::OsStr::to_owned)
+        .or_else(|| std::env::var_os("PATH"));
+    let cwd = command.get_cwd().map(std::path::PathBuf::from);
+    let resolved =
+        crate::cgroup::find_program(&program, path, cwd.as_deref()).with_context(|| {
+            format!(
+                "Unable to spawn {} because it doesn't exist",
+                program.to_string_lossy()
+            )
+        })?;
     let argv = command.get_argv_mut();
+    argv[0] = resolved.into_os_string();
     argv.splice(
         0..0,
         [
@@ -195,45 +216,82 @@ pub(crate) fn wrap(command: &mut portable_pty::CommandBuilder, executable: &Path
             "--".into(),
         ],
     );
+    Ok(())
+}
+
+/// Whether `pid` runs `power reap` with `marker` in its environment.
+fn is_reaper(pid: u32, marker: &[u8]) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).nth(1) == Some(SUBCOMMAND.as_bytes()))
+        && fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|environ| environ.split(|byte| *byte == 0).any(|item| item == marker))
+}
+
+/// What a search for an earlier daemon's reapers found.
+#[derive(Debug, Default)]
+struct Found {
+    /// Reapers pinned by a pidfd that was opened before their identity was read and
+    /// was still alive after, so signalling the pin reaches the reaper.
+    pinned: Vec<Pinned>,
+    /// Reapers that could not be pinned, by PID. They still run, so nothing may
+    /// treat them as gone, and they are never signalled by PID.
+    unpinned: Vec<(u32, std::io::Error)>,
 }
 
 /// Reapers an earlier daemon left for `session`, found by their owner marker.
-fn reapers(marker: &[u8]) -> BTreeMap<u32, u64> {
+/// `open` opens a pidfd, so a kernel that refuses one can be tested.
+fn reapers(marker: &[u8], open: impl Fn(u32) -> std::io::Result<OwnedFd>) -> Found {
+    let mut found = Found::default();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return BTreeMap::new();
+        return found;
     };
-    entries
+    let candidates = entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-                cmdline.split(|byte| *byte == 0).nth(1) == Some(SUBCOMMAND.as_bytes())
-            }) && fs::read(format!("/proc/{pid}/environ"))
-                .is_ok_and(|environ| environ.split(|byte| *byte == 0).any(|item| item == marker))
-        })
-        .filter_map(|pid| Some((pid, start_time(pid)?)))
-        .collect()
-}
-
-fn start_time(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+        // A cheap first look, so only likely reapers are pinned.
+        .filter(|pid| is_reaper(*pid, marker));
+    for pid in candidates {
+        match Pinned::pin_now(pid, &open) {
+            // The pin comes first, then identity is read again, then the pin is
+            // checked alive: had the PID been reused before the pin, the reads would
+            // describe the pinned replacement, and had it been reused after, the pin
+            // would show its own process exited.
+            Ok(Some(pin)) => {
+                if is_reaper(pid, marker) && !pin.exited() {
+                    found.pinned.push(pin);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => found.unpinned.push((pid, error)),
+        }
+    }
+    found
 }
 
 /// Ends what reapers an earlier daemon left for the session marked `marker` still
 /// run, waiting up to `timeout`. Each reaper ends its own tree. Returns how many
-/// reapers were ended, or fails naming those that outlived the timeout.
+/// reapers were ended, or fails naming those that outlived the timeout or that
+/// could not be pinned, which are left alone rather than signalled by PID.
 pub(crate) fn reclaim(marker: &str, timeout: Duration) -> Result<usize> {
-    let found = reapers(marker.as_bytes());
-    let pinned: Vec<_> = found
-        .iter()
-        .filter_map(|(pid, start)| crate::process_tree::Pinned::pin_start(*pid, *start))
-        .collect();
+    reclaim_with(marker, timeout, crate::process_tree::pidfd_open)
+}
+
+fn reclaim_with(
+    marker: &str,
+    timeout: Duration,
+    open: impl Fn(u32) -> std::io::Result<OwnedFd>,
+) -> Result<usize> {
+    let Found { pinned, unpinned } = reapers(marker.as_bytes(), open);
+    if !unpinned.is_empty() {
+        let names: Vec<String> = unpinned
+            .iter()
+            .map(|(pid, error)| format!("{pid} ({error})"))
+            .collect();
+        bail!(
+            "reapers {} could not be pinned, so they were left running",
+            names.join(", ")
+        );
+    }
     for reaper in &pinned {
         reaper.signal(libc::SIGTERM);
     }
@@ -243,11 +301,98 @@ pub(crate) fn reclaim(marker: &str, timeout: Duration) -> Result<usize> {
             let stuck: Vec<_> = pinned
                 .iter()
                 .filter(|reaper| !reaper.exited())
-                .map(|reaper| reaper.pid())
+                .map(Pinned::pid)
                 .collect();
             bail!("reapers {stuck:?} still run");
         }
         thread::sleep(POLL);
     }
     Ok(pinned.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Child, Stdio},
+    };
+
+    /// Ends the fake reaper's process group, its sleep included.
+    fn end_group(pid: u32) {
+        // SAFETY: kill has no memory effects.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+
+    /// A process whose command line and environment look like a reaper's: `sh reap`
+    /// runs a script named `reap`, and stays `sh reap` while it sleeps.
+    fn fake_reaper(directory: &Path, marker: &str) -> Child {
+        fs::write(directory.join(SUBCOMMAND), "sleep 600; :\n").unwrap();
+        let (name, value) = marker.split_once('=').unwrap();
+        let child = Command::new("/bin/sh")
+            .arg(SUBCOMMAND)
+            .current_dir(directory)
+            .env(name, value)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !is_reaper(child.id(), marker.as_bytes()) {
+            assert!(Instant::now() < deadline, "the fake reaper never started");
+            thread::sleep(POLL);
+        }
+        child
+    }
+
+    fn running(pid: u32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().next())
+                .is_some_and(|state| !matches!(state, "Z" | "X"))
+        })
+    }
+
+    #[test]
+    fn a_reaper_that_cannot_be_pinned_is_deferred_not_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = format!("REAPER_TEST=unpinnable-{}", std::process::id());
+        let mut reaper = fake_reaper(directory.path(), &marker);
+        for errno in [libc::EMFILE, libc::ENOSYS] {
+            let refused = reclaim_with(&marker, Duration::from_millis(200), |_| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            let error = refused.expect_err("an unpinnable reaper was taken for gone");
+            assert!(
+                error.to_string().contains(&reaper.id().to_string()),
+                "{error}"
+            );
+            assert!(running(reaper.id()), "an unpinned reaper was signalled");
+        }
+        // Once it can be pinned, it is ended.
+        assert_eq!(reclaim(&marker, Duration::from_secs(5)).unwrap(), 1);
+        end_group(reaper.id());
+        reaper.wait().unwrap();
+    }
+
+    #[test]
+    fn a_reaper_that_exits_after_its_pin_is_never_signalled() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = format!("REAPER_TEST=reused-{}", std::process::id());
+        let reaper = std::sync::Mutex::new(fake_reaper(directory.path(), &marker));
+        // The reaper exits between the first look and the identity reads made while
+        // pinned, as one whose PID is about to be reused does. Its pin then shows it
+        // exited, so whatever takes the PID is never sent anything.
+        let ended = reclaim_with(&marker, Duration::from_secs(1), |pid| {
+            let fd = crate::process_tree::pidfd_open(pid)?;
+            let mut reaper = reaper.lock().unwrap();
+            end_group(reaper.id());
+            reaper.wait().unwrap();
+            Ok(fd)
+        })
+        .unwrap();
+        assert_eq!(ended, 0);
+    }
 }

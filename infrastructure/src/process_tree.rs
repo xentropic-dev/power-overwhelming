@@ -151,9 +151,25 @@ impl Pinned {
             }))
     }
 
-    /// Pins `pid` by a pidfd if it is still the process that started at `start`.
-    pub(crate) fn pin_start(pid: u32, start: u64) -> Option<Self> {
-        Self::open(pid, start).ok().flatten()
+    /// Pins whatever process `pid` names now by a pidfd, before anything is known
+    /// about it, so identity checks made while holding the pin describe the pinned
+    /// process as long as `exited` is false afterwards. `Ok(None)` means no process
+    /// has that PID. Any other failure, `EMFILE` and `ENOSYS` included, leaves the
+    /// process unpinned but not gone.
+    pub(crate) fn pin_now(
+        pid: u32,
+        open: impl Fn(u32) -> io::Result<OwnedFd>,
+    ) -> Result<Option<Self>, io::Error> {
+        let fd = match open(pid) {
+            Ok(fd) => fd,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(Self {
+            pid,
+            start: stat(pid).map_or(0, |stat| stat.start),
+            fd: Some(fd),
+        }))
     }
 
     pub(crate) fn pid(&self) -> u32 {
@@ -233,7 +249,7 @@ impl Pinned {
     }
 }
 
-fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+pub(crate) fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let pid = libc::pid_t::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
     // SAFETY: pidfd_open takes a PID and flags and returns a new descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };

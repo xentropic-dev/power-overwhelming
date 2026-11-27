@@ -188,6 +188,24 @@ impl<T: TerminalRuntime> Application<T> {
         self.records.remove(id)
     }
 
+    /// Drops session `id`'s terminal handle once its process has exited, keeping
+    /// the durable record, so the session no longer looks live while what it left is
+    /// reclaimed. A handle that still runs, such as a relaunch, stays.
+    pub fn retire_terminal(&self, id: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions
+            .get(id)
+            .is_some_and(|live| !self.runtime.is_running(&live.terminal))
+        {
+            sessions.remove(id);
+        }
+    }
+
+    /// Whether a live terminal runs session `id`.
+    pub fn terminal_running(&self, id: &str) -> bool {
+        self.session_is_running(id).unwrap_or(false)
+    }
+
     pub fn terminal(&self, id: &str) -> Result<T::Handle> {
         self.sessions
             .lock()

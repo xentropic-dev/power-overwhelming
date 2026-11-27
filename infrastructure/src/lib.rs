@@ -12,6 +12,7 @@ pub mod plugins;
 mod agent_socket;
 mod dag_adapter;
 mod dag_store;
+mod owned;
 mod ownership;
 mod persistence;
 mod process_tree;

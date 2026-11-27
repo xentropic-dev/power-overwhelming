@@ -1196,6 +1196,9 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         })?;
         if !complete {
             eprintln!("Session {session} left processes running, so it stays for a reclaim.");
+            // The exited terminal no longer owns anything, so the retry must not
+            // mistake its handle for a live one. The record stays for a restart.
+            self.application.retire_terminal(session);
             self.schedule_reclaim(session.to_owned());
             return Ok(());
         }
@@ -1247,7 +1250,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             return;
         };
         let teardown = cleanup.teardown.clone();
-        let job = Box::new(move || dag.retry_reclaim(session));
+        // The timer only starts the retry. The reclaim can wait seconds for a stuck
+        // scope and the record write can wait on the store, so both run on a thread
+        // of their own and never delay a due teardown of another worker.
+        let job = Box::new(move || {
+            let retry = dag.clone();
+            let retried = session.clone();
+            let spawned = std::thread::Builder::new()
+                .name("power-reclaim".into())
+                .spawn(move || retry.retry_reclaim(retried));
+            if let Err(error) = spawned {
+                eprintln!("Could not start a reclaim of session {session}. {error}");
+                dag.schedule_reclaim(session);
+            }
+        });
         if let Err(error) = teardown.schedule(RECLAIM_RETRY, job) {
             eprintln!("Could not schedule another reclaim. {error:#}");
         }
@@ -1260,7 +1276,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         B: 'static,
         I: 'static,
     {
-        if self.application.terminal(&session).is_ok() {
+        if self.application.terminal_running(&session) {
             // A live terminal owns the session again.
             return;
         }

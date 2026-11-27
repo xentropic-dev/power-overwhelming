@@ -216,36 +216,43 @@ impl WorkerScopes {
     /// Ends everything left in `session`'s scopes, waiting up to `timeout` for them
     /// to empty. Returns how many scopes still held processes.
     pub(crate) fn reclaim(&self, session: &str, timeout: Duration) -> Result<usize> {
-        let scopes: Vec<Scope> = self
-            .leftovers(session)?
-            .into_iter()
-            .filter(Scope::populated)
-            .collect();
-        for scope in &scopes {
-            eprintln!(
-                "Ending processes that an earlier daemon left in {}.",
-                scope.name()
-            );
-            let _ = scope.thaw();
-            scope
-                .kill()
-                .with_context(|| format!("Could not kill {}", scope.name()))?;
-        }
-        let deadline = Instant::now() + timeout;
-        while scopes.iter().any(Scope::populated) {
-            if Instant::now() >= deadline {
-                let stuck: Vec<_> = scopes
-                    .iter()
-                    .filter(|scope| scope.populated())
-                    .map(Scope::name)
-                    .collect();
-                bail!("{} still hold processes after SIGKILL", stuck.join(", "));
-            }
-            let _ = scopes.iter().try_for_each(Scope::kill);
-            thread::sleep(POLL);
-        }
-        Ok(scopes.len())
+        reclaim_scopes(self.leftovers(session)?, timeout)
     }
+}
+
+/// Ends everything left in the scopes at `paths`, which an earlier daemon recorded,
+/// in whatever slice it used. This needs no systemd, only `cgroup.kill`, so a daemon
+/// that now runs without cgroup ownership still ends them.
+pub(crate) fn reclaim_paths(paths: &[PathBuf], timeout: Duration) -> Result<usize> {
+    reclaim_scopes(paths.iter().cloned().map(Scope::at).collect(), timeout)
+}
+
+fn reclaim_scopes(scopes: Vec<Scope>, timeout: Duration) -> Result<usize> {
+    let scopes: Vec<Scope> = scopes.into_iter().filter(Scope::populated).collect();
+    for scope in &scopes {
+        eprintln!(
+            "Ending processes that an earlier daemon left in {}.",
+            scope.name()
+        );
+        let _ = scope.thaw();
+        scope
+            .kill()
+            .with_context(|| format!("Could not kill {}", scope.name()))?;
+    }
+    let deadline = Instant::now() + timeout;
+    while scopes.iter().any(Scope::populated) {
+        if Instant::now() >= deadline {
+            let stuck: Vec<_> = scopes
+                .iter()
+                .filter(|scope| scope.populated())
+                .map(Scope::name)
+                .collect();
+            bail!("{} still hold processes after SIGKILL", stuck.join(", "));
+        }
+        let _ = scopes.iter().try_for_each(Scope::kill);
+        thread::sleep(POLL);
+    }
+    Ok(scopes.len())
 }
 
 /// The start of every unit name for `session`. Characters a unit name cannot hold
@@ -319,7 +326,11 @@ fn probe(command: &mut Command) -> Result<String> {
 
 /// Resolves a program the way `execvp` does: a name with a slash is a path, which
 /// is relative to `cwd`, and any other name is looked up in `path`.
-fn find_program(program: &OsStr, path: Option<OsString>, cwd: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_program(
+    program: &OsStr,
+    path: Option<OsString>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
     let executable = |candidate: &Path| {
         fs::metadata(candidate)
             .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
@@ -370,7 +381,6 @@ impl Scope {
             .unwrap_or_default()
     }
 
-    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
