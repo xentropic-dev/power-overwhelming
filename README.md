@@ -357,3 +357,5 @@ To compare daemon startup, reattachment, and PTY round-trip latency on the same 
 ```sh
 python3 scripts/bench-daemon.py ./target/release/power --reference /path/to/previous/power
 ```
+
+To measure terminal rendering, launch the GUI with `POWER_TERMINAL_BENCH=/tmp/power-terminal.jsonl power gui`. It appends one JSON object per second, including idle seconds. Each sample records the Unix time (`t`) and counts since the previous sample for workspace renders (`window`), terminal renders (`terminal`), grid paints (`grid`), rows decoded and checked for links (`decoded_rows`), and rows whose drawing operations were rebuilt (`rows`).
