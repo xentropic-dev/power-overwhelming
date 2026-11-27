@@ -32,10 +32,11 @@ pub enum Kind {
         directory: Option<PathBuf>,
     },
     Boxes,
-    Worktrees(String),
     NewWorktree {
         box_id: String,
         from_session: String,
+        /// The box's folder under the worktree root, where a typed name is checked out.
+        folder: PathBuf,
         created: bool,
     },
     Tabs,
@@ -82,7 +83,6 @@ pub enum Choice {
     Run(String),
     Agent(String),
     CopyText(String),
-    NewWorktree(String),
     CreateWorktree(String),
     Worktree(PathBuf),
     Session(Session, PathBuf),
@@ -144,13 +144,15 @@ pub struct Picker {
     pub agent_talk: HashMap<String, AgentTalkSummary>,
     query: String,
     cursor: usize,
-    select_all: bool,
+    /// Selected byte range of the query, which typing replaces.
+    selection: Option<Range<usize>>,
     edited: bool,
     selected: usize,
     scroll: ScrollHandle,
     theme_scroll: UniformListScrollHandle,
     listing: Option<Listing>,
-    walk_request: Option<PathBuf>,
+    /// A directory to walk, and how deep.
+    walk_request: Option<(PathBuf, usize)>,
     completions: Vec<Completion>,
     help_matches: Vec<usize>,
     matcher: Matcher,
@@ -161,7 +163,6 @@ impl Kind {
         match self {
             Self::Repository { .. } => "New box",
             Self::Boxes => "Boxes",
-            Self::Worktrees(_) => "New tab in a worktree",
             Self::NewWorktree { .. } => "New worktree",
             Self::Tabs => "Tabs",
             Self::Runs { .. } => "DAG runs",
@@ -187,8 +188,7 @@ impl Kind {
         match self {
             Self::Repository { .. } => Some("Repository or worktree path"),
             Self::Boxes => Some("Search boxes"),
-            Self::Worktrees(_) => Some("Search worktrees"),
-            Self::NewWorktree { created, .. } => (!created).then_some("Branch name"),
+            Self::NewWorktree { created, .. } => (!created).then_some("Worktree path"),
             Self::Tabs => Some("Search by tab number or name"),
             Self::Runs { .. } => Some("Search runs"),
             Self::Agents { .. } => Some("Search agents"),
@@ -228,7 +228,7 @@ impl Picker {
             agent_talk: HashMap::new(),
             query: String::new(),
             cursor: 0,
-            select_all: false,
+            selection: None,
             edited: false,
             selected: 0,
             scroll: ScrollHandle::new(),
@@ -247,7 +247,7 @@ impl Picker {
             if !self.edited {
                 self.query = directory.to_string_lossy().into_owned();
                 self.cursor = self.query.len();
-                self.select_all = true;
+                self.selection = Some(0..self.query.len());
                 self.reset_selection();
                 self.refresh_completions();
             }
@@ -259,6 +259,9 @@ impl Picker {
     /// parent changes.
     fn refresh_completions(&mut self) {
         self.completions.clear();
+        if matches!(self.kind, Kind::NewWorktree { created: false, .. }) {
+            return self.refresh_worktree_completions();
+        }
         let Kind::Repository { directory } = &self.kind else {
             return;
         };
@@ -283,7 +286,7 @@ impl Picker {
                 entries: Vec::new(),
                 done: false,
             });
-            self.walk_request = Some(root);
+            self.walk_request = Some((root, WALK_DEPTH));
         }
         let mut completions = Vec::new();
         if typed.is_dir() || fragment.is_empty() {
@@ -344,8 +347,105 @@ impl Picker {
         }
     }
 
-    /// The directory the caller should walk with [`walk`], if the query moved to a new parent.
-    pub fn take_walk_request(&mut self) -> Option<PathBuf> {
+    /// Lists the typed path first, to create it as a worktree or open a shell when it exists,
+    /// then the directories beside it that match the text after the last separator.
+    fn refresh_worktree_completions(&mut self) {
+        let Kind::NewWorktree { folder, .. } = &self.kind else {
+            return;
+        };
+        if self.query.trim().is_empty() {
+            return;
+        }
+        let home = Self::home();
+        let target = worktree_target(&self.query, folder, home.as_deref());
+        let resolved = target
+            .as_ref()
+            .ok()
+            .map(|(branch, path)| path.clone().unwrap_or_else(|| folder.join(branch)));
+        let exists = resolved.as_ref().is_some_and(|path| path.is_dir());
+        let mut completions = vec![Completion {
+            row: Row {
+                label: if exists {
+                    "Open shell"
+                } else {
+                    "Create worktree"
+                }
+                .into(),
+                detail: match (&target, &resolved) {
+                    (Err(message), _) => message.clone(),
+                    (_, Some(path)) => display_path(path, home.as_deref()),
+                    _ => String::new(),
+                },
+                choice: Choice::CreateWorktree(self.query.clone()),
+            },
+            text: self.query.clone(),
+            highlights: Vec::new(),
+        }];
+        let (parent, fragment) = match self.query.rfind(is_separator) {
+            Some(index) => self.query.split_at(index + 1),
+            None => ("", self.query.as_str()),
+        };
+        let (parent, fragment) = (parent.to_owned(), fragment.to_owned());
+        let root = if parent.is_empty() {
+            folder.clone()
+        } else {
+            self.path(&parent, None)
+        };
+        if root.is_absolute()
+            && self
+                .listing
+                .as_ref()
+                .is_none_or(|listing| listing.root != root)
+        {
+            self.listing = Some(Listing {
+                root: root.clone(),
+                entries: Vec::new(),
+                done: false,
+            });
+            self.walk_request = Some((root.clone(), 1));
+        }
+        let pattern = Pattern::parse(&fragment, CaseMatching::Smart, Normalization::Smart);
+        let show_hidden = fragment.starts_with('.');
+        let mut buffer = Vec::new();
+        let mut matches = Vec::new();
+        let entries = self
+            .listing
+            .iter()
+            .filter(|listing| listing.root == root)
+            .flat_map(|listing| &listing.entries);
+        for entry in entries {
+            if entry.depth != 1
+                || (entry.hidden && !show_hidden)
+                || resolved.as_ref() == Some(&entry.path)
+            {
+                continue;
+            }
+            if let Some((rank, ranges)) =
+                path_match(&pattern, &mut self.matcher, entry, &mut buffer)
+            {
+                matches.push((rank, ranges, entry));
+            }
+        }
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.relative.cmp(&b.2.relative)));
+        for (_, highlights, entry) in matches.into_iter().take(MAX_COMPLETIONS) {
+            let mut row = directory_row(entry.relative.clone(), &entry.path, "");
+            row.choice = Choice::Worktree(entry.path.clone());
+            completions.push(Completion {
+                row,
+                text: format!("{parent}{}", entry.relative),
+                highlights,
+            });
+        }
+        self.completions = completions;
+        let count = self.completions.len();
+        if self.selected >= count {
+            self.selected = count.saturating_sub(1);
+        }
+    }
+
+    /// The directory the caller should walk with [`walk`], and how deep, if the query moved
+    /// to a new parent.
+    pub fn take_walk_request(&mut self) -> Option<(PathBuf, usize)> {
         self.walk_request.take()
     }
 
@@ -377,7 +477,7 @@ impl Picker {
         };
         self.query = text;
         self.cursor = self.query.len();
-        self.select_all = false;
+        self.selection = None;
         self.edited = true;
         self.accept_pending = false;
         self.reset_selection();
@@ -429,7 +529,7 @@ impl Picker {
                 })
                 .collect();
         }
-        if matches!(self.kind, Kind::Repository { .. }) && !self.query.is_empty() {
+        if self.completes_paths() && !self.query.is_empty() {
             return self
                 .completions
                 .iter()
@@ -485,18 +585,34 @@ impl Picker {
     }
 
     pub fn selection(&self) -> Option<Choice> {
-        if let Kind::NewWorktree { created: false, .. } = &self.kind {
-            return (!self.query.is_empty()).then(|| Choice::CreateWorktree(self.query.clone()));
-        }
         self.choice(self.selected)
     }
 
-    /// Fills the branch prompt with a suggested name, selected so typing replaces it.
-    pub fn suggest_branch(&mut self, name: String) {
-        if let Kind::NewWorktree { created: false, .. } = &self.kind {
-            self.cursor = name.len();
-            self.query = name;
-            self.select_all = true;
+    /// Whether the rows are path completions of the query.
+    fn completes_paths(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Repository { .. } | Kind::NewWorktree { created: false, .. }
+        )
+    }
+
+    /// Fills the worktree prompt with the path for a suggested name. Only the name is
+    /// selected, so typing or one backspace replaces it and keeps the folder.
+    pub fn suggest_worktree(&mut self, name: &str, home: Option<&Path>) {
+        if let Kind::NewWorktree {
+            folder,
+            created: false,
+            ..
+        } = &self.kind
+        {
+            let mut folder = display_path(folder, home);
+            if !folder.ends_with(is_separator) {
+                folder.push(MAIN_SEPARATOR);
+            }
+            self.query = folder + name;
+            self.cursor = self.query.len();
+            self.selection = Some(self.query.len() - name.len()..self.query.len());
+            self.refresh_completions();
         }
     }
 
@@ -609,10 +725,9 @@ impl Picker {
     }
 
     fn replace_selection(&mut self, text: &str) {
-        if self.select_all {
-            self.query.clear();
-            self.cursor = 0;
-            self.select_all = false;
+        if let Some(range) = self.selection.take() {
+            self.cursor = range.start;
+            self.query.replace_range(range, "");
         }
         self.query.insert_str(self.cursor, text);
         self.cursor += text.len();
@@ -659,9 +774,9 @@ impl Picker {
         }
     }
 
-    /// Completes the selected directory in the new box picker. Returns false elsewhere.
+    /// Completes the selected directory in the path pickers. Returns false elsewhere.
     pub fn complete_selection(&mut self) -> bool {
-        if self.waiting || !matches!(self.kind, Kind::Repository { .. }) {
+        if self.waiting || !self.completes_paths() {
             return false;
         }
         self.complete();
@@ -677,7 +792,7 @@ impl Picker {
         if mods.control && !mods.alt && !mods.platform {
             match key {
                 "a" => {
-                    self.select_all = true;
+                    self.selection = Some(0..self.query.len());
                     self.edited = true;
                 }
                 "v" => {
@@ -685,8 +800,12 @@ impl Picker {
                         self.replace_selection(&text.replace(['\r', '\n', '\0'], ""));
                     }
                 }
-                "c" if self.select_all => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(self.query.clone()));
+                "c" => {
+                    if let Some(range) = self.selection.clone() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            self.query[range].to_owned(),
+                        ));
+                    }
                 }
                 _ => {}
             }
@@ -697,16 +816,22 @@ impl Picker {
                 self.cursor = match key {
                     "home" => 0,
                     "end" => self.query.len(),
-                    "left" if self.select_all => 0,
-                    "right" if self.select_all => self.query.len(),
+                    "left" | "right" if self.selection.is_some() => {
+                        let range = self.selection.clone().unwrap();
+                        if key == "left" {
+                            range.start
+                        } else {
+                            range.end
+                        }
+                    }
                     "left" => self.before_cursor(),
                     _ => self.after_cursor(),
                 };
-                self.select_all = false;
+                self.selection = None;
                 self.edited = true;
             }
             "backspace" | "delete" => {
-                if !self.select_all {
+                if self.selection.is_none() {
                     let range = if key == "backspace" {
                         self.before_cursor()..self.cursor
                     } else {
@@ -749,7 +874,7 @@ impl Picker {
             && self.message.is_none()
             && !self.searching();
         let has_results = !visible.is_empty();
-        let completing = matches!(self.kind, Kind::Repository { .. }) && !self.query.is_empty();
+        let completing = self.completes_paths() && !self.query.is_empty();
         let theme_list = matches!(self.kind, Kind::ColorSchemes { .. }).then(|| {
             let rows = std::mem::take(&mut visible);
             let selected = self.selected;
@@ -921,13 +1046,25 @@ impl Picker {
                             .border_1()
                             .border_color(rgb(colors.accent))
                             .bg(rgb(colors.background));
-                        panel.child(if self.select_all && !self.query.is_empty() {
-                            field.child(
-                                div()
-                                    .bg(rgb(colors.raised))
-                                    .whitespace_nowrap()
-                                    .child(self.query.clone()),
-                            )
+                        let selection = self.selection.clone().filter(|range| !range.is_empty());
+                        panel.child(if let Some(range) = selection {
+                            field
+                                .child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .child(self.query[..range.start].to_owned()),
+                                )
+                                .child(
+                                    div()
+                                        .bg(rgb(colors.raised))
+                                        .whitespace_nowrap()
+                                        .child(self.query[range.clone()].to_owned()),
+                                )
+                                .child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .child(self.query[range.end..].to_owned()),
+                                )
                         } else {
                             field
                                 .child(
@@ -1072,12 +1209,12 @@ fn separator(query: &str) -> char {
 /// batches. It skips anything `.gitignore` excludes and never follows symlinks. Hidden and
 /// build directories are listed but not entered, and hidden ones only directly below the root.
 /// Stops early when the receiver is dropped.
-pub fn walk(root: &Path, sender: &async_channel::Sender<Vec<Entry>>) {
+pub fn walk(root: &Path, depth: usize, sender: &async_channel::Sender<Vec<Entry>>) {
     let found = AtomicUsize::new(0);
     WalkBuilder::new(root)
         .hidden(false)
         .follow_links(false)
-        .max_depth(Some(WALK_DEPTH))
+        .max_depth(Some(depth))
         .build_parallel()
         .visit(&mut Visitors {
             root,
@@ -1263,10 +1400,86 @@ fn run_detail(run: &Run) -> String {
     )
 }
 
+/// Shows a path with the home directory as `~`.
+fn display_path(path: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~{MAIN_SEPARATOR}{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Reads the new worktree prompt as a branch name and, when the path leaves the box's
+/// folder, where to check it out. Text after the folder is the branch, so `feature/x`
+/// works; a bare name means a branch in the folder.
+pub fn worktree_target(
+    query: &str,
+    folder: &Path,
+    home: Option<&Path>,
+) -> Result<(String, Option<PathBuf>), String> {
+    let query = query.trim();
+    let path = match query.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(is_separator) => match home {
+            Some(home) => home.join(rest.trim_start_matches(is_separator)),
+            None => PathBuf::from(query),
+        },
+        _ => PathBuf::from(query),
+    };
+    if let Ok(branch) = path.strip_prefix(folder) {
+        let branch = branch
+            .to_string_lossy()
+            .trim_matches(is_separator)
+            .to_owned();
+        if branch.is_empty() {
+            return Err("Type a name for the worktree.".into());
+        }
+        return Ok((branch, None));
+    }
+    if !path.is_absolute() {
+        if query.contains(is_separator) {
+            return Err(format!(
+                "Type a name, or a full path such as {}{MAIN_SEPARATOR}name.",
+                display_path(folder, home)
+            ));
+        }
+        return Ok((query.to_owned(), None));
+    }
+    match path.file_name() {
+        Some(name) => Ok((name.to_string_lossy().into_owned(), Some(path))),
+        None => Err("Type a name for the worktree.".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Rank, Run, Shortcut, path_match, run_detail, search_shortcuts, walk};
+    use super::{
+        Entry, Rank, Run, Shortcut, display_path, path_match, run_detail, search_shortcuts, walk,
+        worktree_target,
+    };
     use infrastructure::client::Coordinator;
+
+    #[test]
+    fn worktree_prompt_reads_the_name_after_the_box_folder() {
+        let home = PathBuf::from("/home/me");
+        let folder = home.join(".power/repo");
+        let target = |query| worktree_target(query, &folder, Some(&home));
+        assert_eq!(display_path(&folder, Some(&home)), "~/.power/repo");
+        assert_eq!(
+            target("~/.power/repo/quiet-cedar"),
+            Ok(("quiet-cedar".into(), None))
+        );
+        assert_eq!(
+            target("/home/me/.power/repo/feature/x/"),
+            Ok(("feature/x".into(), None))
+        );
+        assert_eq!(target("mine"), Ok(("mine".into(), None)));
+        assert_eq!(
+            target("~/work/mine"),
+            Ok(("mine".into(), Some(home.join("work/mine"))))
+        );
+        assert!(target("~/.power/repo/").is_err());
+        assert!(target("work/mine").is_err());
+    }
 
     #[test]
     fn archived_runs_say_archived_in_the_row_detail() {
@@ -1378,7 +1591,7 @@ mod tests {
         std::fs::write(root.path().join("a/file"), "").unwrap();
         std::fs::write(root.path().join("repo/.gitignore"), "ignored/\n").unwrap();
         let (sender, receiver) = async_channel::unbounded();
-        walk(root.path(), &sender);
+        walk(root.path(), super::WALK_DEPTH, &sender);
         drop(sender);
         let mut found: Vec<String> = std::iter::from_fn(|| receiver.try_recv().ok())
             .flatten()

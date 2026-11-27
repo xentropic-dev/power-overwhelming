@@ -170,8 +170,14 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             box_sel,
             from_session,
             branch,
+            path,
         } => Reply::ViewWorktreeCreated {
-            path: application.create_view_worktree(&box_sel, &from_session, &branch)?,
+            path: application.create_view_worktree(
+                &box_sel,
+                &from_session,
+                &branch,
+                path.as_deref(),
+            )?,
         },
         DagRequest::ListManagedWorktrees { scope } => {
             let box_id = worktree_box(application, scope)?;

@@ -57,6 +57,24 @@ pub struct SavedView {
 }
 
 impl SavedBox {
+    /// Folder name of the repository, which also names its folder under the worktree root.
+    pub fn name(&self) -> String {
+        let directory = if self
+            .repository
+            .file_name()
+            .is_some_and(|name| name == ".git")
+        {
+            self.repository.parent().unwrap_or(&self.repository)
+        } else {
+            &self.repository
+        };
+        directory
+            .file_name()
+            .unwrap_or(directory.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    }
+
     pub fn new(repository: PathBuf, checkout: PathBuf, shortcut: u8) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -100,20 +118,7 @@ impl BoxRegistry for BoxesFile {
             .boxes
             .into_iter()
             .map(|entry| {
-                let directory = if entry
-                    .repository
-                    .file_name()
-                    .is_some_and(|name| name == ".git")
-                {
-                    entry.repository.parent().unwrap_or(&entry.repository)
-                } else {
-                    &entry.repository
-                };
-                let name = directory
-                    .file_name()
-                    .unwrap_or(directory.as_os_str())
-                    .to_string_lossy()
-                    .into_owned();
+                let name = entry.name();
                 RegisteredBox {
                     info: BoxInfo {
                         id: entry.id,

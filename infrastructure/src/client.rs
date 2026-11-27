@@ -563,17 +563,20 @@ pub fn unarchive_run(run: String) -> Result<Run> {
     }
 }
 
-/// Creates a checkout based on the source view's HEAD and returns its path.
+/// Creates a checkout based on the source view's HEAD and returns its path. Without `path`,
+/// the daemon picks one under the worktree root.
 pub fn create_view_worktree(
     box_sel: String,
     from_session: String,
     branch: String,
+    path: Option<PathBuf>,
 ) -> Result<PathBuf> {
     match dag(
         DagRequest::CreateViewWorktree {
             box_sel,
             from_session,
             branch,
+            path,
         },
         DAG_TIMEOUT,
     )? {
