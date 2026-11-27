@@ -10,7 +10,7 @@
 //! `icon_glyph`, `fallback_icon`), and other fallback glyphs wider than a cell are shrunk to it
 //! (`fallback_size`).
 
-use super::{frame::Cell, metrics::CellMetrics};
+use super::{frame::Cell, metrics::CellMetrics, sprites::sprite_char};
 use ghostty_vt::{
     screen::CellWide,
     style::{Style, StyleColor, Underline},
@@ -34,6 +34,12 @@ pub(super) enum RowOp {
         column: usize,
         color: Hsla,
         glyph: PlacedGlyph,
+    },
+    /// A font-independent shape in one cell.
+    Sprite {
+        column: usize,
+        character: char,
+        color: Hsla,
     },
     /// A run of cells shaped together, starting at cell `column`.
     Text {
@@ -79,7 +85,7 @@ impl RowOp {
         window: &mut Window,
     ) {
         match self {
-            Self::Background { .. } | Self::Decoration { .. } => {}
+            Self::Background { .. } | Self::Decoration { .. } | Self::Sprite { .. } => {}
             Self::Icon { color, glyph, .. } => glyph.paint(cell_origin, *color, window),
             Self::Text { color, glyphs, .. } => {
                 for glyph in glyphs {
@@ -260,6 +266,7 @@ impl RunCell<'_> {
     /// Whether `other` can join a run that this cell starts.
     fn joins(&self, other: &Self, ligatures: bool) -> bool {
         other.cell.wide == CellWide::Narrow
+            && sprite_char(&other.cell.text).is_none()
             && other.fg == self.fg
             && other.fade == self.fade
             && look(other.cell.style) == look(self.cell.style)
@@ -295,7 +302,7 @@ pub(super) struct Shaping<'a> {
 }
 
 /// A row's drawing: backgrounds merged into spans of one color, then text in runs of one
-/// style, broken at the cursor, at wide cells (each on its own) and at their spacers.
+/// style, broken at the cursor, at wide cells and their spacers, and at sprites.
 /// `shape` lays out one run's text, as `WindowTextSystem::layout_line` does.
 pub(super) fn row_ops(
     row: &[RunCell],
@@ -323,6 +330,14 @@ pub(super) fn row_ops(
         let first = &row[start];
         x += 1;
         if first.blank() {
+            continue;
+        }
+        if let Some(character) = sprite_char(&first.cell.text) {
+            ops.push(RowOp::Sprite {
+                column: start,
+                character,
+                color: first.fg,
+            });
             continue;
         }
         if let Fit::Icon(icon) = fits[start] {
@@ -733,7 +748,7 @@ mod tests {
             cell_width: px(8.),
             cell_height: px(18.),
             symbols: FontId(1),
-            has_glyph: &|c| c != '\u{e0b0}' && c != '\u{f09b}',
+            has_glyph: &|c| c != '\u{e0a0}' && c != '\u{f09b}',
             ligatures,
             bold_weight: FontWeight::BOLD,
             cursor,
@@ -934,7 +949,10 @@ mod tests {
             .iter()
             .filter_map(|op| match op {
                 RowOp::Text { column, .. } => Some(*column),
-                RowOp::Background { .. } | RowOp::Icon { .. } | RowOp::Decoration { .. } => None,
+                RowOp::Background { .. }
+                | RowOp::Icon { .. }
+                | RowOp::Sprite { .. }
+                | RowOp::Decoration { .. } => None,
             })
             .collect();
         assert_eq!(columns, [0, 3, 7, 9]);
@@ -956,6 +974,48 @@ mod tests {
             .map(|glyph| f32::from(glyph.offset.x))
             .collect();
         assert_eq!(xs, [0., 8., 16., 24.]);
+    }
+
+    #[test]
+    fn sprites_break_text_runs_and_keep_their_cell_and_colors() {
+        let font = font("JetBrains Mono");
+        let frame = screen("\x1b[44mab─█⣿\u{e0b0}⏺cd\x1b[0m".as_bytes());
+        let mut row = cells(&frame, 0);
+        let color = rgb(0xaabbee).into();
+        row[3].fg = color;
+        let background = row[3].cell.bg.unwrap();
+        for ligatures in [false, true] {
+            let mut texts = Vec::new();
+            let ops = row_ops(
+                &row,
+                &shaping(&font, ligatures, None),
+                monospace(&mut texts),
+            );
+            assert_eq!(texts, ["ab", "cd"]);
+            assert_eq!(
+                ops[0],
+                RowOp::Background {
+                    from: 0,
+                    to: 9,
+                    color: background,
+                },
+            );
+            assert!(matches!(ops[1], RowOp::Text { column: 0, .. }));
+            for (index, character) in ['─', '█', '⣿', '\u{e0b0}', '⏺'].into_iter().enumerate()
+            {
+                let column = index + 2;
+                assert_eq!(
+                    ops[index + 2],
+                    RowOp::Sprite {
+                        column,
+                        character,
+                        color: row[column].fg,
+                    },
+                );
+            }
+            assert!(matches!(ops[7], RowOp::Text { column: 7, .. }));
+            assert_eq!(ops.len(), 8);
+        }
     }
 
     #[test]
@@ -982,9 +1042,9 @@ mod tests {
     #[test]
     fn missing_icons_are_fitted_from_the_symbols_font() {
         let font = font("JetBrains Mono");
-        // A powerline arrow the font lacks, then text: it is drawn on its own, over two cells
+        // A powerline branch the font lacks, then text: it is drawn on its own, over two cells
         // when a blank follows, and breaks the text run around it.
-        let frame = screen("ab\u{e0b0} cd\u{f09b}x".as_bytes());
+        let frame = screen("ab\u{e0a0} cd\u{f09b}x".as_bytes());
         let mut texts = Vec::new();
         let ops = row_ops(
             &cells(&frame, 0),
@@ -1015,7 +1075,7 @@ mod tests {
     #[test]
     fn icons_the_font_has_stay_in_their_text_run() {
         let font = font("JetBrains Mono");
-        let frame = screen("a\u{e0b0}b".as_bytes());
+        let frame = screen("a\u{e0a0}b".as_bytes());
         let mut texts = Vec::new();
         let has_glyph = |_: char| true;
         let shaping = Shaping {
@@ -1023,7 +1083,7 @@ mod tests {
             ..shaping(&font, false, None)
         };
         row_ops(&cells(&frame, 0), &shaping, monospace(&mut texts));
-        assert_eq!(texts, ["a\u{e0b0}b"]);
+        assert_eq!(texts, ["a\u{e0a0}b"]);
     }
 
     #[test]
