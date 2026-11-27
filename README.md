@@ -71,7 +71,7 @@ To install the integration later, press `ctrl-b i` in the app or run `power setu
 
 After a daemon restart or reboot, Power restores each open session with its original ID and worktree. Shells reopen in their last directory with their scrollback. Agents with a `resume` spec pick up their conversations, including agents started from a shell with the integration installed. See [Agent profiles](#agent-profiles). Power skips one-off commands and drops sessions whose worktree is gone. Closing a tab ends its session. When the GUI reopens, it shows the last box and its active tab.
 
-Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
+Press and release Ctrl+B for box commands or Ctrl+S for tab commands, then press the command key. Ctrl+B then `?` lists the shortcuts. Ctrl+B then `p` opens the command palette: type to fuzzy-search every box and tab command, with the three you ran most recently listed first. Ctrl+B then `x` detaches a box and Ctrl+B then `s` reopens it. Ctrl+S then `c` opens a shell tab, `t` picks an existing worktree, `r` recovers an unassigned session in the repository, and `x` opens the end-session confirmation. Use `power session list` and `power session end <id>` to manage sessions from the CLI.
 
 ## Skills
 
@@ -261,7 +261,7 @@ When Power launches Claude Code through shell integration, it passes `--settings
 
 Codex and Grok also use the manual setup. Codex runs hooks from any source, including `-c` overrides, only after you review and trust them. Set `[ui.status_line]` in Grok's config file. The `GROK_CONFIG` overlay cannot set it.
 
-Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
+Set a provider hook or status-line command to `power session model --json` to report the model directly. Power accepts a JSON object with a `model` string or an object with `model.id` or `model.display_name`. When the payload also has Claude Code's `rate_limits` (`five_hour`, `seven_day`, `spend_limit`), Power keeps the latest report per model for 10 minutes to show usage limits. For Codex, Power reads the limits from the newest rollout in `$CODEX_HOME/sessions` (default `~/.codex/sessions`). The command produces no output on success and skips reports with no model or no Power session. Any coding agent that runs the command from its active process can use this interface.
 
 For **Codex**, add these entries to the corresponding hook arrays in `~/.codex/hooks.json`, then review and trust the hooks in `/hooks`. Codex reports the model on session start and on the next submitted prompt after a model switch. [Codex hooks](https://learn.chatgpt.com/docs/hooks)
 

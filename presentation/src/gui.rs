@@ -7,8 +7,8 @@ mod workspace_talk;
 
 use self::{agent_tree::AgentTree, dag_view::DagView};
 use crate::{
-    keymap::{Command, Keymap, Scope},
-    picker::{Choice, Kind, Picker, Row},
+    keymap::{Command, Keymap, PluginCommandId, Scope},
+    picker::{Choice, Kind, Picker, Row, worktree_target},
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
@@ -19,7 +19,7 @@ use crate::{
     },
 };
 use anyhow::{Context as _, Result, ensure};
-use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
+use application::{ResolveArtifact, StartSession, WorktreeRoot, agents::AgentProfileRegistry};
 use domain::{
     artifact::{ResolvedArtifact, Target},
     dag::{AgentStatus, Coordinator, RunStatus, TaskState},
@@ -33,11 +33,14 @@ use infrastructure::{
     client::{
         self, Attempt, ManagedAgent, ManagedWorktree, Run, Task, WorktreeCreator, WorktreeScope,
     },
-    plugins::ActiveView,
+    plugins::{
+        ActiveView,
+        panel::{PanelPlugins, PanelUpdate},
+    },
     shell::{self, Shell},
     theme::{self, Colors, Scheme},
     workspace::{
-        Checkout, WorktreeHead, main_checkout, repository_worktree_details, repository_worktrees,
+        Checkout, LocalWorktreeRoot, WorktreeHead, main_checkout, repository_worktree_details,
     },
 };
 use std::{
@@ -266,6 +269,8 @@ struct Workspace {
     hinting: Option<Entity<TerminalView>>,
     /// Set while a prefix is pending or hints are up, so terminals drop input-method text.
     input_hold: InputHold,
+    /// Panel plugins: their commands are in the keymap and they draw panels.
+    panels: PanelPlugins,
     _bar_config: Subscription,
 }
 
@@ -344,8 +349,16 @@ impl Workspace {
         Self::watch_box_icons(window, cx);
         let dag_refresh = Self::watch_dag(window, cx);
         let talk_refresh = Self::watch_talk(window, cx);
-        let status_bar =
-            cx.new(|cx| StatusBar::new(window, cx, Settings::defaults(), Settings::from_sections));
+        let panels = Self::watch_panels(window, cx);
+        let status_bar = cx.new(|cx| {
+            StatusBar::new(
+                window,
+                cx,
+                Settings::defaults(),
+                Settings::from_sections,
+                panels.clone(),
+            )
+        });
         let bar_config = cx.subscribe_in(
             &status_bar,
             window,
@@ -405,6 +418,7 @@ impl Workspace {
             hinting: None,
             main_checkouts: HashMap::new(),
             config_error: None,
+            panels,
             _bar_config: bar_config,
         }
     }
@@ -799,6 +813,50 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Starts the panel plugin host and handles the effects of plugin commands.
+    fn watch_panels(window: &mut Window, cx: &mut Context<Self>) -> PanelPlugins {
+        let (panels, updates) = PanelPlugins::start(infrastructure::config::directory());
+        cx.spawn_in(window, async move |app, cx| {
+            while let Ok(update) = updates.recv().await {
+                if app
+                    .update_in(cx, |this, window, cx| match update {
+                        PanelUpdate::OpenPanel {
+                            panel_id,
+                            refresh_ms,
+                        } => this.open_panel(panel_id, refresh_ms, window, cx),
+                        // Panels draw in the panel view, which renders them on request.
+                        PanelUpdate::Panel { .. } => {}
+                        PanelUpdate::Error(error) => this.show_error(error, cx),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        panels
+    }
+
+    /// Runs a plugin command. Its effect arrives through `watch_panels`.
+    fn invoke_plugin(&mut self, id: PluginCommandId) {
+        if let Some(entry) = self.keymap.plugin(id) {
+            self.panels.invoke(entry.name.clone());
+        }
+    }
+
+    /// Opens a panel a plugin asked for. The panel view that draws it hooks in here.
+    fn open_panel(
+        &mut self,
+        panel_id: String,
+        refresh_ms: Option<u32>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = (panel_id, refresh_ms);
+        cx.notify();
     }
 
     /// Reloads a box's icon whenever an agent sets or resets it.
@@ -1617,13 +1675,13 @@ impl Workspace {
         let Some(picker) = self.picker.as_mut() else {
             return;
         };
-        let Some(root) = picker.take_walk_request() else {
+        let Some((root, depth)) = picker.take_walk_request() else {
             return;
         };
         let id = picker.id;
         let (sender, receiver) = async_channel::bounded(2);
         let walk_root = root.clone();
-        std::thread::spawn(move || crate::picker::walk(&walk_root, &sender));
+        std::thread::spawn(move || crate::picker::walk(&walk_root, depth, &sender));
         cx.spawn(async move |app, cx| {
             loop {
                 let batch = receiver.recv().await;
@@ -2028,36 +2086,49 @@ impl Workspace {
         .detach();
     }
 
-    fn pick_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the new worktree prompt, filled with a generated name in the box's folder under
+    /// the worktree root.
+    fn new_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.active_box() else {
             return;
         };
-        let repository = entry.repository.clone();
-        let rows = entry
-            .active_view
-            .iter()
-            .map(|session| Row {
-                label: "New worktree".into(),
-                detail: String::new(),
-                choice: Choice::NewWorktree(session.clone()),
-            })
-            .collect();
-        let id = self.open_picker(Kind::Worktrees(entry.id.clone()), rows, window, cx);
-        self.load_picker_rows(
-            id,
-            "Looking up worktrees…",
-            "No available worktrees.",
+        let Some(from_session) = entry.active_view.clone() else {
+            self.show_error("Open a tab first. A new worktree starts from its HEAD.", cx);
+            return;
+        };
+        let (box_id, name) = (entry.id.clone(), entry.name());
+        let root = match LocalWorktreeRoot::new(Settings::defaults()).worktree_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.show_error(format!("Could not find the worktree root. {error:#}"), cx);
+                return;
+            }
+        };
+        self.open_picker(
+            Kind::NewWorktree {
+                box_id,
+                from_session,
+                folder: root.join(name),
+                created: false,
+            },
+            Vec::new(),
             window,
             cx,
-            move || worktree_rows(&repository),
         );
+        if let Some(picker) = self.picker.as_mut() {
+            picker.suggest_worktree(
+                &domain::worktree::generated_worktree_name(random_seed()),
+                std::env::home_dir().as_deref(),
+            );
+        }
+        self.start_directory_walk(cx);
     }
 
     fn create_worktree(
         &mut self,
         box_id: String,
         from_session: String,
-        branch: String,
+        (branch, path): (String, Option<PathBuf>),
         picker_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2067,9 +2138,9 @@ impl Workspace {
         picker.message = Some("Creating worktree…".into());
         cx.notify();
         let source_box = box_id.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { client::create_view_worktree(source_box, from_session, branch) });
+        let task = cx.background_executor().spawn(async move {
+            client::create_view_worktree(source_box, from_session, branch, path)
+        });
         cx.spawn_in(window, async move |app, cx| {
             let result = task.await;
             let _ = app.update_in(cx, |this, window, cx| {
@@ -2192,6 +2263,11 @@ impl Workspace {
         };
         match choice {
             Choice::NewBox => self.pick_repository(window, cx),
+            Choice::Command(command) => {
+                self.picker = None;
+                self.restore_focus(window, cx);
+                self.run_command(command, window, cx);
+            }
             Choice::Link(link) => {
                 self.picker = None;
                 self.restore_focus(window, cx);
@@ -2249,44 +2325,35 @@ impl Workspace {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.dismiss_picker(window, cx);
             }
-            Choice::NewWorktree(from_session) => {
-                if let Kind::Worktrees(box_id) = &picker.kind {
-                    self.open_picker(
-                        Kind::NewWorktree {
-                            box_id: box_id.clone(),
-                            from_session,
-                            created: false,
-                        },
-                        Vec::new(),
-                        window,
-                        cx,
-                    );
-                    if let Some(picker) = self.picker.as_mut() {
-                        picker.suggest_branch(domain::worktree::generated_worktree_name(
-                            random_seed(),
-                        ));
-                    }
-                }
-            }
-            Choice::CreateWorktree(branch) => {
+            Choice::CreateWorktree(query) => {
                 if let Kind::NewWorktree {
                     box_id,
                     from_session,
+                    folder,
                     ..
                 } = &picker.kind
                 {
-                    self.create_worktree(
-                        box_id.clone(),
-                        from_session.clone(),
-                        branch,
-                        picker.id,
-                        window,
-                        cx,
-                    );
+                    match worktree_target(&query, folder, std::env::home_dir().as_deref()) {
+                        Ok((branch, path))
+                            if path.as_ref().unwrap_or(&folder.join(&branch)).is_dir() =>
+                        {
+                            let path = path.unwrap_or_else(|| folder.join(&branch));
+                            self.launch(path, Some(box_id.clone()), Some(picker.id), window, cx);
+                        }
+                        Ok(target) => self.create_worktree(
+                            box_id.clone(),
+                            from_session.clone(),
+                            target,
+                            picker.id,
+                            window,
+                            cx,
+                        ),
+                        Err(message) => self.show_error(message, cx),
+                    }
                 }
             }
             Choice::Worktree(path) => {
-                if let Kind::Worktrees(box_id) | Kind::NewWorktree { box_id, .. } = &picker.kind {
+                if let Kind::NewWorktree { box_id, .. } = &picker.kind {
                     self.launch(path, Some(box_id.clone()), Some(picker.id), window, cx);
                 }
             }
@@ -2661,7 +2728,7 @@ impl Workspace {
                         return;
                     }
                     let choice = picker.selection();
-                    if picker.loading && !matches!(choice, Some(Choice::NewWorktree(_))) {
+                    if picker.loading {
                         picker.accept_pending = true;
                     } else if let Kind::End { session, .. } = &picker.kind {
                         let id = session.clone();
@@ -2802,11 +2869,8 @@ impl Workspace {
             Prefix::Box => Scope::Box,
             Prefix::View => Scope::Tab,
         };
-        let command = self.keymap.command(scope, stroke);
-        match command {
-            Some(Command::Help) => return self.open_help(window, cx),
-            Some(Command::Quit) => return window.remove_window(),
-            _ => {}
+        if let Some(command) = self.keymap.command(scope, stroke) {
+            return self.run_command(command, window, cx);
         }
         if self.registry.is_none() {
             return;
@@ -2815,53 +2879,97 @@ impl Workspace {
         let digit = (!mods.control && !mods.alt && !mods.platform)
             .then(|| shortcut_digit(key))
             .flatten();
+        match (prefix, digit) {
+            (Prefix::Box, Some(digit)) => {
+                if let Some(entry) = self
+                    .layout
+                    .boxes
+                    .iter()
+                    .find(|entry| entry.shortcut == Some(digit))
+                {
+                    self.activate_box(entry.id.clone(), window, cx);
+                }
+            }
+            (Prefix::View, Some(_)) => self.navigate_tabs(key, window, cx),
+            _ => {}
+        }
+    }
+
+    /// Runs a box or tab command, from its key or from the command palette, and records it
+    /// as recently run. Other commands are ignored.
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(command, Command::Help | Command::Quit) && self.registry.is_none() {
+            return;
+        }
+        let name = self
+            .keymap
+            .palette_entries()
+            .into_iter()
+            .find(|entry| entry.command == command)
+            .map(|entry| entry.name);
+        if let Some(name) = name
+            && self.layout.remember_command(&name)
+        {
+            self.save();
+        }
         match command {
-            Some(Command::BoxNew) => self.pick_repository(window, cx),
-            Some(Command::BoxPick) => self.pick_boxes(window, cx),
-            Some(Command::BoxRuns) => self.pick_runs(window, cx),
-            Some(Command::BoxAgents) => self.pick_agents(window, cx),
-            Some(Command::BoxTalk) => {
+            Command::Help => self.open_help(window, cx),
+            Command::Quit => window.remove_window(),
+            Command::Palette => self.open_palette(window, cx),
+            Command::BoxNew => self.pick_repository(window, cx),
+            Command::BoxPick => self.pick_boxes(window, cx),
+            Command::BoxRuns => self.pick_runs(window, cx),
+            Command::BoxAgents => self.pick_agents(window, cx),
+            Command::BoxTalk => {
                 if let Some(box_id) = self.layout.active_box.clone() {
                     self.open_talk(box_id, TalkTarget::User, window, cx);
                 }
             }
-            Some(Command::Reload) => {
+            Command::Reload => {
                 self.status_bar.update(cx, StatusBar::reload);
             }
-            Some(Command::BoxDetach) => self.detach_box(window, cx),
-            Some(Command::BoxColorScheme) => self.pick_color_scheme(false, window, cx),
-            Some(Command::BoxSetup) => self.open_setup(false, window, cx),
-            Some(Command::TabNew) => self.launch_in_active_worktree(window, cx),
-            Some(Command::TabWorktree) => self.pick_worktrees(window, cx),
-            Some(Command::TabPick) => self.pick_tabs(window, cx),
-            Some(Command::TabRecover) => self.pick_sessions(window, cx),
-            Some(Command::TabEnd) => self.end_active_tab(window, cx),
-            Some(Command::TabDetach) => self.detach_active_tab(window, cx),
-            Some(Command::TabPaths) => self.open_status_actions(window, cx),
-            Some(Command::TabNext) => self.navigate_tabs("n", window, cx),
-            Some(Command::TabPrevious) => self.navigate_tabs("p", window, cx),
-            Some(Command::TabLast) => self.navigate_tabs("l", window, cx),
-            Some(Command::TabOpenLink) => self.start_hints(cx),
-            Some(Command::TabPreview) => self.focus_preview(window, cx),
-            Some(Command::TerminalZoomIn) => self.zoom_terminals(Some(1.), cx),
-            Some(Command::TerminalZoomOut) => self.zoom_terminals(Some(-1.), cx),
-            Some(Command::TerminalZoomReset) => self.zoom_terminals(None, cx),
-            Some(_) => {}
-            None => match (prefix, digit) {
-                (Prefix::Box, Some(digit)) => {
-                    if let Some(entry) = self
-                        .layout
-                        .boxes
-                        .iter()
-                        .find(|entry| entry.shortcut == Some(digit))
-                    {
-                        self.activate_box(entry.id.clone(), window, cx);
-                    }
-                }
-                (Prefix::View, Some(_)) => self.navigate_tabs(key, window, cx),
-                _ => {}
-            },
+            Command::BoxDetach => self.detach_box(window, cx),
+            Command::BoxColorScheme => self.pick_color_scheme(false, window, cx),
+            Command::BoxSetup => self.open_setup(false, window, cx),
+            Command::TabNew => self.launch_in_active_worktree(window, cx),
+            Command::TabWorktree => self.new_worktree(window, cx),
+            Command::TabPick => self.pick_tabs(window, cx),
+            Command::TabRecover => self.pick_sessions(window, cx),
+            Command::TabEnd => self.end_active_tab(window, cx),
+            Command::TabDetach => self.detach_active_tab(window, cx),
+            Command::TabPaths => self.open_status_actions(window, cx),
+            Command::TabNext => self.navigate_tabs("n", window, cx),
+            Command::TabPrevious => self.navigate_tabs("p", window, cx),
+            Command::TabLast => self.navigate_tabs("l", window, cx),
+            Command::TabOpenLink => self.start_hints(cx),
+            Command::TabPreview => self.focus_preview(window, cx),
+            Command::TerminalZoomIn => self.zoom_terminals(Some(1.), cx),
+            Command::TerminalZoomOut => self.zoom_terminals(Some(-1.), cx),
+            Command::TerminalZoomReset => self.zoom_terminals(None, cx),
+            Command::Plugin(id) => self.invoke_plugin(id),
+            _ => {}
         }
+    }
+
+    /// Opens the command palette over every box and tab command, recent ones first.
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entries = self.keymap.palette_entries();
+        let recent = self
+            .layout
+            .recent_commands
+            .iter()
+            .filter_map(|name| entries.iter().find(|entry| &entry.name == name))
+            .map(|entry| entry.command)
+            .collect();
+        let rows = entries
+            .iter()
+            .map(|entry| Row {
+                label: entry.description.to_owned(),
+                detail: self.keymap.binding(entry.scope, entry.command),
+                choice: Choice::Command(entry.command),
+            })
+            .collect();
+        self.open_picker(Kind::Commands { recent }, rows, window, cx);
     }
 
     /// Closes the task graph and opens an artifact link in the box's preview pane, focused,
@@ -3124,45 +3232,6 @@ fn managed_worktrees(repository: &Path) -> Result<HashMap<PathBuf, ManagedWorktr
         .into_iter()
         .filter(|worktree| worktree.repository == repository)
         .map(|worktree| (worktree.path.clone(), worktree))
-        .collect())
-}
-
-fn worktree_rows(repository: &Path) -> Result<Vec<Row>> {
-    let paths = repository_worktrees(repository)?;
-    let managed = managed_worktrees(repository).unwrap_or_else(|error| {
-        eprintln!("Could not list Power-created worktrees. {error:#}");
-        HashMap::new()
-    });
-    let mut runs = HashMap::new();
-    Ok(paths
-        .into_iter()
-        .filter(|path| path != repository && path.is_dir())
-        .map(|path| {
-            let detail = match managed.get(&path) {
-                Some(worktree) => {
-                    let creator = match &worktree.creator {
-                        WorktreeCreator::View { .. } => "tab".into(),
-                        WorktreeCreator::Attempt { run, task, .. } => runs
-                            .entry(run)
-                            .or_insert_with(|| client::get_run(run.clone()).ok())
-                            .as_ref()
-                            .and_then(|run| run.tasks.iter().find(|entry| &entry.id == task))
-                            .map_or_else(|| format!("Task {task}"), |entry| entry.title.clone()),
-                    };
-                    format!(
-                        "Power-created · {} · {creator} · {}",
-                        worktree.branch,
-                        path.display()
-                    )
-                }
-                None => path.display().to_string(),
-            };
-            Row {
-                label: path_name(&path),
-                detail,
-                choice: Choice::Worktree(path),
-            }
-        })
         .collect())
 }
 

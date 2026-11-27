@@ -177,7 +177,7 @@ fn creates_from_the_view_head_and_records_ownership() -> Result<()> {
     fs::create_dir_all(root.0.join("test-repo/feature-branch"))?;
     let before = now();
 
-    let path = dag.create_view_worktree("2", &view.id, "feature/branch")?;
+    let path = dag.create_view_worktree("2", &view.id, "feature/branch", None)?;
 
     let requested = root.0.join("test-repo/feature-branch-2");
     assert_eq!(
@@ -206,6 +206,35 @@ fn creates_from_the_view_head_and_records_ownership() -> Result<()> {
 }
 
 #[test]
+fn creates_at_a_requested_path() -> Result<()> {
+    let workspace = WorktreeWorkspace::default();
+    let (dag, view) = fixture(workspace.clone())?;
+    let root = TempRoot::new()?;
+    let dag = dag.with_worktree_root(FixedRoot(root.0.clone()));
+    let requested = root.0.join("elsewhere/mine");
+
+    dag.create_view_worktree("box-id", &view.id, "mine", Some(&requested))?;
+    assert_eq!(
+        workspace.0.lock().unwrap().created,
+        std::slice::from_ref(&requested)
+    );
+
+    fs::create_dir_all(&requested)?;
+    let error = dag
+        .create_view_worktree("box-id", &view.id, "other", Some(&requested))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("{} already exists", requested.display())
+    );
+    let error = dag
+        .create_view_worktree("box-id", &view.id, "other", Some(Path::new("relative")))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Worktree path relative must be absolute");
+    Ok(())
+}
+
+#[test]
 fn rejects_a_branch_that_already_exists() -> Result<()> {
     let workspace = WorktreeWorkspace::default();
     let (dag, view) = fixture(workspace.clone())?;
@@ -219,7 +248,7 @@ fn rejects_a_branch_that_already_exists() -> Result<()> {
     ] {
         workspace.0.lock().unwrap().branch = Some(BranchStatus::Exists { checked_out_at });
         let error = dag
-            .create_view_worktree("box-id", &view.id, "feature")
+            .create_view_worktree("box-id", &view.id, "feature", None)
             .unwrap_err();
         assert_eq!(error.to_string(), expected);
     }
@@ -236,7 +265,7 @@ fn reports_git_creation_errors_without_recording_ownership() -> Result<()> {
     let dag = dag.with_worktree_root(FixedRoot("/managed".into()));
 
     let error = dag
-        .create_view_worktree("box-id", &view.id, "invalid name")
+        .create_view_worktree("box-id", &view.id, "invalid name", None)
         .unwrap_err();
 
     assert_eq!(error.to_string(), "fatal: invalid branch name");

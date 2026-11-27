@@ -1356,6 +1356,8 @@ fn terminal_actor(
                         return Ok(false);
                     };
                     let field = match field {
+                        // The daemon keeps usage reports itself once the caller is checked.
+                        MetadataField::Usage => return Ok(true),
                         MetadataField::Task => &mut metadata.task,
                         MetadataField::Model => {
                             if metadata.model != value {

@@ -11,6 +11,7 @@ mod metrics;
 mod paint;
 mod runs;
 mod selection;
+mod sprites;
 mod typing;
 
 pub(crate) use self::links::{LinkAction, link_action};
@@ -269,6 +270,7 @@ impl TerminalView {
             let metrics = cell_metrics(cx.text_system(), &self.font, self.grid.metrics.scale);
             self.grid.remeasure(metrics, &self.commands);
         }
+        self.refresh();
         cx.notify();
     }
 
@@ -361,7 +363,11 @@ impl TerminalView {
     }
 
     fn refresh(&mut self) -> bool {
-        match self.frame.update(&mut self.renderer, &self.terminal) {
+        match self.frame.update_with(
+            &mut self.renderer,
+            &self.terminal,
+            self.settings.minimum_contrast,
+        ) {
             Ok(Some(frame)) => {
                 self.frame = Rc::new(frame);
                 true

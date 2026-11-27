@@ -7,6 +7,7 @@ use super::{
     input::register_mouse_exit,
     links::{LinkAction, link_action},
     runs::{FAINT_OPACITY, RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
+    sprites,
 };
 use gpui::{prelude::*, *};
 use infrastructure::theme::{Scheme, blend};
@@ -174,7 +175,7 @@ impl Render for TerminalView {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(background))
+            .bg(Hsla::from(rgb(background)).opacity(self.settings.opacity))
             .when(hovering, |terminal| terminal.cursor_pointer())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
@@ -269,6 +270,20 @@ impl Render for TerminalView {
                                         span(row, selected.start, selected.end),
                                         selection_background,
                                     ));
+                                }
+                            }
+                            // Full-cell blocks can cover the cursor and link underline.
+                            for (row, drawing) in rows.iter().enumerate() {
+                                for op in &drawing.ops {
+                                    if let RowOp::Sprite {
+                                        column,
+                                        character,
+                                        color,
+                                    } = op
+                                    {
+                                        let cell = span(row, *column, *column + 1);
+                                        sprites::paint(*character, cell, *color, window);
+                                    }
                                 }
                             }
                             if let Some(cursor) = frame.cursor {
