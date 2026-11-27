@@ -649,6 +649,10 @@ struct FakeTerminal {
     reclaim_millis: AtomicU64,
     /// Reclaims started so far.
     reclaims: AtomicU64,
+    /// Sessions whose processes are paused, as the terminal applies them.
+    paused: Mutex<BTreeSet<usize>>,
+    /// Slows each pause or resume, in milliseconds, so concurrent transitions overlap.
+    pause_millis: AtomicU64,
 }
 
 impl TerminalRuntime for FakeTerminal {
@@ -677,6 +681,20 @@ impl TerminalRuntime for FakeTerminal {
 
     fn end(&self, handle: Self::Handle) -> Result<()> {
         handle.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn pause(&self, handle: &Self::Handle, paused: bool) -> Result<()> {
+        thread::sleep(Duration::from_millis(
+            self.pause_millis.load(Ordering::Acquire),
+        ));
+        let key = Arc::as_ptr(handle) as usize;
+        let mut set = self.paused.lock().unwrap();
+        if paused {
+            set.insert(key);
+        } else {
+            set.remove(&key);
+        }
         Ok(())
     }
 
@@ -3143,5 +3161,109 @@ fn a_slow_reclaim_retry_and_its_blocked_write_never_delay_another_workers_teardo
         .read(|db| db.session_agent(&first_session))?
         .unwrap();
     assert_eq!(agent.state, AgentState::Exited);
+    Ok(())
+}
+
+fn terminal_paused(dag: &TestDag, session: &str) -> Result<bool> {
+    let handle = dag.application.terminal(session)?;
+    let key = Arc::as_ptr(&handle) as usize;
+    Ok(dag
+        .application
+        .runtime
+        .paused
+        .lock()
+        .unwrap()
+        .contains(&key))
+}
+
+#[test]
+fn concurrent_run_pause_and_resume_leave_every_worker_matching_the_final_flag() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("two", &[])])?;
+    let first = dag.start(command(&run, false))?;
+    let second = dag.start(Dispatch {
+        task: "two".into(),
+        ..command(&run, false)
+    })?;
+    let sessions = [
+        first.agent.session.clone().unwrap(),
+        second.agent.session.clone().unwrap(),
+    ];
+    // Each pause takes long enough that an unserialized resume would snapshot the
+    // workers before the pause reached them.
+    dag.application
+        .runtime
+        .pause_millis
+        .store(20, Ordering::Release);
+    for round in 0..8 {
+        let start = Barrier::new(2);
+        thread::scope(|scope| {
+            let pause = scope.spawn(|| {
+                start.wait();
+                dag.pause_run(&run)
+            });
+            let resume = scope.spawn(|| {
+                start.wait();
+                dag.resume_run(&run)
+            });
+            pause.join().unwrap().unwrap();
+            resume.join().unwrap().unwrap();
+        });
+        let flag = dag.run(&run)?.paused_at.is_some();
+        for (session, agent) in sessions.iter().zip([&first.agent.id, &second.agent.id]) {
+            let record = dag.store.read(|db| db.agent(agent))?;
+            assert_eq!(record.paused, flag, "round {round}: record of {agent}");
+            assert_eq!(
+                terminal_paused(&dag, session)?,
+                flag,
+                "round {round}: processes of {agent}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_restart_between_a_run_pause_and_its_workers_pauses_them() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let session = started.agent.session.clone().unwrap();
+    // The flag committed, then the daemon ended before the worker was paused.
+    dag.write(|db| db.set_run_paused(&run, Some(now())))?;
+    assert!(!terminal_paused(&dag, &session)?);
+    dag.reapply_pauses(std::slice::from_ref(&session))?;
+    assert!(dag.store.read(|db| db.agent(&started.agent.id))?.paused);
+    assert!(terminal_paused(&dag, &session)?);
+    Ok(())
+}
+
+#[test]
+fn a_coding_agent_in_a_shell_foreground_is_never_paused_or_stopped() -> Result<()> {
+    let (dag, _) = setup()?;
+    let shell = dag.application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Shell,
+    })?;
+    // The identity Power derives for a coding agent in a shell tab's foreground.
+    let mut agent = dag.new_agent(
+        "2".into(),
+        "/worktree".into(),
+        Provider::Agent("claude".into()),
+        None,
+        "claude".into(),
+    );
+    agent.session = Some(shell.id.clone());
+    dag.write(|db| db.insert_agent(&agent))?;
+
+    let paused = dag.set_agent_paused(&agent.id, true).unwrap_err();
+    assert!(format!("{paused:#}").contains("foreground"), "{paused:#}");
+    let stopped = dag.stop_agent(&agent.id).unwrap_err();
+    assert!(format!("{stopped:#}").contains("foreground"), "{stopped:#}");
+    assert!(!terminal_paused(&dag, &shell.id)?);
+    assert!(dag.application.session_is_running(&shell.id)?);
+    assert!(!dag.store.read(|db| db.agent(&agent.id))?.paused);
+    // Nor by the emergency pause, which skips what it cannot isolate.
+    assert!(dag.pause_all_except(&[], None)?.is_empty());
+    assert!(!terminal_paused(&dag, &shell.id)?);
     Ok(())
 }

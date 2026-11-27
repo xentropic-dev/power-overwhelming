@@ -478,7 +478,9 @@ impl Run {
             if task.queued_at.is_some() && !task.state_is_open() {
                 task.state = TaskState::Queued;
             }
-            if task.state == TaskState::Working
+            // Paused shows over either open attempt state. The attempt keeps its own
+            // state, so a resume shows `needs-input` again for a worker still blocked.
+            if matches!(task.state, TaskState::Working | TaskState::NeedsInput)
                 && task.attempts.last().is_some_and(|attempt| attempt.paused)
             {
                 task.state = TaskState::Paused;
@@ -809,6 +811,64 @@ mod tests {
         assert_eq!(run.tasks[0].state, TaskState::Queued);
         assert_eq!(run.status(), RunStatus::Active);
         assert!(!can_dispatch(TaskState::Queued, true));
+    }
+
+    #[test]
+    fn a_paused_worker_shows_paused_over_needs_input_and_needs_input_again_on_resume() {
+        let attempt = |state, paused| Attempt {
+            id: "attempt".into(),
+            number: 1,
+            agent: "agent".into(),
+            session: Some("session".into()),
+            worktree: ".".into(),
+            provider: Provider::Command,
+            model: None,
+            state,
+            summary: None,
+            blocker: Some("Which database?".into()),
+            detail: None,
+            started_at: 1,
+            ended_at: None,
+            paused,
+            artifacts: Vec::new(),
+        };
+        let run_with = |state, paused| {
+            let mut run = Run {
+                id: "run".into(),
+                box_id: "box".into(),
+                title: "Run".into(),
+                coordinator: Coordinator::External { label: "x".into() },
+                created_at: 1,
+                archived_at: None,
+                paused_at: None,
+                tasks: vec![Task {
+                    id: "a".into(),
+                    title: "a".into(),
+                    instructions: String::new(),
+                    deps: Vec::new(),
+                    state: TaskState::Waiting,
+                    queued_at: None,
+                    current_attempt: None,
+                    attempts: vec![attempt(state, paused)],
+                }],
+            };
+            run.derive_task_states();
+            run
+        };
+        for state in [AttemptState::Active, AttemptState::NeedsInput] {
+            let paused = run_with(state, true);
+            assert_eq!(paused.tasks[0].state, TaskState::Paused, "{state:?}");
+            assert_eq!(paused.tasks[0].attempts[0].state, state);
+        }
+        let resumed = run_with(AttemptState::NeedsInput, false);
+        assert_eq!(resumed.tasks[0].state, TaskState::NeedsInput);
+        assert_eq!(
+            resumed.tasks[0].attempts[0].blocker.as_deref(),
+            Some("Which database?")
+        );
+        // A closed attempt is never shown paused.
+        let done = run_with(AttemptState::Succeeded, true);
+        assert_eq!(done.tasks[0].state, TaskState::Completed);
     }
 
     fn task(id: &str, deps: &[&str]) -> TaskSpec {

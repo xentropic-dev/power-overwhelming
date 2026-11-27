@@ -846,10 +846,12 @@ fn wait_process(
             // Cancel the fresh start before signalling, so an exit caused by the
             // teardown is never mistaken for a failed resume.
             drop(relaunch.take());
-            // A stopped process handles SIGTERM only once it runs again, so a paused
-            // tree is resumed first and the end stays clean.
+            // A paused tree is never resumed first, which would let it run ordinary
+            // work, or report, before it is asked to end. Each backend sends every
+            // process SIGTERM and only then SIGCONT, so a stopped process wakes with
+            // the end already pending and runs only its handler.
             if paused && let Some(owner) = owner.as_mut() {
-                owner.resume(marker.as_deref());
+                owner.end_paused(marker.as_deref());
             }
             let ended = owner
                 .as_mut()

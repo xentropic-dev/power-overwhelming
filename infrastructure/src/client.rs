@@ -486,6 +486,14 @@ pub fn set_agent_paused(agent: String, paused: bool) -> Result<ManagedAgent> {
     }
 }
 
+/// Pauses every running agent except `keep` and the caller's own session.
+pub fn pause_all_except(keep: Vec<String>, caller: Option<String>) -> Result<Vec<ManagedAgent>> {
+    match dag(DagRequest::PauseAllExcept { keep, caller }, DAG_TIMEOUT)? {
+        DagResponse::Agents { agents } => Ok(agents.into_iter().map(Into::into).collect()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
 pub fn unarchive_run(run: String) -> Result<Run> {
     match dag(DagRequest::UnarchiveRun { run }, DAG_TIMEOUT)? {
         DagResponse::Run { run } => Ok(run.into()),

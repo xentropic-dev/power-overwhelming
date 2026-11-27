@@ -437,10 +437,15 @@ fn main() -> Result<()> {
                     .into_iter()
                     .find(|agent| agent.id == id)
                     .with_context(|| format!("No agent {id} in this box."))?;
-                let session = agent
-                    .session
-                    .with_context(|| format!("Agent {id} has no terminal session."))?;
-                client::end_session(session)
+                // The daemon ends only the agent's own session, and refuses an agent
+                // that shares a shell session with the shell's other jobs.
+                match client::dag(
+                    DagRequest::StopAgent { agent: agent.id },
+                    Duration::from_secs(30),
+                )? {
+                    DagResponse::Agent { .. } => Ok(()),
+                    _ => anyhow::bail!("Unexpected daemon response"),
+                }
             }
             AgentAction::Start {
                 box_sel,

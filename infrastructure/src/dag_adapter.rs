@@ -90,6 +90,9 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::SetAgentPaused { agent, paused } => Reply::Agent {
             agent: application.set_agent_paused(&agent, paused)?.into(),
         },
+        DagRequest::StopAgent { agent } => Reply::Agent {
+            agent: application.stop_agent(&agent)?.into(),
+        },
         DagRequest::PauseAllExcept { keep, caller } => Reply::Agents {
             agents: convert(application.pause_all_except(&keep, caller.as_deref())?),
         },

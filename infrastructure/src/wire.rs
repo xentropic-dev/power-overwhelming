@@ -931,6 +931,10 @@ pub enum DagRequest {
         agent: String,
         paused: bool,
     },
+    /// Ends an agent's own terminal session, interrupting its open attempt.
+    StopAgent {
+        agent: String,
+    },
     /// Pauses every running agent except `keep` and the caller's own session.
     PauseAllExcept {
         keep: Vec<String>,

@@ -537,14 +537,16 @@ impl Scope {
     /// Killing is retried for a bounded time, and stops early when `cgroup.kill` keeps
     /// failing. The error then names the scope, which stays for a later reclaim.
     pub(crate) fn terminate(&self, root: &Pinned, grace: Duration) -> Result<(), String> {
-        // A frozen process handles SIGTERM only once it runs again.
-        if let Err(error) = self.thaw() {
-            eprintln!("Could not thaw {}. {error}", self.name());
-        }
         let gone = || root.exited() && !self.populated();
         let mut sent = BTreeSet::new();
         if !root.exited() && root.signal(libc::SIGTERM) == Sent::Delivered {
             root.signal(libc::SIGCONT);
+        }
+        self.signal(libc::SIGTERM, &mut sent);
+        // A frozen process handles SIGTERM only once it runs again. It is thawed
+        // only after the end is pending, so it never resumes ordinary work first.
+        if let Err(error) = self.thaw() {
+            eprintln!("Could not thaw {}. {error}", self.name());
         }
         let deadline = Instant::now() + grace;
         while !gone() && Instant::now() < deadline {

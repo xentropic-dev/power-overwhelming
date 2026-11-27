@@ -250,6 +250,9 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     weak: Mutex<std::sync::Weak<Self>>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
+    /// Serializes run pauses and resumes, so a run's flag and its workers' pauses
+    /// change together and two transitions never interleave.
+    run_transitions: Mutex<()>,
 }
 
 /// Ends finished workers. Due teardowns and the record writes that follow them run
@@ -294,6 +297,7 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             weak: Mutex::new(std::sync::Weak::new()),
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
+            run_transitions: Mutex::new(()),
         }
     }
 
@@ -661,6 +665,8 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// is the one place an agent's paused state changes, so the agent tree, the DAG
     /// view and the processes always agree. Pausing a paused agent is a no-op.
     pub fn set_agent_paused(&self, id: &str, paused: bool) -> Result<ManagedAgent> {
+        // Checked before the store lock, which the session list must never wait on.
+        let isolated = self.isolated_session(&self.store.read(|db| db.agent(id))?)?;
         self.write(|db| {
             let mut agent = db.agent(id)?;
             ensure!(
@@ -671,6 +677,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 .session
                 .clone()
                 .with_context(|| format!("Agent {id:?} has no terminal session"))?;
+            ensure!(
+                session == isolated,
+                "Agent {id:?} changed sessions. Try again"
+            );
             if agent.paused == paused {
                 return Ok(agent);
             }
@@ -681,6 +691,38 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             agent = db.agent(id)?;
             Ok(agent)
         })
+    }
+
+    /// Stops an agent cleanly: ends its own terminal session, which interrupts its open
+    /// attempt so it can be dispatched again. A paused agent is ended without being
+    /// resumed first.
+    pub fn stop_agent(&self, id: &str) -> Result<ManagedAgent> {
+        let agent = self.store.read(|db| db.agent(id))?;
+        let session = self.isolated_session(&agent)?;
+        self.application.end_session(&session)?;
+        Ok(agent)
+    }
+
+    /// The agent's session, when every process in it is the agent's own. A coding
+    /// agent found in the foreground of a shell session shares that session with the
+    /// shell and the shell's other jobs, which are not the agent's descendants, so
+    /// Power refuses to pause or stop it rather than reach them. Never call it while
+    /// holding a store lock.
+    fn isolated_session(&self, agent: &ManagedAgent) -> Result<String> {
+        let session = agent
+            .session
+            .clone()
+            .with_context(|| format!("Agent {:?} has no terminal session", agent.id))?;
+        let foreground = matches!(agent.provider, Provider::Agent(_))
+            && self.application.launched_agent(&session) == Some(Agent::Shell);
+        ensure!(
+            !foreground,
+            "Agent {:?} runs in the foreground of shell session {session:?}, which also \
+             runs the shell and its other jobs. Power cannot act on the agent alone, so \
+             pause or stop it from that terminal",
+            agent.id
+        );
+        Ok(session)
     }
 
     /// Pauses every running agent with a session except those in `keep` and the
@@ -716,8 +758,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     }
 
     /// Pauses every running worker of the run and stops dispatching from it, queued
-    /// dispatches included, until it resumes.
+    /// dispatches included, until it resumes. Run transitions are serialized, so a
+    /// concurrent resume either finishes first or sees this pause whole.
     pub fn pause_run(&self, id: &str) -> Result<Run> {
+        let _transition = self.run_transitions.lock().unwrap();
         self.write(|db| {
             let run = load_run(db, id)?;
             if run.paused_at.is_none() {
@@ -726,18 +770,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             }
             Ok(())
         })?;
-        for agent in self.run_workers(id)? {
-            if !agent.paused
-                && let Err(error) = self.set_agent_paused(&agent.id, true)
-            {
-                eprintln!("Could not pause worker {}. {error:#}", agent.id);
-            }
-        }
+        self.pause_run_workers(id)?;
         self.run(id)
     }
 
     /// Resumes the run's paused workers and lets it dispatch again.
     pub fn resume_run(&self, id: &str) -> Result<Run> {
+        let _transition = self.run_transitions.lock().unwrap();
         for agent in self.run_workers(id)? {
             if agent.paused
                 && let Err(error) = self.set_agent_paused(&agent.id, false)
@@ -754,6 +793,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             Ok(())
         })?;
         self.run(id)
+    }
+
+    /// Pauses the run's running workers that are not paused yet.
+    fn pause_run_workers(&self, id: &str) -> Result<()> {
+        for agent in self.run_workers(id)? {
+            if !agent.paused
+                && let Err(error) = self.set_agent_paused(&agent.id, true)
+            {
+                eprintln!("Could not pause worker {}. {error:#}", agent.id);
+            }
+        }
+        Ok(())
     }
 
     /// The run's running workers that have a session.
@@ -1522,6 +1573,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             if !kept {
                 self.write(|db| db.set_agent_paused(&agent.id, false))?;
             }
+        }
+        // A paused run's flag commits before its workers pause, so a daemon that
+        // ended in between left workers running in a paused run. Pause them now.
+        let _transition = self.run_transitions.lock().unwrap();
+        let paused_runs: Vec<String> = self.store.read(|db| {
+            Ok(db
+                .list_runs(None)?
+                .into_iter()
+                .filter(|run| run.paused_at.is_some())
+                .map(|run| run.id)
+                .collect())
+        })?;
+        for run in paused_runs {
+            self.pause_run_workers(&run)?;
         }
         Ok(())
     }

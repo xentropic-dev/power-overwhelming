@@ -101,6 +101,17 @@ case "$1" in
         report success "Ran to the end"
         kill "$child"
         ;;
+    termable)
+        # Records its PID, then reports success once the marker exists. A SIGTERM
+        # writes "$3.term" and exits without reporting, so a stop that ends it
+        # gracefully leaves its attempt interrupted.
+        trap 'echo term > "$fixture_dir/$3.term"; exit 0' TERM
+        printf '%s\n' "$$" > "$fixture_dir/$3.tmp"
+        mv "$fixture_dir/$3.tmp" "$fixture_dir/$3"
+        # `wait` returns at once for a trapped signal, so the handler runs promptly.
+        until test -f "$fixture_dir/$2"; do sleep 0.1 & wait $! || true; done
+        report success "Ran on after a stop"
+        ;;
     graced)
         # Reports success, then marks each tenth of a second it still runs.
         wait_for_marker "$2"

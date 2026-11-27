@@ -1810,6 +1810,44 @@ impl Workspace {
         .detach();
     }
 
+    /// The emergency stop: pauses every running agent except the selected one and the
+    /// agent of the active terminal, through the same use case as
+    /// `power agent pause --all-except`.
+    fn pause_all_except_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let caller = self.active_view();
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let keep = match picker.selection() {
+            Some(Choice::Agent(id)) => vec![id],
+            _ => Vec::new(),
+        };
+        let picker_id = picker.id;
+        let task = cx
+            .background_executor()
+            .spawn(async move { client::pause_all_except(keep, caller) });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = task.await;
+            let _ = app.update(cx, |this, cx| {
+                let Some(picker) = this.picker.as_mut().filter(|entry| entry.id == picker_id)
+                else {
+                    return;
+                };
+                picker.message = Some(match result {
+                    Ok(paused) => format!(
+                        "Paused {} agent{}.",
+                        paused.len(),
+                        if paused.len() == 1 { "" } else { "s" }
+                    ),
+                    Err(error) => format!("Could not pause agents. {error:#}"),
+                });
+                let _ = this.dag_refresh.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn toggle_run_pause(
         &mut self,
         picker: u64,
@@ -2614,6 +2652,11 @@ impl Workspace {
                 Some(Command::PauseAgent) => {
                     if !event.is_held && !picker.waiting {
                         self.toggle_selected_pause(window, cx);
+                    }
+                }
+                Some(Command::PauseAllExcept) => {
+                    if !event.is_held && !picker.waiting {
+                        self.pause_all_except_selected(window, cx);
                     }
                 }
                 Some(Command::PauseRun) => {

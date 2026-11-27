@@ -1353,3 +1353,79 @@ fn peers_message_agents_and_runs_in_other_boxes_and_coordinators_keep_the_log() 
     });
     assert_eq!(log(&coordinator).len(), 20);
 }
+
+#[test]
+fn a_coding_agent_in_a_shell_tab_is_never_paused_or_stopped_with_the_shell_and_its_jobs() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let recipient = sandbox.launch("b", BOX);
+    let shell = success(
+        power(path, None)
+            .args(["session", "start", "shell"])
+            .arg(path.join("a"))
+            .output()
+            .unwrap(),
+    );
+    let shell = shell.trim().to_owned();
+    // A background job of the shell, then the coding agent in its foreground. The job
+    // shares the shell's session but is not the agent's descendant.
+    let job = format!(
+        "sleep 600 & echo $! > {}\r",
+        path.join("sibling.pid").display()
+    );
+    type_into(path, &shell, job.as_bytes());
+    let sibling: String = poll("sibling job", || {
+        let pid = file(path, "sibling.pid").trim().to_owned();
+        (!pid.is_empty()).then_some(pid)
+    });
+    let line = format!("{} {}\r", path.join("sender.sh").display(), recipient.id);
+    type_into(path, &shell, line.as_bytes());
+    poll("sender launch", || {
+        path.join("launched").exists().then_some(())
+    });
+    let sent: Value = serde_json::from_str(&file(path, "sent-launch.json")).unwrap();
+    let agent = sent["messages"][0]["sender"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stopped = || {
+        fs::read_to_string(format!("/proc/{sibling}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next())
+            == Some('T')
+    };
+
+    for args in [
+        vec!["agent", "pause", agent.as_str()],
+        vec!["agent", "stop", agent.as_str(), "--box", BOX],
+    ] {
+        let refused = power(path, None).args(&args).output().unwrap();
+        assert!(!refused.status.success(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("foreground"),
+            "{refused:?}"
+        );
+    }
+    // The emergency pause skips it too.
+    success(
+        power(path, Some(&recipient))
+            .args(["agent", "pause", "--all-except"])
+            .output()
+            .unwrap(),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert!(!stopped(), "the shell's sibling job was paused");
+    assert!(
+        fs::metadata(format!("/proc/{sibling}")).is_ok(),
+        "the shell's sibling job was ended"
+    );
+    let sessions = success(
+        power(path, None)
+            .args(["session", "list"])
+            .output()
+            .unwrap(),
+    );
+    assert!(sessions.contains(&shell), "{sessions}");
+    let _ = Command::new("kill").arg(&sibling).status();
+    fs::write(path.join("release-sender"), "").unwrap();
+}

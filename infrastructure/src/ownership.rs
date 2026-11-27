@@ -92,16 +92,28 @@ impl Owner {
         self.send(TreeSignal::Continue, marker)
     }
 
+    /// Asks every process of a paused worker to exit without resuming it first: each
+    /// gets SIGTERM and only then SIGCONT, so it wakes with the end pending and runs
+    /// only its handler, never ordinary work. A reaper's grandchildren are reached
+    /// too, which the reaper itself, signalling only its children, would leave stopped.
+    pub(crate) fn end_paused(&mut self, marker: Option<&str>) -> usize {
+        self.send(TreeSignal::Terminate, marker)
+    }
+
     fn send(&mut self, signal: TreeSignal, marker: Option<&str>) -> usize {
         let number = match signal {
             TreeSignal::Stop => libc::SIGSTOP,
+            TreeSignal::Terminate => libc::SIGTERM,
             _ => libc::SIGCONT,
         };
         match self {
             Self::Scope { root, scope } => {
                 // The root may still be systemd-run, outside the scope.
-                let root = usize::from(!root.exited() && root.signal(number) == Sent::Delivered);
-                root + scope.signal_all(number)
+                let sent = usize::from(!root.exited() && root.signal(number) == Sent::Delivered);
+                if number == libc::SIGTERM && !root.exited() {
+                    root.signal(libc::SIGCONT);
+                }
+                sent + scope.signal_all(number)
             }
             // The reaper and everything it adopted carry the owner marker.
             Self::Reaper(reaper) => {
