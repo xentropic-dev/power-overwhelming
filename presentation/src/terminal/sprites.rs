@@ -303,6 +303,22 @@ pub(super) fn paint(c: char, cell: Bounds<Pixels>, color: Hsla, window: &mut Win
         }
         return;
     }
+    let Some(rects) = line_rects(c, (x, y, w, h), light) else {
+        return;
+    };
+    // Arms overlap at the center. Painting them separately would stack a
+    // translucent (faint) color there, so paint their union as disjoint quads.
+    for [x0, y0, x1, y1] in disjoint(rects) {
+        rect(x0, y0, x1, y1, color);
+    }
+}
+
+/// Box drawing lines and dashes as rectangles snapped to device pixels and
+/// clipped to the cell. They may overlap.
+fn line_rects(c: char, (x, y, w, h): (f32, f32, f32, f32), light: f32) -> Option<Vec<[f32; 4]>> {
+    let (right, bottom) = (x + w, y + h);
+    let (cx, cy) = (x + (w / 2.0).floor(), y + (h / 2.0).floor());
+    let mut rects = Vec::new();
     if let Some((n, heavy, horizontal)) = dashes(c) {
         // Gaps are at most half the cell. A horizontal line keeps half a gap
         // at each end and a vertical one its gap below, so neighbors tile evenly.
@@ -313,15 +329,15 @@ pub(super) fn paint(c: char, cell: Bounds<Pixels>, color: Hsla, window: &mut Win
         let mut offset = from + if horizontal { gap / 2.0 } else { 0.0 };
         for _ in 0..n {
             if horizontal {
-                rect(offset, cy - t / 2.0, offset + dash, cy + t / 2.0, color);
+                rects.push([offset, cy - t / 2.0, offset + dash, cy + t / 2.0]);
             } else {
-                rect(cx - t / 2.0, offset, cx + t / 2.0, offset + dash, color);
+                rects.push([cx - t / 2.0, offset, cx + t / 2.0, offset + dash]);
             }
             offset += dash + gap;
         }
-        return;
+        return Some(snap(rects, (x, y, right, bottom)));
     }
-    let Some(dirs) = lines(c) else { return };
+    let dirs = lines(c)?;
     let thick = |k: u8| if k == 2 { light * 2.0 } else { light };
     // Where a line along an arm starts, measured from the center toward the
     // arm: `before` and `after` are the crossing arms on this line's side and
@@ -372,12 +388,64 @@ pub(super) fn paint(c: char, cell: Bounds<Pixels>, color: Hsla, window: &mut Win
                 (edge, from)
             };
             if horizontal {
-                rect(a0, cy + off - t / 2.0, a1, cy + off + t / 2.0, color);
+                rects.push([a0, cy + off - t / 2.0, a1, cy + off + t / 2.0]);
             } else {
-                rect(cx + off - t / 2.0, a0, cx + off + t / 2.0, a1, color);
+                rects.push([cx + off - t / 2.0, a0, cx + off + t / 2.0, a1]);
             }
         }
     }
+    Some(snap(rects, (x, y, right, bottom)))
+}
+
+fn snap(rects: Vec<[f32; 4]>, (x, y, right, bottom): (f32, f32, f32, f32)) -> Vec<[f32; 4]> {
+    rects
+        .into_iter()
+        .map(|[x0, y0, x1, y1]| {
+            [
+                x0.round().max(x),
+                y0.round().max(y),
+                x1.round().min(right),
+                y1.round().min(bottom),
+            ]
+        })
+        .filter(|[x0, y0, x1, y1]| x1 > x0 && y1 > y0)
+        .collect()
+}
+
+/// The union of rectangles as non-overlapping ones: split along every edge,
+/// keep covered grid cells and merge each covered run within a row band.
+fn disjoint(rects: Vec<[f32; 4]>) -> Vec<[f32; 4]> {
+    let edges = |a: usize, b: usize| {
+        let mut v: Vec<f32> = rects.iter().flat_map(|r| [r[a], r[b]]).collect();
+        v.sort_by(f32::total_cmp);
+        v.dedup();
+        v
+    };
+    let (xs, ys) = (edges(0, 2), edges(1, 3));
+    let mut out = Vec::new();
+    for band in ys.windows(2) {
+        let (y0, y1) = (band[0], band[1]);
+        let mut run: Option<f32> = None;
+        for (i, col) in xs.windows(2).enumerate() {
+            let covered = rects
+                .iter()
+                .any(|r| r[0] <= col[0] && col[1] <= r[2] && r[1] <= y0 && y1 <= r[3]);
+            match (covered, run) {
+                (true, None) => run = Some(col[0]),
+                (false, Some(x0)) => {
+                    out.push([x0, y0, col[0], y1]);
+                    run = None;
+                }
+                _ => {}
+            }
+            if i == xs.len() - 2
+                && let Some(x0) = run.take()
+            {
+                out.push([x0, y0, col[1], y1]);
+            }
+        }
+    }
+    out
 }
 
 /// Nerd Font powerline separators (U+E0B0..E0BF): arrows, half circles and
@@ -436,8 +504,22 @@ fn powerline(
         _ => return,
     }
     if let Ok(path) = path.build() {
-        window.paint_path(path, color);
+        // The overshoot only removes the seam at this cell's own edges; the
+        // mask keeps it from painting over the neighbors' last columns.
+        let bounds = clip_bounds((x, y, w, h), at);
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            window.paint_path(path, color);
+        });
     }
+}
+
+/// The snapped cell in logical pixels, which no powerline shape may leave.
+fn clip_bounds(
+    (x, y, w, h): (f32, f32, f32, f32),
+    at: impl Fn(f32, f32) -> Point<Pixels>,
+) -> Bounds<Pixels> {
+    let (origin, end) = (at(x, y), at(x + w, y + h));
+    Bounds::new(origin, size(end.x - origin.x, end.y - origin.y))
 }
 
 #[cfg(test)]
@@ -548,5 +630,52 @@ mod tests {
         }
         assert_eq!(arc('┌'), None);
         assert_eq!(dashes('─'), None);
+    }
+
+    fn coverage(rects: &[[f32; 4]], px: f32, py: f32) -> usize {
+        rects
+            .iter()
+            .filter(|r| r[0] <= px && px < r[2] && r[1] <= py && py < r[3])
+            .count()
+    }
+
+    #[test]
+    fn faint_intersections_paint_every_pixel_once() {
+        // A translucent (SGR 2) color must not stack where arms cross.
+        for c in ['─', '┬', '┼', '╋', '╬', '┿', '╪', '╫', '┄', '╍'] {
+            for (w, h) in [(8.0, 17.0), (9.0, 20.0), (16.0, 34.0)] {
+                let light = (w / 8.0f32).round().max(1.0);
+                let rects = disjoint(line_rects(c, (3.0, 5.0, w, h), light).unwrap());
+                for py in 5..5 + h as i32 {
+                    for px in 3..3 + w as i32 {
+                        let n = coverage(&rects, px as f32 + 0.5, py as f32 + 0.5);
+                        assert!(n <= 1, "{c} {w}x{h} pixel ({px},{py}) painted {n} times");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disjoint_keeps_the_union() {
+        let rects = line_rects('╋', (0.0, 0.0, 10.0, 21.0), 1.0).unwrap();
+        let union = disjoint(rects.clone());
+        for py in 0..21 {
+            for px in 0..10 {
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                assert_eq!(coverage(&rects, fx, fy) > 0, coverage(&union, fx, fy) == 1);
+            }
+        }
+    }
+
+    #[test]
+    fn powerline_stays_inside_its_cell_between_contrasting_backgrounds() {
+        // Cells at device x 0..9, 9..18, 18..27; the separator sits in the middle.
+        let at = |x: f32, y: f32| point(px(x / 2.0), px(y / 2.0));
+        let b = clip_bounds((9.0, 0.0, 9.0, 20.0), at);
+        assert_eq!(b.origin.x, px(4.5));
+        assert_eq!(b.right(), px(9.0));
+        assert_eq!(b.origin.y, px(0.0));
+        assert_eq!(b.bottom(), px(10.0));
     }
 }
