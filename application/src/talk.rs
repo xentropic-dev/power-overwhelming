@@ -123,7 +123,7 @@ use domain::{
     dag::{AgentStatus, Coordinator, ManagedAgent},
     talk::{
         Address, AgentRef, Delivery, MAX_BODY_BYTES, NoticeDecision, RATE_WINDOW_MS,
-        REMINDER_AFTER_MS, SenderContext, authorize, notice, rate_limit, resolve,
+        REMINDER_AFTER_MS, RunRef, SenderContext, notice, rate_limit, resolve,
     },
 };
 
@@ -172,14 +172,24 @@ impl<'a> Actor<'a> {
         })
     }
 
+    /// The run records the agent that created it and that agent's session. After a restart
+    /// the same session may register again under a new agent ID and still coordinates it.
+    fn coordinates(&self, coordinator: &str, run: &RunRef) -> bool {
+        self.agent.is_some_and(|sender| {
+            sender.id == coordinator
+                || sender
+                    .session
+                    .as_deref()
+                    .is_some_and(|session| run.coordinator_session.as_deref() == Some(session))
+        })
+    }
+
     fn coordinated_runs(&self) -> impl Iterator<Item = &str> {
         self.directory
             .runs
             .iter()
             .filter_map(|run| match &run.coordinator {
-                Coordinator::Agent { agent }
-                    if self.agent.is_some_and(|sender| sender.id == *agent) =>
-                {
+                Coordinator::Agent { agent } if self.coordinates(agent, run) => {
                     Some(run.id.as_str())
                 }
                 _ => None,
@@ -328,12 +338,6 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     ),
                 };
                 let run = explicit_run.or(recipient_run).or(run);
-                if let Some(run) = run {
-                    ensure!(
-                        directory.run(run)?.box_id == box_id,
-                        "Run {run:?} is in another box"
-                    );
-                }
                 let outgoing = Outgoing {
                     box_id: box_id.into(),
                     sender: actor.sender(run),
@@ -368,7 +372,9 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             let recipient = if let Some(id) = &command.recipient_agent {
                 ensure!(actor.agent.is_none() && parent.involves_agent(id),
                     "Only the user can direct a reply to a participant in this message");
-                Recipient::Agent { id: id.clone(), box_id: parent.box_id.clone() }
+                let agent = directory.agents.iter().find(|agent| agent.id == *id)
+                    .with_context(|| format!("Unknown talk target {id:?}"))?;
+                Recipient::agent(agent)
             } else if from_me {
                 parent.recipient.clone()
             } else {
@@ -383,7 +389,12 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     &Target::One(Address::Agent(id.clone())), &directory)?;
             }
             let mut message = self.build(db, Outgoing {
-                box_id: parent.box_id, sender, recipient, body: command.body,
+                // A reply lives in its recipient's box, which differs across boxes.
+                box_id: match &recipient {
+                    Recipient::Agent { box_id, .. } => box_id.clone(),
+                    Recipient::User => parent.box_id,
+                },
+                sender, recipient, body: command.body,
                 run: parent.run, urgent: command.urgent,
             }, (self.clock)())?;
             message.thread = parent.thread;
@@ -394,7 +405,6 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
     }
 
     fn build(&self, db: &dyn TalkReader, outgoing: Outgoing, now: u64) -> Result<Message> {
-        authorize(&outgoing.sender, &outgoing.recipient)?;
         ensure!(
             !outgoing.urgent || outgoing.sender.has_user_authority(),
             "--urgent is only available to the user"
@@ -569,18 +579,16 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             let scoped_box = filter.box_id.as_deref().or(actor.box_id);
             if let Some(agent) = &mut filter.agent {
                 let target = directory.agent(agent, scoped_box)?;
-                if let Some(from) = actor.agent {
-                    ensure!(
-                        target.box_id == from.box_id,
-                        "Talk target {agent:?} is in another box"
-                    );
-                }
                 filter.box_id = Some(target.box_id.clone());
                 *agent = target.id.clone();
             } else if let Some(run) = &filter.run {
                 filter.box_id = Some(directory.run(run)?.box_id.clone());
             } else {
                 filter.box_id = scoped_box.map(str::to_owned);
+            }
+            if actor.agent.is_some() {
+                // A coordinator reads its runs' messages in every box they reach.
+                filter.box_id = None;
             }
             db.log(&filter)
         })

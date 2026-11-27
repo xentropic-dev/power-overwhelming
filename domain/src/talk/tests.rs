@@ -39,6 +39,7 @@ fn directory() -> Directory {
             coordinator: Coordinator::Agent {
                 agent: "coord".into(),
             },
+            coordinator_session: None,
         }],
     }
 }
@@ -57,6 +58,8 @@ fn addresses_resolve_exact_aliases_and_current_attempts() {
         ("parent", 0),
         ("coordinator", 0),
         ("task:b", 3),
+        // Peers reach agents in other boxes. The envelope still marks them as peers.
+        ("other", 4),
     ] {
         assert_eq!(
             resolve(ctx(), &Target::One(Address::from(input)), &dir),
@@ -70,7 +73,6 @@ fn addresses_resolve_exact_aliases_and_current_attempts() {
     for (input, error) in [
         ("worker", AddressError::Ambiguous("worker".into())),
         ("worker-old", AddressError::Exited("worker-old".into())),
-        ("other", AddressError::OtherBox("other".into())),
         ("task:nope", AddressError::Unknown("task:nope".into())),
         ("", AddressError::Unknown("".into())),
     ] {
@@ -155,13 +157,6 @@ fn message() -> Message {
 #[test]
 fn trust_limits_peers_and_preserves_message_provenance() {
     let mut msg = message();
-    let remote = Recipient::Agent {
-        id: "other".into(),
-        box_id: "remote".into(),
-    };
-    assert!(authorize(&msg.sender, &remote).is_err());
-    assert!(authorize(&msg.sender, &msg.recipient).is_ok());
-    assert!(authorize(&msg.sender, &Recipient::User).is_ok());
     let recent = [1; RATE_LIMIT];
     assert_eq!(rate_limit(&msg.sender, &recent[..19], RATE_WINDOW_MS), None);
     assert_eq!(
@@ -190,7 +185,6 @@ fn trust_limits_peers_and_preserves_message_provenance() {
         (Sender::Shell, "from the user's shell"),
         (Sender::System, "from Power"),
     ] {
-        assert!(authorize(&sender, &remote).is_ok());
         assert_eq!(rate_limit(&sender, &recent, RATE_WINDOW_MS), None);
         msg.sender = sender;
         assert!(envelope(&msg).contains(label));
