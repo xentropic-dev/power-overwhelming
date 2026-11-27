@@ -43,7 +43,16 @@ impl<'a> Separator<'a> {
 
 fn color(colors: &Colors, role: UiColor) -> u32 {
     match role {
-        UiColor::Foreground | UiColor::Contrast => colors.foreground,
+        UiColor::Contrast => colors.foreground,
+        role => ui_color(colors, role, colors.background),
+    }
+}
+
+/// The RGB value of a plugin color name. `contrast` picks ink that reads on `background`.
+pub(crate) fn ui_color(colors: &Colors, role: UiColor, background: u32) -> u32 {
+    match role {
+        UiColor::Contrast => colors.contrast(background),
+        UiColor::Foreground => colors.foreground,
         UiColor::Background => colors.background,
         UiColor::Accent => colors.accent,
         UiColor::Muted => colors.muted,

@@ -58,6 +58,8 @@ const CLEAR_DELAY: Duration = Duration::from_secs(3);
 /// An agent restored with resume arguments that exits this soon after launch had
 /// nothing to resume, so it is started once more with its fallback arguments.
 const RESUME_WINDOW: Duration = Duration::from_secs(5);
+/// How often a foreground jcode's session files are read for its current model.
+const MODEL_POLL: Duration = Duration::from_secs(2);
 /// Written to the terminal when a failed resume starts a new conversation.
 const RESUME_NOTICE: &str =
     "\r\n\x1b[2m── could not resume, started a new conversation ──\x1b[0m\r\n";
@@ -654,7 +656,9 @@ fn launch(
         drop(gone_guard);
         let _ = waiter_tx.send(Command::ProcessExited(detail));
     });
-    if session.agent == Agent::Shell {
+    // Shells poll for foreground changes. A jcode session polls for its model, which jcode
+    // records only in its own session files.
+    if session.agent == Agent::Shell || session.agent.as_str() == "jcode" {
         let poll_tx = tx.clone();
         let lifecycle = lifecycle.clone();
         thread::spawn(move || {
@@ -1147,6 +1151,8 @@ fn terminal_actor(
     };
 
     let mut restore = RestoreState::new(launched_agent.clone(), cwd);
+    // When the foreground jcode's session files were last read for its model.
+    let mut model_checked: Option<Instant> = None;
 
     let mut output_closed = false;
     let mut process_exit: Option<PendingExit> = None;
@@ -1398,8 +1404,26 @@ fn terminal_actor(
                 let _ = reply.send(lifecycle.foreground.lock().unwrap().agent.clone());
             }
             Command::Poll => {
-                if !exited {
+                if !exited && launched_agent == Agent::Shell {
                     restore.poll(run.is_none(), shell_pid, lifecycle);
+                }
+                if !exited
+                    && let Some((pid, agent)) = run.as_ref()
+                    && agent.as_str() == "jcode"
+                    && model_checked.is_none_or(|at| at.elapsed() >= MODEL_POLL)
+                {
+                    model_checked = Some(Instant::now());
+                    if let Some(model) = crate::agents::jcode_process_model(*pid)
+                        && metadata.model.as_ref() != Some(&model)
+                    {
+                        match lifecycle.set_model(agent, Some(model.clone())) {
+                            Ok(()) => {
+                                metadata.model = Some(model);
+                                notify_metadata(&metadata, &mut clients);
+                            }
+                            Err(error) => eprintln!("Could not save agent model. {error:#}"),
+                        }
+                    }
                 }
             }
             Command::SetConversation {

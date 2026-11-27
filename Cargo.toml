@@ -1,5 +1,5 @@
 [workspace]
-members = ["application", "domain", "infrastructure", "presentation", "plugins/power-bar"]
+members = ["application", "domain", "infrastructure", "presentation", "plugins/power-bar", "plugins/dashboard"]
 default-members = ["presentation"]
 resolver = "3"
 

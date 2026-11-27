@@ -2,10 +2,12 @@
 pub(crate) mod agent_tree;
 #[path = "dag_view.rs"]
 mod dag_view;
+#[path = "panel_view.rs"]
+mod panel_view;
 #[path = "workspace_talk.rs"]
 mod workspace_talk;
 
-use self::{agent_tree::AgentTree, dag_view::DagView};
+use self::{agent_tree::AgentTree, dag_view::DagView, panel_view::PanelView};
 use crate::{
     keymap::{Command, Keymap, PluginCommandId, Scope},
     picker::{Choice, Kind, Picker, Row, worktree_target},
@@ -15,7 +17,7 @@ use crate::{
     talk_dialog::{TalkDialog, Target as TalkTarget},
     terminal::{
         AgentChanged, BarContextChanged, InputHold, LinkAction, OpenLink, TerminalView,
-        link_action, load_bundled_fonts,
+        column_width, link_action, load_bundled_fonts, terminal_font_family,
     },
 };
 use anyhow::{Context as _, Result, ensure};
@@ -271,6 +273,10 @@ struct Workspace {
     input_hold: InputHold,
     /// Panel plugins: their commands are in the keymap and they draw panels.
     panels: PanelPlugins,
+    /// The open plugin panel, such as the dashboard.
+    panel: Option<PanelView>,
+    /// The plugin command whose effect is pending, so its panel knows its opening key.
+    panel_opener: Option<Command>,
     _bar_config: Subscription,
 }
 
@@ -395,6 +401,8 @@ impl Workspace {
             input_hold: InputHold::default(),
             picker: None,
             dag: None,
+            panel: None,
+            panel_opener: None,
             dag_refresh,
             talk: None,
             talk_refresh,
@@ -826,9 +834,21 @@ impl Workspace {
                             panel_id,
                             refresh_ms,
                         } => this.open_panel(panel_id, refresh_ms, window, cx),
-                        // Panels draw in the panel view, which renders them on request.
-                        PanelUpdate::Panel { .. } => {}
-                        PanelUpdate::Error(error) => this.show_error(error, cx),
+                        PanelUpdate::Panel { panel_id, panel } => {
+                            if let Some(view) =
+                                this.panel.as_mut().filter(|view| view.panel_id == panel_id)
+                            {
+                                view.show(panel);
+                                cx.notify();
+                            }
+                        }
+                        PanelUpdate::Error(error) => match &mut this.panel {
+                            Some(view) => {
+                                view.error = Some(error);
+                                cx.notify();
+                            }
+                            None => this.show_error(error, cx),
+                        },
                     })
                     .is_err()
                 {
@@ -843,20 +863,123 @@ impl Workspace {
     /// Runs a plugin command. Its effect arrives through `watch_panels`.
     fn invoke_plugin(&mut self, id: PluginCommandId) {
         if let Some(entry) = self.keymap.plugin(id) {
+            self.panel_opener = Some(Command::Plugin(id));
             self.panels.invoke(entry.name.clone());
         }
     }
 
-    /// Opens a panel a plugin asked for. The panel view that draws it hooks in here.
+    /// Opens a panel a plugin asked for and keeps it fresh while it stays open.
     fn open_panel(
         &mut self,
         panel_id: String,
         refresh_ms: Option<u32>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let _ = (panel_id, refresh_ms);
+        let opener = self.panel_opener.take();
+        if self
+            .panel
+            .as_ref()
+            .is_some_and(|panel| panel.panel_id == panel_id)
+        {
+            return;
+        }
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        self.picker = None;
+        self.dag = None;
+        let id = self.next_id();
+        self.panel = Some(PanelView::new(
+            id,
+            panel_id,
+            refresh_ms.map(|ms| Duration::from_millis(ms.into())),
+            opener,
+            focus,
+        ));
+        self.poll_panel(id, window, cx);
         cx.notify();
+    }
+
+    /// Reads the overview off the UI thread and asks the plugin to redraw the panel, every
+    /// refresh interval until panel `id` closes.
+    fn poll_panel(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let overview = cx
+                    .background_executor()
+                    .spawn(async { client::overview() })
+                    .await;
+                let refresh = this.update_in(cx, |this, window, cx| {
+                    let columns = this.panel_columns(window, cx);
+                    let scheme = cx.global::<DesktopScheme>().0;
+                    let panel = this.panel.as_mut().filter(|panel| panel.id == id)?;
+                    match overview {
+                        Ok(overview) => {
+                            this.panels
+                                .render(panel.panel_id.clone(), &overview, columns, scheme)
+                        }
+                        Err(error) => {
+                            panel.error = Some(format!("Could not read the overview. {error:#}"));
+                            cx.notify();
+                        }
+                    }
+                    Some(panel.refresh)
+                });
+                let Ok(Some(refresh)) = refresh else {
+                    break;
+                };
+                cx.background_executor().timer(refresh).await;
+            }
+        })
+        .detach();
+    }
+
+    /// The monospace cell width panels lay out in.
+    fn panel_cell(window: &Window, cx: &App) -> Pixels {
+        column_width(
+            window.text_system(),
+            &font(terminal_font_family(cx)),
+            px(panel_view::TEXT_SIZE),
+            window.scale_factor(),
+        )
+    }
+
+    fn panel_columns(&self, window: &Window, cx: &App) -> u32 {
+        PanelView::columns(window.viewport_size().width, Self::panel_cell(window, cx))
+    }
+
+    fn close_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.take().is_some() {
+            self.restore_focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Keys while a panel is open. Prefixed commands fall through to the usual handling;
+    /// the one that opened the panel closes it again.
+    fn panel_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stroke = &event.keystroke;
+        if self.prefix.is_some() || self.keymap.command(Scope::Prefix, stroke).is_some() {
+            return false;
+        }
+        cx.stop_propagation();
+        let Some(panel) = &mut self.panel else {
+            return true;
+        };
+        match self.keymap.command(Scope::Panel, stroke) {
+            Some(Command::PanelClose) if !event.is_held => self.close_panel(window, cx),
+            Some(command @ (Command::PanelUp | Command::PanelDown)) => {
+                panel.step(command == Command::PanelUp);
+                cx.notify();
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Reloads a box's icon whenever an agent sets or resets it.
@@ -1297,6 +1420,8 @@ impl Workspace {
             talk.focus(window);
         } else if let Some(dag) = &self.dag {
             dag.focus.focus(window);
+        } else if let Some(panel) = &self.panel {
+            panel.focus.focus(window);
         } else if let Some(picker) = &self.picker {
             picker.focus.focus(window);
         } else if let Some(id) = self
@@ -2606,6 +2731,9 @@ impl Workspace {
             self.talk_key(event, window, cx);
             return;
         }
+        if self.panel.is_some() && self.panel_key(event, window, cx) {
+            return;
+        }
         if let Some(dag) = &mut self.dag {
             cx.stop_propagation();
             if dag.picking_artifact {
@@ -2911,6 +3039,13 @@ impl Workspace {
             && self.layout.remember_command(&name)
         {
             self.save();
+        }
+        if let Some(panel) = &self.panel {
+            let toggle = panel.opener == Some(command);
+            self.close_panel(window, cx);
+            if toggle {
+                return;
+            }
         }
         match command {
             Command::Help => self.open_help(window, cx),
@@ -3422,6 +3557,14 @@ impl Render for Workspace {
                     });
                 })
             });
+        let panel = self.panel.as_ref().map(|panel| {
+            panel.render(
+                colors,
+                &self.keymap,
+                terminal_font_family(cx),
+                Self::panel_cell(window, cx),
+            )
+        });
         let graph = self.dag.as_ref().map(|dag| {
             let entity = cx.weak_entity();
             let id = dag.id;
@@ -3562,6 +3705,7 @@ impl Render for Workspace {
             )
             .children(modal)
             .children(graph)
+            .children(panel)
             .children(
                 self.talk
                     .as_ref()
