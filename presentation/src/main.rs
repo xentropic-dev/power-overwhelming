@@ -4,6 +4,8 @@ mod picker;
 mod preview;
 mod settings;
 mod status_bar;
+mod talk_cli;
+mod talk_dialog;
 mod terminal;
 
 use anyhow::{Context, Result};
@@ -17,11 +19,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use domain::{agent::display_name, session::Agent};
 use infrastructure::{
     agents::AgentProfiles,
+    budget::LocalWorkerBudget,
     client::{
         self,
         protocol::{
-            DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec, TaskState,
-            WorktreeRequest,
+            BudgetMode, DagRequest, DagResponse, Provider, ReportStatus, RunEventKind, TaskSpec,
+            TaskState, WorktreeRequest,
         },
     },
     config, daemon,
@@ -53,6 +56,27 @@ struct Cli {
 enum Action {
     Gui,
     Daemon,
+    /// Check that restarting the daemon would not kill DAG workers mid-task. Lists the
+    /// open attempts and asks to confirm, or fails when it cannot ask or the daemon does
+    /// not answer. Prints the PID of the daemon it cleared, which is the only one to
+    /// restart, or nothing when no daemon listens. Run it before anything that restarts
+    /// the daemon.
+    RestartCheck {
+        /// Allow the restart even with workers mid-task or a daemon that does not answer.
+        #[arg(long)]
+        force: bool,
+        /// Only print the PID of the daemon listening on this socket, without checking.
+        #[arg(long, conflicts_with_all = ["force", "stop"])]
+        target: bool,
+        /// Once cleared, stop that daemon: SIGTERM, then SIGKILL after 5 seconds. The
+        /// signals go through a handle on the process that was checked, so they never
+        /// reach another process that reused its PID.
+        #[arg(long)]
+        stop: bool,
+        /// With --stop, leave the daemon alone when it already runs this executable.
+        #[arg(long, requires = "stop", value_name = "PATH")]
+        unless_exe: Option<PathBuf>,
+    },
     Session {
         #[command(subcommand)]
         command: SessionAction,
@@ -71,6 +95,13 @@ enum Action {
     ShellInit {
         #[arg(value_parser = ["bash", "zsh", "fish"])]
         shell: String,
+    },
+    /// Runs a worker under a subreaper that ends everything it starts. The daemon
+    /// uses it without cgroup ownership.
+    #[command(hide = true)]
+    Reap {
+        #[arg(last = true)]
+        argv: Vec<OsString>,
     },
     #[command(hide = true)]
     ExecAgent {
@@ -101,6 +132,8 @@ enum Action {
         #[command(subcommand)]
         command: DagAction,
     },
+    /// Exchange messages with agents and the user.
+    Talk(talk_cli::TalkArgs),
     /// List and prune Power-managed Git worktrees.
     Worktree {
         #[command(subcommand)]
@@ -236,15 +269,15 @@ fn main() -> Result<()> {
     let cli = Cli::try_parse().unwrap_or_else(|error| {
         let mut args = std::env::args_os().skip(1);
         let command = args.next();
-        let dag_command = match command.as_deref().and_then(|arg| arg.to_str()) {
-            Some("box" | "dag") => true,
+        let command_uses_exit_one = match command.as_deref().and_then(|arg| arg.to_str()) {
+            Some("box" | "dag" | "talk") => true,
             Some("agent") => !matches!(
                 args.next().as_deref().and_then(|arg| arg.to_str()),
                 Some("codex" | "claude")
             ),
             _ => false,
         };
-        if error.use_stderr() && dag_command {
+        if error.use_stderr() && command_uses_exit_one {
             let _ = error.print();
             std::process::exit(1);
         }
@@ -254,7 +287,28 @@ fn main() -> Result<()> {
         Some(Action::Daemon) => daemon::serve(
             configured_agents(),
             LocalWorktreeRoot::new(settings::Settings::defaults()),
+            finished_worker_grace(),
+            config::load_talk_policy(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load talk settings. {error:#}");
+                domain::talk::NoticePolicy::default()
+            }),
+            LocalWorkerBudget::new(settings::Settings::defaults()),
+            config::load_stall_after(settings::Settings::defaults()).unwrap_or_else(|error| {
+                eprintln!("Could not load dag.stall_after. {error:#}");
+                Some(application::dag::STALL_AFTER)
+            }),
         ),
+        Some(Action::RestartCheck {
+            force,
+            target,
+            stop,
+            unless_exe,
+        }) => restart_check(
+            force || std::env::var_os("POWER_FORCE_RESTART").is_some_and(|value| value == "1"),
+            target,
+            stop.then_some(unless_exe),
+        ),
+        Some(Action::Talk(args)) => talk_cli::run(args),
         Some(Action::Artifact {
             command: ArtifactAction::Publish { target, title },
         }) => {
@@ -303,11 +357,18 @@ fn main() -> Result<()> {
                     println!("{}", session.id);
                 }
                 SessionAction::End { id } => client::end_session(id)?,
-                SessionAction::Task { label } => client::set_task(
-                    std::env::var("POWER_SESSION").context("Set a task from a Power terminal")?,
-                    label,
-                )?,
-                SessionAction::Model { name, .. } => report_model(name)?,
+                SessionAction::Task { label } => {
+                    report_conversation();
+                    client::set_task(
+                        std::env::var("POWER_SESSION")
+                            .context("Set a task from a Power terminal")?,
+                        label,
+                    )?
+                }
+                SessionAction::Model { name, .. } => {
+                    report_conversation();
+                    report_model(name)?
+                }
             }
             Ok(())
         }
@@ -343,6 +404,7 @@ fn main() -> Result<()> {
             client::ensure_daemon()?;
             print_json(json!({"boxes": protocol_boxes()?}))
         }
+        Some(Action::Reap { argv }) => match infrastructure::reaper::run(argv)? {},
         Some(Action::ExecAgent { id, args }) => exec_agent(&id, args),
         Some(Action::Codex { args }) => exec_agent("codex", args),
         Some(Action::Claude { args }) => exec_agent("claude", args),
@@ -368,9 +430,51 @@ fn main() -> Result<()> {
         Some(Action::Agent { command }) => match command {
             AgentAction::Codex { args } => exec_agent("codex", args),
             AgentAction::Claude { args } => exec_agent("claude", args),
-            AgentAction::List { box_sel } => {
+            AgentAction::List {
+                box_sel,
+                all,
+                all_boxes,
+            } => {
                 client::ensure_daemon()?;
-                print_json(json!({"agents": protocol_agents(box_sel)?}))
+                let caller = (!all_boxes).then(caller_session).flatten();
+                let scoped = box_sel.is_none() && caller.is_some();
+                let agents = list_agents(box_sel, caller, all)?;
+                if scoped {
+                    let others = list_agents(None, None, all)?
+                        .len()
+                        .saturating_sub(agents.len());
+                    if others > 0 {
+                        eprintln!(
+                            "{others} more in other boxes; pass --all-boxes or --box to see them"
+                        );
+                    }
+                }
+                print_json(json!({"agents": agents}))
+            }
+            AgentAction::Pause { ids, all_except } => {
+                client::ensure_daemon()?;
+                if all_except {
+                    let request = DagRequest::PauseAllExcept {
+                        keep: ids,
+                        caller: caller_session(),
+                    };
+                    return dag_reply(request, Duration::from_secs(30));
+                }
+                set_paused(ids, true)
+            }
+            AgentAction::Resume { ids } => {
+                client::ensure_daemon()?;
+                set_paused(ids, false)
+            }
+            AgentAction::End { id, box_sel } | AgentAction::Stop { id, box_sel } => {
+                client::ensure_daemon()?;
+                let agent = protocol_agents(box_sel, true)?
+                    .into_iter()
+                    .find(|agent| agent.id == id)
+                    .with_context(|| format!("No agent {id} in this box."))?;
+                // The daemon ends only the agent's own session, and refuses an agent
+                // that shares a shell session with the shell's other jobs.
+                client::stop_agent(agent.id).map(drop)
             }
             AgentAction::Start {
                 box_sel,
@@ -381,6 +485,8 @@ fn main() -> Result<()> {
                 prompt,
                 args,
             } => {
+                let allow_main_checkout = worktree.allow_main_checkout;
+                let worktree = worktree.request(false, "starting an agent")?;
                 client::ensure_daemon()?;
                 anyhow::ensure!(
                     provider != "command",
@@ -392,7 +498,8 @@ fn main() -> Result<()> {
                         box_sel,
                         caller: caller_session(),
                         provider: Provider::Agent(provider),
-                        worktree: worktree.canonicalize().context("Open worktree")?,
+                        worktree,
+                        allow_main_checkout,
                         parent,
                         label,
                         prompt,
@@ -424,6 +531,13 @@ fn configured_agents() -> AgentProfiles {
     })
 }
 
+fn finished_worker_grace() -> Option<std::time::Duration> {
+    config::load_finished_worker_grace(settings::Settings::defaults()).unwrap_or_else(|error| {
+        eprintln!("Could not load dag settings. {error:#}");
+        Some(application::dag::FINISHED_WORKER_GRACE)
+    })
+}
+
 fn exec_agent(id: &str, args: Vec<OsString>) -> Result<()> {
     let profiles = configured_agents();
     shell::exec_agent(profiles.resolve(&id.into())?, args)
@@ -449,7 +563,41 @@ enum BoxAction {
 
 #[derive(Subcommand)]
 enum AgentAction {
+    /// List the box's live agents.
     List {
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+        /// Include exited and done agents.
+        #[arg(long)]
+        all: bool,
+        /// List agents in every box, not just the current one.
+        #[arg(long, conflicts_with = "box_sel")]
+        all_boxes: bool,
+    },
+    /// Pause an agent's whole process tree (SIGSTOP). Only its own processes are touched.
+    Pause {
+        /// Agents to pause. With --all-except, the agents to leave running.
+        #[arg(required_unless_present = "all_except")]
+        ids: Vec<String>,
+        /// Pause every running agent except the ones named, and the caller's own.
+        #[arg(long)]
+        all_except: bool,
+    },
+    /// Resume a paused agent's process tree.
+    Resume {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Stop an agent cleanly: end its terminal session and interrupt its open attempt,
+    /// which can then be dispatched again with --retry.
+    Stop {
+        id: String,
+        #[arg(long = "box")]
+        box_sel: Option<String>,
+    },
+    /// End an agent's terminal session, interrupting any attempt it still has open.
+    End {
+        id: String,
         #[arg(long = "box")]
         box_sel: Option<String>,
     },
@@ -459,8 +607,8 @@ enum AgentAction {
         /// Coding agent profile ID.
         #[arg(long)]
         provider: String,
-        #[arg(long)]
-        worktree: PathBuf,
+        #[command(flatten)]
+        worktree: WorktreeArgs,
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
@@ -494,11 +642,34 @@ enum DagAction {
         #[arg(long)]
         coordinator: Option<String>,
     },
+    /// List the box's unfinished runs.
     List {
         #[arg(long = "box")]
         box_sel: Option<String>,
+        /// Include completed and archived runs.
+        #[arg(long)]
+        all: bool,
     },
     Show {
+        run: String,
+    },
+    /// Hide a run from default listings, such as an abandoned one.
+    Archive {
+        run: String,
+        /// Archive even while attempts are still open.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Return an archived run to default listings.
+    Unarchive {
+        run: String,
+    },
+    /// Pause every active worker of a run and stop dispatching from it.
+    Pause {
+        run: String,
+    },
+    /// Resume a paused run's workers and let it dispatch again.
+    Resume {
         run: String,
     },
     AddTask {
@@ -559,20 +730,73 @@ enum DagAction {
 struct DispatchArgs {
     run: String,
     task: String,
-    /// Coding agent profile ID, or `command` to run an executable directly.
+    /// Coding agent profile ID, or `command` to run an executable directly. Like any
+    /// provider, `command` needs `--allow-main-checkout` to run in the main checkout.
     #[arg(long)]
     provider: String,
-    /// Existing checkout or `new`. A retry defaults to the previous managed checkout.
-    #[arg(long, value_name = "PATH|new")]
-    worktree: Option<PathBuf>,
-    /// Name of the branch for `--worktree new`.
-    #[arg(long, value_name = "NAME", required_if_eq("worktree", "new"))]
-    branch: Option<String>,
-    /// Starting revision for `--worktree new`. Required outside Power.
-    #[arg(long, value_name = "REV")]
-    base: Option<String>,
+    #[command(flatten)]
+    worktree: WorktreeArgs,
+    /// Fail instead of queueing the task when the worker budget is full.
+    #[arg(long, conflicts_with = "over_budget")]
+    no_queue: bool,
+    /// Start even when the worker budget is full. Starts an already queued task now.
+    #[arg(long)]
+    over_budget: bool,
     #[arg(last = true)]
     args: Vec<String>,
+}
+
+// Where a worker runs. Without `--worktree`, Power creates a worktree on `--branch`, and a
+// retry without either reuses the previous managed worktree. A doc comment here would
+// replace the help text of every command that flattens these arguments.
+#[derive(Args)]
+struct WorktreeArgs {
+    /// Existing checkout to reuse, or `new` (the default) for a Power-managed worktree.
+    #[arg(long, value_name = "PATH|new")]
+    worktree: Option<PathBuf>,
+    /// Name of the branch for a new worktree.
+    #[arg(long, value_name = "NAME", required_if_eq("worktree", "new"))]
+    branch: Option<String>,
+    /// Starting revision for a new worktree. Required outside Power.
+    #[arg(long, value_name = "REV")]
+    base: Option<String>,
+    /// Allow `--worktree` to be the repository's main checkout, for read-only work.
+    #[arg(long, requires = "worktree")]
+    allow_main_checkout: bool,
+}
+
+impl WorktreeArgs {
+    fn request(self, retry: bool, action: &str) -> Result<WorktreeRequest> {
+        Ok(match self.worktree {
+            Some(path) if path.as_os_str() != "new" => {
+                anyhow::ensure!(
+                    self.branch.is_none() && self.base.is_none(),
+                    "--branch and --base create a new worktree, so they can't be used with an \
+                     existing --worktree path"
+                );
+                WorktreeRequest::Existing(path.canonicalize().context("Open worktree")?)
+            }
+            worktree => {
+                anyhow::ensure!(
+                    !self.allow_main_checkout,
+                    "--allow-main-checkout requires an existing --worktree path"
+                );
+                match self.branch {
+                    Some(branch) => WorktreeRequest::New {
+                        branch,
+                        base: self.base,
+                    },
+                    None if retry && worktree.is_none() && self.base.is_none() => {
+                        WorktreeRequest::RetryManaged
+                    }
+                    None => anyhow::bail!(
+                        "Specify --branch <name> for a new worktree when {action}, or \
+                         --worktree <PATH> to reuse an existing one"
+                    ),
+                }
+            }
+        })
+    }
 }
 
 #[derive(Args)]
@@ -596,6 +820,30 @@ fn caller_session() -> Option<String> {
     std::env::var("POWER_SESSION")
         .ok()
         .filter(|id| !id.is_empty())
+}
+
+/// Reports the conversation of an agent that exposes its ID to the commands it runs
+/// through its profile's `conversation_env`, so a restore can resume it. Best effort: a
+/// failed report leaves the command's own work to succeed or fail.
+fn report_conversation() {
+    let Some(session) = caller_session() else {
+        return;
+    };
+    for profile in configured_agents().profiles() {
+        let Some(conversation) = profile
+            .conversation_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|conversation| !conversation.is_empty())
+        else {
+            continue;
+        };
+        let _ = client::set_conversation(
+            session.clone(),
+            profile.id.as_str().to_owned(),
+            conversation,
+        );
+    }
 }
 
 fn report_model(name: Option<String>) -> Result<()> {
@@ -789,6 +1037,7 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
             json!({"link": domain::link::dag_uri(&run.id), "run": run})
         }
         DagResponse::Run { run } => json!({"run": run}),
+        DagResponse::Agents { agents } => json!({"agents": agents}),
         DagResponse::Runs { runs } => {
             let links: serde_json::Map<String, Value> = runs
                 .iter()
@@ -806,6 +1055,12 @@ fn dag_reply(request: DagRequest, timeout: Duration) -> Result<()> {
             "attempt": attempt,
             "agent": agent,
         }),
+        DagResponse::Queued { run, task, reason } => json!({
+            "queued": true,
+            "run": run,
+            "task": task,
+            "reason": reason,
+        }),
         DagResponse::Reported { applied, reason } => json!({"applied": applied, "reason": reason}),
         DagResponse::Events { events, cursor } => json!({"events": events, "cursor": cursor}),
         _ => anyhow::bail!("Unexpected daemon response"),
@@ -819,36 +1074,29 @@ fn report_arg(value: Option<String>, env: &str, flag: &str) -> Result<String> {
         .with_context(|| format!("Specify --{flag} or set {env}"))
 }
 
+const READY_BUDGET_NOTE: &str = "Dispatch every ready task. Past the worker budget \
+     (dag.max_active_workers and dag.min_available_memory in config.lua), Power queues the task \
+     and starts it when a worker reports, so don't hold tasks back or retry queued ones.";
+
 fn dispatch_request(launch: DispatchArgs, retry: bool) -> Result<DagRequest> {
-    let worktree = match launch.worktree {
-        Some(path) if path.as_os_str() == "new" => WorktreeRequest::New {
-            branch: launch
-                .branch
-                .context("Specify --branch with --worktree new")?,
-            base: launch.base,
-        },
-        path => {
-            anyhow::ensure!(
-                launch.branch.is_none() && launch.base.is_none(),
-                "--branch and --base require --worktree new"
-            );
-            match path {
-                Some(path) => {
-                    WorktreeRequest::Existing(path.canonicalize().context("Open worktree")?)
-                }
-                None if retry => WorktreeRequest::RetryManaged,
-                None => anyhow::bail!("Specify --worktree <PATH|new> when dispatching a task"),
-            }
-        }
-    };
+    let allow_main_checkout = launch.worktree.allow_main_checkout;
+    let worktree = launch.worktree.request(retry, "dispatching a task")?;
     Ok(DagRequest::Dispatch {
         run: launch.run,
         task: launch.task,
         provider: launch.provider.into(),
         worktree,
+        allow_main_checkout,
         retry,
         args: launch.args,
         caller: caller_session(),
+        budget: if launch.over_budget {
+            BudgetMode::Override
+        } else if launch.no_queue {
+            BudgetMode::Refuse
+        } else {
+            BudgetMode::Queue
+        },
     })
 }
 
@@ -933,11 +1181,16 @@ fn run_dag(command: DagAction) -> Result<()> {
             title,
             coordinator,
         },
-        DagAction::List { box_sel } => DagRequest::ListRuns {
+        DagAction::List { box_sel, all } => DagRequest::ListRuns {
             box_sel,
             caller: caller_session(),
+            include_finished: all,
         },
         DagAction::Show { run } => DagRequest::GetRun { run },
+        DagAction::Archive { run, force } => DagRequest::ArchiveRun { run, force },
+        DagAction::Unarchive { run } => DagRequest::UnarchiveRun { run },
+        DagAction::Pause { run } => DagRequest::PauseRun { run },
+        DagAction::Resume { run } => DagRequest::ResumeRun { run },
         DagAction::AddTask {
             run,
             id,
@@ -977,12 +1230,16 @@ fn run_dag(command: DagAction) -> Result<()> {
         }
         DagAction::AddDep { run, task, dep } => DagRequest::AddDependency { run, task, dep },
         DagAction::Ready { run } => {
-            let tasks: Vec<_> = protocol_run(run)?
+            let (tasks, queued): (Vec<_>, Vec<_>) = protocol_run(run)?
                 .tasks
                 .into_iter()
-                .filter(|task| task.state == TaskState::Ready)
-                .collect();
-            return print_json(json!({"tasks": tasks}));
+                .filter(|task| matches!(task.state, TaskState::Ready | TaskState::Queued))
+                .partition(|task| task.state == TaskState::Ready);
+            return print_json(json!({
+                "tasks": tasks,
+                "queued": queued.into_iter().map(|task| task.id).collect::<Vec<_>>(),
+                "budget": READY_BUDGET_NOTE,
+            }));
         }
         DagAction::Dispatch { launch, retry } => dispatch_request(launch, retry)?,
         DagAction::Retry(launch) => dispatch_request(launch, true)?,
@@ -992,18 +1249,21 @@ fn run_dag(command: DagAction) -> Result<()> {
             run,
             task,
             attempt,
-        } => DagRequest::Report {
-            run: report_arg(run, "POWER_RUN", "run")?,
-            task: report_arg(task, "POWER_TASK", "task")?,
-            attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
-            summary,
-            status: match status {
-                ReportChoice::Success => ReportStatus::Success,
-                ReportChoice::Failed => ReportStatus::Failed,
-                ReportChoice::NeedsInput => ReportStatus::NeedsInput,
-                ReportChoice::Working => ReportStatus::Working,
-            },
-        },
+        } => {
+            report_conversation();
+            DagRequest::Report {
+                run: report_arg(run, "POWER_RUN", "run")?,
+                task: report_arg(task, "POWER_TASK", "task")?,
+                attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
+                summary,
+                status: match status {
+                    ReportChoice::Success => ReportStatus::Success,
+                    ReportChoice::Failed => ReportStatus::Failed,
+                    ReportChoice::NeedsInput => ReportStatus::NeedsInput,
+                    ReportChoice::Working => ReportStatus::Working,
+                },
+            }
+        }
         DagAction::Events(EventArgs { run, since, kinds }) => DagRequest::Events {
             run,
             since,
@@ -1027,7 +1287,10 @@ fn run_dag(command: DagAction) -> Result<()> {
                     NeedsInput,
                     InputResolved,
                     AttemptInterrupted,
+                    AttemptResumed,
+                    AttemptStalled,
                     TaskReady,
+                    QueuedDispatchFailed,
                 ];
             }
             return dag_reply(
@@ -1046,7 +1309,7 @@ fn run_dag(command: DagAction) -> Result<()> {
     dag_reply(request, timeout)
 }
 
-const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(10);
+const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
     match client::dag(DagRequest::ListBoxes, PROTOCOL_TIMEOUT)? {
@@ -1055,10 +1318,164 @@ fn protocol_boxes() -> Result<Vec<client::protocol::BoxInfo>> {
     }
 }
 
-fn protocol_agents(box_sel: Option<String>) -> Result<Vec<client::protocol::ManagedAgent>> {
+/// Pauses or resumes each agent and prints them.
+fn set_paused(ids: Vec<String>, paused: bool) -> Result<()> {
+    let mut agents = Vec::new();
+    for agent in ids {
+        match client::dag(
+            DagRequest::SetAgentPaused { agent, paused },
+            Duration::from_secs(10),
+        )? {
+            DagResponse::Agent { agent } => agents.push(agent),
+            _ => anyhow::bail!("Unexpected daemon response"),
+        }
+    }
+    print_json(json!({"agents": agents}))
+}
+
+/// Never starts a daemon: with none running there is nothing to interrupt. On success it
+/// prints the PID of the daemon it checked, the one a restart may end, or nothing when
+/// none listens. It fails closed: a daemon that cannot be asked for its workers is not
+/// cleared for a restart unless forced. Forced, it only identifies the daemon and never
+/// waits on a worker list. With `stop`, it then stops the daemon it cleared, unless that
+/// already runs the given executable.
+fn restart_check(force: bool, target_only: bool, stop: Option<Option<PathBuf>>) -> Result<()> {
+    use client::protocol::AgentStatus;
+    use std::io::IsTerminal as _;
+    let finish = |process: client::DaemonProcess| -> Result<()> {
+        let pid = process.pid;
+        let Some(unless) = &stop else {
+            println!("{pid}");
+            return Ok(());
+        };
+        if let Some(exe) = unless
+            && same_file(&format!("/proc/{pid}/exe"), exe)
+        {
+            eprintln!("Daemon (pid {pid}) already runs {}", exe.display());
+            return Ok(());
+        }
+        println!("{pid}");
+        eprintln!("Stopping daemon (pid {pid})");
+        process.stop(Duration::from_secs(5))
+    };
+    // An up-to-date daemon is left alone before any worker check.
+    if let Some(Some(exe)) = &stop
+        && !target_only
+        && let Some(process) =
+            client::daemon_process().context("Could not identify the daemon to restart")?
+        && same_file(&format!("/proc/{}/exe", process.pid), exe)
+    {
+        eprintln!(
+            "Daemon (pid {}) already runs {}",
+            process.pid,
+            exe.display()
+        );
+        return Ok(());
+    }
+    if target_only || force {
+        let Some(process) =
+            client::daemon_process().context("Could not identify the daemon to restart")?
+        else {
+            return Ok(());
+        };
+        if force && !target_only {
+            eprintln!("Skipping the worker check (--force).");
+        }
+        return if target_only {
+            println!("{}", process.pid);
+            Ok(())
+        } else {
+            finish(process)
+        };
+    }
+    let target = client::restart_target(RESTART_CHECK_TIMEOUT).map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}\nRestart cancelled: the daemon may have workers mid-task. Set \
+             POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        )
+    })?;
+    let Some((process, agents)) = target else {
+        return Ok(());
+    };
+    let pid = process.pid;
+    let agents = agents.map_err(|error| {
+        anyhow::anyhow!(
+            "{error:#}\nRestart cancelled: it may have workers mid-task. Wait until it \
+             answers, or set POWER_FORCE_RESTART=1 (or pass --force) to restart anyway"
+        )
+    })?;
+    let open: Vec<_> = agents
+        .iter()
+        .filter(|agent| {
+            agent.run.is_some()
+                && matches!(
+                    agent.status,
+                    AgentStatus::Working | AgentStatus::NeedsInput | AgentStatus::Paused
+                )
+        })
+        .collect();
+    if open.is_empty() {
+        return finish(process);
+    }
+    eprintln!(
+        "{} DAG worker{} mid-task on the daemon (pid {pid}). Restarting it kills every \
+         command they run, such as builds and tests:",
+        open.len(),
+        if open.len() == 1 { " is" } else { "s are" }
+    );
+    for agent in &open {
+        eprintln!(
+            "  {} {}/{} ({}) {}",
+            agent.id,
+            agent.run.as_deref().unwrap_or("-"),
+            agent.task.as_deref().unwrap_or("-"),
+            serde_json::to_value(agent.status)?
+                .as_str()
+                .unwrap_or_default(),
+            agent.label
+        );
+    }
+    if std::io::stdin().is_terminal() {
+        eprint!("Restart anyway? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if matches!(answer.trim(), "y" | "Y" | "yes") {
+            return finish(process);
+        }
+    }
+    anyhow::bail!(
+        "Restart cancelled. Wait for these workers to report, or set POWER_FORCE_RESTART=1 \
+         (or pass --force) to restart anyway"
+    )
+}
+
+/// Whether two paths name the same bytes.
+fn same_file(a: &str, b: &std::path::Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// How long `restart-check` waits for the daemon to list its workers.
+const RESTART_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn protocol_agents(
+    box_sel: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<client::protocol::ManagedAgent>> {
+    list_agents(box_sel, caller_session(), include_finished)
+}
+
+fn list_agents(
+    box_sel: Option<String>,
+    caller: Option<String>,
+    include_finished: bool,
+) -> Result<Vec<client::protocol::ManagedAgent>> {
     let request = DagRequest::ListAgents {
         box_sel,
-        caller: caller_session(),
+        caller,
+        include_finished,
     };
     match client::dag(request, PROTOCOL_TIMEOUT)? {
         DagResponse::Agents { agents } => Ok(agents),

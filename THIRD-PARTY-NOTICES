@@ -12,7 +12,7 @@ License: Apache License, Version 2.0 (licenses/herdr-app.txt)
 JetBrains Mono
 --------------
 
-Font bundled at presentation/assets/fonts/JetBrainsMono-Variable.ttf for terminal metric tests.
+Regular, Bold, Italic and BoldItalic faces (v2.304) bundled at presentation/assets/fonts/ as the terminal default font.
 
 Source: https://github.com/JetBrains/JetBrainsMono
 License: SIL Open Font License, Version 1.1 (licenses/JetBrainsMono-OFL.txt)

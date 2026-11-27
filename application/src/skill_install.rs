@@ -347,8 +347,12 @@ mod tests {
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: domain::agent::ModelCallback::None,
+            turn_hook: domain::agent::TurnHook::None,
             skills_dir: None,
             resume: None,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         }
     }
 

@@ -1,6 +1,6 @@
 use super::DagWorktrees;
 use crate::keymap::{Command, Keymap, Scope};
-use domain::dag::AttemptArtifact;
+use domain::{dag::AttemptArtifact, talk::AgentTalkSummary};
 use gpui::{prelude::*, *};
 use infrastructure::{
     client::{Attempt, Coordinator, Run, Task, TaskState},
@@ -248,6 +248,7 @@ pub(super) struct DagView {
     pub message: Option<String>,
     pub refresh_error: Option<String>,
     pub worktrees: DagWorktrees,
+    pub talk: HashMap<String, AgentTalkSummary>,
     /// Waiting for a digit that picks one of several listed artifacts.
     pub picking_artifact: bool,
     graph: GraphLayout,
@@ -268,6 +269,7 @@ impl DagView {
             message: None,
             refresh_error: None,
             worktrees: DagWorktrees::default(),
+            talk: HashMap::new(),
             picking_artifact: false,
             selected,
             viewport: GraphViewport::new(),
@@ -382,6 +384,18 @@ impl DagView {
         {
             actions.push(format!("{open_key} open worker"));
         }
+        let talk_key = keymap.keys(Scope::Dag, Command::AgentTalk);
+        if self.attempt().is_some() && !talk_key.is_empty() {
+            actions.push(format!("{talk_key} open talk"));
+        }
+        let start_key = keymap.first(Scope::Dag, Command::DagStartNow);
+        if !start_key.is_empty()
+            && self
+                .task()
+                .is_some_and(|task| task.state == TaskState::Queued)
+        {
+            actions.push(format!("{start_key} start now, over budget"));
+        }
         let artifact_key = keymap.first(Scope::Dag, Command::DagArtifact);
         let artifacts = self.artifacts().len();
         if self.picking_artifact {
@@ -465,6 +479,8 @@ impl DagView {
                                 &self.worktrees,
                                 &self.run.id,
                                 self.picking_artifact,
+                                self.attempt()
+                                    .and_then(|attempt| self.talk.get(&attempt.agent)),
                                 open_artifact,
                             ))
                             .into_any_element()
@@ -595,6 +611,13 @@ impl DagView {
                 let action = action.clone();
                 let origin = self.graph.positions[index].origin() * scale + offset;
                 let (label, tint) = task_style(colors, task.state);
+                let stalled = task.state == TaskState::Working
+                    && current_attempt(task).is_some_and(|attempt| {
+                        attempt.stalled
+                            && attempt.state == infrastructure::client::AttemptState::Active
+                    });
+                let label = if stalled { "Working · stalled" } else { label };
+                let tint = if stalled { colors.indexed[3] } else { tint };
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
                 let model = current_attempt(task).and_then(|attempt| attempt.model.clone());
@@ -722,6 +745,7 @@ fn details(
     worktrees: &DagWorktrees,
     run_id: &str,
     picking: bool,
+    talk: Option<&AgentTalkSummary>,
     open_artifact: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
     let mut fields = Vec::new();
@@ -730,6 +754,13 @@ fn details(
         fields.push((
             "Assigned agent",
             format!("{} · {}", attempt.provider.name(), attempt.agent),
+        ));
+        fields.push((
+            "Talk messages",
+            talk.map_or_else(
+                || "0".into(),
+                |talk| format!("{} · {}", talk.count, talk.latest),
+            ),
         ));
         if let Some(model) = &attempt.model {
             fields.push(("Model", model.clone()));
@@ -753,6 +784,14 @@ fn details(
                 ("Result", attempt.summary.clone()),
                 ("Blocker", attempt.blocker.clone()),
                 ("Interruption", attempt.detail.clone()),
+                (
+                    "Stalled",
+                    (attempt.stalled
+                        && attempt.state == infrastructure::client::AttemptState::Active)
+                        .then(|| {
+                            "Idle with no build or test running. Check the worker.".to_string()
+                        }),
+                ),
             ]
             .into_iter()
             .filter_map(|(label, value)| Some((label, value?))),
@@ -834,7 +873,9 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
     match state {
         TaskState::Waiting => ("Waiting", colors.muted),
         TaskState::Ready => ("Ready", colors.indexed[6]),
+        TaskState::Queued => ("Queued", colors.indexed[4]),
         TaskState::Working => ("Working", colors.accent),
+        TaskState::Paused => ("Paused", colors.indexed[4]),
         TaskState::NeedsInput => ("Needs input", colors.indexed[3]),
         TaskState::Completed => ("Completed", colors.indexed[2]),
         TaskState::Failed => ("Failed", colors.error),
@@ -868,6 +909,8 @@ mod tests {
             detail: None,
             started_at: 0,
             ended_at: None,
+            paused: false,
+            stalled: false,
             artifacts: titles
                 .iter()
                 .map(|title| AttemptArtifact {
@@ -909,6 +952,7 @@ mod tests {
             instructions: String::new(),
             deps: deps.iter().copied().map(str::to_owned).collect(),
             state: TaskState::Waiting,
+            queued_at: None,
             current_attempt: None,
             attempts: Vec::new(),
         }

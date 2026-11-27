@@ -2,7 +2,11 @@
 
 use crate::agents::AgentProfiles;
 use anyhow::{Context, Result, bail};
-use domain::agent::{AgentProfile, Injection, ModelCallback, Resume};
+use domain::{
+    agent::{AgentProfile, Injection, ModelCallback, Resume, TurnHook},
+    dag::WorkerBudget,
+    talk::NoticePolicy,
+};
 use mlua::{HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Value};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -10,12 +14,15 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub type Sections = BTreeMap<String, JsonValue>;
 
 pub const AGENTS_SECTION: &str = "agents";
+pub const TALK_SECTION: &str = "talk";
 pub(crate) const WORKTREES_SECTION: &str = "worktrees";
+pub(crate) const DAG_SECTION: &str = "dag";
 
 fn with_bundled_defaults(mut defaults: Sections) -> Sections {
     defaults.entry("power_bar".into()).or_insert_with(|| {
@@ -26,9 +33,119 @@ fn with_bundled_defaults(mut defaults: Sections) -> Sections {
         .entry(AGENTS_SECTION.into())
         .or_insert_with(|| json!({}));
     defaults
+        .entry(TALK_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
         .entry(WORKTREES_SECTION.into())
         .or_insert_with(|| json!({}));
     defaults
+        .entry(DAG_SECTION.into())
+        .or_insert_with(|| json!({}));
+    defaults
+}
+
+/// How long a DAG worker runs after reporting success or failure, from
+/// `dag.end_finished_workers_after` in seconds. `false` keeps finished workers running.
+pub fn load_finished_worker_grace(defaults: Sections) -> Result<Option<Duration>> {
+    finished_worker_grace(&load(with_bundled_defaults(defaults))?)
+}
+
+pub(crate) fn finished_worker_grace(sections: &Sections) -> Result<Option<Duration>> {
+    dag_seconds(
+        sections,
+        "end_finished_workers_after",
+        Some(application::dag::FINISHED_WORKER_GRACE),
+    )
+}
+
+/// How long a DAG worker may sit idle, with nothing it started working, before its
+/// attempt is flagged stalled, from `dag.stall_after` in seconds. `false` turns it off.
+pub fn load_stall_after(defaults: Sections) -> Result<Option<Duration>> {
+    stall_after(&load(with_bundled_defaults(defaults))?)
+}
+
+pub(crate) fn stall_after(sections: &Sections) -> Result<Option<Duration>> {
+    dag_seconds(sections, "stall_after", Some(application::dag::STALL_AFTER))
+}
+
+/// A `dag` setting in seconds from 0 to 86400, or `false` for none.
+fn dag_seconds(
+    sections: &Sections,
+    name: &str,
+    default: Option<Duration>,
+) -> Result<Option<Duration>> {
+    let Some(value) = sections.get(DAG_SECTION) else {
+        return Ok(default);
+    };
+    let table = value.as_object().context("dag must be a table")?;
+    match table.get(name) {
+        None | Some(JsonValue::Null) => Ok(default),
+        Some(JsonValue::Bool(false)) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && (0.0..=86_400.0).contains(seconds))
+            .map(|seconds| Some(Duration::from_secs_f64(seconds)))
+            .with_context(|| format!("dag.{name} must be seconds from 0 to 86400, or false")),
+    }
+}
+
+pub(crate) fn load_worker_budget(defaults: Sections) -> Result<WorkerBudget> {
+    worker_budget(&load(with_bundled_defaults(defaults))?)
+}
+
+/// Reads the `dag` section over the default budget. A limit of 0 removes it.
+pub(crate) fn worker_budget(sections: &Sections) -> Result<WorkerBudget> {
+    let mut budget = WorkerBudget::default();
+    let Some(value) = sections.get(DAG_SECTION) else {
+        return Ok(budget);
+    };
+    let table = value.as_object().context("dag must be a table")?;
+    for (name, value) in table {
+        let count = || {
+            value
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .map(|count| (count > 0).then_some(count))
+                .with_context(|| format!("dag.{name} must be a whole number of workers"))
+        };
+        match name.as_str() {
+            "max_active_workers" => budget.max_active_workers = count()?,
+            "max_active_workers_per_run" => budget.max_active_workers_per_run = count()?,
+            "max_active_workers_per_box" => budget.max_active_workers_per_box = count()?,
+            "min_available_memory" => {
+                let bytes = memory_size(value).with_context(|| {
+                    format!("dag.{name} must be bytes or a size such as \"4 GiB\"")
+                })?;
+                budget.min_available_memory = (bytes > 0).then_some(bytes);
+            }
+            "end_finished_workers_after" | "stall_after" => {}
+            _ => bail!("dag.{name} is not a setting"),
+        }
+    }
+    Ok(budget)
+}
+
+/// A byte count, or a string such as "4 GiB", "512MiB" or "2G" in binary units.
+fn memory_size(value: &JsonValue) -> Option<u64> {
+    if let Some(bytes) = value.as_u64() {
+        return Some(bytes);
+    }
+    let text = value.as_str()?.trim();
+    let split = text
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let scale: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1 << 40,
+        _ => return None,
+    };
+    let bytes = number * scale as f64;
+    (bytes.is_finite() && bytes >= 0.0 && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 /// Load profiles from the same config as the desktop, with the bundled plugin defaults.
@@ -38,6 +155,35 @@ pub fn load_agent_profiles(defaults: Sections) -> Result<AgentProfiles> {
 
 pub(crate) fn load_worktree_root(defaults: Sections) -> Result<Option<PathBuf>> {
     worktree_root(&load(with_bundled_defaults(defaults))?)
+}
+
+pub fn load_talk_policy(defaults: Sections) -> Result<NoticePolicy> {
+    talk_policy(&load(with_bundled_defaults(defaults))?)
+}
+
+/// The fallback idle settings are expressed in seconds, with fractional values supported.
+pub fn talk_policy(sections: &Sections) -> Result<NoticePolicy> {
+    let mut policy = NoticePolicy::default();
+    let Some(value) = sections.get(TALK_SECTION) else {
+        return Ok(policy);
+    };
+    let table = value.as_object().context("talk must be a table")?;
+    for (key, value) in table {
+        let setting = match key.as_str() {
+            "idle_after" => &mut policy.idle_after_ms,
+            "user_quiet" => &mut policy.user_quiet_ms,
+            _ => bail!("talk.{key} is not a setting"),
+        };
+        *setting = value
+            .as_f64()
+            .filter(|seconds| *seconds >= 0.001)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .with_context(|| {
+                format!("talk.{key} must be a duration in seconds of at least 0.001")
+            })?;
+    }
+    Ok(policy)
 }
 
 /// Validate and expand the configured root without touching the filesystem.
@@ -77,6 +223,9 @@ pub fn agent_profiles(sections: &Sections) -> Result<AgentProfiles> {
     let entries = section
         .as_object()
         .context("agents must be a table keyed by profile ID")?;
+    // Lua tables have no order, so new profiles follow the built-in ones by ID.
+    let mut entries: Vec<_> = entries.iter().collect();
+    entries.sort_by_key(|(id, _)| *id);
     for (id, value) in entries {
         let profile = read_agent_profile(id, value.clone(), &profiles)
             .with_context(|| format!("Read agents[{id:?}] from config.lua"))?;
@@ -101,8 +250,12 @@ struct ProfileConfig {
     skip_subcommands: Option<Vec<String>>,
     skip_if_args_contain: Option<Vec<String>>,
     model_callback: Option<ModelCallbackConfig>,
+    turn_hook: Option<TurnHookConfig>,
     skills_dir: Option<PathBuf>,
     resume: Option<ResumeConfig>,
+    env: Option<std::collections::BTreeMap<String, String>>,
+    conversation_env: Option<String>,
+    server_socket_env: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +272,7 @@ struct ResumeConfig {
 enum InjectionConfig {
     Flag { flag: String },
     ConfigValue { flag: String, key: String },
+    FirstMessage,
     None,
 }
 
@@ -127,6 +281,14 @@ enum InjectionConfig {
 enum ModelCallbackConfig {
     ClaudeStatusLine,
     Args { args: Vec<String> },
+    None,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TurnHookConfig {
+    ClaudeSettings,
+    CodexNotify,
     None,
 }
 
@@ -150,6 +312,12 @@ fn read_agent_profile(
     if let Some(resume) = value.get_mut("resume") {
         normalize_empty_lists(resume, &["assign", "resume", "resume_last", "conflicts"]);
     }
+    // Lua cannot tell an empty table from an empty list.
+    if let Some(env) = value.get_mut("env")
+        && env.as_array().is_some_and(Vec::is_empty)
+    {
+        *env = JsonValue::Object(Default::default());
+    }
     let config: ProfileConfig = serde_json::from_value(value)?;
     let mut profile = profiles
         .0
@@ -163,8 +331,12 @@ fn read_agent_profile(
             skip_subcommands: Vec::new(),
             skip_if_args_contain: Vec::new(),
             model_callback: ModelCallback::None,
+            turn_hook: TurnHook::None,
             skills_dir: None,
             resume: None,
+            env: Vec::new(),
+            conversation_env: None,
+            server_socket_env: None,
         });
     if let Some(command) = config.command {
         anyhow::ensure!(
@@ -177,6 +349,7 @@ fn read_agent_profile(
         profile.injection = match injection {
             InjectionConfig::Flag { flag } => Injection::Flag { flag },
             InjectionConfig::ConfigValue { flag, key } => Injection::ConfigValue { flag, key },
+            InjectionConfig::FirstMessage => Injection::FirstMessage,
             InjectionConfig::None => Injection::None,
         };
     }
@@ -187,6 +360,13 @@ fn read_agent_profile(
             ModelCallbackConfig::None => ModelCallback::None,
         };
     }
+    if let Some(hook) = config.turn_hook {
+        profile.turn_hook = match hook {
+            TurnHookConfig::ClaudeSettings => TurnHook::ClaudeSettings,
+            TurnHookConfig::CodexNotify => TurnHook::CodexNotify,
+            TurnHookConfig::None => TurnHook::None,
+        };
+    }
     if let Some(skip) = config.skip_subcommands {
         profile.skip_subcommands = skip;
     }
@@ -195,6 +375,24 @@ fn read_agent_profile(
     }
     if let Some(directory) = config.skills_dir {
         profile.skills_dir = Some(directory);
+    }
+    if let Some(env) = config.env {
+        anyhow::ensure!(
+            env.keys()
+                .all(|name| !name.is_empty() && !name.contains(['=', '\0'])),
+            "env names must be non-empty and contain no = or NUL"
+        );
+        profile.env = env.into_iter().collect();
+    }
+    if let Some(name) = config.conversation_env {
+        profile.conversation_env = (!name.is_empty()).then_some(name);
+    }
+    if let Some(name) = config.server_socket_env {
+        anyhow::ensure!(
+            !name.contains(['=', '\0']),
+            "server_socket_env must contain no = or NUL"
+        );
+        profile.server_socket_env = (!name.is_empty()).then_some(name);
     }
     if let Some(config) = config.resume {
         let defaults = profile.resume.take().unwrap_or_default();
@@ -306,7 +504,92 @@ fn evaluate(
 mod tests {
     use super::*;
     use application::agents::AgentProfileRegistry;
+    use domain::dag::GIB;
     use serde_json::json;
+
+    #[test]
+    fn finished_worker_grace_reads_seconds_or_false() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("config.lua");
+        let grace = |source: &str| {
+            fs::write(&path, source)?;
+            finished_worker_grace(&load_from(&path, with_bundled_defaults(Sections::new()))?)
+        };
+        assert_eq!(grace("")?, Some(application::dag::FINISHED_WORKER_GRACE));
+        assert_eq!(
+            grace("dag.end_finished_workers_after = 2.5")?,
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(grace("dag.end_finished_workers_after = false")?, None);
+        let stall = |source: &str| {
+            fs::write(&path, source)?;
+            stall_after(&load_from(&path, with_bundled_defaults(Sections::new()))?)
+        };
+        assert_eq!(stall("")?, Some(application::dag::STALL_AFTER));
+        assert_eq!(
+            stall("dag.stall_after = 90")?,
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(stall("dag.stall_after = false")?, None);
+        assert!(stall("dag.stall_after = 'later'").is_err());
+        for invalid in [
+            "dag.end_finished_workers_after = -1",
+            "dag.end_finished_workers_after = true",
+            "dag.end_finished_workers_after = 'soon'",
+        ] {
+            assert!(grace(invalid).is_err(), "{invalid} was accepted");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn worker_budget_reads_the_dag_section() -> Result<()> {
+        let sections = |dag: JsonValue| Sections::from([(DAG_SECTION.into(), dag)]);
+        assert_eq!(worker_budget(&Sections::new())?, WorkerBudget::default());
+        assert_eq!(
+            worker_budget(&sections(json!({})))?,
+            WorkerBudget::default()
+        );
+        assert_eq!(
+            worker_budget(&sections(json!({
+                "max_active_workers": 2,
+                "max_active_workers_per_run": 1,
+                "max_active_workers_per_box": 0,
+                "min_available_memory": "1.5 GiB",
+            })))?,
+            WorkerBudget {
+                max_active_workers: Some(2),
+                max_active_workers_per_run: Some(1),
+                max_active_workers_per_box: None,
+                min_available_memory: Some(GIB + GIB / 2),
+            }
+        );
+        for (size, bytes) in [
+            (json!(1024), Some(1024)),
+            (json!("512MiB"), Some(512 << 20)),
+            (json!("2G"), Some(2 * GIB)),
+            (json!(0), None),
+        ] {
+            assert_eq!(
+                worker_budget(&sections(json!({ "min_available_memory": size })))?
+                    .min_available_memory,
+                bytes
+            );
+        }
+        for invalid in [
+            json!({ "max_active_workers": -1 }),
+            json!({ "max_active_workers": "four" }),
+            json!({ "min_available_memory": "4 parsecs" }),
+            json!({ "max_workers": 2 }),
+            json!(3),
+        ] {
+            assert!(
+                worker_budget(&sections(invalid.clone())).is_err(),
+                "{invalid}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn lua_extends_and_overrides_builtin_profiles() -> Result<()> {
@@ -382,7 +665,7 @@ mod tests {
         let error = profiles.resolve(&"unknown".into()).unwrap_err().to_string();
         assert_eq!(
             error,
-            "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, bare, custom"
+            "Unknown agent profile \"unknown\". Known profiles: claude, codex, grok, jcode, bare, custom"
         );
         Ok(())
     }
@@ -408,6 +691,47 @@ mod tests {
             profiles.resolve(&"codex".into())?.resume,
             Some(Resume::default())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_sets_first_message_injection_and_launch_env() -> Result<()> {
+        let sections = evaluate(
+            r#"
+            agents.custom = {
+                injection = { kind = "first_message" },
+                env = { AGENT_SOCKET = "{runtime}/agent-{session}.sock" },
+                conversation_env = "AGENT_SESSION",
+                server_socket_env = "AGENT_SERVER",
+            }
+            agents.jcode = { env = {}, conversation_env = "", server_socket_env = "" }
+            "#,
+            Path::new("config.lua"),
+            [(AGENTS_SECTION.into(), json!({}))].into(),
+        )?;
+        let profiles = agent_profiles(&sections)?;
+        let custom = profiles.resolve(&"custom".into())?;
+        assert_eq!(custom.injection, Injection::FirstMessage);
+        assert_eq!(
+            custom.env,
+            [(
+                "AGENT_SOCKET".into(),
+                "{runtime}/agent-{session}.sock".into()
+            )]
+        );
+        assert_eq!(custom.conversation_env.as_deref(), Some("AGENT_SESSION"));
+        assert_eq!(custom.server_socket_env.as_deref(), Some("AGENT_SERVER"));
+        let jcode = profiles.resolve(&"jcode".into())?;
+        assert!(jcode.env.is_empty());
+        assert_eq!(jcode.conversation_env, None);
+        assert_eq!(jcode.server_socket_env, None);
+        assert_eq!(jcode.injection, Injection::FirstMessage);
+
+        let builtin = AgentProfiles::default();
+        let jcode = builtin.resolve(&"jcode".into())?;
+        assert!(jcode.env.is_empty());
+        assert_eq!(jcode.server_socket_env.as_deref(), Some("JCODE_SOCKET"));
+        assert_eq!(jcode.conversation_env.as_deref(), Some("JCODE_SESSION_ID"));
         Ok(())
     }
 
@@ -447,6 +771,44 @@ mod tests {
             let error = agent_profiles(&sections).err().unwrap();
             assert!(error.to_string().contains(id), "{error:#}");
         }
+    }
+
+    #[test]
+    fn talk_idle_settings_and_turn_hook_overrides_are_loaded() -> Result<()> {
+        let defaults = [
+            (TALK_SECTION.into(), json!({})),
+            (AGENTS_SECTION.into(), json!({})),
+        ]
+        .into();
+        let config = evaluate(
+            r#"
+            talk = { idle_after = 0.015, user_quiet = 0.025 }
+            agents.claude = { turn_hook = { kind = "none" } }
+            agents.grok = { turn_hook = { kind = "codex_notify" } }
+        "#,
+            Path::new("config.lua"),
+            defaults,
+        )?;
+        let timing = talk_policy(&config)?;
+        assert_eq!((timing.idle_after_ms, timing.user_quiet_ms), (15, 25));
+        let profiles = agent_profiles(&config)?;
+        assert_eq!(
+            profiles.resolve(&"claude".into())?.turn_hook,
+            TurnHook::None
+        );
+        assert_eq!(
+            profiles.resolve(&"grok".into())?.turn_hook,
+            TurnHook::CodexNotify
+        );
+        for value in [
+            json!({"idle_after": 0}),
+            json!({"user_quiet": -1}),
+            json!({"idle_after": "5"}),
+            json!({"idle_aftr": 5}),
+        ] {
+            assert!(talk_policy(&[(TALK_SECTION.into(), value)].into()).is_err());
+        }
+        Ok(())
     }
 
     #[test]
