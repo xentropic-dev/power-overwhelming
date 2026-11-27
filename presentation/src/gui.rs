@@ -10,7 +10,10 @@ use crate::{
     preview::{Preview, PreviewAction, decode_image},
     settings::{AutoOpen, MAX_FONT_SIZE, MIN_FONT_SIZE, Previews, Settings, TerminalSettings},
     status_bar::{ConfigChanged, StatusBar},
-    terminal::{AgentChanged, BarContextChanged, OpenLink, TerminalView, load_bundled_fonts},
+    terminal::{
+        AgentChanged, BarContextChanged, OpenLink, TerminalBell, TerminalNotification,
+        TerminalTitleChanged, TerminalView, load_bundled_fonts,
+    },
 };
 use anyhow::{Context as _, Result, ensure};
 use application::{ResolveArtifact, StartSession, agents::AgentProfileRegistry};
@@ -218,6 +221,9 @@ struct TerminalTab {
     _links: Subscription,
     _agent: Subscription,
     _bar_context: Subscription,
+    _title: Subscription,
+    _bell: Subscription,
+    _notification: Subscription,
 }
 
 struct PreviewTab {
@@ -236,6 +242,9 @@ struct Workspace {
     box_icons: HashMap<String, Arc<RenderImage>>,
     sessions: HashMap<String, Session>,
     terminals: HashMap<String, TerminalTab>,
+    terminal_titles: HashMap<String, String>,
+    terminal_notice: Option<String>,
+    terminal_notice_generation: u64,
     tab_scroll: ScrollHandle,
     launching: bool,
     focus: FocusHandle,
@@ -245,6 +254,7 @@ struct Workspace {
     dag_refresh: async_channel::Sender<()>,
     dag_progress: Option<(String, String)>,
     attention: HashMap<String, HashSet<String>>,
+    terminal_bells: HashSet<String>,
     previews: Vec<PreviewTab>,
     active_previews: HashMap<String, u64>,
     next_id: u64,
@@ -372,6 +382,9 @@ impl Workspace {
             box_icons: HashMap::new(),
             sessions: HashMap::new(),
             terminals: HashMap::new(),
+            terminal_titles: HashMap::new(),
+            terminal_notice: None,
+            terminal_notice_generation: 0,
             tab_scroll: ScrollHandle::new(),
             launching: false,
             focus,
@@ -381,6 +394,7 @@ impl Workspace {
             dag_refresh,
             dag_progress: None,
             attention: HashMap::new(),
+            terminal_bells: HashSet::new(),
             previews: Vec::new(),
             active_previews: HashMap::new(),
             next_id: 0,
@@ -1199,6 +1213,55 @@ impl Workspace {
                 app.sync_status_bar(cx);
             }
         });
+        let title = cx.subscribe_in(
+            &view,
+            window,
+            |app, source, changed: &TerminalTitleChanged, window, cx| {
+                let id = source.read(cx).session.id.clone();
+                if changed.0.is_empty() {
+                    app.terminal_titles.remove(&id);
+                } else {
+                    app.terminal_titles.insert(id.clone(), changed.0.clone());
+                }
+                if app.active_view().as_deref() == Some(&id) {
+                    let title = if changed.0.is_empty() {
+                        "Power Overwhelming".to_owned()
+                    } else {
+                        format!("{} — Power Overwhelming", changed.0)
+                    };
+                    window.set_window_title(&title);
+                }
+                cx.notify();
+            },
+        );
+        let bell = cx.subscribe(&view, |app, source, _: &TerminalBell, cx| {
+            let id = source.read(cx).session.id.clone();
+            app.terminal_bells.insert(id);
+            cx.notify();
+        });
+        let notification = cx.subscribe(&view, |app, _, note: &TerminalNotification, cx| {
+            let message = if note.title.is_empty() {
+                note.body.clone()
+            } else if note.body.is_empty() {
+                note.title.clone()
+            } else {
+                format!("{}: {}", note.title, note.body)
+            };
+            app.terminal_notice_generation = app.terminal_notice_generation.wrapping_add(1);
+            let generation = app.terminal_notice_generation;
+            app.terminal_notice = Some(message);
+            cx.spawn(async move |app, cx| {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let _ = app.update(cx, |app, cx| {
+                    if app.terminal_notice_generation == generation {
+                        app.terminal_notice = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+        });
         self.terminals.insert(
             id.to_owned(),
             TerminalTab {
@@ -1207,6 +1270,9 @@ impl Workspace {
                 _links: links,
                 _agent: agent,
                 _bar_context: bar_context,
+                _title: title,
+                _bell: bell,
+                _notification: notification,
             },
         );
     }
@@ -1360,9 +1426,17 @@ impl Workspace {
         let Some(id) = self.layout.active_box.clone() else {
             return;
         };
-        let entry = self.box_mut(&id).unwrap();
-        if entry.views.iter().any(|view| view.session == session) {
-            entry.select_view(session);
+        let selected = {
+            let entry = self.box_mut(&id).unwrap();
+            if entry.views.iter().any(|view| view.session == session) {
+                entry.select_view(session);
+                entry.active_view.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(active) = selected {
+            self.terminal_bells.remove(&active);
             self.picker = None;
             self.dag = None;
             self.save();
@@ -2618,6 +2692,9 @@ impl Workspace {
     }
 
     fn tab_label(&self, index: usize, view: &SavedView) -> String {
+        if let Some(title) = self.terminal_titles.get(&view.session) {
+            return format!("{} {}", index + 1, title);
+        }
         let agent = self
             .sessions
             .get(&view.session)
@@ -2970,7 +3047,11 @@ impl Render for Workspace {
         let box_buttons = self.open_boxes().into_iter().map(|entry| {
             let digit = entry.shortcut.unwrap();
             let active = self.layout.active_box.as_ref() == Some(&entry.id);
-            let needs_input = self.attention.contains_key(&entry.id);
+            let needs_input = self.attention.contains_key(&entry.id)
+                || entry
+                    .views
+                    .iter()
+                    .any(|view| self.terminal_bells.contains(&view.session));
             let id = entry.id.clone();
             div()
                 .id(("box", usize::from(digit)))
@@ -3022,7 +3103,8 @@ impl Render for Workspace {
                 let needs_input = self
                     .attention
                     .values()
-                    .any(|sessions| sessions.contains(&id));
+                    .any(|sessions| sessions.contains(&id))
+                    || self.terminal_bells.contains(&id);
                 unstyled_button(("terminal-tab", index), self.tab_label(index, view))
                     .hover(move |tab| {
                         tab.bg(rgb(if needs_input {
@@ -3194,6 +3276,16 @@ impl Render for Workspace {
                                 .child(error)
                         }),
                     )
+                    .when_some(self.terminal_notice.clone(), |main, notice| {
+                        main.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(colors.raised))
+                                .text_color(rgb(colors.foreground))
+                                .child(notice),
+                        )
+                    })
                     .child(
                         div()
                             .flex()

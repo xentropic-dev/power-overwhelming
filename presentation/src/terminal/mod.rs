@@ -1,3 +1,4 @@
+// Event handling follows herdr-app/src/terminal.rs (Apache-2.0).
 mod frame;
 mod grid;
 mod input;
@@ -17,13 +18,21 @@ use self::grid::PtyGrid;
 use crate::settings::TerminalSettings;
 use anyhow::{Result, bail};
 use domain::session::{Agent, Session};
-use ghostty_vt::{Terminal, key, mouse, render::RenderState, snapshot, terminal::Options};
+use ghostty_vt::{
+    Terminal, key, mouse,
+    render::RenderState,
+    snapshot,
+    terminal::{self, ClipboardLocation, Event as VtEvent, Mode, Options},
+};
 use gpui::*;
 use infrastructure::{
     client::{self, SessionMetadata, TerminalControl, TerminalEvent},
     theme::Scheme,
 };
-use std::{path::PathBuf, sync::Arc, thread};
+use std::{path::PathBuf, sync::Arc, thread, time::Duration};
+
+const MAX_CLIPBOARD_WRITE: usize = 1024 * 1024;
+const MAX_RENDER_HOLD: Duration = Duration::from_secs(1);
 
 /// JetBrains Mono, shipped so the terminal's default font resolves on every machine. A family
 /// GPUI can't find resolves to its UI fallback (Noto Sans and the like) with default features,
@@ -87,6 +96,18 @@ impl EventEmitter<AgentChanged> for TerminalView {}
 pub struct BarContextChanged;
 impl EventEmitter<BarContextChanged> for TerminalView {}
 
+pub struct TerminalTitleChanged(pub String);
+impl EventEmitter<TerminalTitleChanged> for TerminalView {}
+
+pub struct TerminalBell;
+impl EventEmitter<TerminalBell> for TerminalView {}
+
+pub struct TerminalNotification {
+    pub title: String,
+    pub body: String,
+}
+impl EventEmitter<TerminalNotification> for TerminalView {}
+
 pub struct TerminalView {
     pub session: Session,
     pub focus: FocusHandle,
@@ -108,6 +129,8 @@ pub struct TerminalView {
     reporting_mouse: bool,
     exited: bool,
     status: Option<String>,
+    render_held: bool,
+    render_hold_generation: u64,
     encoder: key::Encoder,
     mouse: mouse::Encoder,
     commands: async_channel::Sender<TerminalControl>,
@@ -148,10 +171,10 @@ impl TerminalView {
                     .update_in(cx, |view, _, cx| {
                         let agent = view.session.agent.clone();
                         let metadata = view.metadata.clone();
-                        view.apply(first);
+                        view.apply(first, cx);
                         for _ in 0..127 {
                             let Ok(event) = rx.try_recv() else { break };
-                            view.apply(event);
+                            view.apply(event, cx);
                         }
                         if view.session.agent != agent {
                             cx.emit(AgentChanged(view.session.agent.clone()));
@@ -172,6 +195,13 @@ impl TerminalView {
         scheme
             .apply_to(&mut terminal)
             .expect("apply bundled terminal palette");
+        terminal.set_clipboard_write_policy(match settings.clipboard_write {
+            crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
+            crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
+        });
+        terminal
+            .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
+            .expect("set terminal clipboard size limit");
         Self {
             session,
             focus: cx.focus_handle(),
@@ -192,6 +222,8 @@ impl TerminalView {
             reporting_mouse: false,
             exited: false,
             status: None,
+            render_held: false,
+            render_hold_generation: 0,
             encoder: key::Encoder::new().expect("allocate key encoder"),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             commands,
@@ -215,6 +247,11 @@ impl TerminalView {
             return;
         }
         self.font = terminal_font(&settings, cx);
+        self.terminal
+            .set_clipboard_write_policy(match settings.clipboard_write {
+                crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
+                crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
+            });
         self.settings = settings;
         if !self.exited {
             let metrics = cell_metrics(cx.text_system(), &self.font, self.grid.metrics.scale);
@@ -232,21 +269,25 @@ impl TerminalView {
         }
     }
 
-    fn apply(&mut self, response: TerminalEvent) {
+    fn apply(&mut self, response: TerminalEvent, cx: &mut Context<Self>) {
         let result = (|| -> Result<()> {
             match response {
                 TerminalEvent::Snapshot { data, exited } => {
                     let mut terminal = snapshot::Decoder::from_slice(&data).decode()?;
                     self.scheme.apply_to(&mut terminal)?;
+                    self.configure_terminal(&mut terminal);
+                    let title = terminal.title()?.to_owned();
                     self.terminal = terminal;
                     self.exited = exited;
                     self.status = None;
                     self.selection = None;
                     self.metadata = SessionMetadata::default();
+                    let title = shown_title(&title).into_owned();
+                    cx.emit(TerminalTitleChanged(title));
                 }
                 TerminalEvent::Output(data) => {
                     self.terminal.vt_write(&data);
-                    self.terminal.events().for_each(drop);
+                    self.handle_vt_events(cx);
                 }
                 TerminalEvent::Geometry(geometry) => {
                     self.terminal.resize(
@@ -255,7 +296,7 @@ impl TerminalView {
                         geometry.cell_width.into(),
                         geometry.cell_height.into(),
                     )?;
-                    self.terminal.events().for_each(drop);
+                    self.handle_vt_events(cx);
                     self.selection = None;
                 }
                 TerminalEvent::Exit => {
@@ -273,12 +314,91 @@ impl TerminalView {
         }
     }
 
+    fn handle_vt_events(&mut self, cx: &mut Context<Self>) {
+        for event in self.terminal.events() {
+            match event {
+                VtEvent::Bell => cx.emit(TerminalBell),
+                VtEvent::TitleChanged(title) => {
+                    let title = shown_title(&title).into_owned();
+                    cx.emit(TerminalTitleChanged(title));
+                }
+                VtEvent::ClipboardWrite(write) => {
+                    let total_size = write
+                        .contents
+                        .iter()
+                        .try_fold(0usize, |size, content| size.checked_add(content.data.len()));
+                    if !matches!(total_size, Some(size) if size <= MAX_CLIPBOARD_WRITE) {
+                        continue;
+                    }
+                    let Some(content) = write.contents.iter().find(|content| {
+                        content.mime.split(';').next().is_some_and(|media_type| {
+                            media_type.trim().eq_ignore_ascii_case("text/plain")
+                        })
+                    }) else {
+                        continue;
+                    };
+                    let Ok(text) = std::str::from_utf8(&content.data) else {
+                        continue;
+                    };
+                    match write.location {
+                        ClipboardLocation::Standard => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+                        }
+                        ClipboardLocation::Primary | ClipboardLocation::Selection => {
+                            #[cfg(target_os = "linux")]
+                            cx.write_to_primary(ClipboardItem::new_string(text.to_owned()));
+                            #[cfg(not(target_os = "linux"))]
+                            let _ = text;
+                        }
+                    }
+                }
+                VtEvent::DesktopNotification { title, body } => {
+                    cx.emit(TerminalNotification { title, body });
+                }
+                VtEvent::RenderHold(held) => {
+                    self.render_held = held;
+                    self.render_hold_generation = self.render_hold_generation.wrapping_add(1);
+                    if held {
+                        let generation = self.render_hold_generation;
+                        cx.spawn(async move |view, cx| {
+                            cx.background_executor().timer(MAX_RENDER_HOLD).await;
+                            let _ = view.update(cx, |view, cx| {
+                                if view.render_held && view.render_hold_generation == generation {
+                                    let _ = view.terminal.set_mode(Mode::SYNC_OUTPUT, false);
+                                    view.handle_vt_events(cx);
+                                    view.render_held = false;
+                                    view.refresh();
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                }
+                VtEvent::PtyWrite(_) | VtEvent::PwdChanged(_) | VtEvent::ProgressReport { .. } => {}
+            }
+        }
+    }
+
     fn refresh(&mut self) {
+        if self.render_held {
+            return;
+        }
         let foreground = self.scheme.terminal_ink(&self.terminal).0;
         match frame(&mut self.renderer, &self.terminal, foreground) {
             Ok(frame) => self.frame = Arc::new(frame),
             Err(error) => self.status = Some(error.to_string()),
         }
+    }
+
+    fn configure_terminal(&self, terminal: &mut Terminal) {
+        terminal.set_clipboard_write_policy(match self.settings.clipboard_write {
+            crate::settings::ClipboardWrite::Allow => terminal::ClipboardWritePolicy::Allow,
+            crate::settings::ClipboardWrite::Deny => terminal::ClipboardWritePolicy::Deny,
+        });
+        terminal
+            .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
+            .expect("set terminal clipboard size limit");
     }
 
     /// Records the grid's bounds, inside the padding, and resizes the PTY to the cells that
@@ -289,5 +409,56 @@ impl TerminalView {
 
     fn at(&self, position: Point<Pixels>) -> CellPosition {
         self.grid.at(position)
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::shown_title;
+
+    #[test]
+    fn titles_drop_agent_spinner_frames() {
+        assert_eq!(shown_title("\u{2733} Fix the tests"), "Fix the tests");
+        assert_eq!(shown_title("\u{280b} working"), "working");
+        assert_eq!(shown_title("\u{25d0} \u{2733} two of them"), "two of them");
+        assert_eq!(shown_title("\u{03c0} \u{2839} task"), "\u{03c0} task");
+        assert_eq!(shown_title("\u{2713} build"), "\u{2713} build");
+        assert_eq!(shown_title("\u{2733}"), "\u{2733}");
+    }
+}
+
+/// Adapted from herdr-app/src/terminal.rs (Apache-2.0): remove changing agent spinner frames
+/// from the title while preserving stable status symbols and the actual title text.
+fn shown_title(title: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let spinner = |c: char| matches!(c, '\u{2800}'..='\u{28ff}' | '\u{00b7}' | '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273b}' | '\u{273d}' | '\u{25d0}'..='\u{25d3}');
+    let rest = title.trim_start_matches(|c: char| spinner(c) || c.is_whitespace());
+    let led = title.len() - rest.len();
+    if !rest.is_empty()
+        && title[..led].chars().any(spinner)
+        && title[..led].ends_with(char::is_whitespace)
+    {
+        return Cow::Borrowed(rest);
+    }
+    let braille =
+        |word: &str| !word.is_empty() && word.chars().all(|c| matches!(c, '\u{2800}'..='\u{28ff}'));
+    let mut words = title.splitn(3, ' ');
+    match (words.next(), words.next()) {
+        (Some(prefix), Some(frame))
+            if !prefix.is_empty()
+                && prefix.chars().count() <= 3
+                && !braille(prefix)
+                && braille(frame) =>
+        {
+            match words
+                .next()
+                .map(str::trim_start)
+                .filter(|rest| !rest.is_empty())
+            {
+                Some(rest) => Cow::Owned(format!("{prefix} {rest}")),
+                None => Cow::Borrowed(prefix),
+            }
+        }
+        _ => Cow::Borrowed(title),
     }
 }
