@@ -7,7 +7,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use application::dag::{
-    BoxRegistry, BoxSelection, DagApplication, Dispatch, EventScope, StartAgent,
+    BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EventScope, PlanTask,
+    StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
@@ -81,6 +82,21 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::ArchiveRun { run, force } => Reply::Run {
             run: application.archive_run(&run, force)?.into(),
         },
+        DagRequest::PauseRun { run } => Reply::Run {
+            run: application.pause_run(&run)?.into(),
+        },
+        DagRequest::ResumeRun { run } => Reply::Run {
+            run: application.resume_run(&run)?.into(),
+        },
+        DagRequest::SetAgentPaused { agent, paused } => Reply::Agent {
+            agent: application.set_agent_paused(&agent, paused)?.into(),
+        },
+        DagRequest::StopAgent { agent } => Reply::Agent {
+            agent: application.stop_agent(&agent)?.into(),
+        },
+        DagRequest::PauseAllExcept { keep, caller } => Reply::Agents {
+            agents: convert(application.pause_all_except(&keep, caller.as_deref())?),
+        },
         DagRequest::UnarchiveRun { run } => Reply::Run {
             run: application.unarchive_run(&run)?.into(),
         },
@@ -89,6 +105,23 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         },
         DagRequest::AddDependency { run, task, dep } => Reply::Run {
             run: application.add_dependency(&run, &task, &dep)?.into(),
+        },
+        DagRequest::PlanTask {
+            run,
+            task,
+            provider,
+            model,
+            clear,
+        } => Reply::Run {
+            run: application
+                .plan_task(PlanTask {
+                    run,
+                    task,
+                    clear,
+                    provider: provider.map(Into::into),
+                    model,
+                })?
+                .into(),
         },
         DagRequest::StartAgent {
             box_sel,
@@ -125,16 +158,26 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             retry,
             args,
             caller,
-        } => {
-            let result = application.dispatch(Dispatch {
-                run,
-                task,
-                provider: provider.into(),
-                worktree: worktree.into_domain(allow_main_checkout),
-                retry,
-                args,
-                caller,
-            })?;
+            budget,
+        } => match application.dispatch(Dispatch {
+            run: run.clone(),
+            task: task.clone(),
+            provider: provider.map(Into::into),
+            worktree: worktree.into_domain(allow_main_checkout),
+            retry,
+            args,
+            caller,
+            budget: budget.into(),
+        })? {
+            DispatchOutcome::Started(result) => Reply::Dispatched {
+                attempt: result.attempt.into(),
+                agent: Box::new(result.agent.into()),
+                branch: result.branch,
+            },
+            DispatchOutcome::Queued { reason } => Reply::Queued { run, task, reason },
+        },
+        DagRequest::StartQueued { run, task } => {
+            let result = application.start_queued_now(&run, &task)?;
             Reply::Dispatched {
                 attempt: result.attempt.into(),
                 agent: Box::new(result.agent.into()),
@@ -145,8 +188,14 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
             box_sel,
             from_session,
             branch,
+            path,
         } => Reply::ViewWorktreeCreated {
-            path: application.create_view_worktree(&box_sel, &from_session, &branch)?,
+            path: application.create_view_worktree(
+                &box_sel,
+                &from_session,
+                &branch,
+                path.as_deref(),
+            )?,
         },
         DagRequest::ListManagedWorktrees { scope } => {
             let box_id = worktree_box(application, scope)?;

@@ -1,7 +1,9 @@
 use super::{
-    ActiveView as ViewSnapshot, StatusBarPlugins,
+    ActiveView as ViewSnapshot, PLUGIN_COMMANDS_SECTION, StatusBarPlugins,
     clock::Clock,
     host::{CALL_EPOCHS, engine, load_component, store_limits},
+    merge_command_keys,
+    panel::{PanelPlugins, PanelSetup},
 };
 use crate::{
     config::{self, Sections},
@@ -40,24 +42,28 @@ impl types::Host for HostState {}
 
 impl palette::Host for HostState {
     fn get_palette(&mut self) -> Option<palette::Colors> {
-        let scheme = self.scheme?;
-        let colors = &scheme.colors;
-        Some(palette::Colors {
-            scheme: scheme.name.clone(),
-            foreground: colors.foreground,
-            background: colors.background,
-            cursor: colors.cursor,
-            selection_background: scheme.selection_background,
-            selection_foreground: scheme.selection_foreground,
-            indexed: colors.indexed.to_vec(),
-            accent: colors.accent,
-            muted: colors.muted,
-            surface: colors.surface,
-            raised: colors.raised,
-            border: colors.border,
-            link: colors.link,
-            error: colors.error,
-        })
+        self.scheme.map(palette_colors)
+    }
+}
+
+/// The palette a plugin sees for `scheme`.
+pub(super) fn palette_colors(scheme: &Scheme) -> palette::Colors {
+    let colors = &scheme.colors;
+    palette::Colors {
+        scheme: scheme.name.clone(),
+        foreground: colors.foreground,
+        background: colors.background,
+        cursor: colors.cursor,
+        selection_background: scheme.selection_background,
+        selection_foreground: scheme.selection_foreground,
+        indexed: colors.indexed.to_vec(),
+        accent: colors.accent,
+        muted: colors.muted,
+        surface: colors.surface,
+        raised: colors.raised,
+        border: colors.border,
+        link: colors.link,
+        error: colors.error,
     }
 }
 
@@ -80,9 +86,13 @@ enum Event {
 pub struct UiPlugins(mpsc::Sender<Event>);
 
 impl UiPlugins {
+    /// Starts the bottom-row worker. It also merges the commands and settings tables of
+    /// `panels` into the defaults before config.lua runs, records the commands for `validate`
+    /// under [`PLUGIN_COMMANDS_SECTION`], and hands `panels` their evaluated settings.
     pub fn start<S: Send + Sync + 'static>(
         defaults: Sections,
         validate: fn(&Sections) -> Result<S>,
+        panels: PanelPlugins,
     ) -> (Self, async_channel::Receiver<UiUpdate<S>>) {
         let (events, receiver) = mpsc::channel();
         let (updates, results) = async_channel::unbounded();
@@ -90,7 +100,14 @@ impl UiPlugins {
         let (field_requests, requests) = async_channel::bounded(1);
         thread::spawn(move || publish_fields(requests, fields_events));
         thread::spawn(move || {
-            if let Err(error) = run(receiver, &updates, field_requests, defaults, validate) {
+            if let Err(error) = run(
+                receiver,
+                &updates,
+                field_requests,
+                defaults,
+                validate,
+                &panels,
+            ) {
                 let _ = updates.send_blocking(UiUpdate::Error(Some(format!(
                     "Status UI failed. {error:#}"
                 ))));
@@ -140,7 +157,12 @@ impl Runtime {
         })
     }
 
-    fn load(&self, directory: Option<&Path>, defaults: &Sections) -> Result<(Plugin, Sections)> {
+    fn load(
+        &self,
+        directory: Option<&Path>,
+        defaults: &Sections,
+        panels: &PanelSetup,
+    ) -> Result<(Plugin, Sections)> {
         let external = directory.map(|dir| dir.join("terminal-bottom.wasm"));
         let component = match external.as_ref().filter(|path| path.exists()) {
             Some(path) => load_component(path, &self.engine)
@@ -162,9 +184,11 @@ impl Runtime {
             let api = TerminalBottomWithPalette::instantiate(&mut store, &component, &self.linker)?;
             store.set_epoch_deadline(CALL_EPOCHS);
             let mut defaults = defaults.clone();
-            defaults
-                .entry(config::WORKTREES_SECTION.into())
-                .or_insert_with(|| serde_json::json!({}));
+            for section in [config::WORKTREES_SECTION, config::DAG_SECTION] {
+                defaults
+                    .entry(section.into())
+                    .or_insert_with(|| serde_json::json!({}));
+            }
             let settings = api.call_settings(&mut store)?;
             if let Some(settings) = &settings {
                 ensure!(
@@ -174,11 +198,19 @@ impl Runtime {
                 let value = serde_json::from_str(&settings.defaults_json)?;
                 defaults.entry(settings.key.clone()).or_insert(value);
             }
-            let sections = match directory {
+            let defaults = with_panels(defaults, panels);
+            let mut sections = match directory {
                 Some(directory) => config::load_from(&directory.join("config.lua"), defaults)?,
                 None => defaults,
             };
+            if !panels.commands.is_empty() {
+                sections.insert(
+                    PLUGIN_COMMANDS_SECTION.into(),
+                    serde_json::to_value(&panels.commands)?,
+                );
+            }
             config::worktree_root(&sections)?;
+            config::worker_budget(&sections)?;
             let config = settings.map_or_else(
                 || "{}".into(),
                 |settings| sections[&settings.key].to_string(),
@@ -353,36 +385,72 @@ fn validate_row(row: &Row) -> Result<()> {
     Ok(())
 }
 
+/// `defaults` with panel plugin settings tables and command keys merged in. A settings table
+/// never replaces a section that already exists.
+fn with_panels(mut defaults: Sections, panels: &PanelSetup) -> Sections {
+    for settings in &panels.settings {
+        defaults
+            .entry(settings.key.clone())
+            .or_insert_with(|| settings.defaults.clone());
+    }
+    if !panels.commands.is_empty() {
+        merge_command_keys(
+            defaults
+                .entry(config::KEYS_SECTION.into())
+                .or_insert_with(|| serde_json::json!({})),
+            &panels.commands,
+        );
+    }
+    defaults
+}
+
+/// The evaluated settings tables of panel plugins whose key no built-in section claims.
+fn panel_settings(
+    base: &Sections,
+    sections: &Sections,
+    panels: &PanelSetup,
+) -> BTreeMap<String, serde_json::Value> {
+    panels
+        .settings
+        .iter()
+        .filter(|settings| !base.contains_key(&settings.key))
+        .filter_map(|settings| {
+            let value = sections.get(&settings.key)?;
+            Some((settings.key.clone(), value.clone()))
+        })
+        .collect()
+}
+
 fn run<S: Send + Sync + 'static>(
     receiver: mpsc::Receiver<Event>,
     updates: &async_channel::Sender<UiUpdate<S>>,
     field_requests: async_channel::Sender<(u64, ViewSnapshot)>,
     defaults: Sections,
     validate: fn(&Sections) -> Result<S>,
+    panels: &PanelPlugins,
 ) -> Result<()> {
     let runtime = Runtime::new()?;
     let directory = config::directory();
     let home = env::var("HOME").ok();
-    let (bundled, defaults) = runtime.load(None, &defaults)?;
-    let mut plugin = if let Some(directory) = directory.as_deref() {
-        match runtime
-            .load(Some(directory), &defaults)
-            .and_then(|(plugin, sections)| Ok((plugin, validate(&sections)?)))
-        {
-            Ok((plugin, settings)) => {
-                updates.send_blocking(UiUpdate::Settings(settings))?;
-                plugin
-            }
-            Err(error) => {
-                updates.send_blocking(UiUpdate::Error(Some(format!(
-                    "Status UI configuration failed. {error:#}"
-                ))))?;
-                bundled
-            }
+    let mut setup = panels.setup();
+    let (bundled, defaults) = runtime.load(None, &defaults, &PanelSetup::default())?;
+    let loaded = runtime
+        .load(directory.as_deref(), &defaults, &setup)
+        .and_then(|(plugin, sections)| Ok((plugin, validate(&sections)?, sections)));
+    let mut plugin = match loaded {
+        Ok((plugin, settings, sections)) => {
+            panels.configure(panel_settings(&defaults, &sections, &setup));
+            updates.send_blocking(UiUpdate::Settings(settings))?;
+            plugin
         }
-    } else {
-        updates.send_blocking(UiUpdate::Settings(validate(&defaults)?))?;
-        bundled
+        Err(error) => {
+            let fallback = with_panels(defaults.clone(), &setup);
+            panels.configure(panel_settings(&defaults, &fallback, &setup));
+            updates.send_blocking(UiUpdate::Error(Some(format!(
+                "Status UI configuration failed. {error:#}"
+            ))))?;
+            bundled
+        }
     };
     let mut active = None;
     let mut fields = BTreeMap::new();
@@ -416,9 +484,13 @@ fn run<S: Send + Sync + 'static>(
             Ok(Event::Fields(next, values)) if next == fields_revision => fields = values,
             Ok(Event::Fields(..)) => continue,
             Ok(Event::Reload) => {
-                let replacement = runtime.load(directory.as_deref(), &defaults).and_then(
-                    |(mut candidate, sections)| {
+                panels.reload(None);
+                setup = panels.setup();
+                let replacement = runtime
+                    .load(directory.as_deref(), &defaults, &setup)
+                    .and_then(|(mut candidate, sections)| {
                         let settings = validate(&sections)?;
+                        panels.configure(panel_settings(&defaults, &sections, &setup));
                         let row = active
                             .as_ref()
                             .map(|view| {
@@ -433,8 +505,7 @@ fn run<S: Send + Sync + 'static>(
                             .transpose()?
                             .flatten();
                         Ok((candidate, row, settings))
-                    },
-                );
+                    });
                 match replacement {
                     Ok((candidate, row, settings)) => {
                         plugin = candidate;
@@ -443,6 +514,9 @@ fn run<S: Send + Sync + 'static>(
                         updates.send_blocking(UiUpdate::Error(None))?;
                     }
                     Err(error) => {
+                        // The reloaded panel plugins still need settings to run with.
+                        let fallback = with_panels(defaults.clone(), &setup);
+                        panels.configure(panel_settings(&defaults, &fallback, &setup));
                         updates.send_blocking(UiUpdate::Error(Some(format!(
                             "Status UI configuration failed. {error:#}"
                         ))))?;
@@ -545,7 +619,7 @@ mod tests {
     #[test]
     fn bundled_component_owns_the_row_and_copy_actions() -> Result<()> {
         let runtime = Runtime::new()?;
-        let (mut plugin, _) = runtime.load(None, &Sections::new())?;
+        let (mut plugin, _) = runtime.load(None, &Sections::new(), &PanelSetup::default())?;
         let row = runtime
             .render(
                 &mut plugin,
@@ -617,7 +691,8 @@ mod tests {
         let runtime = Runtime::new()?;
         let defaults =
             Sections::from([("keys".into(), serde_json::json!({"tab": {"paths": "y"}}))]);
-        let (mut plugin, sections) = runtime.load(Some(dir.path()), &defaults)?;
+        let (mut plugin, sections) =
+            runtime.load(Some(dir.path()), &defaults, &PanelSetup::default())?;
         assert_eq!(sections["keys"]["tab"]["paths"], "z");
         let fields = BTreeMap::from([("tag".into(), "sample".into())]);
         let row = runtime
@@ -631,7 +706,64 @@ mod tests {
         assert_eq!(row.right[1].bg.as_deref(), Some("#62a0ea"));
 
         fs::write(&config, r#"power_bar.right = {{ text = "{unknown}" }}"#)?;
-        assert!(runtime.load(Some(dir.path()), &Sections::new()).is_err());
+        assert!(
+            runtime
+                .load(Some(dir.path()), &Sections::new(), &PanelSetup::default())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_command_keys_are_defaults_lua_can_override() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("config.lua"),
+            r#"keys.box["dashboard.open"] = "g"; dashboard.refresh_ms = 500"#,
+        )?;
+        let commands = vec![super::super::PluginCommand {
+            id: "dashboard.open".into(),
+            title: "Open dashboard".into(),
+            description: "Open dashboard".into(),
+            scope: super::super::CommandScope::Box,
+            default_keys: vec!["o".into()],
+        }];
+        let setup = PanelSetup {
+            commands: commands.clone(),
+            settings: vec![
+                super::super::panel::PanelSettings {
+                    key: "dashboard".into(),
+                    defaults: serde_json::json!({"refresh_ms": 2000}),
+                },
+                // A plugin cannot take over a built-in section.
+                super::super::panel::PanelSettings {
+                    key: "keys".into(),
+                    defaults: serde_json::json!({}),
+                },
+            ],
+        };
+        let runtime = Runtime::new()?;
+        let defaults =
+            Sections::from([("keys".into(), serde_json::json!({"box": {"new": ["c"]}}))]);
+        let (_, sections) = runtime.load(Some(dir.path()), &defaults, &setup)?;
+        assert_eq!(sections["keys"]["box"]["dashboard.open"], "g");
+        assert_eq!(sections["keys"]["box"]["new"], serde_json::json!(["c"]));
+        assert_eq!(super::super::plugin_commands(&sections).unwrap(), commands);
+        assert_eq!(
+            panel_settings(&defaults, &sections, &setup),
+            BTreeMap::from([("dashboard".into(), serde_json::json!({"refresh_ms": 500}))])
+        );
+
+        fs::remove_file(dir.path().join("config.lua"))?;
+        let (_, sections) = runtime.load(Some(dir.path()), &defaults, &setup)?;
+        assert_eq!(
+            sections["keys"]["box"]["dashboard.open"],
+            serde_json::json!(["o"])
+        );
+        assert_eq!(sections["dashboard"]["refresh_ms"], 2000);
+        let (_, sections) = runtime.load(Some(dir.path()), &defaults, &PanelSetup::default())?;
+        assert!(sections["keys"]["box"].get("dashboard.open").is_none());
+        assert!(super::super::plugin_commands(&sections).unwrap().is_empty());
         Ok(())
     }
 
@@ -649,7 +781,8 @@ mod tests {
             "#,
         )?;
         let runtime = Runtime::new()?;
-        let (mut plugin, _) = runtime.load(Some(dir.path()), &Sections::new())?;
+        let (mut plugin, _) =
+            runtime.load(Some(dir.path()), &Sections::new(), &PanelSetup::default())?;
         let mut claude = view();
         claude.agent_type = "Claude".into();
         let row = runtime
@@ -677,7 +810,8 @@ mod tests {
             r#"power_bar.left = {{ text = "{theme.name}", bg = "accent" }}"#,
         )?;
         let runtime = Runtime::new()?;
-        let (mut plugin, _) = runtime.load(Some(dir.path()), &Sections::new())?;
+        let (mut plugin, _) =
+            runtime.load(Some(dir.path()), &Sections::new(), &PanelSetup::default())?;
         let view = view();
         for scheme in [
             theme::default_scheme(),

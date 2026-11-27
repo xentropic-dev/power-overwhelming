@@ -1,6 +1,6 @@
 use super::DagWorktrees;
 use crate::keymap::{Command, Keymap, Scope};
-use domain::dag::AttemptArtifact;
+use domain::{dag::AttemptArtifact, talk::AgentTalkSummary};
 use gpui::{prelude::*, *};
 use infrastructure::{
     client::{Attempt, Coordinator, Run, Task, TaskState},
@@ -248,6 +248,7 @@ pub(super) struct DagView {
     pub message: Option<String>,
     pub refresh_error: Option<String>,
     pub worktrees: DagWorktrees,
+    pub talk: HashMap<String, AgentTalkSummary>,
     /// Waiting for a digit that picks one of several listed artifacts.
     pub picking_artifact: bool,
     graph: GraphLayout,
@@ -268,6 +269,7 @@ impl DagView {
             message: None,
             refresh_error: None,
             worktrees: DagWorktrees::default(),
+            talk: HashMap::new(),
             picking_artifact: false,
             selected,
             viewport: GraphViewport::new(),
@@ -382,6 +384,18 @@ impl DagView {
         {
             actions.push(format!("{open_key} open worker"));
         }
+        let talk_key = keymap.keys(Scope::Dag, Command::AgentTalk);
+        if self.attempt().is_some() && !talk_key.is_empty() {
+            actions.push(format!("{talk_key} open talk"));
+        }
+        let start_key = keymap.first(Scope::Dag, Command::DagStartNow);
+        if !start_key.is_empty()
+            && self
+                .task()
+                .is_some_and(|task| task.state == TaskState::Queued)
+        {
+            actions.push(format!("{start_key} start now, over budget"));
+        }
         let artifact_key = keymap.first(Scope::Dag, Command::DagArtifact);
         let artifacts = self.artifacts().len();
         if self.picking_artifact {
@@ -465,6 +479,8 @@ impl DagView {
                                 &self.worktrees,
                                 &self.run.id,
                                 self.picking_artifact,
+                                self.attempt()
+                                    .and_then(|attempt| self.talk.get(&attempt.agent)),
                                 open_artifact,
                             ))
                             .into_any_element()
@@ -595,9 +611,16 @@ impl DagView {
                 let action = action.clone();
                 let origin = self.graph.positions[index].origin() * scale + offset;
                 let (label, tint) = task_style(colors, task.state);
+                let stalled = task.state == TaskState::Working
+                    && current_attempt(task).is_some_and(|attempt| {
+                        attempt.stalled
+                            && attempt.state == infrastructure::client::AttemptState::Active
+                    });
+                let label = if stalled { "Working · stalled" } else { label };
+                let tint = if stalled { colors.indexed[3] } else { tint };
                 let fill = blend(colors.surface, tint, 18);
                 let color = colors.readable(tint, fill);
-                let model = current_attempt(task).and_then(|attempt| attempt.model.clone());
+                let model = node_model(task);
                 div()
                     .id(("dag-node", index))
                     .absolute()
@@ -632,12 +655,20 @@ impl DagView {
                             .child(label),
                     )
                     .when_some(model, |node, model| {
+                        let muted = colors.readable(colors.muted, fill);
+                        let (text, color) = match model {
+                            NodeModel::Actual(model) => (model, muted),
+                            // Planned models are a guess until dispatch, so they recede.
+                            NodeModel::Planned(model) => {
+                                (format!("planned · {model}"), blend(fill, muted, 60))
+                            }
+                        };
                         node.child(
                             div()
                                 .text_size(rems(0.75 * scale))
-                                .text_color(rgb(colors.readable(colors.muted, fill)))
+                                .text_color(rgb(color))
                                 .truncate()
-                                .child(model),
+                                .child(text),
                         )
                     })
                     .on_click(move |_, _, cx| action(GraphAction::Select(index), cx))
@@ -698,6 +729,50 @@ impl GraphEdge {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum NodeModel {
+    /// The model the current attempt runs.
+    Actual(String),
+    /// The coordinator's plan, for a task without an attempt.
+    Planned(String),
+}
+
+fn node_model(task: &Task) -> Option<NodeModel> {
+    match current_attempt(task) {
+        Some(attempt) => attempt.model.clone().map(NodeModel::Actual),
+        None => task
+            .model
+            .clone()
+            .or_else(|| {
+                task.provider
+                    .as_ref()
+                    .map(|provider| provider.name().into())
+            })
+            .map(NodeModel::Planned),
+    }
+}
+
+/// The plan for the details panel, when there is one and the current attempt did not
+/// follow it.
+fn planned_field(task: &Task) -> Option<String> {
+    let text = match (&task.provider, &task.model) {
+        (None, None) => return None,
+        (Some(provider), None) => provider.name().to_owned(),
+        (None, Some(model)) => model.clone(),
+        (Some(provider), Some(model)) => format!("{} · {model}", provider.name()),
+    };
+    let followed = current_attempt(task).is_some_and(|attempt| {
+        task.provider
+            .as_ref()
+            .is_none_or(|provider| *provider == attempt.provider)
+            && task
+                .model
+                .as_ref()
+                .is_none_or(|model| attempt.model.as_ref() == Some(model))
+    });
+    (!followed).then_some(text)
+}
+
 fn current_attempt(task: &Task) -> Option<&Attempt> {
     let id = task.current_attempt.as_deref()?;
     task.attempts.iter().find(|attempt| attempt.id == id)
@@ -722,14 +797,26 @@ fn details(
     worktrees: &DagWorktrees,
     run_id: &str,
     picking: bool,
+    talk: Option<&AgentTalkSummary>,
     open_artifact: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
     let mut fields = Vec::new();
     let artifacts = current_attempt(task).map_or_else(Vec::new, newest_first);
+    let attempted = current_attempt(task).is_some();
+    if let Some(plan) = planned_field(task) {
+        fields.push(("Planned", plan));
+    }
     if let Some(attempt) = current_attempt(task) {
         fields.push((
             "Assigned agent",
             format!("{} · {}", attempt.provider.name(), attempt.agent),
+        ));
+        fields.push((
+            "Talk messages",
+            talk.map_or_else(
+                || "0".into(),
+                |talk| format!("{} · {}", talk.count, talk.latest),
+            ),
         ));
         if let Some(model) = &attempt.model {
             fields.push(("Model", model.clone()));
@@ -753,6 +840,14 @@ fn details(
                 ("Result", attempt.summary.clone()),
                 ("Blocker", attempt.blocker.clone()),
                 ("Interruption", attempt.detail.clone()),
+                (
+                    "Stalled",
+                    (attempt.stalled
+                        && attempt.state == infrastructure::client::AttemptState::Active)
+                        .then(|| {
+                            "Idle with no build or test running. Check the worker.".to_string()
+                        }),
+                ),
             ]
             .into_iter()
             .filter_map(|(label, value)| Some((label, value?))),
@@ -776,7 +871,7 @@ fn details(
                 .child(task.title.clone()),
         )
         .child(div().text_xs().text_color(rgb(color)).child(state))
-        .when(fields.is_empty(), |panel| {
+        .when(!attempted, |panel| {
             panel.child(
                 div()
                     .mt_3()
@@ -834,7 +929,9 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
     match state {
         TaskState::Waiting => ("Waiting", colors.muted),
         TaskState::Ready => ("Ready", colors.indexed[6]),
+        TaskState::Queued => ("Queued", colors.indexed[4]),
         TaskState::Working => ("Working", colors.accent),
+        TaskState::Paused => ("Paused", colors.indexed[4]),
         TaskState::NeedsInput => ("Needs input", colors.indexed[3]),
         TaskState::Completed => ("Completed", colors.indexed[2]),
         TaskState::Failed => ("Failed", colors.error),
@@ -845,8 +942,8 @@ fn task_style(colors: &Colors, state: TaskState) -> (&'static str, u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphDrag, GraphViewport, MAX_ZOOM, MIN_ZOOM, Position, layout, newest_first,
-        numbered_artifact,
+        GraphDrag, GraphViewport, MAX_ZOOM, MIN_ZOOM, NodeModel, Position, layout, newest_first,
+        node_model, numbered_artifact, planned_field,
     };
     use crate::keymap::Command;
     use domain::dag::AttemptArtifact;
@@ -868,6 +965,8 @@ mod tests {
             detail: None,
             started_at: 0,
             ended_at: None,
+            paused: false,
+            stalled: false,
             artifacts: titles
                 .iter()
                 .map(|title| AttemptArtifact {
@@ -908,10 +1007,62 @@ mod tests {
             title: id.into(),
             instructions: String::new(),
             deps: deps.iter().copied().map(str::to_owned).collect(),
+            provider: None,
+            model: None,
             state: TaskState::Waiting,
+            queued_at: None,
             current_attempt: None,
             attempts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn waiting_nodes_show_the_plan_and_attempts_show_what_ran() {
+        let mut waiting = task("waiting", &[]);
+        assert_eq!(node_model(&waiting), None);
+        assert_eq!(planned_field(&waiting), None);
+        waiting.provider = Some(Provider::Agent("codex".into()));
+        assert_eq!(
+            node_model(&waiting),
+            Some(NodeModel::Planned("Codex".into()))
+        );
+        waiting.model = Some("gpt-6.2-sol".into());
+        assert_eq!(
+            node_model(&waiting),
+            Some(NodeModel::Planned("gpt-6.2-sol".into()))
+        );
+        assert_eq!(
+            planned_field(&waiting).as_deref(),
+            Some("Codex · gpt-6.2-sol")
+        );
+
+        let mut started = waiting;
+        started.attempts = vec![Attempt {
+            provider: Provider::Agent("codex".into()),
+            model: Some("gpt-6.2-sol".into()),
+            ..attempt_with(&[])
+        }];
+        started.current_attempt = Some("attempt".into());
+        assert_eq!(
+            node_model(&started),
+            Some(NodeModel::Actual("gpt-6.2-sol".into()))
+        );
+        assert_eq!(
+            planned_field(&started),
+            None,
+            "the attempt followed the plan"
+        );
+        started.attempts[0].model = Some("gpt-mini".into());
+        assert_eq!(
+            node_model(&started),
+            Some(NodeModel::Actual("gpt-mini".into()))
+        );
+        assert_eq!(
+            planned_field(&started).as_deref(),
+            Some("Codex · gpt-6.2-sol")
+        );
+        started.attempts[0].model = None;
+        assert_eq!(node_model(&started), None);
     }
 
     #[test]
