@@ -744,11 +744,17 @@ fn report_conversation() {
         else {
             continue;
         };
+        let model = infrastructure::agents::conversation_model(&profile.id, &conversation);
         let _ = client::set_conversation(
             session.clone(),
             profile.id.as_str().to_owned(),
             conversation,
         );
+        // An agent without a model callback, like jcode, records its model in its
+        // session, so each report also refreshes the model shown in the bar.
+        if let Some(model) = model {
+            let _ = client::set_model(session.clone(), model);
+        }
     }
 }
 
