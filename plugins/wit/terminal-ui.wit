@@ -68,6 +68,8 @@ world terminal-bottom {
     export configure: func(config-json: string) -> result<option<string>, string>;
 
     /// The host renders the returned row and executes declared effects on user selection.
+    /// Field names prefixed with @ are reserved for built-in host values.
+    /// @dag.progress is present when the active session's DAG is running.
     export render: func(view: active-view, fields: list<field>, local-time: option<string>) -> result<option<row>, string>;
 }
 

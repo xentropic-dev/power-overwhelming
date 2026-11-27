@@ -8,7 +8,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct Daemon(Child);
+struct Daemon(Child, String);
+
+/// Gives the daemon `command` starts a systemd slice of its own for its worker
+/// scopes, and returns the slice's name, which the caller stops when done.
+fn own_slice(command: &mut Command) -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let slice = format!(
+        "app-powertest{}x{}.slice",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    command.env("POWER_WORKER_SLICE", &slice);
+    slice
+}
+
+/// Stops a test slice, which ends anything a failed test left in it.
+fn stop_slice(slice: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", slice])
+        .stderr(std::process::Stdio::null())
+        .status();
+}
 
 impl Daemon {
     fn start(root: &Path) -> (Self, PathBuf) {
@@ -20,6 +41,7 @@ impl Daemon {
 
     fn start_with(root: &Path, command: &mut Command) -> (Self, PathBuf) {
         let socket = root.join("power.sock");
+        let slice = own_slice(command);
         let daemon = Self(
             command
                 .arg("daemon")
@@ -29,6 +51,7 @@ impl Daemon {
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .spawn()
                 .unwrap(),
+            slice,
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while UnixStream::connect(&socket).is_err() {
@@ -43,6 +66,7 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        stop_slice(&self.1);
     }
 }
 
@@ -424,6 +448,127 @@ read -r finish
 }
 
 #[test]
+fn jcode_gets_typed_instructions_a_private_socket_and_resumes_its_own_session() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    // A deterministic stand-in for jcode's TUI. Each launch records its arguments and
+    // socket. A fresh one reads the typed first message (a bracketed paste ended by
+    // Enter), then reports a task the way jcode's bash tool runs commands, with
+    // `JCODE_SESSION_ID` set. Marker files make a resume fail or a fresh start stay quiet.
+    fs::write(
+        root.join("jcode"),
+        r#"#!/bin/sh
+set -eu
+dir="${POWER_SOCKET%/*}"
+n=$(($(cat "$dir/count" 2>/dev/null || echo 0) + 1))
+echo "$n" > "$dir/count"
+printf '%s\n' "$@" > "$dir/launch.$n.args"
+printf '%s' "$JCODE_SOCKET" > "$dir/launch.$n.socket"
+if test "${1:-}" = --resume; then
+    test -e "$dir/reject-resume" && exit 1
+    JCODE_SESSION_ID="$2" "$POWER_BIN" session task "resumed-$n"
+    read -r finish
+    exit
+fi
+stty -echo
+# Like a TUI in raw mode, announce that typed input is welcome.
+printf '\033[?2004h'
+end="$(printf '\033')[201~"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$dir/launch.$n.message"
+    case "$line" in *"$end"*) break ;; esac
+done
+# The second Enter arrives as an empty line.
+IFS= read -r second
+test -z "$second"
+if test -e "$dir/quiet"; then
+    "$POWER_BIN" session task "quiet-$n"
+else
+    JCODE_SESSION_ID=session_fake_1 "$POWER_BIN" session task "started-$n"
+fi
+read -r finish
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(root.join("jcode"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(root.to_owned())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let start = || {
+        Daemon::start_with(
+            root,
+            Command::new(env!("CARGO_BIN_EXE_power"))
+                .env("SHELL", "/bin/sh")
+                .env("PATH", &path)
+                // A daemon started from inside jcode inherits its conversation, which
+                // no session it launches may report as its own.
+                .env("JCODE_SESSION_ID", "session_of_the_outer_jcode"),
+        )
+    };
+    let (daemon, socket) = start();
+    let session = event(&mut request(
+        &socket,
+        json!({"request":"launch", "worktree":root, "agent":"jcode"}),
+    ))["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let wait_for_task = |task: &str| {
+        let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
+        while event(&mut attached)["metadata"]["task"].as_str() != Some(task) {}
+    };
+    let read = |name: &str| fs::read_to_string(root.join(name)).unwrap();
+    wait_for_task("started-1");
+    // No arguments: printf still writes one empty line.
+    assert_eq!(read("launch.1.args"), "\n");
+    let first_socket = read("launch.1.socket");
+    assert!(first_socket.len() <= 107, "{first_socket}");
+    assert_eq!(Path::new(&first_socket).parent(), Some(root));
+    let message = read("launch.1.message");
+    assert!(
+        message.starts_with("\x1b[200~You are running inside Power Overwhelming."),
+        "{message:?}"
+    );
+    assert!(message.contains("`power session task 'Short task label'`"));
+    assert!(message.trim_end().ends_with("\x1b[201~"), "{message:?}");
+    drop(daemon);
+
+    // The restore resumes the session jcode reported, on a socket of its own launch.
+    fs::write(root.join("reject-resume"), "").unwrap();
+    fs::write(root.join("quiet"), "").unwrap();
+    let (daemon, _) = start();
+    // The resume fails and a fresh start replaces it.
+    wait_for_task("quiet-3");
+    assert_eq!(read("launch.2.args"), "--resume\nsession_fake_1\n");
+    assert_eq!(read("launch.3.args"), "\n");
+    let sockets = [
+        first_socket,
+        read("launch.2.socket"),
+        read("launch.3.socket"),
+    ];
+    assert!(
+        sockets[0] != sockets[1] && sockets[1] != sockets[2],
+        "{sockets:?}"
+    );
+    drop(daemon);
+
+    // The fresh start never reported a conversation, so the rejected one is gone and the
+    // next restore starts fresh instead of returning to it.
+    fs::remove_file(root.join("reject-resume")).unwrap();
+    let (_restored, _) = start();
+    wait_for_task("quiet-4");
+    assert_eq!(read("launch.4.args"), "\n");
+    event(&mut request(
+        &socket,
+        json!({"request":"end", "session":session}),
+    ));
+}
+
+#[test]
 fn agent_task_and_model_follow_the_run_and_survive_reattachment() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use std::os::unix::fs::PermissionsExt;
@@ -544,17 +689,16 @@ fn shell_hook_gives_hand_started_agents_instructions() {
 
     let socket = root.join("power.sock");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let _daemon = Daemon(
-        Command::new(env!("CARGO_BIN_EXE_power"))
-            .arg("daemon")
-            .env("POWER_SOCKET", &socket)
-            .env("POWER_STATE_DIR", root.join("state"))
-            .env("HOME", &root)
-            .env("SHELL", "/bin/bash")
-            .env("PATH", path)
-            .spawn()
-            .unwrap(),
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_power"));
+    command
+        .arg("daemon")
+        .env("POWER_SOCKET", &socket)
+        .env("POWER_STATE_DIR", root.join("state"))
+        .env("HOME", &root)
+        .env("SHELL", "/bin/bash")
+        .env("PATH", path);
+    let slice = own_slice(&mut command);
+    let _daemon = Daemon(command.spawn().unwrap(), slice);
     let deadline = Instant::now() + Duration::from_secs(5);
     while UnixStream::connect(&socket).is_err() {
         assert!(Instant::now() < deadline, "Daemon did not start");

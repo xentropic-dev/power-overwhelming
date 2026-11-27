@@ -22,9 +22,27 @@ pub struct Layout {
     /// The scheme selected from the desktop picker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_scheme: Option<String>,
+    /// Stable names of the most recently run commands, such as `"box.new"`, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_commands: Vec<String>,
 }
 
+/// How many recently run commands the layout keeps for the command palette.
+pub const RECENT_COMMANDS: usize = 3;
+
 impl Layout {
+    /// Records a command as the most recently run, keeping the newest [`RECENT_COMMANDS`]
+    /// without duplicates. Returns whether the list changed.
+    pub fn remember_command(&mut self, name: &str) -> bool {
+        if self.recent_commands.first().map(String::as_str) == Some(name) {
+            return false;
+        }
+        self.recent_commands.retain(|recent| recent != name);
+        self.recent_commands.insert(0, name.to_owned());
+        self.recent_commands.truncate(RECENT_COMMANDS);
+        true
+    }
+
     /// Read the last atomically saved layout without taking the desktop's lock.
     pub(crate) fn read() -> Result<Self> {
         Self::read_file(&state_directory()?.join("boxes.json"))
@@ -57,6 +75,24 @@ pub struct SavedView {
 }
 
 impl SavedBox {
+    /// Folder name of the repository, which also names its folder under the worktree root.
+    pub fn name(&self) -> String {
+        let directory = if self
+            .repository
+            .file_name()
+            .is_some_and(|name| name == ".git")
+        {
+            self.repository.parent().unwrap_or(&self.repository)
+        } else {
+            &self.repository
+        };
+        directory
+            .file_name()
+            .unwrap_or(directory.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    }
+
     pub fn new(repository: PathBuf, checkout: PathBuf, shortcut: u8) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -100,20 +136,7 @@ impl BoxRegistry for BoxesFile {
             .boxes
             .into_iter()
             .map(|entry| {
-                let directory = if entry
-                    .repository
-                    .file_name()
-                    .is_some_and(|name| name == ".git")
-                {
-                    entry.repository.parent().unwrap_or(&entry.repository)
-                } else {
-                    &entry.repository
-                };
-                let name = directory
-                    .file_name()
-                    .unwrap_or(directory.as_os_str())
-                    .to_string_lossy()
-                    .into_owned();
+                let name = entry.name();
                 RegisteredBox {
                     info: BoxInfo {
                         id: entry.id,
@@ -173,5 +196,38 @@ impl Registry {
             let _ = fs::remove_file(&temporary);
         }
         result.context("Save the box layout")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Layout;
+
+    #[test]
+    fn remember_command_keeps_the_newest_three_without_duplicates() {
+        let mut layout = Layout::default();
+        for name in ["box.new", "tab.next", "box.runs"] {
+            assert!(layout.remember_command(name));
+        }
+        assert_eq!(layout.recent_commands, ["box.runs", "tab.next", "box.new"]);
+        assert!(!layout.remember_command("box.runs"));
+        assert!(layout.remember_command("box.new"));
+        assert_eq!(layout.recent_commands, ["box.new", "box.runs", "tab.next"]);
+        assert!(layout.remember_command("dashboard.open"));
+        assert_eq!(
+            layout.recent_commands,
+            ["dashboard.open", "box.new", "box.runs"]
+        );
+    }
+
+    #[test]
+    fn recent_commands_default_when_missing_from_saved_layouts() {
+        let layout: Layout = serde_json::from_str(r#"{"boxes":[],"active_box":null}"#).unwrap();
+        assert!(layout.recent_commands.is_empty());
+        let mut layout = layout;
+        layout.remember_command("box.pick");
+        let saved = serde_json::to_string(&layout).unwrap();
+        let read: Layout = serde_json::from_str(&saved).unwrap();
+        assert_eq!(read.recent_commands, ["box.pick"]);
     }
 }

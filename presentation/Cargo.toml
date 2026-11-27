@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 application = { path = "../application" }
 async-channel = "2"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 domain = { path = "../domain" }
 fontdb = "0.16"
@@ -38,4 +39,9 @@ cc = "1"
 pkg-config = "0.3"
 
 [dev-dependencies]
+rusqlite = { version = "0.33", features = ["bundled"] }
 base64 = "0.22"
+
+# GPUI's Linux shaper, to shape terminal runs in tests without a window.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+cosmic-text = "=0.14.2"

@@ -1619,6 +1619,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
 
 [[package]]
+name = "dashboard"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3526,6 +3534,7 @@ dependencies = [
  "sha2 0.10.9",
  "signal-hook",
  "tempfile",
+ "toml 1.2.3+spec-1.1.0",
  "uuid",
  "wasmtime",
  "wat",
@@ -5005,7 +5014,9 @@ dependencies = [
  "async-channel 2.5.0",
  "base64 0.22.1",
  "cc",
+ "chrono",
  "clap",
+ "cosmic-text",
  "domain",
  "fontdb 0.16.2",
  "ghostty-vt",
@@ -5019,6 +5030,7 @@ dependencies = [
  "percent-encoding",
  "pkg-config",
  "regex",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tiny_http",

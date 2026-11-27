@@ -32,13 +32,11 @@ impl TerminalView {
     /// Links on screen, top to bottom and without repeats, for keyboard link picking.
     pub fn visible_links(&self) -> Vec<String> {
         let mut links: Vec<String> = Vec::new();
-        for link in self
-            .frame
-            .rows
-            .iter()
-            .flat_map(|row| row.cells.iter())
-            .filter_map(|cell| cell.link.as_deref())
-        {
+        for link in self.frame.rows.iter().flat_map(|row| {
+            row.links
+                .iter()
+                .filter_map(|span| row.cells[span.start].link.as_deref())
+        }) {
             if links.last().map(String::as_str) != Some(link)
                 && !links.iter().any(|seen| seen == link)
             {
@@ -65,18 +63,15 @@ impl TerminalView {
         self.link_at(self.at(point))
     }
 
-    pub(super) fn hovered_link(&self) -> Option<&Arc<str>> {
-        self.link_at_point(self.pointer?)
+    pub(super) fn hovered_span(&self) -> Option<(CellPosition, CellPosition)> {
+        let point = self.pointer.filter(|p| self.grid.bounds.contains(p))?;
+        self.frame.link_span(self.at(point))
     }
 
     pub(super) fn set_pointer(&mut self, position: Option<Point<Pixels>>) -> bool {
-        let previous = self.hovered_link().cloned();
+        let previous = self.hovered_span();
         self.pointer = position;
-        match (previous.as_ref(), self.hovered_link()) {
-            (None, None) => false,
-            (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
-            _ => true,
-        }
+        previous != self.hovered_span()
     }
 
     pub(super) fn clear_pointer(&mut self) -> bool {
@@ -85,11 +80,56 @@ impl TerminalView {
         moved_off_link || released_link
     }
 
-    pub(super) fn pressed_link(&self) -> Option<&Arc<str>> {
+    pub(super) fn pressed_span(&self) -> Option<(CellPosition, CellPosition)> {
         let pressed = self.pressed_link.as_ref()?;
         let (start, end) = self.selection?;
         let link = self.link_at(start)?;
-        (start == end && pressed == link).then_some(link)
+        if start == end && pressed == link {
+            self.frame.link_span(start)
+        } else {
+            None
+        }
+    }
+}
+
+/// Extent of a hovered or pressed link. OSC 8 spans on either side of a soft
+/// wrap can belong to rows captured in different frames.
+impl Frame {
+    pub(super) fn link_span(&self, at: CellPosition) -> Option<(CellPosition, CellPosition)> {
+        let row = self.rows.get(at.row)?;
+        let part = row.links.iter().find(|span| span.contains(&at.column))?;
+        let uri = row.cells[part.start].link.as_deref()?;
+        let mut start = CellPosition {
+            row: at.row,
+            column: part.start,
+        };
+        let mut end = CellPosition {
+            row: at.row,
+            column: part.end - 1,
+        };
+        while start.column == 0 && self.rows[start.row].continues_osc && start.row > 0 {
+            let prior = &self.rows[start.row - 1];
+            if !prior.ends_in_osc || prior.cells.last()?.link.as_deref() != Some(uri) {
+                break;
+            }
+            start = CellPosition {
+                row: start.row - 1,
+                column: prior.links.last()?.start,
+            };
+        }
+        while end.column + 1 == self.rows[end.row].cells.len() && self.rows[end.row].ends_in_osc {
+            let Some(next) = self.rows.get(end.row + 1) else {
+                break;
+            };
+            if !next.continues_osc || next.cells.first()?.link.as_deref() != Some(uri) {
+                break;
+            }
+            end = CellPosition {
+                row: end.row + 1,
+                column: next.links.first()?.end - 1,
+            };
+        }
+        Some((start, end))
     }
 }
 
@@ -152,18 +192,21 @@ pub(super) fn links(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
 fn hint_positions(frame: &Frame) -> Vec<(CellPosition, Arc<str>)> {
     let mut hints: Vec<(CellPosition, Arc<str>)> = Vec::new();
     for (row, line) in frame.rows.iter().enumerate().rev() {
-        let mut previous: Option<&Arc<str>> = None;
-        for (column, cell) in line.cells.iter().enumerate() {
-            if let Some(link) = &cell.link
-                && previous != Some(link)
+        for span in &line.links {
+            if let Some(link) = &line.cells[span.start].link
                 && !hints.iter().any(|(_, seen)| seen == link)
             {
-                hints.push((CellPosition { row, column }, link.clone()));
+                hints.push((
+                    CellPosition {
+                        row,
+                        column: span.start,
+                    },
+                    link.clone(),
+                ));
                 if hints.len() == 9 {
                     return hints;
                 }
             }
-            previous = cell.link.as_ref();
         }
     }
     hints
@@ -172,7 +215,7 @@ fn hint_positions(frame: &Frame) -> Vec<(CellPosition, Arc<str>)> {
 #[cfg(test)]
 mod tests {
     use super::{candidate, hint_positions, links};
-    use crate::terminal::frame::frame;
+    use crate::terminal::frame::Frame;
     use ghostty_vt::{Terminal, render::RenderState, terminal::Options};
 
     #[test]
@@ -207,7 +250,10 @@ mod tests {
         terminal.vt_write(
             b"old pwr://artifact/a\r\nnew pwr://artifact/b and pwr://artifact/c\r\nagain pwr://artifact/a\r\n",
         );
-        let frame = frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap();
+        let frame = Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap();
         let hints: Vec<_> = hint_positions(&frame)
             .into_iter()
             .map(|(position, link)| (position.row, link.to_string()))
@@ -227,7 +273,10 @@ mod tests {
         let mut terminal = Terminal::new(Options::default()).unwrap();
         terminal
             .vt_write(b"\x1b]8;;pwr://dag/osc-1\x1b\\Open graph\x1b]8;;\x1b\\ pwr://dag/plain-2.");
-        let frame = frame(&mut RenderState::new().unwrap(), &terminal, 0xdbe3ee).unwrap();
+        let frame = Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap();
         let cells = &frame.rows[0].cells;
         assert_eq!(cells[0].link.as_deref(), Some("pwr://dag/osc-1"));
         assert_eq!(
