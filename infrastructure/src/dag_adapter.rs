@@ -2,19 +2,24 @@ use crate::{
     box_icons::IconFiles,
     boxes::BoxesFile,
     dag_store::SqliteDagStore,
+    talk_adapter::DaemonTalk,
     terminal::PtyRuntime,
     wire::{self, DagRequest, DagResponse, Response, WorktreePruneEntry, WorktreeScope},
 };
 use anyhow::{Context, Result};
 use application::dag::{
-    BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EventScope, PlanTask,
-    StartAgent,
+    BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EditDelivery, EditTask,
+    EventScope, PlanTask, StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
 pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile, IconFiles>;
 
-pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<DagResponse> {
+pub(crate) fn request(
+    application: &DaemonDag,
+    talk: &DaemonTalk,
+    request: DagRequest,
+) -> Result<DagResponse> {
     use DagResponse as Reply;
     let response = match request {
         DagRequest::ListBoxes => Reply::Boxes {
@@ -106,6 +111,53 @@ pub(crate) fn request(application: &DaemonDag, request: DagRequest) -> Result<Da
         DagRequest::AddDependency { run, task, dep } => Reply::Run {
             run: application.add_dependency(&run, &task, &dep)?.into(),
         },
+        DagRequest::EditTask {
+            run,
+            task,
+            title,
+            instructions,
+            caller,
+        } => {
+            if let Some(session) = &caller {
+                // As for `power talk send`, a coding session sends as a peer.
+                application.register_coding_session(session)?;
+            }
+            let edited = application.edit_task(
+                EditTask {
+                    run,
+                    task,
+                    title,
+                    instructions,
+                    caller,
+                },
+                talk,
+            )?;
+            Reply::TaskEdited {
+                run: edited.run.id,
+                task: edited.task.into(),
+                delivery: match edited.delivery {
+                    EditDelivery::None => wire::EditDelivery::None,
+                    EditDelivery::Sent {
+                        agent,
+                        attempt,
+                        message,
+                    } => wire::EditDelivery::Sent {
+                        agent,
+                        attempt,
+                        message,
+                    },
+                    EditDelivery::Failed {
+                        agent,
+                        attempt,
+                        error,
+                    } => wire::EditDelivery::Failed {
+                        agent,
+                        attempt,
+                        error,
+                    },
+                },
+            }
+        }
         DagRequest::PlanTask {
             run,
             task,
