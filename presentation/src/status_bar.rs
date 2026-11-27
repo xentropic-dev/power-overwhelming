@@ -2,6 +2,7 @@ use crate::terminal::{column_width, terminal_font_family};
 use gpui::{prelude::*, *};
 use infrastructure::plugins::{
     ActiveView,
+    panel::PanelPlugins,
     ui::{Overflow, UiActions, UiColor, UiPlugins, UiRow, UiSegment, UiUpdate},
 };
 use infrastructure::{
@@ -104,8 +105,9 @@ impl StatusBar {
         cx: &mut Context<Self>,
         defaults: Sections,
         validate: fn(&Sections) -> anyhow::Result<S>,
+        panels: PanelPlugins,
     ) -> Self {
-        let (plugins, updates) = UiPlugins::start(defaults, validate);
+        let (plugins, updates) = UiPlugins::start(defaults, validate, panels);
         let updates = cx.spawn_in(window, async move |bar, cx| {
             while let Ok(update) = updates.recv().await {
                 if bar
