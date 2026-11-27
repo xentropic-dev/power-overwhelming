@@ -979,6 +979,9 @@ pub enum DagRequest {
         box_sel: String,
         from_session: String,
         branch: String,
+        /// Where to check out the branch. Defaults to the box's folder under the worktree root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
     },
     ListManagedWorktrees {
         scope: WorktreeScope,

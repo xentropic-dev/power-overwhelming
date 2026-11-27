@@ -188,7 +188,7 @@ const TABLE: &[Entry] = &[
         "worktree",
         C::TabWorktree,
         &["t"],
-        "New tab in another worktree",
+        "New tab in a new worktree",
     ),
     entry(S::Tab, "pick", C::TabPick, &["w"], "Pick tab"),
     entry(S::Tab, "recover", C::TabRecover, &["r"], "Recover session"),
