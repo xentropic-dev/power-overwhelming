@@ -52,8 +52,8 @@ pub fn trim(text: &str, max: usize) -> String {
 
 /// The refresh interval from the `dashboard` settings: `refresh_ms`, at least 250.
 pub fn refresh_ms(config_json: &str) -> Result<u32, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(config_json).map_err(|error| format!("dashboard settings: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|error| format!("dashboard settings: {error}"))?;
     let Some(ms) = value.get("refresh_ms") else {
         return Ok(DEFAULT_REFRESH_MS);
     };

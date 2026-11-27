@@ -7,6 +7,8 @@ mod host;
 #[cfg(feature = "wasm-plugins")]
 pub mod panel;
 #[cfg(feature = "wasm-plugins")]
+mod panel_overview;
+#[cfg(feature = "wasm-plugins")]
 mod status;
 #[cfg(feature = "wasm-plugins")]
 pub mod ui;

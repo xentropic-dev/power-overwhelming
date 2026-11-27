@@ -96,31 +96,35 @@ impl PanelView {
             .as_ref()
             .map_or_else(|| "Loading…".to_owned(), |panel| panel.title.clone());
         let sections = self.panel.iter().flat_map(|panel| {
-            panel.sections.iter().enumerate().map(move |(index, section)| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .when(index > 0, |section| {
-                        section
-                            .mt_2()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(colors.border))
-                    })
-                    .child(
-                        div()
-                            .text_color(rgb(colors.accent))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(section.heading.clone()),
-                    )
-                    .children(
-                        section
-                            .lines
-                            .iter()
-                            .map(|line| render_line(colors, line, cell_width)),
-                    )
-            })
+            panel
+                .sections
+                .iter()
+                .enumerate()
+                .map(move |(index, section)| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .when(index > 0, |section| {
+                            section
+                                .mt_2()
+                                .pt_2()
+                                .border_t_1()
+                                .border_color(rgb(colors.border))
+                        })
+                        .child(
+                            div()
+                                .text_color(rgb(colors.accent))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(section.heading.clone()),
+                        )
+                        .children(
+                            section
+                                .lines
+                                .iter()
+                                .map(|line| render_line(colors, line, cell_width)),
+                        )
+                })
         });
         div()
             .absolute()
@@ -255,17 +259,17 @@ fn render_bar(colors: &Colors, bar: &PanelBar, cell_width: Pixels) -> impl IntoE
         .w(cell_width * bar.width as f32)
         .h(px(TEXT_SIZE * 0.7))
         .bg(rgb(resolve(colors, bar.bg.as_deref(), colors.raised)))
-        .child(
-            div()
-                .h_full()
-                .w(relative(ratio))
-                .bg(rgb(resolve(colors, bar.fg.as_deref(), colors.accent))),
-        )
+        .child(div().h_full().w(relative(ratio)).bg(rgb(resolve(
+            colors,
+            bar.fg.as_deref(),
+            colors.accent,
+        ))))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::PanelView;
+    use gpui::px;
 
     #[test]
     fn columns_follow_the_viewport() {
