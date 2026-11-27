@@ -228,9 +228,9 @@ impl Picker {
         } else {
             Config::DEFAULT
         };
-        let mut matcher = Matcher::new(matcher_config);
+        let matcher = Matcher::new(matcher_config);
         let command_order = match &kind {
-            Kind::Commands { recent } => order_commands(&rows, recent, "", &mut matcher),
+            Kind::Commands { recent } => order_commands(&rows, recent, ""),
             _ => Vec::new(),
         };
         Self {
@@ -769,8 +769,7 @@ impl Picker {
                 self.scroll.scroll_to_item(self.selected);
             }
             Kind::Commands { recent } => {
-                self.command_order =
-                    order_commands(&self.rows, recent, &self.query, &mut self.matcher);
+                self.command_order = order_commands(&self.rows, recent, &self.query);
             }
             _ => self.refresh_completions(),
         }
@@ -1231,15 +1230,10 @@ fn search_shortcuts(shortcuts: &[Shortcut], query: &str, matcher: &mut Matcher) 
 }
 
 /// Orders command palette rows. With an empty query the recent commands come first, newest
-/// first, then the rest in table order. Otherwise rows are ranked by fuzzy score over the
-/// description and binding, with a small bonus for recent commands. Returns row indices,
-/// each with whether its command is recent.
-fn order_commands(
-    rows: &[Row],
-    recent: &[Command],
-    query: &str,
-    matcher: &mut Matcher,
-) -> Vec<(usize, bool)> {
+/// first, then the rest in table order. Otherwise rows are ranked like every other picker
+/// (see [`fuzzy_rank`]), with a small bonus for recent commands among rows matched the same
+/// way. Returns row indices, each with whether its command is recent.
+fn order_commands(rows: &[Row], recent: &[Command], query: &str) -> Vec<(usize, bool)> {
     let is_recent =
         |row: &Row| matches!(row.choice, Choice::Command(command) if recent.contains(&command));
     if query.trim().is_empty() {
@@ -1258,27 +1252,16 @@ fn order_commands(
             .chain(rest.map(|index| (index, false)))
             .collect();
     }
-    let pattern = Pattern::new(
-        query,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    );
-    let mut buffer = Vec::new();
-    let mut matches: Vec<_> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, row)| {
-            let text = format!("{} {}", row.label, row.detail);
-            let score = pattern.score(Utf32Str::new(&text, &mut buffer), matcher)?;
-            let recent = is_recent(row);
-            Some((index, recent, score + if recent { RECENT_BONUS } else { 0 }))
-        })
-        .collect();
-    matches.sort_by_key(|&(_, _, score)| Reverse(score));
+    let mut matches = fuzzy_rank(rows, query);
+    for (index, (_, score)) in &mut matches {
+        if is_recent(&rows[*index]) {
+            *score += RECENT_BONUS;
+        }
+    }
+    matches.sort_by_key(|&(index, rank)| (Reverse(rank), index));
     matches
         .into_iter()
-        .map(|(index, recent, _)| (index, recent))
+        .map(|(index, _)| (index, is_recent(&rows[index])))
         .collect()
 }
 
@@ -1664,8 +1647,7 @@ mod tests {
     }
 
     fn ordered(rows: &[Row], recent: &[Command], query: &str) -> Vec<(Command, bool)> {
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        order_commands(rows, recent, query, &mut matcher)
+        order_commands(rows, recent, query)
             .into_iter()
             .map(|(index, recent)| match rows[index].choice {
                 Choice::Command(command) => (command, recent),
@@ -1738,6 +1720,26 @@ mod tests {
     }
 
     #[test]
+    fn palette_ranks_like_other_pickers() {
+        let keymap = Keymap::default();
+        let rows = palette_rows(&keymap);
+        // Label matches beat matches that need the binding, even for a recent command.
+        let order = ordered(&rows, &[Command::BoxNew], "reload");
+        assert_eq!(order.first(), Some(&(Command::Reload, false)));
+        // A binding-only query still finds the command.
+        let order = ordered(&rows, &[], "ctrl+b then p");
+        assert!(
+            order
+                .iter()
+                .all(|(command, _)| *command != Command::Palette)
+        );
+        assert!(!order.is_empty());
+        // fzf syntax: an exact-prefix atom.
+        let order = ordered(&rows, &[], "^quit");
+        assert_eq!(order, [(Command::Quit, false)]);
+    }
+
+    #[test]
     fn path_match_prefers_the_final_component() {
         let rank = |query, relative| matches(query, relative).unwrap().0;
         assert!(rank("pwo", "src/power-overwhelming") > rank("pwo", "Pictures/wallpapers/old"));
@@ -1799,15 +1801,28 @@ mod tests {
 /// Fuzzy-filters rows with nucleo (fzf syntax, smart case). Rows whose label matches on its own
 /// rank first, so run titles beat accidental hits inside UUIDs or details. Ties keep list order.
 fn fuzzy_rows(rows: &[Row], query: &str) -> Vec<Row> {
+    if query.trim().is_empty() {
+        return rows.to_vec();
+    }
+    let mut ranked = fuzzy_rank(rows, query);
+    ranked.sort_by_key(|&(index, rank)| (Reverse(rank), index));
+    ranked
+        .into_iter()
+        .map(|(index, _)| rows[index].clone())
+        .collect()
+}
+
+/// The rows that the fuzzy `query` matches, in list order, each with its rank: whether the
+/// label matches on its own, then the nucleo score. Higher ranks sort first.
+fn fuzzy_rank(rows: &[Row], query: &str) -> Vec<(usize, (bool, u32))> {
     let query = query.trim();
     if query.is_empty() {
-        return rows.to_vec();
+        return Vec::new();
     }
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buffer = Vec::new();
-    let mut ranked: Vec<_> = rows
-        .iter()
+    rows.iter()
         .enumerate()
         .filter_map(|(index, row)| {
             let label = pattern.score(Utf32Str::new(row.label.trim(), &mut buffer), &mut matcher);
@@ -1827,11 +1842,9 @@ fn fuzzy_rows(rows: &[Row], query: &str) -> Vec<Row> {
                     )
                 }
             };
-            Some((Reverse(rank), index, row))
+            Some((index, rank))
         })
-        .collect();
-    ranked.sort_by_key(|&(rank, index, _)| (rank, index));
-    ranked.into_iter().map(|(_, _, row)| row.clone()).collect()
+        .collect()
 }
 
 /// Byte ranges of `text` that the fuzzy `query` matches, for highlighting. Empty when it doesn't match.
@@ -1879,7 +1892,10 @@ mod fuzzy_row_tests {
 
     #[test]
     fn highlights_cover_the_matched_characters() {
-        assert_eq!(super::fuzzy_highlights("acc", "Acceptance"), [0..3]);
+        assert_eq!(
+            super::fuzzy_highlights("acc", "Acceptance"),
+            [std::ops::Range { start: 0, end: 3 }]
+        );
         assert_eq!(super::fuzzy_highlights("rfp", "Refactor picker").len(), 3);
         assert!(super::fuzzy_highlights("zzz", "Acceptance").is_empty());
     }
