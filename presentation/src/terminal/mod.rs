@@ -208,9 +208,13 @@ impl TerminalView {
         });
         let focus = cx.focus_handle();
         let focus_changes = [
-            cx.on_focus(&focus, window, |view, window, _| view.sync_focus(window)),
-            cx.on_blur(&focus, window, |view, window, _| view.sync_focus(window)),
-            cx.observe_window_activation(window, |view, window, _| view.sync_focus(window)),
+            cx.on_focus(&focus, window, |view, window, cx| {
+                view.sync_focus(window, cx)
+            }),
+            cx.on_blur(&focus, window, |view, window, cx| {
+                view.sync_focus(window, cx)
+            }),
+            cx.observe_window_activation(window, |view, window, cx| view.sync_focus(window, cx)),
         ];
         let mut terminal = Terminal::new(Options::default()).expect("allocate Ghostty terminal");
         scheme

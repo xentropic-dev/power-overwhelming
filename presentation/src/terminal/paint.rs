@@ -135,7 +135,8 @@ impl Render for TerminalView {
         self.grid.metrics = metrics;
         let (cell_size, pad) = (metrics.size, px(self.settings.padding));
         let font_size = px(self.font.size);
-        let cursor_focused = self.focus.is_focused(window);
+        // Matches focus reporting: an inactive window draws the hollow cursor.
+        let cursor_focused = self.typing.focused();
         let terminal = cx.entity();
         let pointer_owner = terminal.downgrade();
         let frame = self.frame.clone();
@@ -163,6 +164,7 @@ impl Render for TerminalView {
         let input_owner = terminal.clone();
         let selection_background = Hsla::from(rgba(scheme.selection_background));
         let terminal_font = self.font.font.clone();
+        let block_font = terminal_font.clone();
         let hovered = self.hovered_span();
         let pressed = self.pressed_span();
         let selection = self.selection_range().filter(|_| pressed.is_none());
@@ -351,17 +353,19 @@ impl Render for TerminalView {
                                     match cursor.style {
                                         CursorVisualStyle::Block => {
                                             window.paint_quad(fill(bounds, color));
-                                            if let Some(cell) = frame
+                                            if let Some((text, font)) = frame
                                                 .rows
                                                 .get(row)
                                                 .and_then(|line| line.cells.get(column))
-                                                .filter(|cell| !cell.text.trim().is_empty())
+                                                .and_then(|cell| {
+                                                    cursor_glyph(cell, &block_font, bold_weight)
+                                                })
                                             {
                                                 paint_cursor_glyph(
                                                     window,
-                                                    &terminal_font,
+                                                    &font,
                                                     font_size,
-                                                    &cell.text,
+                                                    text,
                                                     origin
                                                         + point(metrics.glyph_x, metrics.baseline),
                                                     Hsla::from(rgb(background)),
@@ -485,6 +489,26 @@ fn paint_cursor_outline(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla
     ));
 }
 
+/// The text a focused block cursor redraws over its cell, in the cell's face. Concealed
+/// (SGR 8) and blank cells keep the block but draw no glyph.
+fn cursor_glyph<'a>(
+    cell: &'a super::frame::Cell,
+    font: &Font,
+    bold_weight: FontWeight,
+) -> Option<(&'a str, Font)> {
+    if cell.style.invisible || cell.text.trim().is_empty() {
+        return None;
+    }
+    let mut font = font.clone();
+    if cell.style.bold {
+        font.weight = bold_weight;
+    }
+    if cell.style.italic {
+        font.style = FontStyle::Italic;
+    }
+    Some((&cell.text, font))
+}
+
 fn paint_cursor_glyph(
     window: &mut Window,
     font: &Font,
@@ -518,9 +542,10 @@ fn paint_cursor_glyph(
 
 #[cfg(test)]
 mod tests {
-    use super::{CellMetrics, Highlights, Rc, link_underline};
+    use super::{CellMetrics, Highlights, Rc, cursor_glyph, link_underline};
     use crate::terminal::frame::Frame;
     use ghostty_vt::{Terminal, render::RenderState, terminal::Options};
+    use gpui::{FontStyle, FontWeight, font};
 
     #[test]
     fn link_underline_yields_to_the_cells_own_underline() {
@@ -567,5 +592,25 @@ mod tests {
         assert!(!Rc::ptr_eq(&link, &zoom));
         let font = row.draw_with(1, scaled, hovered(), Some(2), |_| Vec::new());
         assert!(!Rc::ptr_eq(&zoom, &font));
+    }
+
+    #[test]
+    fn block_cursor_hides_concealed_text_and_keeps_the_cells_face() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(b"\x1b[2 q\x1b[8mM\x1b[0m\x1b[1;3mB\x1b[0mp \x1b[1;1H");
+        let frame = Frame::default()
+            .update(&mut RenderState::new().unwrap(), &terminal)
+            .unwrap()
+            .unwrap();
+        let cells = &frame.rows[0].cells;
+        let base = font("Mono");
+        let bold = FontWeight::BOLD;
+        assert!(cursor_glyph(&cells[0], &base, bold).is_none());
+        let (text, face) = cursor_glyph(&cells[1], &base, bold).unwrap();
+        assert_eq!(text, "B");
+        assert_eq!((face.weight, face.style), (bold, FontStyle::Italic));
+        let (_, plain) = cursor_glyph(&cells[2], &base, bold).unwrap();
+        assert_eq!((plain.weight, plain.style), (base.weight, base.style));
+        assert!(cursor_glyph(&cells[3], &base, bold).is_none());
     }
 }
