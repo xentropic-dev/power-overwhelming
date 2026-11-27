@@ -41,14 +41,11 @@ impl Owner {
     }
 
     /// Asks everything to exit, waits up to `grace`, then kills what is left. With a
-    /// cgroup this returns only once the cgroup is empty. The fallback's error names
-    /// processes it could not end.
+    /// cgroup, `Ok` means the cgroup is empty. The error names what could not be
+    /// ended.
     pub(crate) fn terminate(&mut self, grace: Duration) -> Result<(), String> {
         match self {
-            Self::Scope { root, scope } => {
-                scope.terminate(root, grace);
-                Ok(())
-            }
+            Self::Scope { root, scope } => scope.terminate(root, grace),
             Self::Tree(tree) => tree.terminate(grace),
         }
     }

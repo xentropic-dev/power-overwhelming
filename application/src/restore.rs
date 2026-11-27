@@ -14,6 +14,14 @@ pub struct RestoredSession {
     pub prompted: bool,
 }
 
+/// What `restore_sessions_deferring` did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Restore {
+    pub restored: Vec<RestoredSession>,
+    /// Sessions left unrestored because what an earlier daemon left of them still runs.
+    pub deferred: Vec<String>,
+}
+
 /// What the caller of `restore_sessions_with` wants for one saved session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RestoreChoice {
@@ -50,7 +58,19 @@ impl<T: TerminalRuntime> Application<T> {
         &self,
         choose: impl Fn(&str) -> RestoreChoice,
     ) -> Result<Vec<RestoredSession>> {
+        Ok(self.restore_sessions_deferring(choose)?.restored)
+    }
+
+    /// Restores like `restore_sessions_with`, and also returns the sessions whose
+    /// earlier processes could not all be ended. Those keep their records and are
+    /// neither relaunched nor forgotten, so a replacement never runs beside them. A
+    /// later `reclaim` that succeeds lets them go.
+    pub fn restore_sessions_deferring(
+        &self,
+        choose: impl Fn(&str) -> RestoreChoice,
+    ) -> Result<Restore> {
         let mut restored = Vec::new();
+        let mut deferred = Vec::new();
         for record in self.records.list()? {
             // Anything an earlier daemon left of the session ends first, whether it
             // is relaunched or forgotten, so a finished worker's teardown that the
@@ -62,6 +82,15 @@ impl<T: TerminalRuntime> Application<T> {
                     record.id
                 );
             }
+            if reclaimed.is_err() {
+                // The record is how a later start or retry finds what still runs.
+                eprintln!(
+                    "Keeping session {} unrestored until what still runs of it ends.",
+                    record.id
+                );
+                deferred.push(record.id);
+                continue;
+            }
             let plan = match choose(&record.id) {
                 RestoreChoice::Resume(continuation) => self.restore_plan(&record, continuation),
                 RestoreChoice::Forget(reason) => Ok(Plan::Drop(reason)),
@@ -70,11 +99,6 @@ impl<T: TerminalRuntime> Application<T> {
                 Ok(Plan::Launch(options)) => options,
                 Ok(Plan::Drop(reason)) => {
                     eprintln!("Not restoring session {}: {reason}.", record.id);
-                    if reclaimed.is_err() {
-                        // The record is how a later start finds what still runs.
-                        eprintln!("Keeping session {} so a later start ends it.", record.id);
-                        continue;
-                    }
                     if let Err(error) = self.records.remove(&record.id) {
                         eprintln!("Could not forget session {}. {error:#}", record.id);
                     }
@@ -99,7 +123,7 @@ impl<T: TerminalRuntime> Application<T> {
                 Err(error) => eprintln!("Could not restore session {}. {error:#}", record.id),
             }
         }
-        Ok(restored)
+        Ok(Restore { restored, deferred })
     }
 
     fn restore_plan(&self, record: &SessionRecord, continuation: Option<String>) -> Result<Plan> {

@@ -37,7 +37,9 @@ use std::{
 };
 
 pub(crate) type ActiveScheme = Arc<RwLock<&'static Scheme>>;
-type ExitHandler = Arc<dyn Fn(&str, &str) + Send + Sync>;
+/// Reports a session's exit with its detail, and whether everything it started has
+/// exited. An incomplete end leaves processes that a later reclaim must end.
+type ExitHandler = Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
 type ModelChanged = Arc<dyn Fn(&str, &Agent, Option<&str>) -> Result<()> + Send + Sync>;
 /// Saves a session's foreground agent, its conversation and the shell's directory.
 type ForegroundChanged =
@@ -90,6 +92,8 @@ pub struct PtyRuntime {
 }
 
 struct Lifecycle {
+    /// Set when the teardown could not end everything the session started.
+    incomplete: AtomicBool,
     input: Mutex<TerminalInput>,
     talk_wake: SyncSender<()>,
     running: AtomicBool,
@@ -129,7 +133,8 @@ impl Lifecycle {
         if self.running.swap(false, Ordering::AcqRel) {
             self.input.lock().unwrap().writer.take();
             if !self.shutting_down.load(Ordering::Acquire) {
-                (self.on_exit)(&self.session, detail);
+                let complete = !self.incomplete.load(Ordering::Acquire);
+                (self.on_exit)(&self.session, detail, complete);
             }
         }
     }
@@ -279,10 +284,10 @@ impl TerminalRuntime for PtyRuntime {
     }
 
     fn reclaim(&self, session: &str) -> Result<()> {
-        let Some(scopes) = &self.scopes else {
-            return Ok(());
+        let ended = match &self.scopes {
+            Some(scopes) => scopes.reclaim(session, RECLAIM_TIMEOUT)?,
+            None => crate::reaper::reclaim(&format!("POWER_SESSION={session}"), RECLAIM_TIMEOUT)?,
         };
-        let ended = scopes.reclaim(session, RECLAIM_TIMEOUT)?;
         if ended > 0 {
             eprintln!("Ended {ended} scope(s) an earlier daemon left for session {session}.");
         }
@@ -392,7 +397,16 @@ fn launch(
         process.arg(prompt);
     }
     let server = configure(&mut process, runtime, session, &options, &cwd, profile);
+    // Without cgroups, a subreaper adopts whatever the program starts, so its exit
+    // still means the whole tree has gone.
+    let reaper = match &runtime.scopes {
+        Some(_) => None,
+        None => Some(std::env::current_exe().context("Find the reaper")?),
+    };
     let contain = |command: &mut CommandBuilder| {
+        if let Some(reaper) = &reaper {
+            crate::reaper::wrap(command, reaper);
+        }
         runtime
             .scopes
             .as_ref()
@@ -423,10 +437,19 @@ fn launch(
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
     let process = pair.slave.spawn_command(process)?;
-    let pid = process.process_id();
+    let reaped = reaper.is_some();
+    // The terminal follows the program, not the reaper that runs it.
+    let pid = process.process_id().map(|pid| {
+        if reaped {
+            crate::reaper::program_of(pid)
+        } else {
+            pid
+        }
+    });
     let started_at = crate::talk_adapter::now_ms();
     let (write_tx, write_rx) = mpsc::sync_channel::<Vec<u8>>(128);
     let lifecycle = Arc::new(Lifecycle {
+        incomplete: AtomicBool::new(false),
         input: Mutex::new(TerminalInput {
             activity: Activity {
                 last_output: started_at,
@@ -555,6 +578,13 @@ fn launch(
                     "Could not resume {}, so it starts a new conversation.",
                     waiter_lifecycle.session
                 );
+                let pid = pid.map(|pid| {
+                    if reaped {
+                        crate::reaper::program_of(pid)
+                    } else {
+                        pid
+                    }
+                });
                 let _ = waiter_tx.send(Command::Output(RESUME_NOTICE.as_bytes().to_vec()));
                 let _ = waiter_tx.send(Command::Relaunched(pid));
                 // A fresh start without a preassigned ID clears the rejected one, so a
@@ -565,13 +595,18 @@ fn launch(
         let detail = match result {
             Ok((status, Ok(()))) => format!("Worker process exited ({status})"),
             Ok((status, Err(left))) => {
+                waiter_lifecycle.incomplete.store(true, Ordering::Release);
                 eprintln!(
                     "Session {} ended incompletely: {left} are still running.",
                     waiter_lifecycle.session
                 );
                 format!("Worker process exited ({status}), but {left} are still running")
             }
-            Err(error) => format!("Could not wait for worker process ({error})"),
+            Err(error) => {
+                // Nothing confirmed the end, so a later reclaim must.
+                waiter_lifecycle.incomplete.store(true, Ordering::Release);
+                format!("Could not wait for worker process ({error})")
+            }
         };
         // Before the send, which blocks while an ending actor waits for this.
         drop(gone_guard);
@@ -832,6 +867,22 @@ impl TreeGone {
         let mut gone = self.gone.lock().unwrap();
         while !*gone {
             gone = self.changed.wait(gone).unwrap();
+        }
+    }
+
+    /// Waits like `wait`, discarding whatever arrives on `rx` meanwhile, so no
+    /// sender that the end waits for ever blocks on a full queue.
+    fn wait_draining<T>(&self, rx: &Receiver<T>) {
+        loop {
+            while rx.try_recv().is_ok() {}
+            let gone = self.gone.lock().unwrap();
+            if *gone {
+                return;
+            }
+            let _ = self
+                .changed
+                .wait_timeout(gone, Duration::from_millis(10))
+                .unwrap();
         }
     }
 }
@@ -1319,7 +1370,9 @@ fn terminal_actor(
                     // The PTY stays open until the waiter has ended the tree, so the
                     // processes get SIGTERM and its grace before any hangup.
                     drop(teardown);
-                    gone.wait();
+                    // The waiter may still be sending, such as a relaunch notice, so
+                    // the queue keeps draining while the tree ends.
+                    gone.wait_draining(&rx);
                     return Ok(Some(with_terminal_tail(
                         &terminal,
                         "Terminal session ended".into(),
@@ -2029,6 +2082,34 @@ mod tests {
     }
 
     #[test]
+    fn an_ending_actor_keeps_draining_so_a_full_queue_never_blocks_the_waiter() {
+        // The actor waits for the tree while the waiter, whose tree is not yet gone,
+        // sends into a queue that is already full, as after a relaunch.
+        let gone = Arc::new(TreeGone::default());
+        let (tx, rx) = mpsc::sync_channel::<u32>(1);
+        tx.send(0).unwrap();
+        let waiter = {
+            let gone = gone.clone();
+            thread::spawn(move || {
+                for notice in 1..=5 {
+                    tx.send(notice).unwrap();
+                }
+                gone.set();
+            })
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            gone.wait_draining(&rx);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the ending actor and the waiter deadlocked"
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
     fn a_root_exit_waits_for_a_detached_helper_with_a_clean_environment() -> Result<()> {
         let test = crate::cgroup::tests::TestScopes::new();
         let directory = tempfile::tempdir()?;
@@ -2158,13 +2239,14 @@ mod tests {
     fn exits_during_shutdown_are_not_reported() {
         let reported = Arc::new(Mutex::new(Vec::new()));
         let lifecycle = Lifecycle {
+            incomplete: AtomicBool::new(false),
             input: Mutex::default(),
             talk_wake: mpsc::sync_channel(1).0,
             running: AtomicBool::new(true),
             session: "worker".into(),
             on_exit: {
                 let reported = reported.clone();
-                Arc::new(move |session: &str, _: &str| {
+                Arc::new(move |session: &str, _: &str, _: bool| {
                     reported.lock().unwrap().push(session.to_owned())
                 })
             },

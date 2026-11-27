@@ -141,9 +141,9 @@ pub fn serve(
             scheme: scheme.clone(),
             profiles: profiles.clone(),
             talk_wake: talk_wake.clone(),
-            on_exit: Arc::new(move |session, detail| {
+            on_exit: Arc::new(move |session, detail, complete| {
                 if let Some(dag) = exit_dag.get().and_then(Weak::upgrade)
-                    && let Err(error) = dag.session_exited(session, detail)
+                    && let Err(error) = dag.session_exited(session, detail, complete)
                 {
                     eprintln!("Could not record exit for terminal {session}. {error:#}");
                 }
@@ -187,7 +187,7 @@ pub fn serve(
         let persistence = TimerScheduler::start("power-forget", scheduler::DEFAULT_CAPACITY)?;
         dag = dag.with_finished_worker_cleanup(grace, Arc::new(teardown), Arc::new(persistence));
     }
-    let dag = Arc::new(dag);
+    let dag = dag.shared();
     terminal_application
         .set(Arc::downgrade(&application))
         .expect("connect terminal callbacks to the application once");
@@ -273,6 +273,14 @@ fn start_queue(dag: Arc<DaemonDag>, _listening: &UnixListener) {
 /// Finds how this system lets Power own workers, and logs it. Without cgroup
 /// ownership, Power falls back to process discovery.
 fn worker_scopes() -> Option<Arc<WorkerScopes>> {
+    if std::env::var_os(cgroup::DISABLE_ENV).is_some_and(|value| value == "0") {
+        eprintln!(
+            "WARNING: {}=0, so workers run without cgroup ownership. Each runs under a \
+             subreaper that ends everything it started.",
+            cgroup::DISABLE_ENV
+        );
+        return None;
+    }
     let slice = std::env::var(cgroup::SLICE_ENV).unwrap_or_else(|_| cgroup::DEFAULT_SLICE.into());
     match WorkerScopes::detect(&slice) {
         Ok(scopes) => {
@@ -284,9 +292,9 @@ fn worker_scopes() -> Option<Arc<WorkerScopes>> {
         }
         Err(error) => {
             eprintln!(
-                "WARNING: workers run without cgroup ownership ({error:#}). Power falls back to \
-                 finding their processes by ancestry, session and POWER_SESSION, which cannot end \
-                 a process that leaves its session, clears its environment and is reparented."
+                "WARNING: workers run without cgroup ownership ({error:#}). Each runs under a \
+                 subreaper instead, which adopts and ends everything it started, though it \
+                 cannot freeze them."
             );
             None
         }

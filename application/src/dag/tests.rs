@@ -617,6 +617,8 @@ impl ArtifactStore for FakeArtifacts {
 struct FakeTerminal {
     launches: Mutex<Vec<(Session, SessionOptions)>>,
     fail_start: AtomicBool,
+    /// Reclaims fail while set, as when what an earlier daemon left cannot be ended.
+    fail_reclaim: AtomicBool,
 }
 
 impl TerminalRuntime for FakeTerminal {
@@ -650,6 +652,14 @@ impl TerminalRuntime for FakeTerminal {
 
     fn agent(&self, _: &Self::Handle) -> Option<Agent> {
         None
+    }
+
+    fn reclaim(&self, _: &str) -> Result<()> {
+        ensure!(
+            !self.fail_reclaim.load(Ordering::Acquire),
+            "cgroup.kill: Read-only file system"
+        );
+        Ok(())
     }
 }
 
@@ -1042,7 +1052,7 @@ fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> R
     let first = dag.start(new_worktree(&run, "feature/original", Some("main")))?;
     let mut previous = first.attempt.clone();
     for number in 2..=3 {
-        dag.session_exited(previous.session.as_deref().unwrap(), "interrupted")?;
+        dag.session_exited(previous.session.as_deref().unwrap(), "interrupted", true)?;
         let retry = dag.start(Dispatch {
             provider: Provider::Agent("codex".into()),
             worktree: WorktreeRequest::RetryManaged,
@@ -1059,7 +1069,7 @@ fn managed_retries_keep_reusing_the_worktree_until_a_new_one_is_requested() -> R
     }
     assert_eq!(workspace.0.lock().unwrap().creation_requests.len(), 1);
 
-    dag.session_exited(previous.session.as_deref().unwrap(), "interrupted")?;
+    dag.session_exited(previous.session.as_deref().unwrap(), "interrupted", true)?;
     let fresh = dag.start(Dispatch {
         retry: true,
         ..new_worktree(&run, "feature/fresh", Some("main"))
@@ -1116,7 +1126,7 @@ fn attempts_list_their_sessions_artifacts_in_publish_order() -> Result<()> {
     let (dag, run) = setup()?;
     let first = dag.start(command(&run, false))?;
     let first_session = first.agent.session.unwrap();
-    dag.session_exited(&first_session, "worker exited")?;
+    dag.session_exited(&first_session, "worker exited", true)?;
     let second = dag.start(command(&run, true))?;
     let second_session = second.agent.session.unwrap();
 
@@ -1174,7 +1184,7 @@ fn exit_without_report_interrupts_and_late_and_replayed_reports_are_safe() -> Re
     let first = dag.start(command(&run, false))?;
     let first_id = first.attempt.id;
     let session = first.agent.session.unwrap();
-    dag.session_exited(&session, "worker exited with code 7")?;
+    dag.session_exited(&session, "worker exited with code 7", true)?;
     assert_eq!(dag.run(&run)?.tasks[0].state, TaskState::Interrupted);
     let agent = dag.store.read(|db| db.agent(&first.agent.id))?;
     assert_eq!(agent.state, AgentState::Exited);
@@ -1600,6 +1610,19 @@ fn terminal_reports_end_the_worker_session_after_the_grace() -> Result<()> {
         assert!(Instant::now() < deadline, "finished sessions never ended");
         thread::sleep(Duration::from_millis(10));
     }
+    // An ended session keeps its record until its exit confirms nothing of it runs.
+    assert_eq!(dag.application.records.list()?.len(), 3);
+    for (session, _) in &ended {
+        dag.session_exited(session, "ended", true)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dag.application.records.list()?.len() > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "ended sessions were never forgotten"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let saved: Vec<_> = dag
         .application
         .records
@@ -1687,8 +1710,9 @@ fn a_refused_cleanup_ends_the_finished_worker_at_once() -> Result<()> {
     assert!(result.applied);
     assert_eq!(scheduler.0.load(Ordering::Acquire), 1);
     assert!(!handle.load(Ordering::Acquire), "the cleanup was lost");
-    assert!(dag.application.terminal(&session).is_err());
-    assert!(dag.application.records.list()?.is_empty());
+    // The exit confirms the end. A refused forget leaves the record to the next start.
+    dag.session_exited(&session, "ended", true)?;
+    assert_eq!(dag.application.records.list()?.len(), 1);
     Ok(())
 }
 
@@ -1728,6 +1752,114 @@ fn a_replayed_terminal_report_schedules_the_cleanup_again() -> Result<()> {
     }
     assert!(!handle.load(Ordering::Acquire));
     Ok(())
+}
+
+#[test]
+fn an_incomplete_exit_keeps_the_agent_running_and_the_record_until_a_reclaim_ends_it() -> Result<()>
+{
+    let (dag, run) = setup()?;
+    let dag = dag
+        .with_finished_worker_cleanup(
+            Duration::from_secs(600),
+            Arc::new(HeldScheduler::default()),
+            Arc::new(ThreadScheduler),
+        )
+        .shared();
+    let dispatched = dag.start(command(&run, false))?;
+    let session = dispatched.agent.session.unwrap();
+    dag.report(
+        &run,
+        "work",
+        &dispatched.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(true, Ordering::Release);
+    dag.session_exited(&session, "ended, but a helper still runs", false)?;
+    let agent = || -> Result<ManagedAgent> {
+        Ok(dag.store.read(|db| db.session_agent(&session))?.unwrap())
+    };
+    assert_eq!(agent()?.state, AgentState::Running);
+    assert_eq!(dag.application.records.list()?.len(), 1);
+
+    // The live terminal is gone, as it is once its process exits. A failing reclaim
+    // keeps both; one that ends everything lets them go.
+    dag.application.sessions.lock().unwrap().remove(&session);
+    dag.retry_reclaim(session.clone());
+    assert_eq!(agent()?.state, AgentState::Running);
+    assert_eq!(dag.application.records.list()?.len(), 1);
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(false, Ordering::Release);
+    dag.retry_reclaim(session.clone());
+    assert_eq!(agent()?.state, AgentState::Exited);
+    assert!(dag.application.records.list()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_restart_whose_reclaim_fails_neither_exits_the_agent_nor_relaunches_the_session() -> Result<()>
+{
+    let (dag, run) = setup()?;
+    let dag = dag.shared();
+    dag.add_tasks(&run, &[spec("active", &[])])?;
+    let mut sessions = BTreeMap::new();
+    for task in ["work", "active"] {
+        let dispatched = dag.start(Dispatch {
+            task: task.into(),
+            ..command(&run, false)
+        })?;
+        if task == "work" {
+            dag.report(
+                &run,
+                task,
+                &dispatched.attempt.id,
+                ReportStatus::Success,
+                "done",
+            )?;
+        }
+        sessions.insert(task, dispatched.agent.session.unwrap());
+    }
+    let launches = dag.application.runtime.launches.lock().unwrap().len();
+    // The daemon restarts, and what it left of both sessions cannot be ended.
+    dag.application.sessions.lock().unwrap().clear();
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(true, Ordering::Release);
+
+    let restored = dag.restore()?;
+
+    assert!(restored.is_empty(), "{restored:?}");
+    assert_eq!(
+        dag.application.runtime.launches.lock().unwrap().len(),
+        launches,
+        "a replacement launched beside processes that still run"
+    );
+    for session in sessions.values() {
+        let agent = dag.store.read(|db| db.session_agent(session))?.unwrap();
+        assert_eq!(agent.state, AgentState::Running, "{session}");
+    }
+    assert_eq!(dag.application.records.list()?.len(), 2);
+    // No daemon follows the active worker any more, so its attempt is interrupted.
+    let snapshot = dag.run(&run)?;
+    assert_eq!(
+        task_in(&snapshot, "active").attempts[0].state,
+        AttemptState::Interrupted
+    );
+    assert_eq!(
+        task_in(&snapshot, "work").attempts[0].state,
+        AttemptState::Succeeded
+    );
+    Ok(())
+}
+
+fn task_in<'a>(run: &'a Run, id: &str) -> &'a Task {
+    run.tasks.iter().find(|task| task.id == id).unwrap()
 }
 
 /// Keeps records but refuses to delete them, as a failing session database does.
@@ -1896,15 +2028,15 @@ fn a_blocked_session_write_never_delays_the_next_finished_workers_teardown() -> 
     let run = external_run(&dag)?;
     dag.add_tasks(&run, &[spec("second", &[])])?;
     let mut handles = Vec::new();
+    let mut sessions = Vec::new();
     for task in ["work", "second"] {
         let dispatched = dag.start(Dispatch {
             task: task.into(),
             ..command(&run, false)
         })?;
-        handles.push(
-            dag.application
-                .terminal(&dispatched.agent.session.unwrap())?,
-        );
+        let session = dispatched.agent.session.unwrap();
+        handles.push(dag.application.terminal(&session)?);
+        sessions.push(session);
         dag.report(
             &run,
             task,
@@ -1922,8 +2054,15 @@ fn a_blocked_session_write_never_delays_the_next_finished_workers_teardown() -> 
         );
         thread::sleep(Duration::from_millis(10));
     }
+    for handle in ["work", "second"].iter().zip(&sessions) {
+        dag.session_exited(handle.1, "ended", true)?;
+    }
     // The first delete is still blocked while both workers have ended.
-    assert_eq!(records.waiting.load(Ordering::Acquire), 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while records.waiting.load(Ordering::Acquire) != 1 {
+        assert!(Instant::now() < deadline, "the first delete never started");
+        thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(records.list()?.len(), 2);
 
     records.open();
@@ -2041,7 +2180,7 @@ fn agent_status_follows_the_attempt_while_the_session_lives() -> Result<()> {
     ] {
         dag.report(&run, task, &attempt.attempt.id, status, "summary")?;
     }
-    dag.session_exited(exited.agent.session.as_deref().unwrap(), "closed")?;
+    dag.session_exited(exited.agent.session.as_deref().unwrap(), "closed", true)?;
 
     let status = |id: &str| dag.store.read(|db| db.agent(id)).map(|agent| agent.status);
     assert_eq!(status(&working.agent.id)?, AgentStatus::Working);
@@ -2724,7 +2863,7 @@ fn a_paused_scheduler_never_starts_or_removes_a_replaced_queue_entry() -> Result
 
     // Meanwhile the old request starts by override and exits, and a retry queues a new one.
     let old = dag.start_queued_now(&run, "b")?;
-    dag.session_exited(old.agent.session.as_deref().unwrap(), "exited")?;
+    dag.session_exited(old.agent.session.as_deref().unwrap(), "exited", true)?;
     dag.dispatch(with_args("new", true))?;
     let replacement = dag.store.read(|db| db.queued_dispatch(&run, "b"))?;
     let replacement = replacement.context("The retry was not queued")?;

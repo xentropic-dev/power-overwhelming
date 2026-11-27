@@ -175,6 +175,19 @@ impl<T: TerminalRuntime> Application<T> {
         }
     }
 
+    /// Ends whatever still runs of session `id` outside a live terminal, such as what
+    /// an earlier daemon or an incomplete teardown left. An error means some of it may
+    /// still run.
+    pub fn reclaim(&self, id: &str) -> Result<()> {
+        self.runtime.reclaim(id)
+    }
+
+    /// Forgets a session whose processes are gone, without ending anything.
+    pub fn forget_session(&self, id: &str) -> Result<()> {
+        self.sessions.lock().unwrap().remove(id);
+        self.records.remove(id)
+    }
+
     pub fn terminal(&self, id: &str) -> Result<T::Handle> {
         self.sessions
             .lock()

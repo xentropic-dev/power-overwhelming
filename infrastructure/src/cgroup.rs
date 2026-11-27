@@ -31,10 +31,18 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 pub(crate) const DEFAULT_SLICE: &str = "app-power.slice";
 /// Names another slice, so isolated tests never share the daemon's.
 pub(crate) const SLICE_ENV: &str = "POWER_WORKER_SLICE";
+/// Set to `0` to run workers without cgroup ownership, under the subreaper fallback.
+pub(crate) const DISABLE_ENV: &str = "POWER_WORKER_CGROUPS";
 /// How often a teardown checks whether the cgroup is empty.
 const POLL: Duration = Duration::from_millis(20);
 /// How often a teardown logs a cgroup that outlives `cgroup.kill`.
 const STUCK_LOG: Duration = Duration::from_secs(10);
+/// How long a teardown keeps killing a cgroup that does not empty before it reports
+/// the teardown as incomplete and leaves the scope for a later reclaim.
+const KILL_LIMIT: Duration = Duration::from_secs(10);
+/// How many `cgroup.kill` writes in a row may fail before a teardown stops retrying.
+/// A write that keeps failing, such as on a read-only mount, will not start working.
+const KILL_ERRORS: u32 = 5;
 /// How long detection waits for the user manager to answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -128,7 +136,7 @@ impl WorkerScopes {
             .map(OsStr::to_owned)
             .or_else(|| std::env::var_os("PATH"));
         let cwd = command.get_cwd().map(PathBuf::from);
-        find_program(&program, path, cwd.as_deref()).with_context(|| {
+        let resolved = find_program(&program, path, cwd.as_deref()).with_context(|| {
             format!(
                 "Unable to spawn {} because it doesn't exist",
                 program.to_string_lossy()
@@ -161,34 +169,55 @@ impl WorkerScopes {
         wrapper.push(format!("--unit={unit}").into());
         wrapper.push("--".into());
         let argv = command.get_argv_mut();
+        // systemd-run resolves the program against its own PATH and directory, so it
+        // gets the one this launch resolved.
+        argv[0] = resolved.into_os_string();
         argv.splice(0..0, wrapper);
         Ok(Scope::at(self.slice_dir.join(&unit)))
     }
 
     /// Scopes an earlier launch of `session` left behind, which may still hold
     /// processes after a daemon restart.
-    pub(crate) fn leftovers(&self, session: &str) -> Vec<Scope> {
+    /// A slice that cannot be read is an error, since its scopes may still run.
+    pub(crate) fn leftovers(&self, session: &str) -> Result<Vec<Scope>> {
         let prefix = unit_prefix(session);
-        let Ok(entries) = fs::read_dir(&self.slice_dir) else {
-            return Vec::new();
+        Ok(self
+            .scope_names()?
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .map(|name| Scope::at(self.slice_dir.join(name)))
+            .collect())
+    }
+
+    /// Every scope name in the slice. A slice systemd has not created holds none.
+    fn scope_names(&self) -> Result<Vec<String>> {
+        let entries = match fs::read_dir(&self.slice_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Could not read {}", self.slice_dir.display()));
+            }
         };
-        entries
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".scope"))
-            })
-            .map(|entry| Scope::at(entry.path()))
-            .collect()
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("Could not read {}", self.slice_dir.display()))?;
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with("power-")
+                && name.ends_with(".scope")
+            {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
     }
 
     /// Ends everything left in `session`'s scopes, waiting up to `timeout` for them
     /// to empty. Returns how many scopes still held processes.
     pub(crate) fn reclaim(&self, session: &str, timeout: Duration) -> Result<usize> {
         let scopes: Vec<Scope> = self
-            .leftovers(session)
+            .leftovers(session)?
             .into_iter()
             .filter(Scope::populated)
             .collect();
@@ -304,7 +333,15 @@ fn find_program(program: &OsStr, path: Option<OsString>, cwd: Option<&Path>) -> 
         return executable(&candidate).then_some(candidate);
     }
     std::env::split_paths(&path?)
-        .map(|directory| directory.join(program))
+        .map(|directory| {
+            // execvp searches a relative entry, the empty one included, from the
+            // directory the program starts in.
+            let directory = match cwd {
+                Some(cwd) if directory.is_relative() => cwd.join(directory),
+                _ => directory,
+            };
+            directory.join(program)
+        })
         .find(|candidate| executable(candidate))
 }
 
@@ -475,9 +512,11 @@ impl Scope {
 
     /// Asks every process to exit, waits up to `grace` for the scope to empty, then
     /// kills the cgroup. `root` is the launched process, which may still be
-    /// `systemd-run` and outside the scope. Returns only once the root has exited and
-    /// the scope is empty: after the root has exited, nothing new can join the scope.
-    pub(crate) fn terminate(&self, root: &Pinned, grace: Duration) {
+    /// `systemd-run` and outside the scope. `Ok` means the root has exited and the
+    /// scope is empty: after the root has exited, nothing new can join the scope.
+    /// Killing is retried for a bounded time, and stops early when `cgroup.kill` keeps
+    /// failing. The error then names the scope, which stays for a later reclaim.
+    pub(crate) fn terminate(&self, root: &Pinned, grace: Duration) -> Result<(), String> {
         // A frozen process handles SIGTERM only once it runs again.
         if let Err(error) = self.thaw() {
             eprintln!("Could not thaw {}. {error}", self.name());
@@ -493,13 +532,27 @@ impl Scope {
             self.signal(libc::SIGTERM, &mut sent);
             thread::sleep(POLL);
         }
-        let mut logged = Instant::now();
+        let killing = Instant::now();
+        let mut logged = killing;
+        let mut failures = 0;
         while !gone() {
             if !root.exited() {
                 root.signal(libc::SIGKILL);
             }
-            if let Err(error) = self.kill() {
-                eprintln!("Could not kill {}. {error}", self.name());
+            match self.kill() {
+                Ok(()) => failures = 0,
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 {
+                        eprintln!("Could not kill {}. {error}", self.name());
+                    }
+                    if failures >= KILL_ERRORS {
+                        return Err(self.stuck(&format!("cgroup.kill keeps failing ({error})")));
+                    }
+                }
+            }
+            if killing.elapsed() >= KILL_LIMIT {
+                return Err(self.stuck("it outlived cgroup.kill"));
             }
             thread::sleep(POLL);
             if logged.elapsed() >= STUCK_LOG {
@@ -511,6 +564,15 @@ impl Scope {
                 );
             }
         }
+        Ok(())
+    }
+
+    fn stuck(&self, why: &str) -> String {
+        format!(
+            "processes {:?} in {}, kept for a later reclaim because {why}",
+            self.pids(),
+            self.name()
+        )
     }
 }
 
@@ -626,9 +688,9 @@ pub(crate) mod tests {
         );
         assert!(scope.populated(), "the helper left the scope");
         assert!(scope.contains(helper));
-        assert_eq!(test.scopes.leftovers("detach-test").len(), 1);
+        assert_eq!(test.scopes.leftovers("detach-test").unwrap().len(), 1);
 
-        scope.terminate(&root, Duration::from_millis(300));
+        scope.terminate(&root, Duration::from_millis(300)).unwrap();
         assert!(!scope.populated());
         assert!(!running(helper), "{helper} survived");
     }
@@ -647,7 +709,7 @@ pub(crate) mod tests {
         let root = Pinned::child(child.id());
         read_pid(&ready);
         let started = Instant::now();
-        scope.terminate(&root, Duration::from_millis(300));
+        scope.terminate(&root, Duration::from_millis(300)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!scope.populated());
@@ -701,9 +763,95 @@ pub(crate) mod tests {
         settle(false);
         scope.freeze().unwrap();
         settle(true);
-        scope.terminate(&root, Duration::from_millis(300));
+        scope.terminate(&root, Duration::from_millis(300)).unwrap();
         assert!(!scope.populated());
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_failing_cgroup_kill_ends_the_teardown_with_an_error_and_keeps_the_scope() {
+        use std::os::unix::fs::PermissionsExt;
+        let test = TestScopes::new();
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        // Both the root and its child ignore SIGTERM, so only cgroup.kill could end them.
+        let script = format!(
+            "trap '' TERM; setsid -f sleep 600; echo $$ > {0}.tmp; mv {0}.tmp {0}; exec sleep 600",
+            ready.display()
+        );
+        let (mut child, scope) = spawn(&test.scopes, "readonly-test", &script);
+        let root = Pinned::child(child.id());
+        read_pid(&ready);
+        let kill = scope.path().join("cgroup.kill");
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o444)).unwrap();
+        let started = Instant::now();
+        // The root dies by its pidfd, but the scope keeps the detached child.
+        let ended = scope.terminate(&root, Duration::from_millis(100));
+        let took = started.elapsed();
+        fs::set_permissions(&kill, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = ended.expect_err("an incomplete teardown reported success");
+        assert!(error.contains("readonly-test"), "{error}");
+        assert!(took < Duration::from_secs(2), "kept retrying for {took:?}");
+        assert!(scope.populated(), "the scope was not kept");
+        assert_eq!(
+            test.scopes
+                .reclaim("readonly-test", Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_slice_is_a_reclaim_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let test = TestScopes::new();
+        let (mut child, scope) = spawn(&test.scopes, "hidden-test", "sleep 600");
+        wait_populated(&scope);
+        let slice = &test.scopes.slice_dir;
+        let mode = fs::metadata(slice).unwrap().permissions().mode();
+        fs::set_permissions(slice, fs::Permissions::from_mode(0o300)).unwrap();
+        let reclaimed = test.scopes.reclaim("hidden-test", Duration::from_secs(1));
+        fs::set_permissions(slice, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(reclaimed.is_err(), "an unreadable slice reclaimed nothing");
+        assert_eq!(test.scopes.leftovers("hidden-test").unwrap().len(), 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_relative_path_entry_resolves_against_the_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let test = TestScopes::new();
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("local-bin");
+        fs::create_dir(&bin).unwrap();
+        let program = bin.join("power-test-local");
+        let marker = directory.path().join("ran");
+        fs::write(&program, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = CommandBuilder::new("power-test-local");
+        command.env("PATH", "local-bin:/usr/bin:/bin");
+        command.cwd(directory.path());
+        // The daemon's own directory has no local-bin.
+        assert_ne!(std::env::current_dir().unwrap(), directory.path());
+        test.scopes.wrap(&mut command, "relative-test").unwrap();
+        assert!(
+            command
+                .get_argv()
+                .iter()
+                .any(|arg| arg == program.as_os_str())
+        );
+        let argv = command.get_argv();
+        let status = Command::new(&argv[0])
+            .args(&argv[1..])
+            .envs([("PATH", "local-bin:/usr/bin:/bin")])
+            .current_dir(directory.path())
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(marker.exists(), "the local program did not run");
     }
 
     #[test]

@@ -239,6 +239,8 @@ pub struct DagApplication<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: Bo
     /// `None` keeps finished workers running.
     finished_cleanup: Option<FinishedCleanup>,
     budget: Option<(Box<dyn WorkerBudgetSource>, Box<dyn MemoryProbe>)>,
+    /// This application, once shared, so a scheduled reclaim can call back.
+    weak: Mutex<std::sync::Weak<Self>>,
     event_generation: Mutex<u64>,
     events_changed: Condvar,
 }
@@ -282,9 +284,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             worktree_root: None,
             finished_cleanup: None,
             budget: None,
+            weak: Mutex::new(std::sync::Weak::new()),
             event_generation: Mutex::new(0),
             events_changed: Condvar::new(),
         }
+    }
+
+    /// Shares the application so scheduled reclaims can reach it. Without this, a
+    /// session that kept processes is retried only by the next daemon start.
+    pub fn shared(self) -> Arc<Self> {
+        let shared = Arc::new(self);
+        *shared.weak.lock().unwrap() = Arc::downgrade(&shared);
+        shared
     }
 
     /// Enables managed worktree dispatch for stores and workspaces that support it.
@@ -1100,11 +1111,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         Ok(result)
     }
 
-    /// Ends a finished worker's session after the grace, then forgets its record so a
-    /// restart cannot bring it back. Ending takes everything the worker started down.
-    /// The due teardown holds the terminal handle taken now, so it takes no lock a
-    /// launch holds across a store write and never writes a store itself. A scheduler
-    /// that refuses the teardown leaves the work here, so the session ends now.
+    /// Ends a finished worker's session after the grace. Ending takes everything the
+    /// worker started down. Its record, which is how a restart finds what may still
+    /// run, is forgotten only once the session's exit confirms that all of it is gone
+    /// (see `session_exited`). The due teardown holds the terminal handle taken now, so
+    /// it takes no lock a launch holds across a store write and never writes a store
+    /// itself. A scheduler that refuses the teardown leaves the work here, so the
+    /// session ends now.
     fn end_finished_session(&self, session: String, cleanup: &FinishedCleanup)
     where
         T: 'static,
@@ -1113,29 +1126,20 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             return;
         };
         let application = self.application.clone();
-        let persistence = cleanup.persistence.clone();
         let scheduled = session.clone();
+        let handle = terminal.clone();
         let job = Box::new(move || {
-            if let Err(error) = application.stop_terminal(&terminal) {
+            if let Err(error) = application.stop_terminal(&handle) {
                 eprintln!("Could not end finished worker session {scheduled}. {error:#}");
-            }
-            let forget = {
-                let application = application.clone();
-                let session = scheduled.clone();
-                Box::new(move || end_finished(&application, &session))
-            };
-            if let Err(error) = persistence.schedule(Duration::ZERO, forget) {
-                // The attempt is finished, so a restart forgets the record anyway.
-                eprintln!(
-                    "Could not schedule forgetting ended session {scheduled}, so a restart forgets it. {error:#}"
-                );
             }
         });
         if let Err(error) = cleanup.teardown.schedule(cleanup.grace, job) {
             eprintln!(
                 "Could not schedule the end of finished worker session {session}, so it ends now. {error:#}"
             );
-            end_finished(&self.application, &session);
+            if let Err(error) = self.application.stop_terminal(&terminal) {
+                eprintln!("Could not end finished worker session {session}. {error:#}");
+            }
         }
     }
 
@@ -1169,14 +1173,123 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         })
     }
 
-    pub fn session_exited(&self, session: &str, detail: &str) -> Result<()> {
-        self.write(|db| {
-            if let Some(agent) = db.session_agent(session)? {
-                interrupt(db, Some(session), detail, &|_| false)?;
+    /// Records that a session's process exited. `complete` says whether everything it
+    /// started has exited too. Only then is its agent exited, and a finished worker's
+    /// record forgotten so a restart cannot bring it back. Otherwise the agent stays
+    /// running and the record stays, so a later reclaim can end what remains.
+    pub fn session_exited(&self, session: &str, detail: &str, complete: bool) -> Result<()>
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let finished = self.write(|db| {
+            let Some(agent) = db.session_agent(session)? else {
+                return Ok(false);
+            };
+            interrupt(db, Some(session), detail, &|_| false)?;
+            if complete {
                 db.set_agent_exited(&agent.id)?;
             }
-            Ok(())
-        })
+            Ok(agent.attempt.is_some())
+        })?;
+        if !complete {
+            eprintln!("Session {session} left processes running, so it stays for a reclaim.");
+            self.schedule_reclaim(session.to_owned());
+            return Ok(());
+        }
+        if finished && self.finished_cleanup.is_some() {
+            self.forget_ended(session.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Forgets an ended worker's record off the caller's thread, which may be a
+    /// terminal's, so a slow session store never holds it.
+    fn forget_ended(&self, session: String)
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let application = self.application.clone();
+        let forget = Box::new(move || {
+            if let Err(error) = application.forget_session(&session) {
+                eprintln!("Could not forget ended session {session}. {error:#}");
+            }
+        });
+        let refused = match &self.finished_cleanup {
+            Some(cleanup) => cleanup.persistence.schedule(Duration::ZERO, forget).err(),
+            None => Some(anyhow::anyhow!("no cleanup")),
+        };
+        if let Some(error) = refused {
+            // The attempt is finished, so a restart forgets the record anyway.
+            eprintln!("Could not schedule forgetting an ended session. {error:#}");
+        }
+    }
+
+    /// Retries ending what still runs of `session` until it is gone, then exits its
+    /// agent and forgets its record if its attempt is over. Only a live daemon with
+    /// cleanup enabled retries. Otherwise the next start does.
+    fn schedule_reclaim(&self, session: String)
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        let Some(cleanup) = &self.finished_cleanup else {
+            return;
+        };
+        let Some(dag) = self.weak.lock().unwrap().upgrade() else {
+            return;
+        };
+        let teardown = cleanup.teardown.clone();
+        let job = Box::new(move || dag.retry_reclaim(session));
+        if let Err(error) = teardown.schedule(RECLAIM_RETRY, job) {
+            eprintln!("Could not schedule another reclaim. {error:#}");
+        }
+    }
+
+    fn retry_reclaim(&self, session: String)
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
+        if self.application.terminal(&session).is_ok() {
+            // A live terminal owns the session again.
+            return;
+        }
+        match self.application.reclaim(&session) {
+            Ok(()) => {
+                if let Err(error) = self.reclaimed(&session) {
+                    eprintln!("Could not record the end of session {session}. {error:#}");
+                }
+            }
+            Err(error) => {
+                eprintln!("Session {session} still has processes running. {error:#}");
+                self.schedule_reclaim(session);
+            }
+        }
+    }
+
+    /// Records that nothing of `session` runs any more.
+    fn reclaimed(&self, session: &str) -> Result<()> {
+        let finished = self.write(|db| {
+            let Some(agent) = db.session_agent(session)? else {
+                return Ok(true);
+            };
+            db.set_agent_exited(&agent.id)?;
+            Ok(db.open_attempts(Some(session))?.is_empty())
+        })?;
+        if finished {
+            self.application.forget_session(session)?;
+        }
+        Ok(())
     }
 
     /// Restores saved sessions on daemon start, then reconciles attempts with them.
@@ -1184,7 +1297,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// is told to continue, and its run records `AttemptResumed`. Workers waiting on the
     /// user, coordinators and plain sessions resume without a prompt. A worker whose
     /// attempt already succeeded, failed or was interrupted is forgotten, not restored.
-    pub fn restore(&self) -> Result<Vec<String>> {
+    pub fn restore(&self) -> Result<Vec<String>>
+    where
+        T: 'static,
+        S: 'static,
+        B: 'static,
+        I: 'static,
+    {
         let (open, finished): (BTreeMap<String, OpenAttempt>, BTreeSet<String>) =
             self.store.read(|db| {
                 let open: BTreeMap<_, _> = db
@@ -1206,20 +1325,24 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             .into_iter()
             .filter(|(_, open)| open.attempt.state == AttemptState::Active)
             .collect();
-        let restored = self.application.restore_sessions_with(|session| {
+        let restore = self.application.restore_sessions_deferring(|session| {
             if finished.contains(session) {
                 RestoreChoice::Forget("its DAG attempt already finished")
             } else {
                 RestoreChoice::Resume(active.get(session).map(continuation_prompt))
             }
         })?;
+        let (restored, deferred) = (restore.restored, restore.deferred);
         let resumed: Vec<_> = restored
             .iter()
             .filter(|session| session.prompted)
             .filter_map(|session| active.get(&session.id))
             .collect();
         let restored: Vec<_> = restored.into_iter().map(|session| session.id).collect();
-        self.reconcile_restored(&restored, &resumed)?;
+        self.reconcile_with(&restored, &deferred, &resumed)?;
+        for session in deferred {
+            self.schedule_reclaim(session);
+        }
         Ok(restored)
     }
 
@@ -1233,6 +1356,18 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
     /// Reconciles like `reconcile`, and records `AttemptResumed` for each attempt in
     /// `resumed`, whose worker was told to continue.
     fn reconcile_restored(&self, restored: &[String], resumed: &[&OpenAttempt]) -> Result<()> {
+        self.reconcile_with(restored, &[], resumed)
+    }
+
+    /// Reconciles like `reconcile_restored`. An agent of a session in `running`, whose
+    /// earlier processes could not be ended, stays running until a reclaim ends them,
+    /// though its open attempt is interrupted since no daemon follows it.
+    fn reconcile_with(
+        &self,
+        restored: &[String],
+        running: &[String],
+        resumed: &[&OpenAttempt],
+    ) -> Result<()> {
         let restored_ids = restored;
         let restored = |session: Option<&str>| {
             session.is_some_and(|session| restored.iter().any(|id| id == session))
@@ -1277,6 +1412,13 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 }
                 let orphaned =
                     !attempting.contains(&agent.id) && !workspace.worktree_exists(&agent.worktree);
+                let still_running = agent
+                    .session
+                    .as_deref()
+                    .is_some_and(|session| running.iter().any(|id| id == session));
+                if still_running {
+                    continue;
+                }
                 if orphaned || !restored(agent.session.as_deref()) {
                     db.set_agent_exited(&agent.id)?;
                 }
@@ -1853,14 +1995,8 @@ fn find_task<'a>(run: &'a Run, id: &str) -> Result<&'a Task> {
         .with_context(|| format!("Unknown task {id:?} in run {:?}", run.id))
 }
 
-/// Ends a finished worker's session if it still runs.
-fn end_finished<T: TerminalRuntime>(application: &Application<T>, session: &str) {
-    if application.terminal(session).is_ok()
-        && let Err(error) = application.end_session(session)
-    {
-        eprintln!("Could not end finished worker session {session}. {error:#}");
-    }
-}
+/// How long a session that still has processes waits before the next reclaim.
+const RECLAIM_RETRY: Duration = Duration::from_secs(5);
 
 fn report(
     db: &dyn DagTransaction,

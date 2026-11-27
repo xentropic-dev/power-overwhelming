@@ -15,6 +15,7 @@ mod dag_store;
 mod ownership;
 mod persistence;
 mod process_tree;
+pub mod reaper;
 mod scheduler;
 pub mod shell;
 pub mod skill_install;

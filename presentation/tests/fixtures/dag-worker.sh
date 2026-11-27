@@ -78,6 +78,26 @@ case "$1" in
             exec sleep 600
         fi
         ;;
+    stubborn)
+        # Like escape-stay, but the helper ignores SIGTERM, so only a kill ends it.
+        wait_for_marker "$2"
+        helper="$fixture_dir/$4.helper"
+        setsid -f env -i /bin/sh -c 'trap "" TERM; echo $$ > "$0.tmp"; mv "$0.tmp" "$0"; while :; do sleep 1; done' "$helper"
+        until test -f "$helper"; do sleep 0.05; done
+        printf '%s %s\n' "$$" "$(cat "$helper")" > "$fixture_dir/$4.tmp"
+        mv "$fixture_dir/$4.tmp" "$fixture_dir/$4"
+        report success "$3"
+        exec sleep 600
+        ;;
+    graced)
+        # Reports success, then marks each tenth of a second it still runs.
+        wait_for_marker "$2"
+        report success "$3"
+        while :; do
+            date +%s%N >> "$fixture_dir/$4"
+            sleep 0.1
+        done
+        ;;
     input)
         report needs-input "Which option should I use?"
         wait_for_marker "$2"

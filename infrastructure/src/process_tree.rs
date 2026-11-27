@@ -8,10 +8,10 @@
 //! - The root is the caller's child, which the caller leaves unreaped until the
 //!   tree is gone. Until then its PID, and the session ID it leads, cannot be reused.
 //! - Every other member is held by a pidfd, opened only after its start time was
-//!   checked, and signalled through it. Only a kernel without pidfds falls back to a
-//!   start-time pin rechecked before each signal. A member whose pidfd cannot be
-//!   opened for any other reason is never signalled by PID, and an end that leaves
-//!   it running says so.
+//!   checked, and signalled through it. A member whose pidfd cannot be opened, on a
+//!   kernel without pidfds too, is never signalled by PID, and an end that leaves it
+//!   running says so. Only the root, which cannot be reused while unreaped, may be
+//!   signalled by PID.
 //! - A member's PID seeds discovery of its children only while its pidfd shows it
 //!   alive, which also means its PID still names it.
 
@@ -126,15 +126,38 @@ impl Pinned {
     /// `Err` means the process could not be pinned at all, so it must not be
     /// signalled by PID.
     fn open(pid: u32, start: u64) -> Result<Option<Self>, io::Error> {
-        let fd = match pidfd_open(pid) {
-            Ok(fd) => Some(fd),
-            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => None,
+        Self::open_with(pid, start, pidfd_open)
+    }
+
+    /// `open` with the pidfd source given, so a kernel without pidfds can be tested.
+    /// Every error but `ESRCH` leaves the process unpinned, `ENOSYS` included: a start
+    /// time checked apart from the signal cannot stop a reused PID from receiving it.
+    fn open_with(
+        pid: u32,
+        start: u64,
+        open: impl Fn(u32) -> io::Result<OwnedFd>,
+    ) -> Result<Option<Self>, io::Error> {
+        let fd = match open(pid) {
+            Ok(fd) => fd,
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
             Err(error) => return Err(error),
         };
         Ok(stat(pid)
             .filter(|stat| stat.start == start && !stat.zombie)
-            .map(|_| Self { pid, start, fd }))
+            .map(|_| Self {
+                pid,
+                start,
+                fd: Some(fd),
+            }))
+    }
+
+    /// Pins `pid` by a pidfd if it is still the process that started at `start`.
+    pub(crate) fn pin_start(pid: u32, start: u64) -> Option<Self> {
+        Self::open(pid, start).ok().flatten()
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// Pins a process that is not the caller's child by a pidfd. Without one, the
@@ -603,6 +626,25 @@ mod tests {
         assert!(running(stranger.id()));
         stranger.kill().unwrap();
         stranger.wait().unwrap();
+    }
+
+    #[test]
+    fn without_pidfds_a_member_is_never_pinned_so_never_signalled_by_pid() {
+        let mut child = Command::new("sleep").arg("600").spawn().unwrap();
+        let pid = child.id();
+        let start = stat(pid).unwrap().start;
+        let enosys = |_| Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        let pinned = Pinned::open_with(pid, start, enosys);
+        assert_eq!(
+            pinned
+                .map(|pinned| pinned.is_some())
+                .map_err(|error| error.raw_os_error()),
+            Err(Some(libc::ENOSYS))
+        );
+        // A live pidfd still pins it.
+        assert!(Pinned::open(pid, start).unwrap().is_some());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

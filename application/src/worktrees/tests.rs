@@ -490,7 +490,7 @@ fn removing_a_worktree_retires_the_agents_left_in_it() -> Result<()> {
     assert_eq!(agent_state(&dag, "elsewhere")?, AgentState::Running);
     // The session's exit report marks this one, as for any other exit.
     assert_eq!(agent_state(&dag, "with-session")?, AgentState::Running);
-    dag.session_exited(&stale.id, "ended")?;
+    dag.session_exited(&stale.id, "ended", true)?;
     assert_eq!(agent_state(&dag, "with-session")?, AgentState::Exited);
     Ok(())
 }

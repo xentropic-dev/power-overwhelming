@@ -97,10 +97,6 @@ fn populated_scopes(root: &Path, session: &str) -> Vec<String> {
 struct Daemon(Child);
 
 impl Daemon {
-    fn start(root: &Path) -> Self {
-        Self::start_with(root, &[])
-    }
-
     fn start_with(root: &Path, env: &[(&str, &str)]) -> Self {
         let mut daemon = Self(
             power(root)
@@ -250,6 +246,8 @@ fn init_repo(directory: &Path) {
 
 struct Fixture {
     daemon: Daemon,
+    /// Extra environment every daemon of this fixture starts with.
+    env: Vec<(String, String)>,
     directory: tempfile::TempDir,
     checkout: PathBuf,
     worktrees: [PathBuf; 2],
@@ -261,6 +259,10 @@ impl Fixture {
     }
 
     fn with_configure(configure: impl FnOnce(&Path)) -> Self {
+        Self::with_configure_env(configure, &[])
+    }
+
+    fn with_configure_env(configure: impl FnOnce(&Path), env: &[(&str, &str)]) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("pX.")
             .rand_bytes(4)
@@ -316,9 +318,13 @@ impl Fixture {
         // writes it with `write_config` too.
         write_config(root, "");
         configure(root);
-        let daemon = Daemon::start(root);
+        let daemon = Daemon::start_with(root, env);
         Self {
             daemon,
+            env: env
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
             directory,
             checkout,
             worktrees,
@@ -335,12 +341,21 @@ impl Fixture {
 
     fn restart_with(&mut self, env: &[(&str, &str)]) {
         self.daemon.stop();
-        self.daemon = Daemon::start_with(self.root(), env);
+        let mut all = self.env();
+        all.extend_from_slice(env);
+        self.daemon = Daemon::start_with(self.root(), &all);
     }
 
     fn restart_gracefully(&mut self) {
         self.daemon.shut_down();
-        self.daemon = Daemon::start(self.root());
+        self.daemon = Daemon::start_with(self.root(), &self.env());
+    }
+
+    fn env(&self) -> Vec<(&str, &str)> {
+        self.env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect()
     }
 
     fn command(&self, args: &[&str]) -> Output {
@@ -1727,6 +1742,138 @@ fn a_detached_helper_with_a_clean_environment_ends_before_its_worker_is_exited()
     let task = task(&fixture.show(&run), "escape").clone();
     assert_eq!(task.attempts[0].id, attempt.id);
     assert_eq!(task.attempts[0].state, AttemptState::Succeeded);
+}
+
+/// The cgroup directories of the session's scopes.
+fn scope_dirs(root: &Path, session: &str) -> Vec<PathBuf> {
+    let prefix = format!("power-{session}-");
+    fs::read_dir(slice_dir(root))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn agent_state(fixture: &Fixture, agent: &str) -> Value {
+    let listed = fixture.agents();
+    json!(
+        listed
+            .iter()
+            .find(|listed| listed.id == agent)
+            .unwrap()
+            .state
+    )
+}
+
+#[test]
+fn a_restart_during_a_teardown_keeps_the_record_until_the_scope_is_empty() {
+    // Half a second of grace, then a teardown whose helper ignores SIGTERM, so the
+    // teardown is still waiting out its grace when the daemon restarts.
+    let mut fixture = with_grace("0.5");
+    let run = fixture.create_run().id;
+    let (_, agent, root, helper) = dispatch_escape(&fixture, &run, "stubborn");
+    let session = agent.session.clone().unwrap();
+    fixture.wait_for_state(&run, "stubborn", TaskState::Completed);
+    thread::sleep(Duration::from_millis(900));
+    assert!(process_running(helper), "the teardown ended early");
+
+    fixture.restart_gracefully();
+
+    wait_for_exit_with_empty_scopes(&fixture, &agent.id, &session, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived the restart");
+    let listed = fixture.command(&["session", "list"]);
+    assert!(!String::from_utf8(listed.stdout).unwrap().contains(&session));
+}
+
+#[test]
+fn a_failed_reclaim_keeps_the_agent_running_until_a_retry_ends_its_scope() {
+    let mut fixture = with_grace("600");
+    let run = fixture.create_run().id;
+    let (_, agent, _, helper) = dispatch_escape(&fixture, &run, "escape-stay");
+    let session = agent.session.clone().unwrap();
+    fixture.wait_for_state(&run, "escape-stay", TaskState::Completed);
+    let kills: Vec<_> = scope_dirs(fixture.root(), &session)
+        .into_iter()
+        .map(|scope| scope.join("cgroup.kill"))
+        .collect();
+    assert!(!kills.is_empty());
+    for kill in &kills {
+        fs::set_permissions(kill, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    // The old daemon dies without a teardown, and the new one cannot kill the scope.
+    fixture.restart();
+    thread::sleep(Duration::from_secs(2));
+    assert!(process_running(helper));
+    assert_eq!(agent_state(&fixture, &agent.id), "running");
+    let listed = fixture.command(&["session", "list"]);
+    assert!(
+        !String::from_utf8(listed.stdout).unwrap().contains(&session),
+        "a session whose processes could not be ended was relaunched"
+    );
+
+    for kill in &kills {
+        fs::set_permissions(kill, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    wait_for_exit_with_empty_scopes(&fixture, &agent.id, &session, &[helper]);
+}
+
+#[test]
+fn without_cgroups_a_detached_helper_ends_before_its_worker_is_exited() {
+    let fixture = Fixture::with_configure_env(
+        |root| write_config(root, "dag.end_finished_workers_after = 600\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    );
+    let run = fixture.create_run().id;
+    let (attempt, agent, root, helper) = dispatch_escape(&fixture, &run, "escape");
+    let session = agent.session.clone().unwrap();
+    assert!(
+        populated_scopes(fixture.root(), &session).is_empty(),
+        "the fallback used a scope"
+    );
+    wait_for_exit_after(&fixture, &agent.id, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived");
+    let task = task(&fixture.show(&run), "escape").clone();
+    assert_eq!(task.attempts[0].id, attempt.id);
+    assert_eq!(task.attempts[0].state, AttemptState::Succeeded);
+}
+
+#[test]
+fn without_cgroups_a_restart_ends_what_a_finished_worker_left() {
+    let mut fixture = Fixture::with_configure_env(
+        |root| write_config(root, "dag.end_finished_workers_after = 600\n"),
+        &[("POWER_WORKER_CGROUPS", "0")],
+    );
+    let run = fixture.create_run().id;
+    let (_, agent, root, helper) = dispatch_escape(&fixture, &run, "escape-stay");
+    fixture.wait_for_state(&run, "escape-stay", TaskState::Completed);
+    fixture.restart();
+    wait_for_exit_after(&fixture, &agent.id, &[root, helper]);
+    assert!(!process_running(helper), "{helper} survived the restart");
+}
+
+#[test]
+fn a_finished_worker_keeps_running_for_the_whole_grace() {
+    let fixture = with_grace("1.5");
+    let run = fixture.create_run().id;
+    fixture.add_task(&run, "graced");
+    let (_, agent) = dispatched(fixture.dispatch(
+        &run,
+        "graced",
+        &fixture.worktrees[0],
+        false,
+        &["graced", "graced-go", "Done", "graced-marks"],
+    ));
+    fixture.release("graced-go");
+    wait_for_exit_after(&fixture, &agent.id, &[]);
+    let marks: Vec<u128> = fs::read_to_string(fixture.root().join("graced-marks"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    let ran = Duration::from_nanos((marks.last().unwrap() - marks[0]) as u64);
+    assert!(ran >= Duration::from_millis(1200), "ended after {ran:?}");
 }
 
 #[test]
