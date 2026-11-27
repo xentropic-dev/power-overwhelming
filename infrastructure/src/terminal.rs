@@ -58,6 +58,8 @@ const CLEAR_DELAY: Duration = Duration::from_secs(3);
 /// An agent restored with resume arguments that exits this soon after launch had
 /// nothing to resume, so it is started once more with its fallback arguments.
 const RESUME_WINDOW: Duration = Duration::from_secs(5);
+/// How often a foreground jcode's session files are read for its current model.
+const MODEL_POLL: Duration = Duration::from_secs(2);
 /// Written to the terminal when a failed resume starts a new conversation.
 const RESUME_NOTICE: &str =
     "\r\n\x1b[2m── could not resume, started a new conversation ──\x1b[0m\r\n";
@@ -654,7 +656,9 @@ fn launch(
         drop(gone_guard);
         let _ = waiter_tx.send(Command::ProcessExited(detail));
     });
-    if session.agent == Agent::Shell {
+    // Shells poll for foreground changes. A jcode session polls for its model, which jcode
+    // records only in its own session files.
+    if session.agent == Agent::Shell || session.agent.as_str() == "jcode" {
         let poll_tx = tx.clone();
         let lifecycle = lifecycle.clone();
         thread::spawn(move || {
@@ -1147,6 +1151,8 @@ fn terminal_actor(
     };
 
     let mut restore = RestoreState::new(launched_agent.clone(), cwd);
+    // When the foreground jcode's session files were last read for its model.
+    let mut model_checked: Option<Instant> = None;
 
     let mut output_closed = false;
     let mut process_exit: Option<PendingExit> = None;
@@ -1356,6 +1362,8 @@ fn terminal_actor(
                         return Ok(false);
                     };
                     let field = match field {
+                        // The daemon keeps usage reports itself once the caller is checked.
+                        MetadataField::Usage => return Ok(true),
                         MetadataField::Task => &mut metadata.task,
                         MetadataField::Model => {
                             if metadata.model != value {
@@ -1396,8 +1404,26 @@ fn terminal_actor(
                 let _ = reply.send(lifecycle.foreground.lock().unwrap().agent.clone());
             }
             Command::Poll => {
-                if !exited {
+                if !exited && launched_agent == Agent::Shell {
                     restore.poll(run.is_none(), shell_pid, lifecycle);
+                }
+                if !exited
+                    && let Some((pid, agent)) = run.as_ref()
+                    && agent.as_str() == "jcode"
+                    && model_checked.is_none_or(|at| at.elapsed() >= MODEL_POLL)
+                {
+                    model_checked = Some(Instant::now());
+                    if let Some(model) = crate::agents::jcode_process_model(*pid)
+                        && metadata.model.as_ref() != Some(&model)
+                    {
+                        match lifecycle.set_model(agent, Some(model.clone())) {
+                            Ok(()) => {
+                                metadata.model = Some(model);
+                                notify_metadata(&metadata, &mut clients);
+                            }
+                            Err(error) => eprintln!("Could not save agent model. {error:#}"),
+                        }
+                    }
                 }
             }
             Command::SetConversation {
@@ -1919,43 +1945,10 @@ fn requested_model(
     agent: &Agent,
     args: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Option<String> {
-    let short_flag = match agent.as_str() {
-        "codex" | "grok" | "jcode" => true,
-        "claude" => false,
-        _ => return None,
-    };
-    let mut model = None;
-    let mut expecting_value = false;
-    for arg in args {
-        let arg = arg.as_ref();
-        if arg == "--" {
-            break;
-        }
-        if std::mem::take(&mut expecting_value) {
-            model = arg
-                .to_str()
-                .filter(|value| !value.starts_with('-'))
-                .and_then(model_name);
-        }
-        if arg == "--model" || (short_flag && arg == "-m") {
-            expecting_value = true;
-        } else if let Some((flag, value)) = arg.to_str().and_then(|arg| arg.split_once('='))
-            && (flag == "--model" || (short_flag && flag == "-m"))
-        {
-            model = model_name(value);
-        }
-    }
-    if expecting_value { None } else { model }
+    domain::agent::requested_model(agent.as_str(), args)
 }
 
-fn model_name(value: &str) -> Option<String> {
-    let value = value.trim();
-    (valid_metadata(value) && !value.is_empty()).then(|| value.to_owned())
-}
-
-pub(crate) fn valid_metadata(value: &str) -> bool {
-    value.chars().count() <= 120 && !value.chars().any(char::is_control)
-}
+pub(crate) use domain::agent::valid_metadata;
 
 fn program_name(arg: &str) -> &str {
     let name = arg.rsplit('/').next().unwrap_or(arg);

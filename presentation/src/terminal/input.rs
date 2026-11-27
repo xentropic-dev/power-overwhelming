@@ -181,7 +181,9 @@ impl TerminalView {
         self.focus.focus(window);
         self.set_pointer(Some(event.position));
         let cell = self.at(event.position);
-        let link = self.link_at_point(event.position).cloned();
+        let link = self
+            .clickable_link_at(event.position, event.modifiers)
+            .cloned();
         if !event.modifiers.shift
             && self.terminal.is_mouse_tracking().unwrap_or(false)
             && link.is_none()
@@ -196,7 +198,7 @@ impl TerminalView {
             );
             return;
         }
-        self.pressed_link = link.filter(|_| !event.modifiers.shift);
+        self.pressed_link = link;
         self.selection = Some((cell, cell));
         self.dragging = true;
         cx.notify();
@@ -255,7 +257,7 @@ impl TerminalView {
                 self.selection = None;
                 if let Some(pressed) = pressed
                     && self
-                        .link_at_point(event.position)
+                        .clickable_link_at(event.position, event.modifiers)
                         .is_some_and(|link| *link == pressed)
                 {
                     cx.emit(OpenLink(pressed.to_string()));

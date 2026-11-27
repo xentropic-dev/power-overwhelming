@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 use application::dag::{
     BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EditDelivery, EditTask,
-    EventScope, StartAgent,
+    EventScope, PlanTask, StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
@@ -158,6 +158,23 @@ pub(crate) fn request(
                 },
             }
         }
+        DagRequest::PlanTask {
+            run,
+            task,
+            provider,
+            model,
+            clear,
+        } => Reply::Run {
+            run: application
+                .plan_task(PlanTask {
+                    run,
+                    task,
+                    clear,
+                    provider: provider.map(Into::into),
+                    model,
+                })?
+                .into(),
+        },
         DagRequest::StartAgent {
             box_sel,
             caller,
@@ -197,7 +214,7 @@ pub(crate) fn request(
         } => match application.dispatch(Dispatch {
             run: run.clone(),
             task: task.clone(),
-            provider: provider.into(),
+            provider: provider.map(Into::into),
             worktree: worktree.into_domain(allow_main_checkout),
             retry,
             args,
@@ -223,8 +240,14 @@ pub(crate) fn request(
             box_sel,
             from_session,
             branch,
+            path,
         } => Reply::ViewWorktreeCreated {
-            path: application.create_view_worktree(&box_sel, &from_session, &branch)?,
+            path: application.create_view_worktree(
+                &box_sel,
+                &from_session,
+                &branch,
+                path.as_deref(),
+            )?,
         },
         DagRequest::ListManagedWorktrees { scope } => {
             let box_id = worktree_box(application, scope)?;

@@ -5,7 +5,9 @@ use super::{
     frame::{CellPosition, Row},
     ime::Preedit,
     input::register_mouse_exit,
-    runs::{FAINT_OPACITY, RowOp, RunCell, Shaping, row_ops},
+    links::{LinkAction, link_action},
+    runs::{FAINT_OPACITY, RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
+    sprites,
 };
 use gpui::{prelude::*, *};
 use infrastructure::theme::{Scheme, blend};
@@ -160,7 +162,7 @@ impl Render for TerminalView {
         let input_owner = terminal.clone();
         let selection_background = Hsla::from(rgba(scheme.selection_background));
         let terminal_font = self.font.font.clone();
-        let hovered = self.hovered_span();
+        let hovered = self.hovered_span(window.modifiers());
         let pressed = self.pressed_span();
         let selection = self.selection_range().filter(|_| pressed.is_none());
         let ligatures = self.settings.ligatures;
@@ -173,7 +175,7 @@ impl Render for TerminalView {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(background))
+            .bg(Hsla::from(rgb(background)).opacity(self.settings.opacity))
             .when(hovering, |terminal| terminal.cursor_pointer())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
@@ -201,6 +203,10 @@ impl Render for TerminalView {
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             let grid = metrics.snap(bounds.origin);
                             let text_system = window.text_system().clone();
+                            let symbols = text_system.resolve_font(&font(SYMBOLS_FAMILY));
+                            let primary = text_system.resolve_font(&terminal_font);
+                            let has_glyph =
+                                |c: char| text_system.advance(primary, font_size, c).is_ok();
                             let rows: Vec<_> = frame
                                 .rows
                                 .iter()
@@ -220,6 +226,9 @@ impl Render for TerminalView {
                                         font: &terminal_font,
                                         font_size,
                                         cell_width: cell_size.width,
+                                        cell_height: cell_size.height,
+                                        symbols,
+                                        has_glyph: &has_glyph,
                                         ligatures,
                                         bold_weight,
                                         cursor,
@@ -263,6 +272,20 @@ impl Render for TerminalView {
                                     ));
                                 }
                             }
+                            // Full-cell blocks can cover the cursor and link underline.
+                            for (row, drawing) in rows.iter().enumerate() {
+                                for op in &drawing.ops {
+                                    if let RowOp::Sprite {
+                                        column,
+                                        character,
+                                        color,
+                                    } = op
+                                    {
+                                        let cell = span(row, *column, *column + 1);
+                                        sprites::paint(*character, cell, *color, window);
+                                    }
+                                }
+                            }
                             if let Some(cursor) = frame.cursor {
                                 let origin = metrics.cell_origin(grid, cursor.row, cursor.column);
                                 let thickness = metrics.underline_thickness.max(px(2.));
@@ -275,6 +298,14 @@ impl Render for TerminalView {
                             for (row, line) in frame.rows.iter().enumerate() {
                                 let highlights = &rows[row].highlights;
                                 for link in &line.links {
+                                    // Web links are underlined only while Ctrl-hovered.
+                                    let web =
+                                        line.cells[link.start].link.as_deref().is_some_and(|uri| {
+                                            link_action(uri) == LinkAction::OpenBrowser
+                                        });
+                                    if web && !highlights.hovered.contains(&link.start) {
+                                        continue;
+                                    }
                                     // Cells with an underline of their own keep its style.
                                     let mut column = link.start;
                                     while column < link.end {
@@ -301,9 +332,11 @@ impl Render for TerminalView {
                             let baseline = point(metrics.glyph_x, metrics.baseline);
                             for (row, drawing) in rows.iter().enumerate() {
                                 for op in &drawing.ops {
-                                    if let RowOp::Text { column, .. } = op {
+                                    if let RowOp::Text { column, .. } | RowOp::Icon { column, .. } =
+                                        op
+                                    {
                                         let origin = metrics.cell_origin(grid, row, *column);
-                                        op.paint(origin + baseline, window);
+                                        op.paint(origin, origin + baseline, window);
                                         op.paint_fade(origin, cell_size, window);
                                     }
                                 }

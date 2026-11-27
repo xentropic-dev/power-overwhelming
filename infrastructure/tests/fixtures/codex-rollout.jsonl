@@ -1,0 +1,6 @@
+{"timestamp":"2026-11-25T10:00:00.000Z","type":"session_meta","payload":{"id":"fixture","cwd":"/work"}}
+{"timestamp":"2026-11-25T10:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5.5-codex"}}
+{"timestamp":"2026-11-25T10:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":3.0,"window_minutes":300,"resets_at":1795800000},"secondary":{"used_percent":60.0,"window_minutes":10080,"resets_at":1795966484}}}}
+{"timestamp":"2026-11-25T10:01:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Mentions token_count in passing."}]}}
+{"timestamp":"2026-11-25T10:02:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":12.5,"window_minutes":300,"resets_at":1795900000},"secondary":{"used_percent":64.0,"window_minutes":10080,"resets_at":1795966484},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"plan_type":"pro"}}}
+{"timestamp":"2026-11-25T10:02:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}}

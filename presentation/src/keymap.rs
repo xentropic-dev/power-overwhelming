@@ -6,18 +6,27 @@
 //! ```lua
 //! keys.tab.next = { "n", "j" }
 //! keys.prefix.tab = "ctrl-a"
+//! keys.box["dashboard.open"] = "g"
 //! ```
+//!
+//! Panel plugins add commands under namespaced ids in their scope's table, such as
+//! `keys.box["dashboard.open"]`. Users rebind them exactly like built-in commands.
 
 use anyhow::{Context as _, Result, bail};
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 /// The config section the keymap reads.
-pub const SECTION: &str = "keys";
+pub const SECTION: &str = infrastructure::config::KEYS_SECTION;
+
+/// An index into the keymap's plugin command registry.
+pub type PluginCommandId = u16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
+    /// A command a panel plugin registered. Look it up with [`Keymap::plugin`].
+    Plugin(PluginCommandId),
     BoxPrefix,
     TabPrefix,
     BoxNew,
@@ -31,6 +40,7 @@ pub enum Command {
     Reload,
     Quit,
     Help,
+    Palette,
     TabNew,
     TabWorktree,
     TabPick,
@@ -69,7 +79,11 @@ pub enum Command {
     DagArtifact,
     DagStartNow,
     DagClose,
+    PanelUp,
+    PanelDown,
+    PanelClose,
     TabOpenLink,
+    TerminalOpenLink,
     TabPreview,
     TerminalZoomIn,
     TerminalZoomOut,
@@ -89,6 +103,17 @@ pub enum Command {
     PreviewExit,
     HintSearch,
     HintCancel,
+}
+
+impl Command {
+    pub(crate) fn terminal_link(modifiers: Modifiers, requires_control: bool) -> Option<Self> {
+        (!modifiers.shift && (!requires_control || terminal_link_modifier(modifiers)))
+            .then_some(Self::TerminalOpenLink)
+    }
+}
+
+pub(crate) fn terminal_link_modifier(modifiers: Modifiers) -> bool {
+    modifiers.control && !modifiers.shift && !modifiers.alt && !modifiers.platform
 }
 
 /// Where a key press is interpreted.
@@ -112,6 +137,8 @@ pub enum Scope {
     Runs,
     /// On the task graph.
     Dag,
+    /// In a plugin panel, such as the dashboard.
+    Panel,
     /// While the preview pane has focus.
     Preview,
     /// While links on screen show number hints. Digits 1–9 always open a hint.
@@ -132,6 +159,7 @@ impl Scope {
             Self::Talk => "talk",
             Self::Runs => "runs",
             Self::Dag => "dag",
+            Self::Panel => "panel",
             Self::Preview => "preview",
             Self::Hints => "hints",
             Self::Terminal => "terminal",
@@ -166,8 +194,42 @@ const fn entry(
 use Command as C;
 use Scope as S;
 
+/// A bindable command as the command palette lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandEntry<'a> {
+    pub scope: Scope,
+    pub command: Command,
+    /// A stable name such as `box.new`, saved in the recent command list.
+    pub name: String,
+    pub description: &'a str,
+}
+
+/// A command a plugin registered, with its default keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginEntry {
+    pub scope: Scope,
+    /// The namespaced id, such as `dashboard.open`. It is also the config name.
+    pub name: String,
+    pub description: String,
+    pub keys: Vec<String>,
+}
+
+impl PluginEntry {
+    fn from_command(command: infrastructure::plugins::PluginCommand) -> Self {
+        Self {
+            scope: match command.scope {
+                infrastructure::plugins::CommandScope::Box => Scope::Box,
+                infrastructure::plugins::CommandScope::Tab => Scope::Tab,
+            },
+            name: command.id,
+            description: command.description,
+            keys: command.default_keys,
+        }
+    }
+}
+
 pub struct Shortcut {
-    pub description: &'static str,
+    pub description: String,
     pub binding: String,
 }
 
@@ -187,13 +249,14 @@ const TABLE: &[Entry] = &[
     entry(S::Box, "setup", C::BoxSetup, &["i"], "Shell integration setup"),
     entry(S::Box, "quit", C::Quit, &["q"], "Quit"),
     entry(S::Box, "help", C::Help, &["?"], "Keyboard shortcuts"),
+    entry(S::Box, "palette", C::Palette, &["p"], "Open command palette"),
     entry(S::Tab, "new", C::TabNew, &["c"], "New tab"),
     entry(
         S::Tab,
         "worktree",
         C::TabWorktree,
         &["t"],
-        "New tab in another worktree",
+        "New tab in a new worktree",
     ),
     entry(S::Tab, "pick", C::TabPick, &["w"], "Pick tab"),
     entry(S::Tab, "recover", C::TabRecover, &["r"], "Recover session"),
@@ -269,6 +332,9 @@ const TABLE: &[Entry] = &[
     entry(S::Dag, "artifact", C::DagArtifact, &["p"], "Preview the selected task's artifact, then 1–9 to pick"),
     entry(S::Dag, "start_now", C::DagStartNow, &["s"], "Start the selected queued task now, over the worker budget"),
     entry(S::Dag, "close", C::DagClose, &["escape"], "Close task graph"),
+    entry(S::Panel, "up", C::PanelUp, &["k", "up"], "Scroll the panel up"),
+    entry(S::Panel, "down", C::PanelDown, &["j", "down"], "Scroll the panel down"),
+    entry(S::Panel, "close", C::PanelClose, &["escape"], "Close the panel"),
     entry(S::Preview, "previous", C::PreviewPrevious, &["h", "left"], "Previous preview"),
     entry(S::Preview, "next", C::PreviewNext, &["l", "right"], "Next preview"),
     entry(S::Preview, "close", C::PreviewClose, &["escape", "x"], "Close preview"),
@@ -378,12 +444,31 @@ impl Key {
 #[derive(Clone, Debug)]
 pub struct Keymap {
     bindings: Vec<(Scope, Command, Vec<Key>)>,
+    plugins: Vec<PluginEntry>,
 }
 
 impl Default for Keymap {
     fn default() -> Self {
-        Self::from_config(&defaults()).expect("default key bindings are valid")
+        Self::from_config(&defaults(), &[]).expect("default key bindings are valid")
     }
+}
+
+/// Reads a key value: one key name or a list of them.
+fn parse_keys(value: &Value, path: &str) -> Result<Vec<Key>> {
+    let keys: Result<Vec<_>> = match value {
+        Value::String(key) => vec![Key::parse(key)].into_iter().collect(),
+        Value::Array(keys) => keys
+            .iter()
+            .map(|key| match key {
+                Value::String(key) => Key::parse(key),
+                _ => bail!("must list key names"),
+            })
+            .collect(),
+        // Lua cannot tell an empty list from an empty table.
+        Value::Object(map) if map.is_empty() => Ok(Vec::new()),
+        _ => bail!("{path} must be a key name or a list of key names"),
+    };
+    keys.with_context(|| path.to_owned())
 }
 
 /// The default `keys` section, used to seed `config.lua`.
@@ -399,13 +484,27 @@ pub fn defaults() -> Value {
 }
 
 impl Keymap {
+    /// Reads `keys` and the plugin commands the plugin host recorded in the sections.
     pub fn from_sections(config: &infrastructure::config::Sections) -> Result<Self> {
-        Self::from_config(config.get(SECTION).unwrap_or(&Value::Null))
+        let plugins = infrastructure::plugins::plugin_commands(config)
+            .map_err(anyhow::Error::msg)
+            .context("Read plugin commands")?
+            .into_iter()
+            .map(PluginEntry::from_command)
+            .collect::<Vec<_>>();
+        Self::from_config(config.get(SECTION).unwrap_or(&Value::Null), &plugins)
             .context("Read keys from config.lua")
     }
 
     /// Resolve a `keys` value. Missing entries keep their defaults; unknown ones are errors.
-    pub fn from_config(value: &Value) -> Result<Self> {
+    /// Plugin commands are named by id in their scope's table.
+    ///
+    /// A plugin's default key that collides with another command is dropped, so a new
+    /// plugin cannot break a working config. A collision set in config.lua is an error.
+    pub fn from_config(value: &Value, plugins: &[PluginEntry]) -> Result<Self> {
+        if plugins.len() > usize::from(PluginCommandId::MAX) {
+            bail!("Too many plugin commands");
+        }
         let empty = Map::new();
         let sections = match value {
             Value::Null => &empty,
@@ -417,10 +516,13 @@ impl Keymap {
                 bail!("keys.{section} must be a table");
             };
             for name in names.keys() {
-                if !TABLE
+                let builtin = TABLE
                     .iter()
-                    .any(|entry| entry.scope.section() == section && entry.name == name)
-                {
+                    .any(|entry| entry.scope.section() == section && entry.name == name);
+                let plugin = plugins
+                    .iter()
+                    .any(|entry| entry.scope.section() == section && entry.name == *name);
+                if !builtin && !plugin {
                     bail!("keys.{section}.{name} is not a command");
                 }
             }
@@ -429,22 +531,18 @@ impl Keymap {
         let mut seen = BTreeMap::new();
         for entry in TABLE {
             let path = format!("keys.{}.{}", entry.scope.section(), entry.name);
-            let keys: Result<Vec<_>> = match sections
+            let keys = match sections
                 .get(entry.scope.section())
                 .and_then(|section| section.get(entry.name))
             {
-                None => entry.keys.iter().map(|key| Key::parse(key)).collect(),
-                Some(Value::String(key)) => vec![Key::parse(key)].into_iter().collect(),
-                Some(Value::Array(keys)) => keys
+                None => entry
+                    .keys
                     .iter()
-                    .map(|key| match key {
-                        Value::String(key) => Key::parse(key),
-                        _ => bail!("must list key names"),
-                    })
-                    .collect(),
-                Some(_) => bail!("{path} must be a key name or a list of key names"),
+                    .map(|key| Key::parse(key))
+                    .collect::<Result<_>>()
+                    .with_context(|| path.clone())?,
+                Some(value) => parse_keys(value, &path)?,
             };
-            let keys = keys.with_context(|| path.clone())?;
             for key in &keys {
                 let scopes: &[Scope] = match entry.scope {
                     Scope::Picker => &[Scope::Picker, Scope::Dialog, Scope::AgentTree, Scope::Runs],
@@ -462,7 +560,58 @@ impl Keymap {
             }
             bindings.push((entry.scope, entry.command, keys));
         }
-        Ok(Self { bindings })
+        for (index, entry) in plugins.iter().enumerate() {
+            let command = Command::Plugin(index as PluginCommandId);
+            let path = format!("keys.{}[{:?}]", entry.scope.section(), entry.name);
+            if TABLE
+                .iter()
+                .any(|builtin| builtin.scope == entry.scope && builtin.name == entry.name)
+                || plugins[..index]
+                    .iter()
+                    .any(|other| other.scope == entry.scope && other.name == entry.name)
+            {
+                bail!("{path} is registered twice");
+            }
+            let defaults = json!(entry.keys);
+            let configured = sections
+                .get(entry.scope.section())
+                .and_then(|section| section.get(&entry.name))
+                .filter(|value| **value != defaults);
+            let keys = match configured {
+                Some(value) => parse_keys(value, &path)?,
+                None => entry
+                    .keys
+                    .iter()
+                    // A plugin's invalid default leaves the command without that key.
+                    .filter_map(|key| Key::parse(key).ok())
+                    .collect(),
+            };
+            let mut kept = Vec::new();
+            for key in keys {
+                let slot = (entry.scope.section(), key.label());
+                match seen.get(&slot) {
+                    Some((_, other)) if *other == command => {}
+                    Some((other, _)) if configured.is_some() => {
+                        bail!("{} is bound to both {other} and {path}", key.label());
+                    }
+                    Some(_) => continue,
+                    None => {
+                        seen.insert(slot, (path.clone(), command));
+                    }
+                }
+                kept.push(key);
+            }
+            bindings.push((entry.scope, command, kept));
+        }
+        Ok(Self {
+            bindings,
+            plugins: plugins.to_vec(),
+        })
+    }
+
+    /// The plugin command behind a [`Command::Plugin`] id.
+    pub fn plugin(&self, id: PluginCommandId) -> Option<&PluginEntry> {
+        self.plugins.get(usize::from(id))
     }
 
     /// The command a key press runs in `scope`, including shared picker bindings.
@@ -504,6 +653,57 @@ impl Keymap {
             .map_or_else(|| "(unbound)".to_owned(), Key::label)
     }
 
+    /// Every bindable command, in table order, then plugin commands named by their id, such
+    /// as `dashboard.open`.
+    pub fn entries(&self) -> impl Iterator<Item = CommandEntry<'_>> {
+        let builtin = TABLE.iter().map(|entry| CommandEntry {
+            scope: entry.scope,
+            command: entry.command,
+            name: format!("{}.{}", entry.scope.section(), entry.name),
+            description: entry.description,
+        });
+        let plugins = self
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| CommandEntry {
+                scope: entry.scope,
+                command: Command::Plugin(index as PluginCommandId),
+                name: entry.name.clone(),
+                description: &entry.description,
+            });
+        builtin.chain(plugins)
+    }
+
+    /// The commands the palette runs: box and tab commands, each once, without the palette.
+    pub fn palette_entries(&self) -> Vec<CommandEntry<'_>> {
+        let mut entries: Vec<CommandEntry<'_>> = Vec::new();
+        for entry in self.entries() {
+            if matches!(entry.scope, Scope::Box | Scope::Tab)
+                && entry.command != Command::Palette
+                && !entries.iter().any(|seen| seen.command == entry.command)
+            {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// The full key sequence for a box or tab command, such as `Ctrl+B then p`. Empty when
+    /// the command or its prefix is unbound.
+    pub fn binding(&self, scope: Scope, command: Command) -> String {
+        let prefix = match scope {
+            Scope::Box => self.keys(Scope::Prefix, C::BoxPrefix),
+            Scope::Tab => self.keys(Scope::Prefix, C::TabPrefix),
+            _ => return self.keys(scope, command),
+        };
+        let keys = self.keys(scope, command);
+        if prefix.is_empty() || keys.is_empty() {
+            return String::new();
+        }
+        format!("{prefix} then {keys}")
+    }
+
     /// Shortcut help generated from the current bindings.
     pub fn help(&self) -> Vec<Shortcut> {
         let prefix = |command| self.keys(Scope::Prefix, command);
@@ -518,13 +718,13 @@ impl Keymap {
             })
         };
         if !box_prefix.is_empty() {
-            add("Switch box", format!("{box_prefix} then 1–9, 0"));
+            add("Switch box".into(), format!("{box_prefix} then 1–9, 0"));
         }
         if !tab_prefix.is_empty() {
-            add("Select tab", format!("{tab_prefix} then 1–9"));
+            add("Select tab".into(), format!("{tab_prefix} then 1–9"));
         }
         if !tab_prefix.is_empty() && !open_links.is_empty() {
-            add("Open the numbered link", format!("{hints} 1–9"));
+            add("Open the numbered link".into(), format!("{hints} 1–9"));
         }
         for entry in TABLE {
             let keys = self.keys(entry.scope, entry.command);
@@ -532,14 +732,17 @@ impl Keymap {
                 continue;
             }
             let binding = match entry.scope {
-                Scope::Box if !box_prefix.is_empty() => format!("{box_prefix} then {keys}"),
-                Scope::Tab if !tab_prefix.is_empty() => format!("{tab_prefix} then {keys}"),
+                Scope::Box | Scope::Tab => match self.binding(entry.scope, entry.command) {
+                    binding if binding.is_empty() => continue,
+                    binding => binding,
+                },
                 Scope::Picker => format!("In pickers: {keys}"),
                 Scope::Dialog => format!("In dialogs without search: {keys}"),
                 Scope::AgentTree => format!("In the agent tree: {keys}"),
                 Scope::Talk => format!("In talk: {keys}"),
                 Scope::Runs => format!("In the run picker: {keys}"),
                 Scope::Dag => format!("In the task graph: {keys}"),
+                Scope::Panel => format!("In panels such as the dashboard: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
                 Scope::Terminal => format!("In the terminal: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
@@ -547,7 +750,13 @@ impl Keymap {
                 }
                 _ => continue,
             };
-            add(entry.description, binding);
+            add(entry.description.to_owned(), binding);
+        }
+        for (index, entry) in self.plugins.iter().enumerate() {
+            let binding = self.binding(entry.scope, Command::Plugin(index as PluginCommandId));
+            if !binding.is_empty() {
+                add(entry.description.clone(), binding);
+            }
         }
         shortcuts
     }
@@ -559,6 +768,23 @@ mod tests {
 
     fn stroke(text: &str) -> Keystroke {
         Keystroke::parse(text).unwrap()
+    }
+
+    #[test]
+    fn terminal_link_click_preserves_selection_and_preview_gestures() {
+        for (modifiers, browser, preview) in [
+            (Modifiers::default(), None, Some(C::TerminalOpenLink)),
+            (
+                stroke("ctrl-a").modifiers,
+                Some(C::TerminalOpenLink),
+                Some(C::TerminalOpenLink),
+            ),
+            (stroke("shift-a").modifiers, None, None),
+            (stroke("ctrl-shift-a").modifiers, None, None),
+        ] {
+            assert_eq!(Command::terminal_link(modifiers, true), browser);
+            assert_eq!(Command::terminal_link(modifiers, false), preview);
+        }
     }
 
     #[test]
@@ -609,7 +835,7 @@ mod tests {
                     && shortcut.binding == "In the terminal: Ctrl+Shift+C")
         );
         let custom =
-            Keymap::from_config(&json!({ "terminal": { "paste": "shift-insert" } })).unwrap();
+            Keymap::from_config(&json!({ "terminal": { "paste": "shift-insert" } }), &[]).unwrap();
         assert_eq!(
             custom.command(Scope::Terminal, &stroke("shift-insert")),
             Some(C::TerminalPaste)
@@ -743,14 +969,17 @@ mod tests {
 
     #[test]
     fn config_overrides_merge_over_defaults() {
-        let keymap = Keymap::from_config(&json!({
-            "tab": { "next": ["n", "j"] },
-            "box": { "runs": "g" },
-            "dag": { "open": "space", "artifact": "a" },
-            "agent_tree": { "expand": "ctrl-e", "end": "ctrl-d" },
-            "runs": { "show_finished": "ctrl-g" },
-            "prefix": { "tab": "ctrl-a" },
-        }))
+        let keymap = Keymap::from_config(
+            &json!({
+                "tab": { "next": ["n", "j"] },
+                "box": { "runs": "g" },
+                "dag": { "open": "space", "artifact": "a" },
+                "agent_tree": { "expand": "ctrl-e", "end": "ctrl-d" },
+                "runs": { "show_finished": "ctrl-g" },
+                "prefix": { "tab": "ctrl-a" },
+            }),
+            &[],
+        )
         .unwrap();
         assert_eq!(keymap.command(Scope::Tab, &stroke("j")), Some(C::TabNext));
         assert_eq!(
@@ -819,9 +1048,159 @@ mod tests {
             (json!({ "tab": { "next": "hyper-j" } }), "Unknown modifier"),
             (json!({ "tab": { "next": 3 } }), "must be a key name"),
         ] {
-            let error = format!("{:#}", Keymap::from_config(&config).unwrap_err());
+            let error = format!("{:#}", Keymap::from_config(&config, &[]).unwrap_err());
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    fn dashboard() -> infrastructure::plugins::PluginCommand {
+        infrastructure::plugins::PluginCommand {
+            id: "dashboard.open".into(),
+            title: "Open dashboard".into(),
+            description: "Open dashboard".into(),
+            scope: infrastructure::plugins::CommandScope::Box,
+            default_keys: vec!["o".into()],
+        }
+    }
+
+    fn plugin_keymap(
+        lua: &str,
+        commands: &[infrastructure::plugins::PluginCommand],
+    ) -> Result<Keymap> {
+        let mut keys = super::defaults();
+        infrastructure::plugins::merge_command_keys(&mut keys, commands);
+        let config = tempfile::NamedTempFile::new()?;
+        std::fs::write(config.path(), lua)?;
+        let mut sections =
+            infrastructure::config::load_from(config.path(), [(SECTION.into(), keys)])?;
+        sections.insert(
+            infrastructure::plugins::PLUGIN_COMMANDS_SECTION.into(),
+            serde_json::to_value(commands)?,
+        );
+        Keymap::from_sections(&sections)
+    }
+
+    #[test]
+    fn plugin_commands_bind_by_id_and_remap_from_lua() -> Result<()> {
+        let keymap = plugin_keymap("", &[dashboard()])?;
+        let Some(C::Plugin(id)) = keymap.command(Scope::Box, &stroke("o")) else {
+            panic!("o should run the plugin command");
+        };
+        assert_eq!(keymap.plugin(id).unwrap().name, "dashboard.open");
+        assert!(
+            keymap
+                .help()
+                .iter()
+                .any(|row| row.description == "Open dashboard" && row.binding == "Ctrl+B then o")
+        );
+
+        let keymap = plugin_keymap(r#"keys.box["dashboard.open"] = "g""#, &[dashboard()])?;
+        assert_eq!(keymap.command(Scope::Box, &stroke("o")), None);
+        assert_eq!(keymap.command(Scope::Box, &stroke("g")), Some(C::Plugin(0)));
+        assert_eq!(keymap.keys(Scope::Box, C::Plugin(0)), "g");
+        assert!(
+            keymap
+                .help()
+                .iter()
+                .any(|row| row.description == "Open dashboard" && row.binding == "Ctrl+B then g")
+        );
+
+        let entry = keymap
+            .palette_entries()
+            .into_iter()
+            .find(|entry| entry.command == C::Plugin(0))
+            .expect("the palette lists plugin commands");
+        assert_eq!(entry.name, "dashboard.open");
+        assert_eq!(entry.description, "Open dashboard");
+        assert_eq!(keymap.binding(Scope::Box, C::Plugin(0)), "Ctrl+B then g");
+
+        let unbound = plugin_keymap(r#"keys.box["dashboard.open"] = {}"#, &[dashboard()])?;
+        assert_eq!(unbound.command(Scope::Box, &stroke("o")), None);
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_keys_reject_unknown_names_and_configured_conflicts() -> Result<()> {
+        // Without the plugin loaded, its name is a typo like any other.
+        let error = format!(
+            "{:#}",
+            plugin_keymap(r#"keys.box["dashboard.open"] = "g""#, &[]).unwrap_err()
+        );
+        assert!(error.contains("is not a command"), "{error}");
+        let error = format!(
+            "{:#}",
+            plugin_keymap(r#"keys.box["dashboard.open"] = "c""#, &[dashboard()]).unwrap_err()
+        );
+        assert!(error.contains("bound to both keys.box.new"), "{error}");
+        // A built-in rebound onto the plugin's configured key conflicts too.
+        let error = format!(
+            "{:#}",
+            plugin_keymap(
+                r#"keys.box.runs = "g"; keys.box["dashboard.open"] = "g""#,
+                &[dashboard()]
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("bound to both"), "{error}");
+        let mut twice = dashboard();
+        twice.default_keys = vec!["z".into()];
+        let error = format!(
+            "{:#}",
+            plugin_keymap("", &[dashboard(), twice]).unwrap_err()
+        );
+        assert!(error.contains("registered twice"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_plugin_default_that_collides_is_dropped_not_fatal() -> Result<()> {
+        let mut greedy = dashboard();
+        greedy.id = "greedy.open".into();
+        greedy.default_keys = vec!["c".into(), "z".into()];
+        let keymap = plugin_keymap("", &[greedy])?;
+        assert_eq!(keymap.command(Scope::Box, &stroke("c")), Some(C::BoxNew));
+        assert_eq!(keymap.command(Scope::Box, &stroke("z")), Some(C::Plugin(0)));
+        // A user who moves the built-in frees the key for nobody but themselves.
+        let keymap = plugin_keymap(r#"keys.box.new = "n""#, &[dashboard()])?;
+        assert_eq!(keymap.command(Scope::Box, &stroke("n")), Some(C::BoxNew));
+        Ok(())
+    }
+
+    #[test]
+    fn palette_lists_box_and_tab_commands_once_with_stable_names() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.command(Scope::Box, &stroke("p")), Some(C::Palette));
+        let entries = keymap.palette_entries();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| matches!(entry.scope, Scope::Box | Scope::Tab))
+        );
+        assert!(!entries.iter().any(|entry| entry.command == C::Palette));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.command == C::Help)
+                .count(),
+            1
+        );
+        let new = entries
+            .iter()
+            .find(|entry| entry.command == C::BoxNew)
+            .unwrap();
+        assert_eq!(new.name, "box.new");
+        assert_eq!(new.description, "New box");
+        assert_eq!(keymap.binding(Scope::Box, C::BoxNew), "Ctrl+B then c");
+        assert_eq!(keymap.binding(Scope::Tab, C::TabNext), "Ctrl+S then n");
+        assert!(
+            keymap
+                .help()
+                .iter()
+                .any(|row| row.description == "Open command palette"
+                    && row.binding == "Ctrl+B then p")
+        );
+        let unbound = Keymap::from_config(&json!({ "box": { "new": [] } }), &[]).unwrap();
+        assert_eq!(unbound.binding(Scope::Box, C::BoxNew), "");
     }
 
     #[test]

@@ -204,6 +204,7 @@ impl Sandbox {
             active_box: Some(BOX.into()),
             onboarded: true,
             color_scheme: None,
+            recent_commands: Vec::new(),
         };
         fs::write(
             path.join("state/boxes.json"),

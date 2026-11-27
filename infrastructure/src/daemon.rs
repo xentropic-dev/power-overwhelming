@@ -9,9 +9,11 @@ use crate::{
     persistence::{SqliteArtifacts, SqliteSessions},
     plugins::Plugins,
     scheduler::{self, TimerScheduler},
+    system::ProcSystem,
     talk_adapter::{self, DaemonTalk},
     terminal::{ActiveScheme, Command, PtyRuntime},
     theme,
+    usage::ProviderUsage,
     wire::{self, DagRequest, DagResponse, Request, Response},
     workspace::{LocalWorkspace, LocalWorktreeRoot},
 };
@@ -76,6 +78,8 @@ struct Server {
     dag: Arc<DaemonDag>,
     talk: Arc<DaemonTalk>,
     talk_wake: mpsc::SyncSender<()>,
+    system: ProcSystem,
+    usage: ProviderUsage,
 }
 
 /// Runs the daemon. `finished_worker_grace` is how long a DAG worker runs after its
@@ -235,6 +239,8 @@ pub fn serve(
         dag,
         application,
         scheme,
+        system: ProcSystem::default(),
+        usage: ProviderUsage::from_env(),
     }));
     acceptor
         .join()
@@ -594,6 +600,10 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 crate::terminal::valid_metadata(value),
                 "Session metadata must be at most 120 characters on one line"
             );
+            if matches!(field, wire::MetadataField::Usage) {
+                crate::usage::decode_usage(value)?;
+            }
+            let usage = matches!(field, wire::MetadataField::Usage).then(|| value.to_owned());
             let value = (!value.is_empty()).then(|| value.to_owned());
             let (send, receive) = mpsc::sync_channel(1);
             application.terminal(&session)?.send(Command::SetMetadata {
@@ -606,6 +616,9 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 receive.recv_timeout(Duration::from_secs(3))??,
                 "Session metadata must come from the active agent"
             );
+            if let Some(usage) = usage {
+                server.usage.claude.record(&usage)?;
+            }
             Ok(Response::Ok)
         }
         Request::SetConversation {
@@ -720,6 +733,19 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 });
             }
             Ok(Response::Dag { dag: Box::new(dag) })
+        }
+        Request::Overview => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs());
+            let overview = application::overview::OverviewQuery {
+                system: &server.system,
+                usage: &server.usage,
+            }
+            .execute(&*server.dag, now)?;
+            Ok(Response::Overview {
+                overview: Box::new(overview.into()),
+            })
         }
         Request::WatchArtifacts | Request::WatchBoxIcons => {
             unreachable!("Watches use the streaming handler")

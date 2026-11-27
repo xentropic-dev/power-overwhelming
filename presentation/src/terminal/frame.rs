@@ -1,15 +1,17 @@
 //! Row damage and reuse adapted from herdr-app `src/vt.rs`
-//! (https://github.com/ogulcancelik/herdr-app), licensed under Apache-2.0.
+//! (https://github.com/ogulcancelik/herdr-app), licensed under Apache-2.0. Minimum
+//! contrast is adapted from the same file. Wrapped link scanning adapted from herdr-app
+//! `src/vt.rs`, Apache-2.0.
 
-use super::links::{candidate, links};
+use super::links::{candidate, mark_links};
 use super::paint::RowDrawing;
 use anyhow::Result;
 use ghostty_vt::{
-    Terminal,
+    Error, Terminal,
     render::{CellIterator, Colors, Dirty, RenderState, RowId, RowIteration, RowIterator},
     screen::CellWide,
     style::{Style, StyleColor, Underline},
-    terminal::{Point as VtPoint, PointCoordinate},
+    terminal::{Point as VtPoint, PointCoordinate, PointSpace},
 };
 use gpui::{Hsla, rgb};
 use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
@@ -20,6 +22,7 @@ pub(super) struct CellPosition {
     pub(super) column: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct Cell {
     /// The cell's grapheme, or a space when it has none. Concealed (SGR 8) cells keep theirs,
     /// which selection copies; drawing hides them.
@@ -32,6 +35,8 @@ pub(super) struct Cell {
     pub(super) underline_color: Option<Hsla>,
     pub(super) wide: CellWide,
     pub(super) link: Option<Arc<str>>,
+    /// The link came from scanning text rather than OSC 8, so a rescan replaces it.
+    pub(super) text_link: bool,
 }
 
 pub(super) struct Row {
@@ -39,8 +44,13 @@ pub(super) struct Row {
     pub(super) cells: Vec<Cell>,
     /// Row-local runs of clickable cells, retained with the text.
     pub(super) links: Vec<Range<usize>>,
-    pub(super) continues_osc: bool,
-    pub(super) ends_in_osc: bool,
+    /// The row's first link continues the previous row's last one across a soft wrap.
+    pub(super) continues_link: bool,
+    /// The row's last link runs on into the next row across a soft wrap.
+    pub(super) ends_in_link: bool,
+    /// Soft-wrap flags: this row continues the one above, or wraps into the one below.
+    continues: bool,
+    wraps: bool,
     pub(super) drawing: RefCell<Option<Rc<RowDrawing>>>,
 }
 
@@ -53,15 +63,27 @@ pub(super) struct Frame {
     pub(super) ime_cursor: Option<CellPosition>,
     pub(super) colors: Option<Colors>,
     cols: u16,
+    minimum_contrast: f32,
 }
 
 impl Frame {
     /// None means the last frame still describes the viewport. Only acknowledge
     /// Ghostty's damage after every row and its links have been captured.
+    #[cfg(test)]
     pub(super) fn update(
         &self,
         renderer: &mut RenderState,
         terminal: &Terminal,
+    ) -> Result<Option<Self>> {
+        self.update_with(renderer, terminal, 1.)
+    }
+
+    /// Like `update`, raising text below `minimum_contrast` (a WCAG ratio, 1 disables it).
+    pub(super) fn update_with(
+        &self,
+        renderer: &mut RenderState,
+        terminal: &Terminal,
+        minimum_contrast: f32,
     ) -> Result<Option<Self>> {
         let state = renderer.update(terminal)?;
         let vt_cursor = state.cursor()?;
@@ -74,8 +96,10 @@ impl Frame {
         let dirty = state.dirty()?;
         let cols = state.cols()?;
         let height = usize::from(state.rows()?);
-        let full =
-            dirty == Dirty::Full || self.colors.as_ref() != Some(&colors) || self.cols != cols;
+        let full = dirty == Dirty::Full
+            || self.colors.as_ref() != Some(&colors)
+            || self.cols != cols
+            || self.minimum_contrast != minimum_contrast;
         if !full && dirty == Dirty::Clean && self.rows.len() == height {
             if self.cursor == cursor && self.ime_cursor == ime_cursor {
                 return Ok(None);
@@ -86,6 +110,7 @@ impl Frame {
                 ime_cursor,
                 colors: Some(colors),
                 cols,
+                minimum_contrast,
             }));
         }
 
@@ -105,25 +130,31 @@ impl Frame {
                 && !row.dirty()?
                 && let Some(kept) = previous.get(&id)
             {
-                rows.push(Rc::clone(kept));
+                rows.push((Rc::clone(kept), false));
             } else {
-                rows.push(Rc::new(read_row(
-                    row,
-                    &mut cell_iter,
-                    terminal,
-                    rows.len() as u32,
-                    id,
-                    &colors,
-                )?));
+                rows.push((
+                    Rc::new(read_row(
+                        row,
+                        &mut cell_iter,
+                        terminal,
+                        rows.len() as u32,
+                        id,
+                        &colors,
+                        minimum_contrast,
+                    )?),
+                    true,
+                ));
             }
         }
         state.clean()?;
+        let rows = relink(rows, terminal);
         Ok(Some(Self {
             rows,
             cursor,
             ime_cursor,
             colors: Some(colors),
             cols,
+            minimum_contrast,
         }))
     }
 }
@@ -135,34 +166,27 @@ fn read_row<'s>(
     y: u32,
     id: RowId,
     colors: &Colors,
+    minimum_contrast: f32,
 ) -> Result<Row> {
-    let foreground = rgba_color(
-        colors.foreground.r,
-        colors.foreground.g,
-        colors.foreground.b,
-    );
     let default_background = rgba_color(
         colors.background.r,
         colors.background.g,
         colors.background.b,
     );
     super::bench::count(&super::bench::DECODED_ROWS);
-    let wrapped = row.raw_row()?.is_wrap_continuation()?;
+    let raw_row = row.raw_row()?;
+    let continues = raw_row.is_wrap_continuation()?;
+    let wraps = raw_row.is_wrapped()?;
     let mut osc_link: Option<Arc<str>> = None;
-    let mut continues_osc = false;
     let mut uri_buffer = [0; 8192];
     let mut source = cell_iter.update(row)?;
     let mut cells = Vec::new();
-    let mut text = String::new();
-    let mut offsets = Vec::new();
     while let Some(cell) = source.next() {
         let mut grapheme = String::new();
         cell.graphemes_utf8(&mut grapheme)?;
         if grapheme.is_empty() {
             grapheme.push(' ');
         }
-        offsets.push(text.len());
-        text.push_str(&grapheme);
         let raw = cell.raw_cell()?;
         let osc_uri = if raw.has_hyperlink()? {
             terminal
@@ -183,16 +207,22 @@ fn read_row<'s>(
                 .filter(|previous| previous.as_ref() == uri)
                 .unwrap_or_else(|| Arc::from(uri))
         });
-        if cells.is_empty() {
-            continues_osc = wrapped && osc_link.is_some();
-        }
         let style = cell.style()?;
-        let mut fg = cell
-            .fg_color()?
-            .map_or(foreground, |c| rgba_color(c.r, c.g, c.b));
-        let mut bg = cell.bg_color()?.map(|c| rgba_color(c.r, c.g, c.b));
+        let fg_rgb = cell.fg_color()?.unwrap_or(colors.foreground);
+        let bg_color = cell.bg_color()?;
+        let mut fg = rgba_color(fg_rgb.r, fg_rgb.g, fg_rgb.b);
+        let mut bg = bg_color.map(|c| rgba_color(c.r, c.g, c.b));
+        let (mut ink, mut paper) = (fg_rgb, bg_color.unwrap_or(colors.background));
         if style.inverse {
             (fg, bg) = (bg.unwrap_or(default_background), Some(fg));
+            (ink, paper) = (paper, ink);
+        }
+        if minimum_contrast > 1. && !preserves_graphics_color(&grapheme) {
+            let ink = packed_rgb(ink.r, ink.g, ink.b);
+            let readable = readable(ink, packed_rgb(paper.r, paper.g, paper.b), minimum_contrast);
+            if readable != ink {
+                fg = rgb(readable).into();
+            }
         }
         let underline_color = match style.underline_color {
             _ if style.underline == Underline::None => None,
@@ -211,42 +241,285 @@ fn read_row<'s>(
             underline_color,
             wide: raw.wide()?,
             link: osc_link.clone(),
+            text_link: false,
         });
     }
-    for (range, uri) in links(&text) {
-        let start = offsets.partition_point(|offset| *offset < range.start);
-        let end = offsets.partition_point(|offset| *offset < range.end);
-        let link = Arc::from(uri);
-        for cell in &mut cells[start..end] {
-            if cell.link.is_none() {
-                cell.link = Some(Arc::clone(&link));
-            }
-        }
-    }
-    let mut spans = Vec::new();
-    let mut col = 0;
-    while col < cells.len() {
-        let start = col;
-        col += 1;
-        if let Some(link) = &cells[start].link {
-            while cells
-                .get(col)
-                .and_then(|c| c.link.as_ref())
-                .is_some_and(|next| Arc::ptr_eq(next, link))
-            {
-                col += 1;
-            }
-            spans.push(start..col);
-        }
-    }
-    Ok(Row {
+    let mut row = Row {
         id,
         cells,
-        links: spans,
-        continues_osc,
-        ends_in_osc: osc_link.is_some(),
+        links: Vec::new(),
+        continues_link: false,
+        ends_in_link: false,
+        continues,
+        wraps,
         drawing: RefCell::default(),
+    };
+    row.index_links();
+    Ok(row)
+}
+
+impl Row {
+    /// Rebuild the row's link runs and its wrap joins from the cells' links.
+    fn index_links(&mut self) {
+        let cells = &self.cells;
+        let mut spans = Vec::new();
+        let mut col = 0;
+        while col < cells.len() {
+            let start = col;
+            col += 1;
+            if let Some(link) = &cells[start].link {
+                while cells
+                    .get(col)
+                    .and_then(|c| c.link.as_ref())
+                    .is_some_and(|next| Arc::ptr_eq(next, link) || **next == **link)
+                {
+                    col += 1;
+                }
+                spans.push(start..col);
+            }
+        }
+        // A wide character that does not fit leaves a spacer in the last column.
+        let last = cells
+            .iter()
+            .rposition(|cell| cell.wide != CellWide::SpacerHead)
+            .map_or(0, |last| last + 1);
+        self.continues_link = self.continues && spans.first().is_some_and(|span| span.start == 0);
+        self.ends_in_link = self.wraps && spans.last().is_some_and(|span| span.end >= last);
+        self.links = spans;
+    }
+}
+
+/// Rescan text links along each soft-wrapped logical line that holds a newly read row, or
+/// that runs past the viewport, so URLs that wrap across rows stay one link.
+fn relink(rows: Vec<(Rc<Row>, bool)>, terminal: &Terminal) -> Vec<Rc<Row>> {
+    let count = rows.len();
+    let mut out = Vec::with_capacity(count);
+    let mut start = 0;
+    while start < count {
+        let mut end = start + 1;
+        while end < count && rows[end - 1].0.wraps && rows[end].0.continues {
+            end += 1;
+        }
+        let group = &rows[start..end];
+        let past_top = start == 0 && group[0].0.continues;
+        let past_bottom = end == count && group[end - start - 1].0.wraps;
+        if group.iter().any(|(_, fresh)| *fresh) || past_top || past_bottom {
+            let mut owned: Vec<Row> = group.iter().map(|(row, _)| row.unlinked()).collect();
+            let width = owned[0].cells.len() as u16;
+            let prefix = if past_top {
+                wrap_prefix(terminal, width)
+            } else {
+                (String::new(), true)
+            };
+            let suffix = if past_bottom {
+                wrap_suffix(terminal, (end - 1) as u32, width)
+            } else {
+                (String::new(), true)
+            };
+            mark_links(&mut owned, prefix, suffix);
+            for (mut row, (kept, _)) in owned.into_iter().zip(group) {
+                row.index_links();
+                if row.same_links(kept) {
+                    out.push(Rc::clone(kept));
+                } else {
+                    out.push(Rc::new(row));
+                }
+            }
+        } else {
+            out.extend(group.iter().map(|(row, _)| Rc::clone(row)));
+        }
+        start = end;
+    }
+    out
+}
+
+impl Row {
+    /// A copy without the links found in text, ready for a rescan.
+    fn unlinked(&self) -> Row {
+        let mut cells = self.cells.clone();
+        for cell in &mut cells {
+            if cell.text_link {
+                cell.link = None;
+                cell.text_link = false;
+            }
+        }
+        Row {
+            id: self.id,
+            cells,
+            links: Vec::new(),
+            continues_link: false,
+            ends_in_link: false,
+            continues: self.continues,
+            wraps: self.wraps,
+            drawing: RefCell::default(),
+        }
+    }
+
+    fn same_links(&self, other: &Row) -> bool {
+        self.links == other.links
+            && self.continues_link == other.continues_link
+            && self.ends_in_link == other.ends_in_link
+            && self
+                .cells
+                .iter()
+                .zip(&other.cells)
+                .all(|(a, b)| a.link == b.link)
+    }
+}
+
+// Bound how much scrollback a single viewport edge can add to a logical line.
+const WRAP_REACH: u32 = 32;
+
+/// Scrollback text before the viewport and whether it reaches the logical line's start.
+fn wrap_prefix(terminal: &Terminal, width: u16) -> (String, bool) {
+    let Some(top) = screen_y(terminal, 0) else {
+        return (String::new(), true);
+    };
+    let mut lines = Vec::new();
+    let mut complete = top < WRAP_REACH;
+    for y in (top.saturating_sub(WRAP_REACH)..top).rev() {
+        let Some((row, text)) = screen_line(terminal, y, width) else {
+            complete = true;
+            break;
+        };
+        if !row.is_wrapped().unwrap_or(false) {
+            complete = true;
+            break;
+        }
+        lines.push(text);
+        if !row.is_wrap_continuation().unwrap_or(false) {
+            complete = true;
+            break;
+        }
+    }
+    (lines.into_iter().rev().collect(), complete)
+}
+
+/// Text after the viewport and whether it reaches the logical line's end.
+fn wrap_suffix(terminal: &Terminal, last_visible: u32, width: u16) -> (String, bool) {
+    let Some(bottom) = screen_y(terminal, last_visible) else {
+        return (String::new(), true);
+    };
+    let mut suffix = String::new();
+    let mut complete = false;
+    for y in bottom + 1..=bottom.saturating_add(WRAP_REACH) {
+        let Some((row, text)) = screen_line(terminal, y, width) else {
+            complete = true;
+            break;
+        };
+        if !row.is_wrap_continuation().unwrap_or(false) {
+            complete = true;
+            break;
+        }
+        suffix.push_str(&text);
+        if !row.is_wrapped().unwrap_or(false) {
+            complete = true;
+            break;
+        }
+    }
+    (suffix, complete)
+}
+
+fn screen_y(terminal: &Terminal, viewport_y: u32) -> Option<u32> {
+    let reference = terminal
+        .grid_ref(VtPoint::Viewport(PointCoordinate {
+            x: 0,
+            y: viewport_y,
+        }))
+        .ok()?;
+    Some(
+        terminal
+            .point_from_grid_ref(&reference, PointSpace::Screen)
+            .ok()??
+            .y,
+    )
+}
+
+fn screen_line(
+    terminal: &Terminal,
+    y: u32,
+    width: u16,
+) -> Option<(ghostty_vt::screen::Row, String)> {
+    let mut text = String::new();
+    let mut grapheme = vec![' '; 16];
+    let row = terminal
+        .grid_ref(VtPoint::Screen(PointCoordinate { x: 0, y }))
+        .ok()?
+        .row()
+        .ok()?;
+    for x in 0..width {
+        let reference = terminal
+            .grid_ref(VtPoint::Screen(PointCoordinate { x, y }))
+            .ok()?;
+        if matches!(
+            reference.cell().ok()?.wide().ok()?,
+            CellWide::SpacerHead | CellWide::SpacerTail
+        ) {
+            continue;
+        }
+        let count = match reference.graphemes(&mut grapheme) {
+            Err(Error::OutOfSpace { required }) => {
+                grapheme.resize(required, ' ');
+                reference.graphemes(&mut grapheme)
+            }
+            result => result,
+        }
+        .ok()?;
+        if count == 0 {
+            text.push(' ');
+        } else {
+            text.extend(grapheme[..count].iter());
+        }
+    }
+    Some((row, text))
+}
+
+fn packed_rgb(r: u8, g: u8, b: u8) -> u32 {
+    u32::from_be_bytes([0, r, g, b])
+}
+
+/// Box drawing, blocks, braille, powerline and legacy computing sprites keep their authored
+/// colors even when that color has low contrast.
+fn preserves_graphics_color(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| {
+        ('\u{2500}'..='\u{259f}').contains(&c)
+            || ('\u{2800}'..='\u{28ff}').contains(&c)
+            || ('\u{e0b0}'..='\u{e0d7}').contains(&c)
+            || c == '\u{23fa}'
+            || ('\u{1fb00}'..='\u{1fbff}').contains(&c)
+            || ('\u{1cc00}'..='\u{1cebf}').contains(&c)
     })
+}
+
+/// `foreground`, or near-white / near-black when it would vanish into `background`.
+fn readable(foreground: u32, background: u32, minimum: f32) -> u32 {
+    if contrast(foreground, background) >= minimum {
+        return foreground;
+    }
+    let (light, dark) = (0xf2f2f4, 0x1b1b1e);
+    if contrast(light, background) >= contrast(dark, background) {
+        light
+    } else {
+        dark
+    }
+}
+
+fn contrast(a: u32, b: u32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn luminance(color: u32) -> f32 {
+    let [_, r, g, b] = color.to_be_bytes();
+    let linear = |value: u8| {
+        let value = f32::from(value) / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
 }
 
 fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
@@ -255,7 +528,65 @@ fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, RenderState, Terminal};
+    use super::{Frame, RenderState, Terminal, contrast, preserves_graphics_color, readable};
+    use gpui::{Hsla, rgb};
+
+    #[test]
+    fn minimum_contrast_replaces_low_contrast_text_but_keeps_graphics_colors() {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(b"\x1b[48;2;0;0;0m\x1b[38;2;16;16;16mA\xe2\xa0\x81");
+        let frame = Frame::default()
+            .update_with(&mut RenderState::new().unwrap(), &terminal, 4.5)
+            .unwrap()
+            .unwrap();
+        let cells = &frame.rows[0].cells;
+        assert_eq!(cells[0].fg, Hsla::from(rgb(0xf2f2f4)));
+        assert_eq!(cells[1].fg, Hsla::from(rgb(0x101010)));
+    }
+
+    #[test]
+    fn contrast_ratio_one_leaves_program_colors_unchanged() {
+        assert_eq!(readable(0x101010, 0x000000, 1.), 0x101010);
+    }
+
+    #[test]
+    fn minimum_contrast_selects_a_dark_fallback_on_light_backgrounds() {
+        assert_eq!(readable(0xffffff, 0xffffff, 4.5), 0x1b1b1e);
+        assert!(contrast(readable(0xffffff, 0xffffff, 4.5), 0xffffff) >= 4.5);
+    }
+
+    #[test]
+    fn minimum_contrast_exempts_sprite_and_powerline_ranges() {
+        for glyph in ["─", "▅", "⠁", "\u{e0b0}", "⏺", "🬀", "\u{1cc00}"] {
+            assert!(preserves_graphics_color(glyph), "{glyph}");
+        }
+        assert!(!preserves_graphics_color("A"));
+    }
+
+    fn low_contrast_cell(glyph: &str) -> Hsla {
+        let mut terminal = Terminal::new(Options::default()).unwrap();
+        terminal.vt_write(format!("\x1b[48;2;0;0;0m\x1b[38;2;16;16;16m{glyph}").as_bytes());
+        let frame = Frame::default()
+            .update_with(&mut RenderState::new().unwrap(), &terminal, 4.5)
+            .unwrap()
+            .unwrap();
+        frame.rows[0].cells[0].fg
+    }
+
+    #[test]
+    fn minimum_contrast_keeps_extended_powerline_colors() {
+        for glyph in ["\u{e0c0}", "\u{e0d7}"] {
+            assert_eq!(low_contrast_cell(glyph), Hsla::from(rgb(0x101010)));
+        }
+    }
+
+    #[test]
+    fn minimum_contrast_keeps_graphics_colors_with_combining_marks() {
+        assert_eq!(
+            low_contrast_cell("\u{2500}\u{0301}"),
+            Hsla::from(rgb(0x101010))
+        );
+    }
     use ghostty_vt::terminal::Options;
     use std::sync::Arc;
 
@@ -388,7 +719,11 @@ mod tests {
         assert!(cells[10].link.is_none());
         assert_eq!(second.as_ref(), "pwr://artifact/two");
         assert!(Arc::ptr_eq(second, cells[28].link.as_ref().unwrap()));
-        assert!(cells[30..36].iter().all(|cell| cell.link.is_none()));
+        assert!(
+            cells[30..36]
+                .iter()
+                .all(|cell| cell.link.as_deref() == Some("https://example.com"))
+        );
     }
 }
 
@@ -412,5 +747,128 @@ mod conceal_tests {
             .collect();
         assert!(text.starts_with("aSECRETz"));
         assert!(frame.rows[0].cells[1].style.invisible);
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::{Frame, RenderState, Terminal};
+    use ghostty_vt::terminal::{Options, ScrollViewport};
+    use std::sync::Arc;
+
+    fn frame(renderer: &mut RenderState, terminal: &Terminal) -> Frame {
+        Frame::default()
+            .update(renderer, terminal)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn sized(cols: u16, rows: u16) -> Terminal {
+        Terminal::new(Options {
+            cols,
+            rows,
+            ..Options::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn wrapped_links_share_a_span_and_skip_the_wide_wrap_spacer() {
+        let mut terminal = sized(10, 4);
+        let uri = "https://x界.test/path";
+        terminal.vt_write(format!("{uri} rest").as_bytes());
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal);
+        let first = frame.rows[0].cells[0].link.as_ref().unwrap();
+        assert_eq!(first.as_ref(), uri);
+        assert!(frame.rows[0].cells[9].link.is_none());
+        for (row, columns) in [(0, 0..9), (1, 0..10), (2, 0..2)] {
+            for cell in &frame.rows[row].cells[columns] {
+                assert!(Arc::ptr_eq(first, cell.link.as_ref().unwrap()));
+            }
+        }
+        assert!(frame.rows[2].cells[2].link.is_none());
+        use super::CellPosition;
+        let start = CellPosition { row: 0, column: 0 };
+        let end = CellPosition { row: 2, column: 1 };
+        assert_eq!(
+            frame.link_span(CellPosition { row: 1, column: 4 }),
+            Some((start, end))
+        );
+    }
+
+    #[test]
+    fn wrapped_osc_link_takes_precedence_over_a_printed_url() {
+        let mut terminal = sized(12, 3);
+        terminal.vt_write(b"\x1b]8;;pwr://dag/run\x1b\\https://example.org\x1b]8;;\x1b\\");
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal);
+        let first = frame.rows[0].cells[0].link.as_ref().unwrap();
+        assert_eq!(first.as_ref(), "pwr://dag/run");
+        assert_eq!(
+            frame.rows[1].cells[6].link.as_deref(),
+            Some("pwr://dag/run")
+        );
+        assert!(frame.rows[1].cells[7].link.is_none());
+    }
+
+    #[test]
+    fn wrapped_links_include_scrollback_on_both_sides_of_the_viewport() {
+        let mut terminal = sized(12, 2);
+        let uri = "https://example.com/a/long/path";
+        terminal.vt_write(format!("{uri}\r\nend").as_bytes());
+        let mut renderer = RenderState::new().unwrap();
+        for position in [ScrollViewport::Top, ScrollViewport::Bottom] {
+            terminal.scroll_viewport(position);
+            let frame = frame(&mut renderer, &terminal);
+            assert_eq!(frame.rows[0].cells[0].link.as_deref(), Some(uri));
+        }
+    }
+
+    #[test]
+    fn urls_running_past_the_scan_reach_stay_inert() {
+        let mut terminal = sized(10, 2);
+        let uri = format!("https://example.com/{}", "a".repeat(10 * 40));
+        terminal.vt_write(format!("{uri}\r\nend").as_bytes());
+        let mut renderer = RenderState::new().unwrap();
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let top = frame(&mut renderer, &terminal);
+        assert!(top.rows.iter().all(|row| row.links.is_empty()));
+        terminal.scroll_viewport(ScrollViewport::Bottom);
+        let bottom = frame(&mut renderer, &terminal);
+        assert!(bottom.rows[0].links.is_empty());
+
+        // Punctuation on the last scanned cell must not hide the truncation.
+        let mut terminal = sized(10, 2);
+        let uri = format!("https://example.com/{};{}", "a".repeat(319), "a".repeat(80));
+        terminal.vt_write(format!("{uri}\r\nend").as_bytes());
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let top = frame(&mut RenderState::new().unwrap(), &terminal);
+        assert!(top.rows.iter().all(|row| row.links.is_empty()));
+    }
+
+    #[test]
+    fn hard_newline_at_the_right_edge_keeps_urls_on_their_own_lines() {
+        let mut terminal = sized(16, 2);
+        let uri = "https://a.test/x";
+        terminal.vt_write(format!("{uri}\r\nmore").as_bytes());
+        let frame = frame(&mut RenderState::new().unwrap(), &terminal);
+        assert_eq!(frame.rows[0].cells[15].link.as_deref(), Some(uri));
+        assert!(frame.rows[1].cells[0].link.is_none());
+    }
+
+    #[test]
+    fn editing_one_half_of_a_wrapped_url_relinks_the_cached_half() {
+        let mut terminal = sized(10, 4);
+        let mut renderer = RenderState::new().unwrap();
+        terminal.vt_write(b"https://a.test/long\x1b[H");
+        let first = frame(&mut renderer, &terminal);
+        assert_eq!(
+            first.rows[1].cells[0].link.as_deref(),
+            Some("https://a.test/long")
+        );
+        // Breaking the scheme damages the first row only; the cached second row loses its link.
+        terminal.vt_write(b"X");
+        let second = first.update(&mut renderer, &terminal).unwrap().unwrap();
+        assert!(second.rows[1].cells[0].link.is_none());
+        assert!(second.rows[0].cells[0].link.is_none());
     }
 }
