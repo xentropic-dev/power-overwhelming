@@ -31,6 +31,7 @@ pub enum Command {
     Reload,
     Quit,
     Help,
+    Palette,
     TabNew,
     TabWorktree,
     TabPick,
@@ -166,6 +167,16 @@ const fn entry(
 use Command as C;
 use Scope as S;
 
+/// A bindable command as the command palette lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandEntry<'a> {
+    pub scope: Scope,
+    pub command: Command,
+    /// A stable name such as `box.new`, saved in the recent command list.
+    pub name: String,
+    pub description: &'a str,
+}
+
 pub struct Shortcut {
     pub description: &'static str,
     pub binding: String,
@@ -187,6 +198,7 @@ const TABLE: &[Entry] = &[
     entry(S::Box, "setup", C::BoxSetup, &["i"], "Shell integration setup"),
     entry(S::Box, "quit", C::Quit, &["q"], "Quit"),
     entry(S::Box, "help", C::Help, &["?"], "Keyboard shortcuts"),
+    entry(S::Box, "palette", C::Palette, &["p"], "Open command palette"),
     entry(S::Tab, "new", C::TabNew, &["c"], "New tab"),
     entry(
         S::Tab,
@@ -504,6 +516,45 @@ impl Keymap {
             .map_or_else(|| "(unbound)".to_owned(), Key::label)
     }
 
+    /// Every bindable command, in table order.
+    pub fn entries(&self) -> impl Iterator<Item = CommandEntry<'_>> {
+        TABLE.iter().map(|entry| CommandEntry {
+            scope: entry.scope,
+            command: entry.command,
+            name: format!("{}.{}", entry.scope.section(), entry.name),
+            description: entry.description,
+        })
+    }
+
+    /// The commands the palette runs: box and tab commands, each once, without the palette.
+    pub fn palette_entries(&self) -> Vec<CommandEntry<'_>> {
+        let mut entries: Vec<CommandEntry<'_>> = Vec::new();
+        for entry in self.entries() {
+            if matches!(entry.scope, Scope::Box | Scope::Tab)
+                && entry.command != Command::Palette
+                && !entries.iter().any(|seen| seen.command == entry.command)
+            {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    /// The full key sequence for a box or tab command, such as `Ctrl+B then p`. Empty when
+    /// the command or its prefix is unbound.
+    pub fn binding(&self, scope: Scope, command: Command) -> String {
+        let prefix = match scope {
+            Scope::Box => self.keys(Scope::Prefix, C::BoxPrefix),
+            Scope::Tab => self.keys(Scope::Prefix, C::TabPrefix),
+            _ => return self.keys(scope, command),
+        };
+        let keys = self.keys(scope, command);
+        if prefix.is_empty() || keys.is_empty() {
+            return String::new();
+        }
+        format!("{prefix} then {keys}")
+    }
+
     /// Shortcut help generated from the current bindings.
     pub fn help(&self) -> Vec<Shortcut> {
         let prefix = |command| self.keys(Scope::Prefix, command);
@@ -532,8 +583,10 @@ impl Keymap {
                 continue;
             }
             let binding = match entry.scope {
-                Scope::Box if !box_prefix.is_empty() => format!("{box_prefix} then {keys}"),
-                Scope::Tab if !tab_prefix.is_empty() => format!("{tab_prefix} then {keys}"),
+                Scope::Box | Scope::Tab => match self.binding(entry.scope, entry.command) {
+                    binding if binding.is_empty() => continue,
+                    binding => binding,
+                },
                 Scope::Picker => format!("In pickers: {keys}"),
                 Scope::Dialog => format!("In dialogs without search: {keys}"),
                 Scope::AgentTree => format!("In the agent tree: {keys}"),
@@ -822,6 +875,43 @@ mod tests {
             let error = format!("{:#}", Keymap::from_config(&config).unwrap_err());
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    #[test]
+    fn palette_lists_box_and_tab_commands_once_with_stable_names() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.command(Scope::Box, &stroke("p")), Some(C::Palette));
+        let entries = keymap.palette_entries();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| matches!(entry.scope, Scope::Box | Scope::Tab))
+        );
+        assert!(!entries.iter().any(|entry| entry.command == C::Palette));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.command == C::Help)
+                .count(),
+            1
+        );
+        let new = entries
+            .iter()
+            .find(|entry| entry.command == C::BoxNew)
+            .unwrap();
+        assert_eq!(new.name, "box.new");
+        assert_eq!(new.description, "New box");
+        assert_eq!(keymap.binding(Scope::Box, C::BoxNew), "Ctrl+B then c");
+        assert_eq!(keymap.binding(Scope::Tab, C::TabNext), "Ctrl+S then n");
+        assert!(
+            keymap
+                .help()
+                .iter()
+                .any(|row| row.description == "Open command palette"
+                    && row.binding == "Ctrl+B then p")
+        );
+        let unbound = Keymap::from_config(&json!({ "box": { "new": [] } })).unwrap();
+        assert_eq!(unbound.binding(Scope::Box, C::BoxNew), "");
     }
 
     #[test]
