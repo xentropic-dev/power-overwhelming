@@ -55,13 +55,22 @@ fn next(updates: &async_channel::Receiver<PanelUpdate>) -> Result<PanelUpdate> {
     bail!("No panel update arrived")
 }
 
+/// The commands of the installed fixture, leaving out the bundled dashboard's.
+fn installed(panels: &PanelPlugins) -> Vec<PluginCommand> {
+    panels
+        .commands()
+        .into_iter()
+        .filter(|command| !command.id.starts_with("dashboard."))
+        .collect()
+}
+
 #[test]
 fn panel_plugins_register_commands_open_and_draw_panels() -> Result<()> {
     let directory = tempfile::tempdir()?;
     install(directory.path(), FIXTURE)?;
     let (panels, updates) = PanelPlugins::start(Some(directory.path().to_owned()));
     assert_eq!(
-        panels.commands(),
+        installed(&panels),
         [PluginCommand {
             id: "fixture.open".into(),
             title: "Open fixture".into(),
@@ -71,8 +80,14 @@ fn panel_plugins_register_commands_open_and_draw_panels() -> Result<()> {
         }]
     );
 
+    let settings: Vec<_> = panels
+        .setup()
+        .settings
+        .into_iter()
+        .filter(|settings| settings.key != "dashboard")
+        .collect();
     assert_eq!(
-        panels.setup().settings,
+        settings,
         [PanelSettings {
             key: "fixture".into(),
             defaults: json!({"refresh_ms": 2000}),
@@ -144,17 +159,17 @@ fn a_spinning_plugin_is_dropped_with_an_error_and_reload_restores_it() -> Result
     assert_ne!(spinning, FIXTURE);
     install(directory.path(), &spinning)?;
     let (panels, updates) = PanelPlugins::start(Some(directory.path().to_owned()));
-    assert_eq!(panels.commands().len(), 1);
+    assert_eq!(installed(&panels).len(), 1);
     panels.invoke("fixture.open");
     match next(&updates)? {
         PanelUpdate::Error(error) => assert!(error.contains("Disabled plugin"), "{error}"),
         other => bail!("Unexpected update {other:?}"),
     }
-    assert!(panels.commands().is_empty());
+    assert!(installed(&panels).is_empty());
 
     install(directory.path(), FIXTURE)?;
     panels.reload(None);
-    assert_eq!(panels.commands().len(), 1);
+    assert_eq!(installed(&panels).len(), 1);
     Ok(())
 }
 
@@ -170,7 +185,7 @@ fn invalid_plugins_and_bad_output_are_rejected() -> Result<()> {
         ),
     )?;
     let (panels, updates) = PanelPlugins::start(Some(directory.path().to_owned()));
-    assert!(panels.commands().is_empty());
+    assert!(installed(&panels).is_empty());
     match next(&updates)? {
         PanelUpdate::Error(error) => assert!(error.contains("Invalid command id"), "{error}"),
         other => bail!("Unexpected update {other:?}"),

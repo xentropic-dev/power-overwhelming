@@ -925,12 +925,10 @@ impl Workspace {
                     let scheme = cx.global::<DesktopScheme>().0;
                     let panel = this.panel.as_mut().filter(|panel| panel.id == id)?;
                     match overview {
-                        Ok(overview) => this.panels.render(
-                            panel.panel_id.clone(),
-                            &overview,
-                            columns,
-                            scheme,
-                        ),
+                        Ok(overview) => {
+                            this.panels
+                                .render(panel.panel_id.clone(), &overview, columns, scheme)
+                        }
                         Err(error) => {
                             panel.error = Some(format!("Could not read the overview. {error:#}"));
                             cx.notify();

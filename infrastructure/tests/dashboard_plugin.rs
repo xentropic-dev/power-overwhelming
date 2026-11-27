@@ -3,13 +3,14 @@
 //! The bundled dashboard component, through the panel plugin host.
 
 use anyhow::{Result, bail};
+use domain::{
+    dag::RunStatus,
+    overview::{BoxOverview, ModelUsage, Overview, RunOverview, SystemStats, Totals, UsageWindow},
+};
 use infrastructure::{
     plugins::{
         CommandScope,
-        panel::{
-            BoxOverview, ModelUsage, Overview, Panel, PanelItem, PanelPlugins, PanelUpdate,
-            RunOverview, RunStatus, SystemStats, Totals, UsageWindow,
-        },
+        panel::{Panel, PanelItem, PanelPlugins, PanelUpdate},
     },
     theme,
 };
@@ -28,7 +29,7 @@ fn next(updates: &async_channel::Receiver<PanelUpdate>) -> Result<PanelUpdate> {
     bail!("No panel update arrived")
 }
 
-fn run(title: &str, status: RunStatus, completed: u32, eta_secs: Option<u64>) -> RunOverview {
+fn run(title: &str, status: RunStatus, completed: usize, eta_secs: Option<u64>) -> RunOverview {
     RunOverview {
         run: format!("run-{title}"),
         box_id: "b1".into(),
@@ -116,10 +117,10 @@ fn draw() -> Result<Panel> {
     assert_eq!(command.default_keys, ["o"]);
     panels.invoke("dashboard.open");
     match next(&updates)? {
-        PanelUpdate::OpenPanel(id) => assert_eq!(id, "dashboard"),
+        PanelUpdate::OpenPanel { panel_id, .. } => assert_eq!(panel_id, "dashboard"),
         other => bail!("Unexpected update {other:?}"),
     }
-    panels.render("dashboard", overview(), 100, theme::default_scheme());
+    panels.render("dashboard", &overview(), 100, theme::default_scheme());
     match next(&updates)? {
         PanelUpdate::Panel { panel_id, panel } => {
             assert_eq!(panel_id, "dashboard");
