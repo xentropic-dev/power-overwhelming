@@ -1263,6 +1263,14 @@ pub enum DagRequest {
         status: ReportStatus,
         summary: String,
     },
+    /// Reports needs-input and asks the user the summary as a decision request, atomically.
+    ReportDecision {
+        run: String,
+        task: String,
+        attempt: String,
+        summary: String,
+        choices: Vec<String>,
+    },
     /// Events with `seq > since`. Blocks up to `wait_ms` when none match yet.
     Events {
         run: String,
@@ -1350,6 +1358,9 @@ pub enum DagResponse {
     Reported {
         applied: bool,
         reason: Option<String>,
+    },
+    DecisionRequested {
+        message: talk::TalkMessage,
     },
     TaskEdited {
         run: String,

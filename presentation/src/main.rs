@@ -1376,28 +1376,23 @@ fn run_dag(command: DagAction) -> Result<()> {
                     matches!(status, ReportChoice::NeedsInput),
                     "--choices is only for needs-input"
                 );
-                let request = DagRequest::Report {
+                // One daemon request: the report and the decision request commit together.
+                let request = DagRequest::ReportDecision {
                     run: report_arg(run, "POWER_RUN", "run")?,
                     task: report_arg(task, "POWER_TASK", "task")?,
                     attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
-                    summary: summary.clone(),
-                    status: ReportStatus::NeedsInput,
-                };
-                dag_reply(request, timeout)?;
-                let ask = client::talk::ask(
-                    client::talk::Caller {
-                        session: caller_session(),
-                        ..Default::default()
-                    },
                     summary,
                     choices,
-                    None,
-                )?;
+                };
+                let DagResponse::DecisionRequested { message } = client::dag(request, timeout)?
+                else {
+                    anyhow::bail!("Unexpected daemon response");
+                };
                 eprintln!(
                     "Asked the user {} · thread {}. Wait with: power talk wait {} --reply-to {}",
-                    ask.id.0, ask.thread.0, ask.thread.0, ask.id.0
+                    message.id, message.thread, message.thread, message.id
                 );
-                return Ok(());
+                return print_json(json!({"applied": true, "message": message}));
             }
             DagRequest::Report {
                 run: report_arg(run, "POWER_RUN", "run")?,

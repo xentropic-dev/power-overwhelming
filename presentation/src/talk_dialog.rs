@@ -7,7 +7,6 @@ use application::talk::LogFilter;
 use domain::talk::{Message, MessageId, Recipient, Sender, envelope};
 use gpui::{prelude::*, *};
 use infrastructure::{client::talk, theme::Colors};
-use std::collections::HashSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
@@ -37,25 +36,19 @@ impl Query {
         let caller = caller(self.box_id.clone());
         if let Some(id) = &self.expanded {
             talk::show(caller, id.clone(), true)
+        } else if self.target == Target::User {
+            talk::desktop_inbox(self.box_id.clone(), now_ms())
         } else {
             let messages = talk::log(
-                caller.clone(),
+                caller,
                 LogFilter {
                     agent: self.target.agent().map(str::to_owned),
-                    to_user: self.target == Target::User,
                     ..LogFilter::default()
                 },
             )?;
-            // The user inbox leads with open decision requests from every box.
-            let decisions = if self.target == Target::User {
-                talk::decisions(caller, false)?
-            } else {
-                Vec::new()
-            };
-            let mut threads = HashSet::new();
-            Ok(decisions
+            let mut threads = std::collections::HashSet::new();
+            Ok(messages
                 .into_iter()
-                .chain(messages)
                 .filter(|message| threads.insert(message.thread.clone()))
                 .collect())
         }
@@ -88,11 +81,7 @@ impl Send {
 }
 
 pub fn caller(box_id: String) -> talk::Caller {
-    talk::Caller {
-        box_sel: Some(box_id),
-        session: None,
-        desktop: true,
-    }
+    talk::Caller::desktop(box_id)
 }
 
 pub struct TalkDialog {
@@ -230,12 +219,19 @@ impl TalkDialog {
         if self.expanded.is_some() || self.draft.is_some() {
             return None;
         }
-        self.threads.get(self.selected_thread).filter(|message| {
-            message
-                .decision
-                .as_ref()
-                .is_some_and(|d| d.answered_at.is_none())
-        })
+        self.threads
+            .get(self.selected_thread)
+            .filter(|message| answerable(message, now_ms()))
+    }
+
+    /// When the next open request in the list expires, so the list refreshes then.
+    pub fn next_expiry(&self) -> Option<u64> {
+        let now = now_ms();
+        self.threads
+            .iter()
+            .filter(|message| answerable(message, now))
+            .filter_map(|message| message.decision.as_ref()?.expires_at)
+            .min()
     }
 
     /// Answers the selected decision request with its `index`th choice.
@@ -349,6 +345,7 @@ impl TalkDialog {
             Target::Agent { label, .. } => format!("Talk with {label}"),
             Target::User => "Your inbox".into(),
         };
+        let now = now_ms();
         let mut actions = Vec::new();
         let mut action = |scope, command, description| {
             if !keymap.keys(scope, command).is_empty() {
@@ -433,9 +430,34 @@ impl TalkDialog {
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
                             .children(messages.iter().enumerate().map(|(index, message)| {
+                                let open = !expanded && answerable(message, now);
+                                let section = (!expanded)
+                                    .then(|| {
+                                        let previous = index
+                                            .checked_sub(1)
+                                            .and_then(|i| messages.get(i))
+                                            .is_some_and(|m| answerable(m, now));
+                                        if open && index == 0 {
+                                            Some("Open decisions")
+                                        } else if !open && previous {
+                                            Some("History")
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .flatten();
                                 div()
                                     .px_3()
                                     .py_2()
+                                    .when_some(section, |row, label| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(colors.muted))
+                                                .child(label),
+                                        )
+                                    })
                                     .when(index == selected, |row| row.bg(rgb(colors.raised)))
                                     .child(
                                         div()
@@ -470,6 +492,19 @@ impl TalkDialog {
             )
             .into_any_element()
     }
+}
+
+fn answerable(message: &Message, now: u64) -> bool {
+    message.is_open_decision(now)
+}
+
+/// The choice a key answers: only an unmodified digit from 1, so no chord commits one.
+pub fn choice_index(keystroke: &Keystroke) -> Option<usize> {
+    if keystroke.modifiers.modified() {
+        return None;
+    }
+    let digit = keystroke.key.parse::<usize>().ok()?;
+    (1..=9).contains(&digit).then(|| digit - 1)
 }
 
 fn metadata(message: &Message) -> String {
@@ -523,8 +558,74 @@ fn metadata(message: &Message) -> String {
     format!("{sender} → {recipient}{from_box} · {time} · {state}")
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{answerable, choice_index};
+    use domain::talk::{
+        Decision, Delivery, Message, MessageId, Recipient, Sender, ThreadId, open_decisions_first,
+    };
+    use gpui::Keystroke;
+
+    fn message(id: &str, decision: Option<Decision>) -> Message {
+        Message {
+            id: MessageId(id.into()),
+            box_id: "box".into(),
+            sender: Sender::Shell,
+            recipient: Recipient::User,
+            body: id.into(),
+            thread: ThreadId(id.into()),
+            reply_to: None,
+            broadcast: None,
+            run: None,
+            created_at: 0,
+            delivery: Delivery::default(),
+            urgent: false,
+            decision,
+        }
+    }
+
+    fn decision(expires_at: Option<u64>, answered_at: Option<u64>) -> Option<Decision> {
+        Some(Decision {
+            choices: vec!["Yes".into(), "No".into()],
+            expires_at,
+            answered_at,
+        })
+    }
+
+    #[test]
+    fn only_open_requests_lead_the_list_and_closed_ones_join_the_history() {
+        let rows = vec![
+            message("plain", None),
+            message("expired", decision(Some(10), None)),
+            message("answered", decision(None, Some(5))),
+            message("open", decision(Some(100), None)),
+        ];
+        let ids = |rows: &[Message]| rows.iter().map(|m| m.id.0.clone()).collect::<Vec<_>>();
+        let sorted = open_decisions_first(rows.clone(), 50);
+        assert_eq!(ids(&sorted), ["open", "plain", "expired", "answered"]);
+        assert!(answerable(&sorted[0], 50));
+        assert!(!answerable(&sorted[2], 50));
+        // At its deadline the last open request closes too.
+        let later = open_decisions_first(rows, 100);
+        assert_eq!(ids(&later), ["plain", "expired", "answered", "open"]);
+        assert!(later.iter().all(|m| !answerable(m, 100)));
+    }
+
+    #[test]
+    fn only_an_unmodified_digit_picks_a_choice() {
+        let key = |text: &str| Keystroke::parse(text).unwrap();
+        assert_eq!(choice_index(&key("1")), Some(0));
+        assert_eq!(choice_index(&key("9")), Some(8));
+        assert_eq!(choice_index(&key("0")), None);
+        assert_eq!(choice_index(&key("a")), None);
+        for chord in ["ctrl-1", "alt-2", "shift-3", "super-1", "ctrl-shift-1"] {
+            assert_eq!(choice_index(&key(chord)), None, "{chord}");
+        }
+    }
 }

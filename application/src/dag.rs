@@ -295,6 +295,40 @@ pub trait TaskMessenger {
     ) -> Result<String>;
 }
 
+/// Writes the DAG and talk stores in one transaction, so a report and the decision request
+/// it posts commit together or not at all.
+pub trait JointStore {
+    /// An error rolls back both stores' changes and events.
+    fn write_joint<V>(
+        &self,
+        operation: impl FnOnce(&dyn DagTransaction, &dyn crate::talk::TalkTransaction) -> Result<V>,
+    ) -> Result<V>;
+}
+
+/// Posts a worker's decision request to the user inbox. The talk use case implements it.
+pub trait DecisionPoster {
+    /// Rejects a request that could not be posted, before anything is written.
+    fn check_decision(&self, body: &str, choices: &[String]) -> Result<()>;
+    /// Posts it as `agent`, within `run`, in the caller's transaction.
+    fn post_decision(
+        &self,
+        db: &dyn crate::talk::TalkTransaction,
+        agent: &str,
+        run: &str,
+        body: &str,
+        choices: Vec<String>,
+    ) -> Result<domain::talk::Message>;
+}
+
+pub struct ReportDecision {
+    pub run: String,
+    pub task: String,
+    pub attempt: String,
+    /// The question, also the attempt's blocker.
+    pub summary: String,
+    pub choices: Vec<String>,
+}
+
 pub struct EditTask {
     pub run: String,
     pub task: String,
@@ -1718,6 +1752,55 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
             self.end_finished_session(session, cleanup);
         }
         Ok(result)
+    }
+
+    /// Reports `needs-input` and asks the user the summary as a decision request, as one
+    /// change. The request comes from the reported attempt's worker. A rejected report
+    /// posts nothing, and a request that cannot be posted leaves the report unapplied.
+    pub fn report_decision(
+        &self,
+        command: ReportDecision,
+        poster: &dyn DecisionPoster,
+    ) -> Result<domain::talk::Message>
+    where
+        S: JointStore,
+    {
+        poster.check_decision(&command.summary, &command.choices)?;
+        let message = self.store.write_joint(|db, talk| {
+            let stopping = db.stopping_sessions()?;
+            let (result, _) = report(
+                db,
+                &command.run,
+                &command.task,
+                &command.attempt,
+                ReportStatus::NeedsInput,
+                &command.summary,
+                &stopping,
+            )?;
+            if !result.applied {
+                bail!(
+                    "Power did not apply the needs-input report ({}), so it asked the user nothing",
+                    result.reason.as_deref().unwrap_or("rejected")
+                );
+            }
+            let run = load_run(db, &command.run)?;
+            let attempt = find_task(&run, &command.task)?
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == command.attempt)
+                .context("The reported attempt is gone")?;
+            poster.post_decision(
+                talk,
+                &attempt.agent,
+                &command.run,
+                &command.summary,
+                command.choices,
+            )
+        })?;
+        let mut generation = self.event_generation.lock().unwrap();
+        *generation = generation.wrapping_add(1);
+        self.events_changed.notify_all();
+        Ok(message)
     }
 
     /// Ends a finished worker's session after the grace. Ending takes everything the

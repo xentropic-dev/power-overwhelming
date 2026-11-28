@@ -36,28 +36,31 @@ pub(super) fn migrate(db: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS talk_events_box ON talk_events(box_id, seq);",
     )?;
-    let has_sender_box: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('talk_messages')
-             WHERE name = 'sender_box')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_sender_box {
+    // Each column is checked and added on its own, so a startup interrupted between two
+    // additions repairs the rest on the next one.
+    for (column, kind) in [
         // `box_id` is the recipient's box. A peer may write from another one.
-        db.execute("ALTER TABLE talk_messages ADD COLUMN sender_box TEXT", [])?;
+        ("sender_box", "TEXT"),
+        // A JSON array of choices marks a decision request to the user.
+        ("decision_choices", "TEXT"),
+        ("decision_expires_at", "INTEGER"),
+        ("decision_answered_at", "INTEGER"),
+    ] {
+        add_missing_column(db, column, kind)?;
     }
-    let has_decision: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('talk_messages')
-             WHERE name = 'decision_choices')",
-        [],
+    Ok(())
+}
+
+fn add_missing_column(db: &Connection, column: &str, kind: &str) -> Result<()> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('talk_messages') WHERE name = ?1)",
+        [column],
         |row| row.get(0),
     )?;
-    if !has_decision {
-        // A JSON array of choices marks a decision request to the user.
-        db.execute_batch(
-            "ALTER TABLE talk_messages ADD COLUMN decision_choices TEXT;
-             ALTER TABLE talk_messages ADD COLUMN decision_expires_at INTEGER;
-             ALTER TABLE talk_messages ADD COLUMN decision_answered_at INTEGER;",
+    if !exists {
+        db.execute(
+            &format!("ALTER TABLE talk_messages ADD COLUMN {column} {kind}"),
+            [],
         )?;
     }
     Ok(())
@@ -92,6 +95,21 @@ impl TalkStore for SqliteDagStore {
                 |db| matches!(TalkDb(db).cursor(), Ok(current) if current == cursor),
             )
             .unwrap();
+    }
+}
+
+impl application::dag::JointStore for SqliteDagStore {
+    fn write_joint<V>(
+        &self,
+        operation: impl FnOnce(&dyn application::dag::DagTransaction, &dyn TalkTransaction) -> Result<V>,
+    ) -> Result<V> {
+        let mut db = self.0.lock().unwrap();
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = operation(&super::DagDb(&transaction), &TalkDb(&transaction))?;
+        transaction.commit()?;
+        // Talk waiters and watchers see the request.
+        self.1.notify_all();
+        Ok(result)
     }
 }
 
@@ -556,6 +574,51 @@ mod tests {
             assert!(db.inbox(&Recipient::User, None, false)?.is_empty());
             assert_eq!(db.message(&message.id)?.unwrap().delivery.read_at, Some(6));
             assert_eq!(db.events(1, Some("box"))?[0].kind, TalkEventKind::Read);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_partially_migrated_database_gains_every_missing_column() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        drop(SqliteDagStore::initialize(Connection::open(file.path())?)?);
+        // A startup that stopped after the first decision column, before the others.
+        let db = Connection::open(file.path())?;
+        db.execute_batch(
+            "ALTER TABLE talk_messages DROP COLUMN decision_expires_at;
+             ALTER TABLE talk_messages DROP COLUMN decision_answered_at;",
+        )?;
+        let store = SqliteDagStore::initialize(db)?;
+        let message = Message {
+            id: MessageId("ask".into()),
+            box_id: "box".into(),
+            sender: Sender::Shell,
+            recipient: Recipient::User,
+            body: "Ship it?".into(),
+            thread: ThreadId("ask".into()),
+            reply_to: None,
+            broadcast: None,
+            run: None,
+            created_at: 1,
+            delivery: Delivery {
+                queued_at: 1,
+                ..Delivery::default()
+            },
+            urgent: false,
+            decision: Some(Decision {
+                choices: vec!["Yes".into(), "No".into()],
+                expires_at: Some(50),
+                answered_at: None,
+            }),
+        };
+        store.write(|db| db.insert(&message))?;
+        store.write(|db| {
+            assert_eq!(db.decisions(false, 10)?, vec![message.clone()]);
+            assert!(db.answer(&message.id, 20)?);
+            assert!(!db.answer(&message.id, 21)?);
+            assert!(db.decisions(false, 30)?.is_empty());
+            let all = db.decisions(true, 30)?;
+            assert_eq!(all[0].decision.as_ref().unwrap().answered_at, Some(20));
             Ok(())
         })
     }

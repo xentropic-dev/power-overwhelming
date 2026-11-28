@@ -1837,6 +1837,190 @@ fn edit_task_tells_the_running_worker_without_a_restart() {
     assert_eq!(events[0]["attempt"].as_str(), fixture.a.attempt.as_deref());
 }
 
+fn task_state(fixture: &Fixture, task: &str) -> String {
+    let shown = json(
+        power(fixture.path(), None)
+            .args(["dag", "show", &fixture.run.id])
+            .output()
+            .unwrap(),
+    );
+    let tasks = shown["run"]["tasks"].as_array().unwrap();
+    let task = tasks.iter().find(|t| t["id"] == task).unwrap();
+    task["state"].as_str().unwrap().to_owned()
+}
+
+fn report_choices(
+    fixture: &Fixture,
+    worker: &ManagedAgent,
+    attempt: &str,
+    choices: &str,
+) -> Output {
+    power(fixture.path(), Some(worker))
+        .args([
+            "dag",
+            "report",
+            "needs-input",
+            "--summary",
+            "Ship it?",
+            "--run",
+            &fixture.run.id,
+            "--task",
+            worker.task.as_deref().unwrap(),
+            "--attempt",
+            attempt,
+            "--choices",
+            choices,
+        ])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_command_worker_asks_through_needs_input_and_the_desktop_answers_from_another_box() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let worker = &fixture.b;
+    let attempt = worker.attempt.clone().unwrap();
+    // This test alone drives the desktop client in-process, against the sandbox daemon.
+    unsafe { std::env::set_var("POWER_SOCKET", path.join("power.sock")) };
+    let open = |box_id: &str| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        infrastructure::client::talk::desktop_inbox(box_id.into(), now).unwrap()
+    };
+    let decisions = || messages(talk(path, None, &["decisions", "--all", "--json"]));
+
+    // Rejected inputs change nothing: no report and no request.
+    for (attempt, choices) in [
+        ("not-an-attempt", "Approve,Deny"),
+        (attempt.as_str(), "A,A"),
+    ] {
+        let failed = report_choices(&fixture, worker, attempt, choices);
+        assert!(!failed.status.success(), "{failed:?}");
+        assert_eq!(task_state(&fixture, "b"), "working");
+        assert!(decisions().is_empty());
+    }
+    let wrong = power(path, Some(worker))
+        .args([
+            "dag",
+            "report",
+            "success",
+            "--summary",
+            "x",
+            "--choices",
+            "A",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    // A stale attempt is rejected too: a's attempt does not belong to task b.
+    let stale = report_choices(
+        &fixture,
+        worker,
+        fixture.a.attempt.as_deref().unwrap(),
+        "A,B",
+    );
+    assert!(!stale.status.success());
+    assert!(decisions().is_empty());
+
+    // The accepted report and its request commit together, bound to the reported attempt.
+    let asked = json(report_choices(&fixture, worker, &attempt, "Approve,Deny"));
+    let request = asked["message"].clone();
+    assert_eq!(task_state(&fixture, "b"), "needs_input");
+    assert_eq!(request["run"], fixture.run.id.as_str());
+    assert_eq!(request["sender"]["id"], worker.id.as_str());
+    assert_eq!(request["sender"]["role"], "worker on task b");
+    assert_eq!(request["decision"]["choices"][0], "Approve");
+
+    // Neither a peer nor a shell can answer it.
+    let peer = talk(
+        path,
+        Some(&fixture.a),
+        &["reply", field(&request, "id"), "Approve"],
+    );
+    assert!(
+        String::from_utf8_lossy(&peer.stderr).contains("Only the user"),
+        "{peer:?}"
+    );
+    let shell = talk(path, None, &["reply", field(&request, "id"), "Approve"]);
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("Only the user"),
+        "{shell:?}"
+    );
+
+    // The desktop inbox of another box leads with it.
+    let inbox = open(REMOTE_BOX);
+    assert_eq!(inbox[0].id.0, field(&request, "id"));
+    assert_eq!(inbox[0].run.as_deref(), Some(fixture.run.id.as_str()));
+
+    // A request that expires leaves the open section for the history.
+    let expiring = messages(talk(
+        path,
+        Some(&fixture.a),
+        &[
+            "ask",
+            "user",
+            "--choices",
+            "Now,Later",
+            "--expires",
+            "1",
+            "Soon?",
+            "--json",
+        ],
+    ))
+    .remove(0);
+    assert!(
+        open(REMOTE_BOX)[..2]
+            .iter()
+            .any(|m| m.id.0 == field(&expiring, "id"))
+    );
+    thread::sleep(Duration::from_millis(1_100));
+    let inbox = open(REMOTE_BOX);
+    let position = inbox
+        .iter()
+        .position(|m| m.id.0 == field(&expiring, "id"))
+        .unwrap();
+    assert!(position > 0, "an expired request is not open");
+    assert_eq!(inbox[0].id.0, field(&request, "id"));
+    let caller = infrastructure::client::talk::Caller::desktop(REMOTE_BOX.into());
+    let late = infrastructure::client::talk::reply(
+        caller.clone(),
+        inbox[position].id.clone(),
+        "Now".into(),
+        None,
+    );
+    assert!(format!("{:#}", late.unwrap_err()).contains("expired"));
+
+    // The desktop answers the remote request the way the dialog does.
+    let answer =
+        infrastructure::client::talk::reply(caller, inbox[0].id.clone(), "Approve".into(), None)
+            .unwrap();
+    assert_eq!(answer.sender, domain::talk::Sender::User);
+    let printed = success(talk(path, Some(worker), &["inbox"]));
+    assert!(printed.contains("Approve"), "{printed}");
+    let inbox = open(REMOTE_BOX);
+    // Nothing is open any more: the answered and the expired requests are history.
+    assert!(inbox.iter().all(|m| {
+        !m.decision
+            .as_ref()
+            .is_some_and(|d| d.answered_at.is_none() && d.expires_at.is_none())
+    }));
+    assert!(
+        inbox
+            .iter()
+            .any(|m| m.thread.0 == field(&request, "thread"))
+    );
+    assert_eq!(
+        decisions()
+            .iter()
+            .filter(|m| m["decision"]["answered_at"].is_u64())
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn the_user_answers_decision_requests_from_every_box_and_peers_cannot() {
     let sandbox = Sandbox::new();

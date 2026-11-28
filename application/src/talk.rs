@@ -847,10 +847,12 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             let parent = require_message(db, &command.message)?;
             let sender = actor.sender(parent.run.as_deref());
             let now = (self.clock)();
-            // The one choke point for answers: only the user answers a decision request, once.
+            // The one choke point for answers: only the user, in the desktop, answers a
+            // decision request, once. A shell has the user's authority, but Power cannot
+            // confirm that the user wrote its answer.
             if let Some(decision) = &parent.decision {
                 ensure!(
-                    sender.has_user_authority(),
+                    sender.is_user_authored(),
                     "Only the user can answer decision request {:?}",
                     command.message.0
                 );
@@ -1271,6 +1273,53 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::TaskMessenger fo
             .next()
             .map(|message| message.id.0)
             .context("Talk queued no message for the worker")
+    }
+}
+
+impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::DecisionPoster for Talk<S, A, N> {
+    fn check_decision(&self, body: &str, choices: &[String]) -> Result<()> {
+        validate_body(body)?;
+        Decision::new(choices.to_vec(), None).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    fn post_decision(
+        &self,
+        db: &dyn TalkTransaction,
+        agent: &str,
+        run: &str,
+        body: &str,
+        choices: Vec<String>,
+    ) -> Result<Message> {
+        self.check_decision(body, &choices)?;
+        let directory = db.directory()?;
+        let worker = directory
+            .agents
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .with_context(|| format!("Unknown worker {agent:?}"))?;
+        let actor = Actor {
+            agent: Some(worker),
+            box_id: Some(&worker.box_id),
+            desktop: false,
+            directory: &directory,
+        };
+        let now = (self.clock)();
+        let mut message = self.build(
+            db,
+            Outgoing {
+                box_id: worker.box_id.clone(),
+                sender: actor.sender(Some(run)),
+                recipient: Recipient::User,
+                body: body.into(),
+                run: Some(run.into()),
+                urgent: false,
+            },
+            now,
+        )?;
+        message.decision = Some(Decision::new(choices, None).map_err(anyhow::Error::msg)?);
+        db.insert(&message)?;
+        Ok(message)
     }
 }
 

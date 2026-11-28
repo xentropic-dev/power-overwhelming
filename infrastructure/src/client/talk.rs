@@ -13,6 +13,39 @@ pub struct Caller {
     pub desktop: bool,
 }
 
+impl Caller {
+    /// The desktop, acting for the user in `box_id`.
+    pub fn desktop(box_id: String) -> Self {
+        Self {
+            session: None,
+            box_sel: Some(box_id),
+            desktop: true,
+        }
+    }
+}
+
+/// The desktop's user inbox for `box_id`: one row per thread, led by the decision requests
+/// from every box that are still open at `now`. Closed requests stay in the history.
+pub fn desktop_inbox(box_id: String, now: u64) -> Result<Vec<Message>> {
+    let caller = Caller::desktop(box_id);
+    let messages = log(
+        caller.clone(),
+        LogFilter {
+            to_user: true,
+            ..LogFilter::default()
+        },
+    )?;
+    let mut threads = std::collections::HashSet::new();
+    // Every box's requests, closed ones too, so an answered or expired request from
+    // another box stays in the history.
+    let rows = decisions(caller, true)?
+        .into_iter()
+        .chain(messages)
+        .filter(|message| threads.insert(message.thread.clone()))
+        .collect();
+    Ok(domain::talk::open_decisions_first(rows, now))
+}
+
 fn request(caller: Caller, command: TalkCommand) -> Request {
     Request::Talk {
         talk: TalkRequest {

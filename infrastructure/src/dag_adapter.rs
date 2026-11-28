@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 use application::dag::{
     BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EditDelivery, EditTask,
-    EventScope, PlanTask, StartAgent,
+    EventScope, PlanTask, ReportDecision, StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
@@ -285,6 +285,26 @@ pub(crate) fn request(
                 reason: result.reason,
             }
         }
+        DagRequest::ReportDecision {
+            run,
+            task,
+            attempt,
+            summary,
+            choices,
+        } => Reply::DecisionRequested {
+            message: application
+                .report_decision(
+                    ReportDecision {
+                        run,
+                        task,
+                        attempt,
+                        summary,
+                        choices,
+                    },
+                    talk,
+                )?
+                .into(),
+        },
         DagRequest::Events {
             run,
             since,

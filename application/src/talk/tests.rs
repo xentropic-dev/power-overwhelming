@@ -496,6 +496,18 @@ fn only_the_user_answers_a_decision_request_and_only_once() -> Result<()> {
     };
     let peer = answer(Some("b-session")).unwrap_err();
     assert!(format!("{peer:#}").contains("Only the user"));
+    // A shell has the user's authority, but nothing shows the user wrote its answer.
+    let shell = talk
+        .reply(Reply {
+            caller: caller(None),
+            message: request.id.clone(),
+            recipient_agent: None,
+            body: "Approve".into(),
+            urgent: false,
+        })
+        .unwrap_err();
+    assert!(format!("{shell:#}").contains("Only the user"));
+    assert_eq!(talk.decisions(caller(None), false)?.len(), 1);
     let reply = answer(None)?;
     assert_eq!(reply.sender, Sender::User);
     assert_eq!(reply.reply_to, Some(request.id.clone()));
@@ -522,6 +534,8 @@ fn the_first_turn_start_reserves_the_hook_path_for_urgent_messages() -> Result<(
         run: None,
         body: "now".into(),
         urgent: true,
+        choices: Vec::new(),
+        expires_in: None,
     })?;
     talk.deliver_pending()?;
     assert!(terminal.typed.lock().unwrap().is_empty());

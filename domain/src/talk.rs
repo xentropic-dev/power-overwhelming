@@ -37,6 +37,12 @@ impl Sender {
     pub fn has_user_authority(&self) -> bool {
         matches!(self, Self::User | Self::Shell)
     }
+
+    /// Power confirmed that the user wrote it, through the desktop. A shell has the user's
+    /// authority but not this, so it cannot answer a decision request.
+    pub fn is_user_authored(&self) -> bool {
+        matches!(self, Self::User)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,7 +99,7 @@ pub struct Message {
 pub const MAX_CHOICES: usize = 9;
 pub const MAX_CHOICE_BYTES: usize = 64;
 
-/// A question to the user with fixed answers. Only a reply with the user's authority
+/// A question to the user with fixed answers. Only a reply the user wrote in the desktop
 /// answers it, once, before it expires.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Decision {
@@ -128,6 +134,25 @@ impl Decision {
     pub fn is_open(&self, now: u64) -> bool {
         self.answered_at.is_none() && self.expires_at.is_none_or(|at| at > now)
     }
+}
+
+impl Message {
+    /// A decision request the user can answer at `now`: neither answered nor expired.
+    pub fn is_open_decision(&self, now: u64) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.is_open(now))
+    }
+}
+
+/// Puts the decision requests still open at `now` first. Answered and expired ones stay in
+/// the history with every other message, in their order.
+pub fn open_decisions_first(messages: Vec<Message>, now: u64) -> Vec<Message> {
+    let (mut open, history): (Vec<_>, Vec<_>) = messages
+        .into_iter()
+        .partition(|message| message.is_open_decision(now));
+    open.extend(history);
+    open
 }
 
 /// The delivery metadata of an unread message, without its body.
