@@ -1467,10 +1467,8 @@ fn terminal_actor(
                             &mut metadata.model
                         }
                     };
-                    if *field != value {
-                        *field = value;
-                        notify_metadata(&metadata, &mut clients);
-                    }
+                    let changed = *field != value;
+                    *field = value;
                     if is_model {
                         model_reported = true;
                     }
@@ -1485,6 +1483,11 @@ fn terminal_actor(
                             conversation: None,
                         });
                         restore.claim(owner, identity, labels, lifecycle);
+                    }
+                    // Save before anyone sees the report, so a daemon killed right after
+                    // it was shown still restores the agent that made it.
+                    if changed {
+                        notify_metadata(&metadata, &mut clients);
                     }
                     Ok(true)
                 })();
