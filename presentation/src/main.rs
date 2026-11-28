@@ -886,7 +886,11 @@ fn report_conversation() {
         let _ = client::set_conversation(
             session.clone(),
             profile.id.as_str().to_owned(),
-            conversation,
+            Some(conversation),
+            false,
+            // The agent itself names the conversation it runs, so a saved ID it
+            // reports is that conversation, not a new one assigned the same ID.
+            true,
         );
         // An agent without a model callback, like jcode, records its model in its
         // session, so each report also refreshes the model shown in the bar.

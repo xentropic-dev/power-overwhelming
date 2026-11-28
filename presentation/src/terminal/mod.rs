@@ -2,6 +2,7 @@
 //! `src/terminal.rs` (Apache-2.0).
 
 pub(crate) mod bench;
+mod find;
 mod frame;
 mod grid;
 mod hold;
@@ -172,6 +173,12 @@ pub struct TerminalView {
     /// Numbered link labels shown while the user picks a link by keyboard.
     hints: Vec<(CellPosition, Arc<str>)>,
     hint_footer: Option<String>,
+    finder: find::Finder,
+    /// Whether a pump of the running search is scheduled.
+    find_pumping: bool,
+    /// Whether a composition the find bar owned was cut off by its closing, so the input
+    /// method's commit for it goes nowhere.
+    find_orphan: bool,
     /// Buttons whose press went to the program, so their motion and release go too.
     buttons: Vec<MouseButton>,
     /// The last mouse report sent, as motion, so motion within one cell isn't repeated.
@@ -304,6 +311,9 @@ impl TerminalView {
             pressed_link: None,
             hints: Vec::new(),
             hint_footer: None,
+            finder: find::Finder::default(),
+            find_pumping: false,
+            find_orphan: false,
             buttons: Vec::new(),
             last_mouse_report: Vec::new(),
             scrolled: Point::default(),
@@ -412,6 +422,7 @@ impl TerminalView {
                     self.status = None;
                     // The gesture tracks cells of the terminal it replaced.
                     self.selector.reset(&previous);
+                    self.finder.rebind(&self.terminal);
                     self.metadata = SessionMetadata::default();
                     let title = shown_title(&title).into_owned();
                     cx.emit(TerminalTitleChanged(title));
@@ -509,8 +520,13 @@ impl TerminalView {
             return false;
         }
         let selection = selection::viewport_range(&self.terminal);
-        let moved = selection != self.selection;
+        let mut moved = selection != self.selection;
         self.selection = selection;
+        if self.finder.is_open() {
+            let spans = self.finder.spans().to_vec();
+            self.finder.pump(&self.terminal);
+            moved |= spans != self.finder.spans();
+        }
         moved | self.refresh_frame()
     }
 
@@ -915,5 +931,123 @@ mod gesture_tests {
         );
         let selected = view.read_with(cx, |view, _| super::selection::text(&view.terminal));
         assert_eq!(selected, None, "a tracked click doesn't select");
+    }
+
+    #[gpui::test]
+    fn the_find_query_never_reaches_the_program(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"needle one\r\nneedle two");
+        view.update(cx, |view, cx| view.open_find(cx));
+        let rx = feed(&view, cx, b"");
+        // A raw keystroke the workspace didn't take goes nowhere while the bar is open.
+        cx.simulate_keystrokes("z");
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            // Text the platform types, and an input method's commit, use the input handler.
+            view.replace_text_in_range(None, "nee", window, cx);
+            view.replace_and_mark_text_in_range(None, "d", None, window, cx);
+            assert!(
+                view.find_bar().unwrap().0.ends_with('d'),
+                "composition shows in the bar"
+            );
+            view.replace_text_in_range(None, "d", window, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("le\n".into()));
+        view.update(cx, |view, cx| view.find_paste(cx));
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        let query = view.read_with(cx, |view, _| view.finder.query().to_owned());
+        assert_eq!(query, "needle");
+        // Once closed, typing goes to the program again.
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.close_find(cx);
+            view.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(inputs(&rx), vec!["x".to_owned()]);
+    }
+
+    #[gpui::test]
+    fn the_find_bar_keeps_the_mouse_from_the_terminal(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"text\x1b[?1000h\x1b[?1006h");
+        view.update(cx, |view, cx| view.open_find(cx));
+        cx.run_until_parked();
+        let rx = feed(&view, cx, b"");
+        let none = Modifiers::none();
+        // Over the bar, near the top right of the terminal.
+        let bar = bounds(&view, cx).top_right() + point(px(-200.), px(14.));
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            cx.simulate_mouse_down(bar, button, none);
+            cx.simulate_mouse_up(bar, button, none);
+        }
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: bar,
+            delta: gpui::ScrollDelta::Lines(point(0., 3.)),
+            ..Default::default()
+        });
+        assert_eq!(
+            inputs(&rx),
+            Vec::<String>::new(),
+            "the bar takes its own presses"
+        );
+        // Below the bar the program still hears the mouse.
+        let at = cell(&view, cx, 3., 1.);
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_up(at, MouseButton::Left, none);
+        assert_eq!(inputs(&rx).len(), 2);
+        assert!(view.read_with(cx, |view, _| view.finding()));
+    }
+
+    #[gpui::test]
+    fn middle_click_pastes_primary_into_the_find_query(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"needle");
+        view.update(cx, |view, cx| view.open_find(cx));
+        cx.run_until_parked();
+        let rx = feed(&view, cx, b"");
+        cx.update(|_, cx| cx.write_to_primary(gpui::ClipboardItem::new_string("needle".into())));
+        let none = Modifiers::none();
+        let at = cell(&view, cx, 3., 1.);
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(at, MouseButton::Middle, none);
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        let query = view.read_with(cx, |view, _| view.finder.query().to_owned());
+        assert_eq!(query, "needle");
+    }
+
+    #[gpui::test]
+    fn closing_find_drops_its_pending_composition(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        view.update(cx, |view, cx| view.open_find(cx));
+        let rx = feed(&view, cx, b"");
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_and_mark_text_in_range(None, "に", None, window, cx);
+        });
+        cx.run_until_parked();
+        // The bar's close control, at its right end.
+        let close = bounds(&view, cx).top_right() + point(px(-16.), px(14.));
+        cx.simulate_click(close, Modifiers::none());
+        assert!(
+            !view.read_with(cx, |view, _| view.finding()),
+            "Close closes"
+        );
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_text_in_range(None, "日", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.typing.marked().map(str::to_owned)),
+            None
+        );
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(inputs(&rx), vec!["x".to_owned()]);
     }
 }
