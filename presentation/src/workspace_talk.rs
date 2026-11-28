@@ -63,6 +63,8 @@ impl Workspace {
                     })
                     .await;
                 let Ok(next) = app.update(cx, |workspace, cx| {
+                    // One instant orders the list and schedules its next expiry.
+                    let now = talk_dialog::now_ms();
                     if let Some((scope, Ok(agents))) = update.0
                         && workspace.summary_scope().as_ref() == Some(&scope)
                     {
@@ -79,15 +81,19 @@ impl Workspace {
                     if let Some((query, result)) = update.1
                         && let Some(dialog) = &mut workspace.talk
                     {
-                        dialog.apply(&query, result);
+                        dialog.apply(&query, result, now);
                     }
                     cx.notify();
-                    workspace.talk.as_ref().and_then(TalkDialog::next_expiry)
+                    let next = workspace
+                        .talk
+                        .as_ref()
+                        .and_then(|dialog| dialog.next_expiry(now));
+                    next.map(|at| (at, now))
                 }) else {
                     break;
                 };
-                expiry = next.map(|at| {
-                    let wait = Duration::from_millis(at.saturating_sub(talk_dialog::now_ms()) + 50);
+                expiry = next.map(|(at, now)| {
+                    let wait = Duration::from_millis(at.saturating_sub(now) + 50);
                     let tick = tick.clone();
                     let timer = cx.background_executor().timer(wait);
                     cx.background_executor().spawn(async move {

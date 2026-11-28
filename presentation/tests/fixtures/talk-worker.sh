@@ -20,5 +20,15 @@ while IFS= read -r line; do
                 "$POWER_BIN" talk reply "$id" 'fixture reply'
             fi
             ;;
+        'report-choices '*)
+            # Asks from inside this worker's session: report-choices TASK ATTEMPT CHOICES.
+            set -- ${line#report-choices }
+            status=0
+            "$POWER_BIN" dag report needs-input --summary 'Ship it?' --task "$1" \
+                --attempt "$2" --choices "$3" \
+                > "$root/report-$name.out" 2> "$root/report-$name.err" || status=$?
+            printf '%s\n' "$status" > "$root/report-$name.tmp"
+            mv "$root/report-$name.tmp" "$root/report-$name.status"
+            ;;
     esac
 done

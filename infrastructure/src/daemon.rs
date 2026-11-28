@@ -481,7 +481,27 @@ fn accept(
     handle(socket, request, &startup.server())
 }
 
-fn handle(mut socket: UnixStream, request: Request, server: &Server) -> Result<()> {
+/// Whether the process at the other end of `socket` is the desktop: it holds the box
+/// layout lock, and runs in no Power session, so no agent can pass as it.
+fn verified_desktop(socket: &UnixStream, server: &Server) -> bool {
+    let Ok(pid) = wire::peer_pid(socket) else {
+        return false;
+    };
+    crate::boxes::holds_layout_lock(pid)
+        && !server
+            .dag
+            .list_sessions()
+            .iter()
+            .any(|session| server.application.session_owns_process(&session.id, pid))
+}
+
+fn handle(mut socket: UnixStream, mut request: Request, server: &Server) -> Result<()> {
+    // A client only claims the desktop. The daemon decides.
+    if let Request::Talk { talk } = &mut request
+        && talk.desktop
+    {
+        talk.desktop = verified_desktop(&socket, server);
+    }
     let application = &server.application;
     match request {
         Request::WatchArtifacts => return stream(socket, &ARTIFACT_WATCHERS),
@@ -772,7 +792,8 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             talk: talk_adapter::request(&server.talk, &server.dag, talk)?,
         }),
         Request::Dag { dag } => {
-            let dag = dag_adapter::request(&server.dag, &server.talk, dag)?;
+            let dag =
+                dag_adapter::request(&server.dag, &server.talk, dag, wire::peer_pid(socket).ok())?;
             if let DagResponse::BoxIcon { box_id } = &dag {
                 broadcast(&BOX_ICON_WATCHERS, || Response::BoxIconChanged {
                     box_id: box_id.clone(),

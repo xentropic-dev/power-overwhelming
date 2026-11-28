@@ -327,6 +327,9 @@ pub struct ReportDecision {
     /// The question, also the attempt's blocker.
     pub summary: String,
     pub choices: Vec<String>,
+    /// The process that asks, as the daemon verified it. It must run in the attempt's
+    /// session. `None` when unknown, which is refused.
+    pub caller_pid: Option<u32>,
 }
 
 pub struct EditTask {
@@ -1766,6 +1769,23 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         S: JointStore,
     {
         poster.check_decision(&command.summary, &command.choices)?;
+        // The request speaks in the worker's name, so only a process in the attempt's own
+        // session may ask. Checked before the transaction: the terminal is never asked
+        // while a store lock is held.
+        let session = self.run(&command.run).ok().and_then(|run| {
+            let task = run.tasks.into_iter().find(|task| task.id == command.task)?;
+            task.attempts
+                .into_iter()
+                .find(|attempt| attempt.id == command.attempt)?
+                .session
+        });
+        ensure!(
+            session.as_deref().is_some_and(|session| command
+                .caller_pid
+                .is_some_and(|pid| self.application.session_owns_process(session, pid))),
+            "Only the worker of attempt {:?} can ask the user in its name",
+            command.attempt
+        );
         let message = self.store.write_joint(|db, talk| {
             let stopping = db.stopping_sessions()?;
             let (result, _) = report(
@@ -1789,6 +1809,10 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
                 .iter()
                 .find(|attempt| attempt.id == command.attempt)
                 .context("The reported attempt is gone")?;
+            ensure!(
+                attempt.session == session,
+                "The reported attempt changed sessions, so it asked the user nothing"
+            );
             poster.post_decision(
                 talk,
                 &attempt.agent,

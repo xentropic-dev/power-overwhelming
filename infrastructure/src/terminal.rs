@@ -316,6 +316,14 @@ impl TerminalRuntime for PtyRuntime {
         Ok(())
     }
 
+    fn owns_process(&self, handle: &Self::Handle, pid: u32) -> bool {
+        let (reply, answer) = mpsc::sync_channel(1);
+        handle.send(Command::Owns { pid, reply }).is_ok()
+            && answer
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap_or(false)
+    }
+
     /// Ends what any earlier launch of `session` left, whichever backend started it:
     /// the scopes its ledger records, wherever they are, the scopes of this daemon's
     /// slice, and fallback reapers, so a daemon that restarts with or without cgroup
@@ -391,6 +399,12 @@ pub enum Command {
     Poll,
     /// Recheck the foreground now and reply with the agent that owns it.
     ResolveForeground(SyncSender<Agent>),
+    /// Whether process `pid` runs inside this session: the session's own process or one
+    /// of its descendants.
+    Owns {
+        pid: u32,
+        reply: SyncSender<bool>,
+    },
     OutputClosed,
     ProcessExited(String),
     /// Save pending scrollback and foreground state, then acknowledge after the attempt.
@@ -1512,6 +1526,10 @@ fn terminal_actor(
                             .is_ok()
                     });
                 }
+            }
+            Command::Owns { pid, reply } => {
+                let owned = !exited && shell_pid.is_some_and(|root| descends_from(pid, root));
+                let _ = reply.send(owned);
             }
             Command::ResolveForeground(reply) => {
                 let _ = reply.send(lifecycle.foreground.lock().unwrap().agent.clone());

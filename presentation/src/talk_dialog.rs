@@ -128,13 +128,20 @@ impl TalkDialog {
         }
     }
 
-    pub fn apply(&mut self, query: &Query, result: Result<Vec<Message>>) {
+    /// Shows a load's result as of `now`. A request can expire while the load runs, so
+    /// the user inbox is ordered again at `now`, the same instant `next_expiry` takes.
+    pub fn apply(&mut self, query: &Query, result: Result<Vec<Message>>, now: u64) {
         if self.query() != *query {
             return;
         }
         self.loading = false;
         match result {
             Ok(rows) => {
+                let rows = if self.expanded.is_none() && self.target == Target::User {
+                    domain::talk::open_decisions_first(rows, now)
+                } else {
+                    rows
+                };
                 self.error = None;
                 if self.expanded.is_some() {
                     let previous = self
@@ -224,9 +231,9 @@ impl TalkDialog {
             .filter(|message| answerable(message, now_ms()))
     }
 
-    /// When the next open request in the list expires, so the list refreshes then.
-    pub fn next_expiry(&self) -> Option<u64> {
-        let now = now_ms();
+    /// When the next request open at `now` expires, so the list refreshes then. Pass the
+    /// `now` the list was last applied at, so both agree on which requests are open.
+    pub fn next_expiry(&self, now: u64) -> Option<u64> {
         self.threads
             .iter()
             .filter(|message| answerable(message, now))
@@ -615,6 +622,32 @@ mod tests {
         let later = open_decisions_first(rows, 100);
         assert_eq!(ids(&later), ["plain", "expired", "answered", "open"]);
         assert!(later.iter().all(|m| !answerable(m, 100)));
+    }
+
+    #[gpui::test]
+    fn a_request_that_expires_during_a_load_joins_the_history_when_applied(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{TalkDialog, Target};
+        let focus = cx.update(|cx| cx.focus_handle());
+        let mut dialog = TalkDialog::new(1, "box".into(), Target::User, focus);
+        let query = dialog.query();
+        // The load captured both as open at 50, so they arrive in the open order.
+        let loaded = open_decisions_first(
+            vec![
+                message("plain", None),
+                message("soon", decision(Some(60), None)),
+                message("later", decision(Some(500), None)),
+            ],
+            50,
+        );
+        assert_eq!(loaded[0].id.0, "soon");
+        // "soon" expires before the result is applied at 70.
+        dialog.apply(&query, Ok(loaded), 70);
+        let ids: Vec<_> = dialog.threads.iter().map(|m| m.id.0.as_str()).collect();
+        assert_eq!(ids, ["later", "soon", "plain"]);
+        // The timer comes from the same instant: the request still open at 70.
+        assert_eq!(dialog.next_expiry(70), Some(500));
     }
 
     #[test]

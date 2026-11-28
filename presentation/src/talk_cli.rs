@@ -139,6 +139,7 @@ pub fn run(args: TalkArgs) -> Result<()> {
         session: super::caller_session(),
         box_sel: args.box_sel,
         desktop: false,
+        socket: None,
     };
     let json = args.json;
     if !matches!(

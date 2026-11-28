@@ -719,6 +719,8 @@ struct FakeTerminal {
     paused: Mutex<BTreeSet<usize>>,
     /// Slows each pause or resume, in milliseconds, so concurrent transitions overlap.
     pause_millis: AtomicU64,
+    /// The one process every live session owns, standing in for its worker.
+    worker_pid: Mutex<Option<u32>>,
 }
 
 impl TerminalRuntime for FakeTerminal {
@@ -766,6 +768,10 @@ impl TerminalRuntime for FakeTerminal {
 
     fn agent(&self, _: &Self::Handle) -> Option<Agent> {
         None
+    }
+
+    fn owns_process(&self, handle: &Self::Handle, pid: u32) -> bool {
+        handle.load(Ordering::Acquire) && *self.worker_pid.lock().unwrap() == Some(pid)
     }
 
     fn reclaim(&self, session: &str) -> Result<()> {
@@ -5056,7 +5062,7 @@ fn a_needs_input_decision_commits_with_its_report_or_not_at_all() -> Result<()> 
     let (dag, run) = setup()?;
     let started = dag.start(command(&run, false))?;
     let attempt = started.attempt.id.clone();
-    let ask = |attempt: &str, choices: &[&str], fail: bool| {
+    let ask_as = |pid: u32, attempt: &str, choices: &[&str], fail: bool| {
         let poster = Poster {
             fail,
             posted: Mutex::new(Vec::new()),
@@ -5068,12 +5074,24 @@ fn a_needs_input_decision_commits_with_its_report_or_not_at_all() -> Result<()> 
                 attempt: attempt.into(),
                 summary: "Ship it?".into(),
                 choices: choices.iter().map(|c| (*c).into()).collect(),
+                caller_pid: Some(pid),
             },
             &poster,
         );
         (result, poster.posted.into_inner().unwrap())
     };
+    let ask = |attempt: &str, choices: &[&str], fail: bool| ask_as(7, attempt, choices, fail);
     let state = || dag.run(&run).map(|run| run.tasks[0].state);
+
+    // Only a process in the attempt's session may ask in its worker's name.
+    let (result, posted) = ask(&attempt, &["Yes"], false);
+    assert!(format!("{:#}", result.unwrap_err()).contains("Only the worker"));
+    assert!(posted.is_empty());
+    *dag.application.runtime.worker_pid.lock().unwrap() = Some(7);
+    let (result, posted) = ask_as(8, &attempt, &["Yes"], false);
+    assert!(format!("{:#}", result.unwrap_err()).contains("Only the worker"));
+    assert!(posted.is_empty());
+    assert_eq!(state()?, TaskState::Working);
 
     // Invalid choices or a failed post leave the attempt working.
     let (result, posted) = ask(&attempt, &[], false);

@@ -15,10 +15,12 @@ use std::{os::unix::net::UnixStream, time::Duration};
 
 pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile, IconFiles>;
 
+/// `peer` is the calling process, as the socket's credentials report it.
 pub(crate) fn request(
     application: &DaemonDag,
     talk: &DaemonTalk,
     request: DagRequest,
+    peer: Option<u32>,
 ) -> Result<DagResponse> {
     use DagResponse as Reply;
     let response = match request {
@@ -300,6 +302,7 @@ pub(crate) fn request(
                         attempt,
                         summary,
                         choices,
+                        caller_pid: peer,
                     },
                     talk,
                 )?
