@@ -1966,10 +1966,28 @@ fn installed_build_of(program: &str, executable: &Path, command: &str, target: &
     let named = [program, &executable.to_string_lossy()]
         .into_iter()
         .any(|program| {
-            versioned_build_of(program_name(program), command)
+            let name = program_name(program);
+            name == command
+                || versioned_build_of(name, command)
                 || versions_owner(program) == Some(command)
         });
-    named && executable.parent().is_some() && executable.parent() == target.parent()
+    // Sharing a general-purpose directory such as `bin` is no evidence. The executable
+    // must sit in the same versioned install as the target, possibly at another version
+    // after a launcher such as `builds/stable` was repointed while it ran.
+    named
+        && executable
+            .parent()
+            .and_then(versions_root)
+            .is_some_and(|root| target.parent().and_then(versions_root) == Some(root))
+}
+
+/// The `versions` folder of a versioned install that `dir` is, or a version of.
+fn versions_root(dir: &Path) -> Option<&Path> {
+    if dir.file_name()? == "versions" {
+        return Some(dir);
+    }
+    let parent = dir.parent()?;
+    (parent.file_name()? == "versions" && is_version(dir.file_name()?.to_str()?)).then_some(parent)
 }
 
 /// The PATH a process started with.
@@ -2715,8 +2733,24 @@ mod tests {
             "claude",
             installed
         ));
+        // A running build stays recognized after `stable` moves to a newer version.
+        let upgraded = Path::new("/home/u/.jcode/builds/versions/1.1.3/jcode");
+        assert!(installed_build_of("jcode", target, "jcode", upgraded));
+        assert!(installed_build_of(
+            &bin.to_string_lossy(),
+            bin,
+            "jcode",
+            upgraded
+        ));
         // Names and layouts that fit the patterns but sit elsewhere are not the agent.
         for (program, command, target) in [
+            // An unrelated build beside the profile's command in a shared bin folder.
+            ("/usr/local/bin/codex-64", "codex", "/usr/local/bin/codex"),
+            (
+                "/home/u/.jcode/builds/versions/1.1.2/jcode",
+                "jcode",
+                "/home/v/.jcode/builds/versions/1.1.3/jcode",
+            ),
             ("/opt/x/codex-64", "codex", "/usr/lib/codex/codex"),
             (
                 "/tmp/unrelated/claude/versions/2.0.1",
