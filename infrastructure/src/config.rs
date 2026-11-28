@@ -174,6 +174,8 @@ pub fn talk_policy(sections: &Sections) -> Result<NoticePolicy> {
         let setting = match key.as_str() {
             "idle_after" => &mut policy.idle_after_ms,
             "user_quiet" => &mut policy.user_quiet_ms,
+            "busy_stale" => &mut policy.busy_stale_ms,
+            "hook_grace" => &mut policy.hook_grace_ms,
             _ => bail!("talk.{key} is not a setting"),
         };
         *setting = value

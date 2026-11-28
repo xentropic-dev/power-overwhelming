@@ -123,41 +123,97 @@ pub struct Talk<S, A, N> {
     hooks: Arc<Mutex<Hooks>>,
 }
 
-/// Sessions whose provider turn hook waits to hand over messages. While one waits, the
-/// session gets no terminal notices except urgent ones from the user.
+/// Turn-hook state per session. A session appears here once its provider ran a Power turn
+/// hook, and from then on the hook, not a terminal notice, delivers while it is healthy.
 #[derive(Default)]
 struct Hooks {
     next: u64,
-    waiting: HashMap<String, u64>,
-    /// A hook that just handed over messages holds notices until its waiter attaches.
-    grace_until: HashMap<String, u64>,
+    sessions: HashMap<String, HookSession>,
 }
 
-/// A registered turn-hook waiter. Dropping it hands delivery back to terminal notices.
-/// How long a turn end reported by a hook holds terminal notices for the session's hook
-/// waiter to attach. A hook that never attaches delays the fallback notice by this much.
-pub const HOOK_GRACE_MS: u64 = 3_000;
+#[derive(Default)]
+struct HookSession {
+    /// Bumps with each turn-state change reported through Talk. Leases and claims bind to
+    /// it, so nothing a hook started in one turn can act in a later one.
+    turn: u64,
+    /// The attached waiter's lease ID and the turn it waits in.
+    lease: Option<(u64, u64)>,
+    /// A turn end reported by a hook holds terminal notices until then, so the waiter can
+    /// attach first.
+    grace_until: u64,
+    /// Messages a hook has received but not confirmed emitting. They are neither read nor
+    /// announced, and go back to the queue if the hook never confirms.
+    claim: Option<(u64, Vec<MessageId>)>,
+}
 
+impl HookSession {
+    fn waiting(&self) -> bool {
+        self.lease.is_some_and(|(_, turn)| turn == self.turn)
+    }
+}
+
+/// How long a waiter started with the Stop hook waits for that hook's turn-end report.
+/// Claude Code runs both Stop hooks at once, so either may reach Power first.
+pub const HOOK_ATTACH_MS: u64 = 5_000;
+
+/// A turn-hook waiter. Dropping it hands delivery back to terminal notices.
 pub struct HookLease {
     hooks: Arc<Mutex<Hooks>>,
     session: String,
     id: u64,
+    turn: u64,
 }
 
 impl HookLease {
-    /// A later turn's waiter for the same session replaced this one.
-    pub fn superseded(&self) -> bool {
-        self.hooks.lock().unwrap().waiting.get(&self.session) != Some(&self.id)
+    /// A later waiter replaced this one, or the turn it waited in is over.
+    pub fn stale(&self) -> bool {
+        self.hooks
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&self.session)
+            .is_none_or(|hook| hook.lease != Some((self.id, self.turn)) || hook.turn != self.turn)
     }
 }
 
 impl Drop for HookLease {
     fn drop(&mut self) {
         let mut hooks = self.hooks.lock().unwrap();
-        if hooks.waiting.get(&self.session) == Some(&self.id) {
-            hooks.waiting.remove(&self.session);
+        if let Some(hook) = hooks.sessions.get_mut(&self.session)
+            && hook.lease.is_some_and(|(id, _)| id == self.id)
+        {
+            hook.lease = None;
         }
     }
+}
+
+/// Messages a hook holds for handover. Until `Talk::hook_confirm`, nothing is marked: a
+/// claim dropped unconfirmed returns its messages to the queue, eligible for a notice.
+pub struct HookClaim {
+    hooks: Arc<Mutex<Hooks>>,
+    session: String,
+    id: u64,
+    pub messages: Vec<Message>,
+}
+
+impl Drop for HookClaim {
+    fn drop(&mut self) {
+        let mut hooks = self.hooks.lock().unwrap();
+        if let Some(hook) = hooks.sessions.get_mut(&self.session)
+            && hook.claim.as_ref().is_some_and(|(id, _)| *id == self.id)
+        {
+            hook.claim = None;
+        }
+    }
+}
+
+/// What a waiting hook got.
+pub enum HookWait {
+    Claimed(HookClaim),
+    /// Nothing yet. The lease is still current.
+    Timeout,
+    /// A later waiter or turn replaced the lease.
+    Stale,
 }
 
 use anyhow::{Context, bail, ensure};
@@ -320,134 +376,176 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         }
     }
 
-    /// Registers the session's turn-hook waiter, replacing any earlier one.
-    pub fn attach_hook(&self, caller: &Caller) -> Result<HookLease> {
-        let session = caller
-            .session
-            .clone()
-            .context("POWER_SESSION is required for hook delivery")?;
+    /// Applies a turn report and bumps the session's hook turn when the state changes.
+    /// Holding the hook lock while the state changes makes every claim's check of the turn
+    /// and state atomic with respect to it.
+    fn turn_report(&self, session: &str, state: HookState, ready_only: bool) -> Result<()> {
         let mut hooks = self.hooks.lock().unwrap();
-        hooks.next += 1;
-        let id = hooks.next;
-        hooks.waiting.insert(session.clone(), id);
-        Ok(HookLease {
-            hooks: self.hooks.clone(),
-            session,
-            id,
-        })
+        let before = self
+            .activity
+            .activity(session)
+            .map(|activity| activity.hook);
+        self.activity.report_turn(session, state, ready_only)?;
+        if before != Some(state)
+            && let Some(hook) = hooks.sessions.get_mut(session)
+        {
+            hook.turn += 1;
+        }
+        Ok(())
     }
 
-    fn hooked(&self, session: &str, now: u64) -> bool {
-        let hooks = self.hooks.lock().unwrap();
-        hooks.waiting.contains_key(session)
-            || hooks
-                .grace_until
-                .get(session)
-                .is_some_and(|until| now < *until)
-    }
-
-    /// Unread messages the session's turn hook may hand over now, without marking them.
-    /// `turn_ended` reports the turn end first and holds terminal notices for
-    /// `HOOK_GRACE_MS`, so a notice never races the hook. Nothing is handed over mid-turn.
-    pub fn hook_pending(&self, caller: &Caller, turn_ended: bool) -> Result<Vec<Message>> {
-        let session = caller
+    fn hook_session(caller: &Caller) -> Result<&str> {
+        caller
             .session
             .as_deref()
-            .context("POWER_SESSION is required for hook delivery")?;
-        if turn_ended {
-            let until = (self.clock)().saturating_add(HOOK_GRACE_MS);
-            self.hooks
-                .lock()
-                .unwrap()
-                .grace_until
-                .insert(session.into(), until);
-            self.activity
-                .report_turn(session, HookState::Ready, false)?;
-        }
-        let live = self.live(caller);
-        let Some(activity) = self.activity.activity(session) else {
-            return Ok(Vec::new());
+            .context("POWER_SESSION is required for hook delivery")
+    }
+
+    /// The Stop hook reports the turn end and claims what it may hand over now. Terminal
+    /// notices wait `hook_grace_ms` for the background waiter to attach.
+    pub fn hook_turn_end(&self, caller: &Caller) -> Result<Option<HookClaim>> {
+        let session = Self::hook_session(caller)?;
+        self.hooks
+            .lock()
+            .unwrap()
+            .sessions
+            .entry(session.into())
+            .or_default();
+        self.turn_report(session, HookState::Ready, false)?;
+        let turn = {
+            let mut hooks = self.hooks.lock().unwrap();
+            let hook = hooks.sessions.entry(session.into()).or_default();
+            hook.grace_until = (self.clock)().saturating_add(self.policy.hook_grace_ms);
+            hook.turn
         };
-        if activity.hook != HookState::Ready {
-            return Ok(Vec::new());
+        self.claim(caller, session, turn, None)
+    }
+
+    /// Registers the session's waiter for the turn that just ended, replacing any earlier
+    /// one. It waits until `deadline` for the turn end, since the Stop hook reporting it
+    /// runs alongside. None if the session never reached a turn end by then.
+    pub fn attach_hook(&self, caller: &Caller, deadline: Instant) -> Result<Option<HookLease>> {
+        let session = Self::hook_session(caller)?;
+        loop {
+            {
+                let mut hooks = self.hooks.lock().unwrap();
+                let ready = self
+                    .activity
+                    .activity(session)
+                    .is_some_and(|activity| activity.hook == HookState::Ready);
+                if ready {
+                    hooks.next += 1;
+                    let id = hooks.next;
+                    let hook = hooks.sessions.entry(session.into()).or_default();
+                    hook.lease = Some((id, hook.turn));
+                    return Ok(Some(HookLease {
+                        hooks: self.hooks.clone(),
+                        session: session.into(),
+                        id,
+                        turn: hook.turn,
+                    }));
+                }
+                hooks.sessions.entry(session.into()).or_default();
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        self.store.read(|db| {
+    }
+
+    /// Whether the session's waiter is attached for its current turn.
+    pub fn hook_attached(&self, caller: &Caller) -> Result<bool> {
+        let session = Self::hook_session(caller)?;
+        Ok(self
+            .hooks
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session)
+            .is_some_and(HookSession::waiting))
+    }
+
+    /// Claims the messages a hook may hand over now. The store write serializes it with
+    /// notices, and under the hook lock it rechecks that the session is still in `turn`,
+    /// at a turn end, and, for a waiter, that its lease is current. One atomic step.
+    fn claim(
+        &self,
+        caller: &Caller,
+        session: &str,
+        turn: u64,
+        lease: Option<u64>,
+    ) -> Result<Option<HookClaim>> {
+        let live = self.live(caller);
+        self.store.write(|db| {
             let directory = db.directory()?;
             let actor = self.actor(caller, &directory, live.as_ref())?;
             let Some(agent) = actor.agent else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
             let needs_input = agent.status == AgentStatus::NeedsInput;
             let mut messages = db.inbox(&actor.recipient(), actor.box_id, false)?;
+            let mut hooks = self.hooks.lock().unwrap();
+            hooks.next += 1;
+            let id = hooks.next;
+            let Some(hook) = hooks.sessions.get_mut(session) else {
+                return Ok(None);
+            };
+            let current = hook.turn == turn
+                && lease.is_none_or(|lease| hook.lease == Some((lease, turn)))
+                && hook.claim.is_none();
+            let Some(activity) = self.activity.activity(session) else {
+                return Ok(None);
+            };
+            if !current || activity.hook != HookState::Ready {
+                return Ok(None);
+            }
             messages.retain(|message| hook_deliverable(&message.queued(), activity, needs_input));
-            Ok(messages)
+            if messages.is_empty() {
+                return Ok(None);
+            }
+            hook.claim = Some((id, messages.iter().map(|m| m.id.clone()).collect()));
+            Ok(Some(HookClaim {
+                hooks: self.hooks.clone(),
+                session: session.into(),
+                id,
+                messages,
+            }))
         })
     }
 
-    /// The hook hands these messages over. Marks them notified and read, since the agent
-    /// receives their bodies, and returns those no notice or other hook delivered first.
-    /// A hook that fails before this call leaves the messages to terminal notices.
-    pub fn hook_delivered(&self, caller: &Caller, ids: &[MessageId]) -> Result<Vec<Message>> {
-        let live = self.live(caller);
-        let delivered = self.store.write(|db| {
-            let directory = db.directory()?;
-            let actor = self.actor(caller, &directory, live.as_ref())?;
-            let recipient = actor.recipient();
-            let mut messages = Vec::new();
-            for id in ids {
-                if let Some(message) = db.message(id)?
-                    && message.recipient == recipient
-                    && message.delivery.notified_at.is_none()
-                    && message.delivery.read_at.is_none()
-                {
-                    messages.push(message);
-                }
-            }
-            let now = (self.clock)();
-            let marked: Vec<_> = messages.iter().map(|message| &message.id).collect();
+    /// The hook emitted the claimed messages to the agent. Marks them notified and read,
+    /// since the agent has their bodies, and reports the turn the handover continues.
+    pub fn hook_confirm(&self, claim: HookClaim) -> Result<()> {
+        let now = (self.clock)();
+        self.store.write(|db| {
+            let marked: Vec<_> = claim.messages.iter().map(|message| &message.id).collect();
             db.mark(&marked, DeliveryChange::Notified, now)?;
-            db.mark(&marked, DeliveryChange::Read, now)?;
-            for message in &mut messages {
-                message.delivery.notified_at = Some(now);
-                message.delivery.read_at = Some(now);
-            }
-            Ok(messages)
+            db.mark(&marked, DeliveryChange::Read, now)
         })?;
-        // Handing messages over continues the turn, which may report no start of its own.
-        if !delivered.is_empty()
-            && let Some(session) = &caller.session
-        {
-            self.activity.report_turn(session, HookState::Busy, false)?;
-        }
-        Ok(delivered)
+        let session = claim.session.clone();
+        drop(claim);
+        self.turn_report(&session, HookState::Busy, false)
     }
 
-    /// Waits while the lease is current for messages the hook may hand over. Returns
-    /// none at the deadline or once a later waiter replaced this one.
+    /// Waits while the lease is current for messages to claim, until `deadline`.
     pub fn hook_wait(
         &self,
         lease: &HookLease,
         caller: &Caller,
         deadline: Instant,
-    ) -> Result<Vec<Message>> {
+    ) -> Result<HookWait> {
         loop {
-            if lease.superseded() {
-                return Ok(Vec::new());
+            if lease.stale() {
+                return Ok(HookWait::Stale);
             }
             let cursor = self.cursor()?;
-            let messages = self.hook_pending(caller, false)?;
-            if !messages.is_empty() {
-                let until = (self.clock)().saturating_add(HOOK_GRACE_MS);
-                self.hooks
-                    .lock()
-                    .unwrap()
-                    .grace_until
-                    .insert(lease.session.clone(), until);
-                return Ok(messages);
+            if let Some(claim) = self.claim(caller, &lease.session, lease.turn, Some(lease.id))? {
+                return Ok(HookWait::Claimed(claim));
             }
             let now = Instant::now();
             if now >= deadline {
-                return Ok(Vec::new());
+                return Ok(HookWait::Timeout);
             }
             // Turn state lives outside the store, so recheck it at least every quarter second.
             self.store.wait_for_change(
@@ -455,6 +553,25 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 deadline.min(now + std::time::Duration::from_millis(250)),
             );
         }
+    }
+
+    /// Whether a healthy turn hook delivers for the session now, and the messages a hook
+    /// holds. A hooked session gets no terminal notices. It stops being hooked when its
+    /// waiter is gone past the grace period, or its busy report goes stale because the
+    /// turn end never arrived.
+    fn hook_hold(&self, session: &str, activity: Activity, now: u64) -> (bool, Vec<MessageId>) {
+        let hooks = self.hooks.lock().unwrap();
+        let Some(hook) = hooks.sessions.get(session) else {
+            return (false, Vec::new());
+        };
+        let in_turn = activity.hook == HookState::Busy && !self.policy.busy_stale(activity, now);
+        let hooked = hook.waiting() || now < hook.grace_until || in_turn;
+        let claimed = hook
+            .claim
+            .as_ref()
+            .map(|(_, ids)| ids.clone())
+            .unwrap_or_default();
+        (hooked, claimed)
     }
 
     fn actor<'a>(
@@ -791,7 +908,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         let session = caller
             .session
             .context("POWER_SESSION is required to report a turn")?;
-        self.activity.report_turn(&session, state, ready_only)
+        self.turn_report(&session, state, ready_only)
     }
 
     pub fn cursor(&self) -> Result<u64> {
@@ -878,7 +995,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         };
         let needs_input = agent.status == AgentStatus::NeedsInput;
         let now = (self.clock)();
-        let hooked = self.hooked(&session, now);
+        let (hooked, claimed) = self.hook_hold(&session, activity, now);
         let mut plan = Plan {
             session,
             activity,
@@ -887,12 +1004,15 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             remind: Vec::new(),
         };
         for message in db.queued(&Recipient::agent(&agent), &agent.box_id)? {
+            // A healthy turn hook delivers everything, urgent user messages included, at
+            // the next turn boundary. Messages a hook holds wait for its confirmation.
+            if hooked || claimed.contains(&message.id) {
+                continue;
+            }
             match self
                 .policy
                 .decide(activity, needs_input, activity.paused, &message, now)
             {
-                // The turn hook delivers everything but urgent messages from the user.
-                _ if hooked && !(message.urgent && message.sender.has_user_authority()) => {}
                 NoticeDecision::Notify => plan.notify.push(message),
                 NoticeDecision::Remind => plan.remind.push(message),
                 NoticeDecision::Hold(_) => {}

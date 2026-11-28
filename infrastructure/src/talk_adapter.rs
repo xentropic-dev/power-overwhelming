@@ -4,20 +4,24 @@ use crate::{
     terminal::PtyRuntime,
     wire::{
         self, Response,
-        talk::{TalkCommand, TalkRequest, TalkResponse},
+        talk::{HookEmitted, TalkCommand, TalkRequest, TalkResponse},
     },
 };
 use anyhow::{Context, Result, bail};
 use application::{
     Application,
     dag::BoxSelection,
-    talk::{Caller, LogFilter, Notifier, Reply, SendMessage, SessionActivity, Talk},
+    talk::{
+        Caller, HOOK_ATTACH_MS, HookClaim, HookWait, LogFilter, Notifier, Reply, SendMessage,
+        SessionActivity, Talk,
+    },
 };
 use domain::session::Agent;
 use domain::talk::{
     Activity, Address, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
 };
 use std::{
+    io::BufReader,
     os::unix::net::UnixStream,
     sync::{Arc, mpsc::Receiver},
     thread,
@@ -220,19 +224,57 @@ pub(crate) fn request(
         TalkCommand::Summary => TalkResponse::Summary {
             agents: talk.summary(caller)?.into_iter().map(Into::into).collect(),
         },
-        TalkCommand::HookPending { turn_ended } => items(talk.hook_pending(&caller, turn_ended)?),
-        TalkCommand::HookDelivered { ids } => items(
-            talk.hook_delivered(&caller, &ids.into_iter().map(MessageId).collect::<Vec<_>>())?,
-        ),
-        TalkCommand::Watch | TalkCommand::HookWait => {
-            unreachable!("Talk watches use the streaming handler")
+        TalkCommand::HookStatus => TalkResponse::Hook {
+            attached: talk.hook_attached(&caller)?,
+        },
+        TalkCommand::Watch | TalkCommand::HookStop | TalkCommand::HookWait => {
+            unreachable!("Talk watches and hooks use the streaming handler")
         }
     })
 }
 
-/// Holds the session's hook waiter until messages arrive or the client goes away. A
-/// keepalive every few seconds detects a client that died, which hands delivery back to
-/// terminal notices.
+fn talk_ok() -> Response {
+    Response::Talk {
+        talk: TalkResponse::Ok,
+    }
+}
+
+/// Sends the claim and marks it delivered only once the hook confirms it emitted it. A
+/// hook that dies or never answers drops the claim, which returns the messages.
+fn hand_over(talk: &DaemonTalk, claim: HookClaim, mut socket: &UnixStream) -> Result<()> {
+    let messages = claim.messages.iter().cloned().map(Into::into).collect();
+    wire::send(
+        &mut socket,
+        &Response::Talk {
+            talk: TalkResponse::Messages { messages },
+        },
+    )?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let emitted: Option<HookEmitted> = wire::receive(&mut BufReader::new(socket))?;
+    if emitted.is_some_and(|emitted| emitted.emitted) {
+        talk.hook_confirm(claim)?;
+        wire::send(&mut socket, &talk_ok())?;
+    }
+    Ok(())
+}
+
+/// A Stop hook: reports the turn end and hands over what is queued.
+pub(crate) fn hook_stop(
+    talk: &DaemonTalk,
+    dag: &DaemonDag,
+    request: TalkRequest,
+    mut socket: &UnixStream,
+) -> Result<()> {
+    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
+    match talk.hook_turn_end(&caller)? {
+        Some(claim) => hand_over(talk, claim, socket),
+        None => wire::send(&mut socket, &talk_ok()),
+    }
+}
+
+/// Holds the session's hook waiter until messages arrive, the turn changes or the client
+/// goes away. A keepalive every few seconds detects a client that died, which hands
+/// delivery back to terminal notices.
 pub(crate) fn hook_wait(
     talk: &DaemonTalk,
     dag: &DaemonDag,
@@ -240,27 +282,17 @@ pub(crate) fn hook_wait(
     mut socket: &UnixStream,
 ) -> Result<()> {
     let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
-    let lease = talk.attach_hook(&caller)?;
-    let ok = || Response::Talk {
-        talk: TalkResponse::Ok,
+    let deadline = Instant::now() + Duration::from_millis(HOOK_ATTACH_MS);
+    let Some(lease) = talk.attach_hook(&caller, deadline)? else {
+        return Ok(());
     };
-    wire::send(&mut socket, &ok())?;
+    wire::send(&mut socket, &talk_ok())?;
     loop {
-        let messages = talk.hook_wait(&lease, &caller, Instant::now() + Duration::from_secs(5))?;
-        if lease.superseded() {
-            return Ok(());
+        match talk.hook_wait(&lease, &caller, Instant::now() + Duration::from_secs(5))? {
+            HookWait::Claimed(claim) => return hand_over(talk, claim, socket),
+            HookWait::Stale => return Ok(()),
+            HookWait::Timeout => wire::send(&mut socket, &talk_ok())?,
         }
-        if !messages.is_empty() {
-            return wire::send(
-                &mut socket,
-                &Response::Talk {
-                    talk: TalkResponse::Messages {
-                        messages: messages.into_iter().map(Into::into).collect(),
-                    },
-                },
-            );
-        }
-        wire::send(&mut socket, &ok())?;
     }
 }
 

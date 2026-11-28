@@ -380,8 +380,9 @@ pub fn envelope(message: &Message) -> String {
         Sender::System => "Message from Power.",
     };
     let mut framed = format!(
-        "[power talk] {} · thread {} · from {}. {context} The body follows, each line quoted with {QUOTE:?}.",
+        "[power talk] {}{} · thread {} · from {}. {context} The body follows, each line quoted with {QUOTE:?}.",
         message.id.0,
+        if message.urgent { " · urgent" } else { "" },
         message.thread.0,
         sender_label(&message.sender),
     );
@@ -472,6 +473,13 @@ pub struct Activity {
 pub struct NoticePolicy {
     pub idle_after_ms: u64,
     pub user_quiet_ms: u64,
+    /// A busy report with no output, input or report for this long is stale: the turn
+    /// ended without its end being reported, for example because a Stop hook failed.
+    /// Provider spinners keep a live turn's output going, so a stale report is idle.
+    pub busy_stale_ms: u64,
+    /// How long a turn end reported by a hook holds terminal notices for the session's
+    /// hook waiter to attach. A waiter that never attaches delays the fallback by this much.
+    pub hook_grace_ms: u64,
 }
 
 impl Default for NoticePolicy {
@@ -479,6 +487,8 @@ impl Default for NoticePolicy {
         Self {
             idle_after_ms: 5_000,
             user_quiet_ms: 10_000,
+            busy_stale_ms: 60_000,
+            hook_grace_ms: 3_000,
         }
     }
 }
@@ -535,6 +545,23 @@ pub enum HoldReason {
 }
 
 impl NoticePolicy {
+    /// Whether a busy report went stale, so the turn it started is taken to be over.
+    pub fn busy_stale(self, activity: Activity, now: u64) -> bool {
+        let last = activity
+            .last_output
+            .max(activity.last_input)
+            .max(activity.reported_at)
+            .max(activity.last_notice);
+        activity.hook == HookState::Busy && now.saturating_sub(last) >= self.busy_stale_ms
+    }
+
+    /// Whether the session sits at a turn boundary where a turn hook may hand messages
+    /// over: the provider reported the turn end, or its busy report went stale.
+    pub fn turn_over(self, activity: Activity, now: u64) -> bool {
+        !activity.awaiting_turn_end
+            && (activity.hook == HookState::Ready || self.busy_stale(activity, now))
+    }
+
     pub fn decide(
         self,
         activity: Activity,
@@ -571,7 +598,8 @@ impl NoticePolicy {
         // never proves it ended. One notice per turn: hold until the turn-end callback.
         let idle = !activity.awaiting_turn_end
             && match activity.hook {
-                HookState::Busy => false,
+                // A stale busy report means the turn end went unreported. Fall back to quiet.
+                HookState::Busy => self.busy_stale(activity, now) && output_quiet && user_quiet,
                 // Typing after the turn ended may be a draft or navigation. Wait for the user to
                 // pause instead of treating the session as busy until the next report.
                 HookState::Ready => {

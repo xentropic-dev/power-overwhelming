@@ -303,33 +303,44 @@ impl From<TalkAgentSummary> for AgentTalkSummary {
     }
 }
 
-/// Messages the session's turn hook may hand over now. `turn_ended` reports the turn end.
-pub fn hook_pending(caller: Caller, turn_ended: bool) -> Result<Vec<Message>> {
-    messages(caller, TalkCommand::HookPending { turn_ended })
-}
-
-/// Records that the hook handed these messages over. Returns those it may still show.
-pub fn hook_delivered(caller: Caller, ids: Vec<MessageId>) -> Result<Vec<Message>> {
-    messages(
-        caller,
-        TalkCommand::HookDelivered {
-            ids: ids.into_iter().map(|id| id.0).collect(),
-        },
-    )
-}
-
-/// Waits until messages arrive for the session's hook. None if a later hook took over
-/// or the daemon ended the wait.
-pub fn hook_wait(caller: Caller) -> Result<Option<Vec<Message>>> {
-    let mut socket = connect(caller, TalkCommand::HookWait, Duration::from_secs(15))?;
+/// Runs a turn hook against the daemon. `emit` hands the messages to the agent, and only
+/// after it succeeds does the hook confirm them, so the daemon marks them read. A hook that
+/// fails or dies before confirming leaves them queued. Returns whether it emitted any.
+pub fn hook(
+    caller: Caller,
+    wait: bool,
+    emit: impl FnOnce(&[Message]) -> Result<()>,
+) -> Result<bool> {
+    let command = if wait {
+        TalkCommand::HookWait
+    } else {
+        TalkCommand::HookStop
+    };
+    // A waiting hook gets a keepalive every five seconds.
+    let mut socket = connect(caller, command, Duration::from_secs(15))?;
     while let Some(response) = wire::receive(&mut socket)? {
         match decode(response)? {
-            TalkResponse::Ok => {}
+            TalkResponse::Ok if wait => {}
+            TalkResponse::Ok => return Ok(false),
             TalkResponse::Messages { messages } => {
-                return Ok(Some(messages.into_iter().map(Into::into).collect()));
+                let messages: Vec<Message> = messages.into_iter().map(Into::into).collect();
+                emit(&messages)?;
+                wire::send(socket.get_mut(), &HookEmitted { emitted: true })?;
+                match wire::receive(&mut socket)?.map(decode).transpose()? {
+                    Some(TalkResponse::Ok) => return Ok(true),
+                    _ => bail!("Power did not record the hook's delivery"),
+                }
             }
             _ => bail!("Unexpected talk hook response"),
         }
     }
-    Ok(None)
+    Ok(false)
+}
+
+/// Whether the session's waiting hook is attached for its current turn.
+pub fn hook_attached(caller: Caller) -> Result<bool> {
+    match decode(wire::request(&request(caller, TalkCommand::HookStatus))?)? {
+        TalkResponse::Hook { attached } => Ok(attached),
+        _ => bail!("Unexpected talk response"),
+    }
 }

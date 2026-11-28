@@ -548,12 +548,20 @@ fn handle(mut socket: UnixStream, request: Request, server: &Server) -> Result<(
     if let Request::Talk {
         talk:
             talk @ wire::TalkRequest {
-                command: wire::talk::TalkCommand::HookWait,
+                command: wire::talk::TalkCommand::HookStop | wire::talk::TalkCommand::HookWait,
                 ..
             },
     } = request
     {
-        if let Err(error) = talk_adapter::hook_wait(&server.talk, &server.dag, talk, &socket) {
+        let handler = if matches!(talk.command, wire::talk::TalkCommand::HookStop) {
+            talk_adapter::hook_stop
+        } else {
+            talk_adapter::hook_wait
+        };
+        let result = handler(&server.talk, &server.dag, talk, &socket);
+        // A turn change or a returned claim may make notices due.
+        let _ = server.talk_wake.try_send(());
+        if let Err(error) = result {
             wire::send(
                 socket,
                 &Response::Error {

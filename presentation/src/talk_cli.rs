@@ -97,6 +97,8 @@ enum HookEvent {
     Stop,
     /// Claude Code asyncRewake Stop hook. Waits while idle and exits 2 with messages.
     Wait,
+    /// Prints whether the session's waiting hook is attached.
+    Status,
 }
 
 #[derive(Args)]
@@ -180,56 +182,42 @@ pub fn run(args: TalkArgs) -> Result<()> {
             report_turn(caller, true, from_notify, json)
         }
         Action::Busy => report_turn(caller, false, false, json),
+        Action::Hook(HookEvent::Status) => {
+            let attached = talk::hook_attached(caller)?;
+            super::print_json(json!({"attached": attached}))
+        }
         Action::Hook(event) => {
             // The provider sends the hook's event on stdin. Power needs none of it.
             let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-            // A failed hook must never stop the agent or loop it. It prints nothing and
-            // the messages stay queued for terminal notices.
-            let caller_for_fallback = caller.clone();
-            match hook(caller, event) {
-                Ok(Some((reason, HookEvent::Stop))) => {
-                    println!("{}", json!({"decision": "block", "reason": reason}));
+            let wait = matches!(event, HookEvent::Wait);
+            // A failed hook must never stop the agent or loop it. Messages it did not
+            // confirm stay queued, and terminal notices take over.
+            let result = talk::hook(caller.clone(), wait, |messages| {
+                let reason = hook_reason(messages);
+                if wait {
+                    let mut stderr = io::stderr().lock();
+                    writeln!(stderr, "{reason}")?;
+                    stderr.flush()?;
+                } else {
+                    let mut stdout = io::stdout().lock();
+                    writeln!(stdout, "{}", json!({"decision": "block", "reason": reason}))?;
+                    stdout.flush()?;
                 }
-                Ok(Some((reason, HookEvent::Wait))) => {
-                    eprintln!("{reason}");
-                    std::process::exit(2);
-                }
-                Ok(None) => {}
+                Ok(())
+            });
+            match result {
+                Ok(true) if wait => std::process::exit(2),
+                Ok(_) => {}
                 Err(error) => {
                     eprintln!("Power talk hook failed. {error:#}");
-                    // Still report the turn end so terminal notices can deliver.
-                    if matches!(event, HookEvent::Stop) {
-                        let _ = talk::turn(caller_for_fallback, true, false);
+                    // Still report the turn end so terminal notices can deliver. If Power
+                    // is unreachable, the unreported turn end goes stale instead.
+                    if !wait {
+                        let _ = talk::turn(caller, true, false);
                     }
                 }
             }
             Ok(())
-        }
-    }
-}
-
-/// The rendered messages the hook hands over, if any. A message counts as delivered only
-/// once the daemon records it, so no message is both handed over and typed as a notice.
-fn hook(caller: Caller, event: HookEvent) -> Result<Option<(String, HookEvent)>> {
-    loop {
-        let pending = match event {
-            HookEvent::Stop => talk::hook_pending(caller.clone(), true)?,
-            HookEvent::Wait => match talk::hook_wait(caller.clone())? {
-                Some(messages) => messages,
-                None => return Ok(None),
-            },
-        };
-        if pending.is_empty() {
-            return Ok(None);
-        }
-        let ids = pending.into_iter().map(|message| message.id).collect();
-        let delivered = talk::hook_delivered(caller.clone(), ids)?;
-        if !delivered.is_empty() {
-            return Ok(Some((hook_reason(&delivered), event)));
-        }
-        // Another hook or a notice delivered them first.
-        if matches!(event, HookEvent::Stop) {
-            return Ok(None);
         }
     }
 }

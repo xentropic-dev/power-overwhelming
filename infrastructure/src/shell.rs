@@ -313,6 +313,10 @@ pub(crate) const MODEL_CALLBACK: &str = "power session model --json";
 /// Launcher hooks and whether the provider reports only turn ends (Codex `notify`).
 /// Claude Code kills an asyncRewake hook at its timeout. The next turn end starts another.
 const HOOK_WAIT_SECONDS: u64 = 24 * 60 * 60;
+/// The background talk waiter. Its marker tells the stall probe that this process waits
+/// for messages and does no work, and `exec` keeps the hook's shell out of the tree.
+pub(crate) const TALK_WAITER_ENV: &str = "POWER_TALK_WAITER";
+const TALK_WAITER_COMMAND: &str = "POWER_TALK_WAITER=1 exec power talk hook wait";
 
 pub(crate) fn launch_callbacks(
     profile: &AgentProfile,
@@ -370,7 +374,7 @@ fn callback_args(
                 // second waits in the background and wakes the idle agent when one arrives.
                 "Stop": [{ "hooks": [
                     { "type": "command", "command": "power talk hook stop" },
-                    { "type": "command", "command": "power talk hook wait",
+                    { "type": "command", "command": TALK_WAITER_COMMAND,
                       "asyncRewake": true, "timeout": HOOK_WAIT_SECONDS },
                 ] }],
                 "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "power talk busy" }] }],
@@ -935,7 +939,7 @@ mod tests {
             "power talk hook stop"
         );
         let wait = &settings["hooks"]["Stop"][0]["hooks"][1];
-        assert_eq!(wait["command"], "power talk hook wait");
+        assert_eq!(wait["command"], TALK_WAITER_COMMAND);
         assert_eq!(wait["asyncRewake"], true);
         assert_eq!(
             settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
