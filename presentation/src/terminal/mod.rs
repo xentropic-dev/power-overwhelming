@@ -13,6 +13,7 @@ mod links;
 mod metrics;
 mod paint;
 mod runs;
+mod scroll;
 mod selection;
 mod sprites;
 mod typing;
@@ -25,6 +26,7 @@ pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
 use self::frame::{CellPosition, Frame};
 use self::grid::PtyGrid;
+pub use self::input::ScrollTarget;
 pub use self::typing::InputHold;
 use self::typing::Typing;
 use crate::settings::TerminalSettings;
@@ -174,9 +176,14 @@ pub struct TerminalView {
     finder: find::Finder,
     /// Whether a pump of the running search is scheduled.
     find_pumping: bool,
-    reporting_mouse: bool,
-    /// A middle press went to the program, so its release must too.
-    reporting_middle: bool,
+    /// Buttons whose press went to the program, so their motion and release go too.
+    buttons: Vec<MouseButton>,
+    /// The last mouse report sent, as motion, so motion within one cell isn't repeated.
+    last_mouse_report: Vec<u8>,
+    /// Fractions of a line or column the wheel moved that haven't scrolled yet.
+    scrolled: Point<f32>,
+    /// Where in the scrollbar thumb a drag holds it, while one is in progress.
+    scrollbar_grab: Option<f32>,
     exited: bool,
     status: Option<String>,
     render_held: bool,
@@ -303,8 +310,10 @@ impl TerminalView {
             hint_footer: None,
             finder: find::Finder::default(),
             find_pumping: false,
-            reporting_mouse: false,
-            reporting_middle: false,
+            buttons: Vec::new(),
+            last_mouse_report: Vec::new(),
+            scrolled: Point::default(),
+            scrollbar_grab: None,
             exited: false,
             status: None,
             render_held: false,
@@ -621,6 +630,7 @@ fn configure(
     contrast: &Rc<std::cell::Cell<f32>>,
 ) {
     terminal.set_clipboard_write_policy(clipboard_policy(settings));
+    client::limit_scrollback(terminal).expect("set terminal scrollback limits");
     terminal
         .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
         .expect("set terminal clipboard size limit");

@@ -199,6 +199,8 @@ terminal.padding = 6            -- space around the grid in logical pixels, 0 to
 
 The table also holds `ligatures` (default `false`), `scroll_speed` (0.1 to 5, default 1), `copy_on_select` (default `false`), `clipboard_write` (`"allow"` or `"deny"`, for OSC 52), `minimum_contrast` (1 to 21, default 1) and `opacity` (0 to 1, default 1). Power reports an unknown key or a value out of range. Ctrl+S then `+` or `=` makes terminal text bigger, Ctrl+S then `-` makes it smaller and Ctrl+S then `0` restores the configured size. Zoom applies to every terminal and resizes their sessions.
 
+Terminals keep 10,000 lines (at most 10 MB) of scrollback. The wheel or touchpad scrolls it, at `scroll_speed` lines per notch, and the scrollbar on the right edge can be dragged. Shift+PageUp, Shift+PageDown, Shift+Home and Shift+End page through it and jump to its ends, and Ctrl+Shift+Up and Ctrl+Shift+Down move a line. These are the `terminal` keymap's `scroll_page_up`, `scroll_page_down`, `scroll_top`, `scroll_bottom`, `scroll_line_up` and `scroll_line_down`. Programs that track the mouse get every button, drags, the wheel and the sideways wheel. Hold Shift to select instead. On the alternate screen the wheel sends arrow keys to programs that don't track the mouse.
+
 In a terminal, drag to select, double-click for a word, triple-click for a line and Shift+click to extend. Dragging past the top or bottom edge scrolls. The selection stays on its text while output arrives. Ctrl+Shift+A selects the screen and scrollback. A finished selection goes to the clipboard when `copy_on_select` is on, and to PRIMARY on Linux, where middle-click pastes it.
 
 ## DAG orchestration
@@ -222,6 +224,8 @@ dag = {
 ```
 
 The defaults are 4 workers and 4 GiB.
+
+A daemon restart holds restored workers to the same budget, including its memory floor. Stopped workers that still run keep their slots. Workers waiting on input are admitted next, then active workers, each most recently started first, while the budget has room. Each worker past it has its attempt interrupted, with any question it was waiting on kept in the attempt's detail, and its task queued to retry with the same provider, arguments and worktree, so it starts like any queued dispatch once a worker reports. A worker whose earlier processes could not be ended keeps its open attempt and its slot, and its task is queued only after a reclaim confirms they are gone. Command workers are never relaunched or replayed, since their command can be anything: the restart interrupts them, frees their slots, and the queue starts waiting tasks in their place.
 
 `power dag create` and `power dag show` return the run and a `pwr://dag/<run-id>` link. Coordinators share that link verbatim on its own line when they create or reopen a run. Click the link or open it with Ctrl+S then `o` to see the live graph.
 
