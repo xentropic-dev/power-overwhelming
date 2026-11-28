@@ -798,28 +798,20 @@ fn agent_started_through_a_symlink_to_another_binary_sets_metadata() {
     let builds = root.join("builds");
     fs::create_dir(&builds).unwrap();
     // A copy of sh stands in for a versioned agent binary whose name matches no
-    // profile. Only the `jcode` symlink on PATH points at it.
+    // profile. Only the `jcode` symlink on the shell's own PATH points at it.
     let build = builds.join("agent-build-7");
     fs::copy("/bin/sh", &build).unwrap();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
     std::os::unix::fs::symlink(&build, bin.join("jcode")).unwrap();
-    let path = std::env::join_paths(
-        std::iter::once(bin.clone())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let (_daemon, socket) = Daemon::start_with(
-        &root,
-        Command::new(env!("CARGO_BIN_EXE_power"))
-            .env("SHELL", "/bin/sh")
-            .env("PATH", &path),
-    );
+    // The agent starts through a link of yet another name.
+    std::os::unix::fs::symlink(&build, root.join("starter")).unwrap();
+    let (_daemon, socket) = Daemon::start(&root);
     let launched = event(&mut request(
         &socket,
         json!({"request":"launch", "worktree":root, "agent":"shell"}),
     ));
-    let session = &launched["session"]["id"];
+    let session = launched["session"]["id"].as_str().unwrap().to_owned();
     let subscribe = || request(&socket, json!({"request":"subscribe", "session":session}));
     let mut attached = subscribe();
     assert_eq!(event(&mut attached)["event"], "snapshot");
@@ -829,10 +821,11 @@ fn agent_started_through_a_symlink_to_another_binary_sets_metadata() {
             json!({"request":"input", "session":session, "data":STANDARD.encode(data)}),
         ));
     };
-    // Started by its own path, as a launcher re-executing its versioned build does.
-    input(
-        "builds/agent-build-7 -c 'power session task \"Linked task\"; power session model \"Linked model\"; read finish'\n",
-    );
+    // The daemon's PATH lacks `bin`, so the profile resolves only in the shell's.
+    input(&format!(
+        "export PATH={}:$PATH; ./starter -c 'power session task \"Linked task\"; power session model \"Linked model\"; read finish'\n",
+        bin.display()
+    ));
     let mut metadata = json!(null);
     while metadata["model"] != "Linked model" {
         let message = event(&mut attached);
@@ -841,9 +834,17 @@ fn agent_started_through_a_symlink_to_another_binary_sets_metadata() {
         }
     }
     assert_eq!(metadata["task"], "Linked task");
-    let mut reattached = subscribe();
-    assert_eq!(event(&mut reattached)["event"], "snapshot");
-    assert_eq!(event(&mut reattached)["agent"], "jcode");
+    let listed = Command::new(env!("CARGO_BIN_EXE_power"))
+        .args(["session", "list"])
+        .env("POWER_SOCKET", &socket)
+        .output()
+        .unwrap();
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    let line = listed
+        .lines()
+        .find(|line| line.contains(&session))
+        .unwrap_or_else(|| panic!("{session} missing from {listed}"));
+    assert!(line.contains("jcode"), "{line}");
     input("\n");
     event(&mut request(
         &socket,
