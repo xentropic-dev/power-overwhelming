@@ -22,11 +22,17 @@ impl TerminalView {
     /// Opens the find bar. Keys then edit the query until it closes.
     pub fn open_find(&mut self, cx: &mut Context<Self>) {
         self.finder.open(&self.terminal);
+        self.find_orphan = false;
         self.after_find(cx);
     }
 
     pub fn close_find(&mut self, cx: &mut Context<Self>) {
         self.finder.close();
+        // A composition begun in the bar belongs to it, so its late commit is dropped
+        // rather than typed into the program.
+        if self.typing.unmark() {
+            self.find_orphan = true;
+        }
         cx.notify();
     }
 

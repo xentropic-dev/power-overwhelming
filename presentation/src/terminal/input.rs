@@ -246,6 +246,11 @@ impl TerminalView {
             .and_then(|item| item.text())
             .filter(|text| !text.is_empty())
         {
+            // The find bar owns input while open, so PRIMARY lands in its query.
+            if self.finding() {
+                self.find_insert(&text, cx);
+                return;
+            }
             let bytes = paste_for(&self.terminal, &text);
             self.keyboard_input(bytes, cx);
         }

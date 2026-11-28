@@ -176,6 +176,9 @@ pub struct TerminalView {
     finder: find::Finder,
     /// Whether a pump of the running search is scheduled.
     find_pumping: bool,
+    /// Whether a composition the find bar owned was cut off by its closing, so the input
+    /// method's commit for it goes nowhere.
+    find_orphan: bool,
     /// Buttons whose press went to the program, so their motion and release go too.
     buttons: Vec<MouseButton>,
     /// The last mouse report sent, as motion, so motion within one cell isn't repeated.
@@ -310,6 +313,7 @@ impl TerminalView {
             hint_footer: None,
             finder: find::Finder::default(),
             find_pumping: false,
+            find_orphan: false,
             buttons: Vec::new(),
             last_mouse_report: Vec::new(),
             scrolled: Point::default(),
@@ -993,5 +997,57 @@ mod gesture_tests {
         cx.simulate_mouse_up(at, MouseButton::Left, none);
         assert_eq!(inputs(&rx).len(), 2);
         assert!(view.read_with(cx, |view, _| view.finding()));
+    }
+
+    #[gpui::test]
+    fn middle_click_pastes_primary_into_the_find_query(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"needle");
+        view.update(cx, |view, cx| view.open_find(cx));
+        cx.run_until_parked();
+        let rx = feed(&view, cx, b"");
+        cx.update(|_, cx| cx.write_to_primary(gpui::ClipboardItem::new_string("needle".into())));
+        let none = Modifiers::none();
+        let at = cell(&view, cx, 3., 1.);
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(at, MouseButton::Middle, none);
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        let query = view.read_with(cx, |view, _| view.finder.query().to_owned());
+        assert_eq!(query, "needle");
+    }
+
+    #[gpui::test]
+    fn closing_find_drops_its_pending_composition(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        view.update(cx, |view, cx| view.open_find(cx));
+        let rx = feed(&view, cx, b"");
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_and_mark_text_in_range(None, "に", None, window, cx);
+        });
+        cx.run_until_parked();
+        // The bar's close control, at its right end.
+        let close = bounds(&view, cx).top_right() + point(px(-16.), px(14.));
+        cx.simulate_click(close, Modifiers::none());
+        assert!(
+            !view.read_with(cx, |view, _| view.finding()),
+            "Close closes"
+        );
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_text_in_range(None, "日", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.typing.marked().map(str::to_owned)),
+            None
+        );
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(inputs(&rx), vec!["x".to_owned()]);
     }
 }

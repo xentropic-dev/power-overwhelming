@@ -64,6 +64,7 @@ impl EntityInputHandler for TerminalView {
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.find_orphan = false;
         if self.typing.unmark() {
             cx.notify();
         }
@@ -76,6 +77,11 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if std::mem::take(&mut self.find_orphan) {
+            self.typing.unmark();
+            cx.notify();
+            return;
+        }
         match self.typing.commit(text) {
             // While the find bar is open it owns text input; nothing reaches the program.
             Some(_) if self.finding() => self.find_insert(text, cx),
@@ -92,7 +98,10 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.typing.mark(text);
+        // The orphaned composition's updates stay out of the terminal too.
+        if !self.find_orphan {
+            self.typing.mark(text);
+        }
         cx.notify();
     }
 
