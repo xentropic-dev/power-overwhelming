@@ -331,12 +331,19 @@ fn main() -> Result<()> {
             client::ensure_daemon()?;
             match command {
                 SessionAction::List => {
+                    let agents = list_agents(None, None, true)?;
                     for session in client::list_sessions()? {
+                        let attempt = agents
+                            .iter()
+                            .find(|agent| agent.session.as_deref() == Some(session.id.as_str()))
+                            .map(session_attempt)
+                            .unwrap_or_default();
                         println!(
-                            "{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}",
                             session.id,
                             session.agent.name(),
-                            session.worktree.display()
+                            session.worktree.display(),
+                            attempt
                         );
                     }
                 }
@@ -1571,6 +1578,15 @@ fn same_file(a: &str, b: &std::path::Path) -> bool {
 
 /// How long `restart-check` waits for the daemon to list its workers.
 const RESTART_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The DAG attempt a session's agent works on, as `run/task#attempt`, or empty.
+fn session_attempt(agent: &client::protocol::ManagedAgent) -> String {
+    match (&agent.run, &agent.task, &agent.attempt) {
+        (Some(run), Some(task), Some(attempt)) => format!("{run}/{task}#{attempt}"),
+        (_, _, Some(attempt)) => attempt.clone(),
+        _ => String::new(),
+    }
+}
 
 fn protocol_agents(
     box_sel: Option<String>,
