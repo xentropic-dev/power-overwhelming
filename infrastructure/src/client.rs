@@ -41,13 +41,34 @@ pub fn list_sessions() -> Result<Vec<Session>> {
 }
 
 /// Live sessions with the DAG attempt each runs, from one daemon snapshot.
+/// A daemon older than the CLI drops the unknown request, so the legacy listing keeps
+/// sessions visible, without attempts, until the daemon restarts.
 pub fn list_session_listings() -> Result<Vec<SessionListing>> {
-    match wire::request(&Request::ListWithAttempts)? {
-        Response::SessionListings { sessions } => {
-            Ok(sessions.into_iter().map(Into::into).collect())
-        }
-        _ => bail!("Unexpected daemon response"),
-    }
+    with_legacy_fallback(
+        || match wire::request(&Request::ListWithAttempts)? {
+            Response::SessionListings { sessions } => {
+                Ok(sessions.into_iter().map(Into::into).collect())
+            }
+            _ => bail!("Unexpected daemon response"),
+        },
+        list_sessions,
+    )
+}
+
+fn with_legacy_fallback(
+    listings: impl FnOnce() -> Result<Vec<SessionListing>>,
+    legacy: impl FnOnce() -> Result<Vec<Session>>,
+) -> Result<Vec<SessionListing>> {
+    listings().or_else(|error| match legacy() {
+        Ok(sessions) => Ok(sessions
+            .into_iter()
+            .map(|session| SessionListing {
+                session,
+                attempt: None,
+            })
+            .collect()),
+        Err(_) => Err(error),
+    })
 }
 
 pub fn list_worktrees(directory: PathBuf) -> Result<Vec<PathBuf>> {
@@ -699,4 +720,33 @@ pub fn watch_runs(box_sel: Option<String>, deliver: impl Fn(RunEvent) -> bool) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod legacy_listing_tests {
+    use super::*;
+
+    #[test]
+    fn listing_falls_back_to_legacy_sessions_when_daemon_lacks_attempts() {
+        let listings = with_legacy_fallback(
+            || bail!("Daemon disconnected before replying; the request may have been applied"),
+            || {
+                Ok(vec![Session {
+                    id: "box".into(),
+                    worktree: PathBuf::from("/tmp/w"),
+                    agent: Agent::Shell,
+                }])
+            },
+        )
+        .unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].session.id, "box");
+        assert!(listings[0].attempt.is_none());
+    }
+
+    #[test]
+    fn listing_reports_the_original_error_when_both_requests_fail() {
+        let error = with_legacy_fallback(|| bail!("first"), || bail!("second")).unwrap_err();
+        assert_eq!(error.to_string(), "first");
+    }
 }
