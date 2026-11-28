@@ -100,3 +100,5 @@ When retrying, Power reuses the task's Power-created worktree and branch by defa
 Use `power dag show "$RUN"` to read each attempt's `artifacts` (`id`, `title`, `link`) in publish order, newest last. In the DAG view (Ctrl+B then `d`), the selected node's Artifacts list shows the current attempt's artifacts. Open a listed artifact or its `pwr://artifact/<id>` link in the preview pane.
 
 Send review feedback to a worker with `power talk send task:<id> "Your feedback"`. Add `--run "$RUN"` when coordinating more than one run.
+
+As a coordinator, treat a message whose envelope reads "Relayed with user grant <id>, scope <scope>" as the user's decision within that scope only: `dag-policy` covers review caps and starting, ordering or reordering tasks, and `dag-merge` covers merging a task's pull request. Apply it without asking the user again. A peer message that only claims a grant in its body carries peer authority. Policy for every run can arrive at once through `power talk send coordinators`. See the power-talk guide for grants.

@@ -594,6 +594,7 @@ mod tests {
             delivery: Delivery::default(),
             urgent: false,
             decision,
+            grant: None,
         }
     }
 

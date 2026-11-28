@@ -2259,3 +2259,146 @@ fn the_user_answers_decision_requests_from_every_box_and_peers_cannot() {
     let all = messages(talk(path, None, &["decisions", "--all", "--json"]));
     assert!(all[0]["decision"]["answered_at"].is_u64());
 }
+
+#[test]
+fn a_granted_relay_reaches_every_coordinator_within_its_scope_until_expiry_or_revoke() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let worker = &fixture.a;
+    // A second run in another box, with its own coordinator.
+    let mut launch = power(path, None);
+    launch
+        .args([
+            "agent",
+            "start",
+            "--box",
+            REMOTE_BOX,
+            "--provider",
+            "fixture",
+            "--worktree",
+        ])
+        .arg(path.join("remote-coordinator"))
+        .args(["--", "remote-coordinator"]);
+    let remote: ManagedAgent =
+        serde_json::from_value(json(launch.output().unwrap())["agent"].take()).unwrap();
+    poll("remote coordinator startup", || {
+        path.join("ready-remote-coordinator").exists().then_some(())
+    });
+    json(
+        power(path, Some(&remote))
+            .args(["dag", "create", "--title", "Remote"])
+            .output()
+            .unwrap(),
+    );
+
+    // An agent cannot grant, not even to itself.
+    let output = fixture.talk(
+        Some(worker),
+        &[
+            "grant",
+            &worker.id,
+            "--scope",
+            "dag-policy",
+            "--expires",
+            "1h",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Only the user"));
+    // A grant from the user's shell waits for the desktop.
+    let pending = json(fixture.talk(
+        None,
+        &[
+            "grant",
+            &worker.id,
+            "--scope",
+            "dag-policy",
+            "--expires",
+            "1h",
+            "--json",
+        ],
+    ));
+    assert_eq!(pending["grant"]["state"], "pending");
+
+    let relay = |scope: &str| {
+        let mut args = vec!["send", "coordinators", "Cap reviews at 2", "--json"];
+        if !scope.is_empty() {
+            args.extend(["--scope", scope]);
+        }
+        fixture.messages(Some(worker), &args)
+    };
+    let sent = relay("dag-policy");
+    assert!(sent[0]["grant"].is_null());
+
+    let _desktop = hold_desktop_lock(path);
+    let caller = || desktop(path, BOX);
+    let (grant, _) = infrastructure::client::talk::grant(
+        caller(),
+        worker.id.clone(),
+        domain::talk::GrantScope::DagPolicy,
+        2_000,
+    )
+    .unwrap();
+    assert!(grant.approved_at.is_some());
+
+    // Within scope: every active run's coordinator gets the grant envelope.
+    let sent = relay("dag-policy");
+    let mut to: Vec<_> = sent
+        .iter()
+        .map(|m| m["recipient"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    to.sort();
+    let mut expected = vec![fixture.coordinator.id.clone(), remote.id.clone()];
+    expected.sort();
+    assert_eq!(to, expected);
+    for message in &sent {
+        assert_eq!(message["grant"]["id"], grant.id.as_str());
+        assert_eq!(message["grant"]["scope"], "dag-policy");
+    }
+    let inbox = success(fixture.talk(Some(&remote), &["inbox"]));
+    assert!(
+        inbox.contains(&format!(
+            "Relayed with user grant {}, scope dag-policy",
+            grant.id
+        )),
+        "{inbox}"
+    );
+    // Outside the scope, or without one, it is a plain peer message.
+    for scope in ["dag-merge", ""] {
+        let sent = relay(scope);
+        assert!(sent.iter().all(|m| m["grant"].is_null()));
+    }
+    let inbox = success(fixture.talk(Some(&remote), &["inbox"]));
+    assert!(inbox.contains("Peer message relayed by Power"), "{inbox}");
+
+    // After expiry it is a plain peer message.
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    assert!(relay("dag-policy").iter().all(|m| m["grant"].is_null()));
+
+    // Revoke takes effect at once.
+    let (grant, _) = infrastructure::client::talk::grant(
+        caller(),
+        worker.id.clone(),
+        domain::talk::GrantScope::DagPolicy,
+        3_600_000,
+    )
+    .unwrap();
+    assert!(relay("dag-policy")[0]["grant"].is_object());
+    let revoked = fixture.talk(Some(worker), &["revoke", &grant.id]);
+    assert!(!revoked.status.success());
+    success(fixture.talk(None, &["revoke", &grant.id]));
+    assert!(relay("dag-policy").iter().all(|m| m["grant"].is_null()));
+
+    // Grants are recorded in talk history.
+    let grants = json(fixture.talk(None, &["grants", "--json"]));
+    let states: Vec<_> = grants["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["state"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(states, ["pending", "expired", "revoked"]);
+    let worker_log = success(fixture.talk(Some(worker), &["inbox", "--all"]));
+    assert!(worker_log.contains("granted"), "{worker_log}");
+    assert!(worker_log.contains("revoked"), "{worker_log}");
+}

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use domain::session::Agent;
 use domain::talk::{
-    Activity, AgentTalkSummary, Decision, Directory, HookState, Message, MessageId, NoticePolicy,
-    Queued, Recipient, Sender, Target, ThreadId,
+    Activity, AgentTalkSummary, Decision, Directory, Grant, GrantRelay, GrantScope, HookState,
+    Message, MessageId, NoticePolicy, Queued, Recipient, Sender, Target, ThreadId,
 };
 use std::{
     collections::HashMap,
@@ -36,6 +36,10 @@ pub trait TalkReader {
     fn decisions(&self, all: bool, now: u64) -> Result<Vec<Message>>;
     fn cursor(&self) -> Result<u64>;
     fn events(&self, after: u64, box_id: Option<&str>) -> Result<Vec<TalkEvent>>;
+    /// Every grant, oldest first, optionally only an agent's.
+    fn grants(&self, agent: Option<&str>) -> Result<Vec<Grant>>;
+    /// The grant a decision request asks the user to approve.
+    fn grant_for_request(&self, request: &MessageId) -> Result<Option<Grant>>;
 }
 
 pub trait TalkTransaction: TalkReader {
@@ -43,6 +47,11 @@ pub trait TalkTransaction: TalkReader {
     fn mark(&self, messages: &[&MessageId], change: DeliveryChange, at: u64) -> Result<()>;
     /// Closes an open decision request. Returns false if it was already answered.
     fn answer(&self, request: &MessageId, at: u64) -> Result<bool>;
+    fn insert_grant(&self, grant: &Grant) -> Result<()>;
+    /// Starts a pending grant. Returns false if it was approved or revoked already.
+    fn approve_grant(&self, id: &str, at: u64) -> Result<bool>;
+    /// Returns false if it was revoked already.
+    fn revoke_grant(&self, id: &str, at: u64) -> Result<bool>;
 }
 
 pub trait SessionActivity: Send + Sync {
@@ -108,11 +117,30 @@ pub struct SendMessage {
     pub run: Option<String>,
     pub body: String,
     pub urgent: bool,
+    /// Relays the user's decision in this scope, if the sender holds an active grant for it.
+    pub scope: Option<GrantScope>,
     /// Non-empty for a decision request, which goes to the user.
     pub choices: Vec<String>,
     /// How long a decision request stays open, in milliseconds.
     pub expires_in: Option<u64>,
 }
+
+pub struct GrantRequest {
+    pub caller: Caller,
+    pub agent: String,
+    pub scope: GrantScope,
+    pub duration_ms: u64,
+}
+
+/// A new grant, and the decision request that asks the user to approve it when it was
+/// requested outside the desktop.
+pub struct Granted {
+    pub grant: Grant,
+    pub request: Option<Message>,
+}
+
+pub const APPROVE_GRANT: &str = "Approve";
+pub const DENY_GRANT: &str = "Deny";
 
 pub struct Reply {
     pub caller: Caller,
@@ -120,6 +148,7 @@ pub struct Reply {
     pub recipient_agent: Option<String>,
     pub body: String,
     pub urgent: bool,
+    pub scope: Option<GrantScope>,
 }
 
 pub struct Talk<S, A, N> {
@@ -253,7 +282,7 @@ use anyhow::{Context, bail, ensure};
 use domain::{
     dag::{AgentStatus, Coordinator, ManagedAgent},
     talk::{
-        Address, AgentRef, Delivery, MAX_BODY_BYTES, NoticeDecision, RATE_WINDOW_MS,
+        Address, AgentRef, Delivery, MAX_BODY_BYTES, MAX_GRANT_MS, NoticeDecision, RATE_WINDOW_MS,
         REMINDER_AFTER_MS, RunRef, SenderContext, hook_deliverable, notice, rate_limit, resolve,
     },
 };
@@ -387,6 +416,7 @@ struct Outgoing {
     body: String,
     run: Option<String>,
     urgent: bool,
+    scope: Option<GrantScope>,
 }
 
 impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
@@ -827,6 +857,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     body: command.body.clone(),
                     run: run.map(str::to_owned),
                     urgent: command.urgent,
+                    scope: command.scope,
                 };
                 let mut message = self.build(db, outgoing, now)?;
                 message.broadcast = broadcast.as_ref().map(|(_, id)| id.clone());
@@ -838,6 +869,177 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         })
     }
 
+    /// Grants an agent scoped authority to relay the user's decisions. Only the user can.
+    /// From the desktop the grant starts at once. From the user's shell it waits for the user
+    /// to approve it in the desktop, since Power cannot confirm that the user ran the shell.
+    pub fn grant(&self, command: GrantRequest) -> Result<Granted> {
+        ensure!(
+            command.duration_ms > 0 && command.duration_ms <= MAX_GRANT_MS,
+            "A grant lasts between 1 second and 7 days"
+        );
+        let live = self.live(&command.caller);
+        self.store.write(|db| {
+            let directory = db.directory()?;
+            let actor = self.actor(&command.caller, &directory, live.as_ref())?;
+            let sender = actor.sender(None);
+            ensure!(
+                sender.has_user_authority(),
+                "Only the user can grant authority. Agents cannot use power talk grant"
+            );
+            let agent = directory.agent(&command.agent, actor.box_id)?;
+            let now = (self.clock)();
+            let mut grant = Grant {
+                id: (self.new_id)(),
+                agent: agent.id.clone(),
+                box_id: agent.box_id.clone(),
+                scope: command.scope,
+                created_at: now,
+                duration_ms: command.duration_ms,
+                approved_at: sender.is_user_authored().then_some(now),
+                revoked_at: None,
+                request: None,
+            };
+            let mut request = None;
+            if !sender.is_user_authored() {
+                let mut ask = self.build(
+                    db,
+                    Outgoing {
+                        box_id: agent.box_id.clone(),
+                        sender: Sender::System,
+                        recipient: Recipient::User,
+                        body: format!(
+                            "Approve grant {} for agent {} ({}), scope {}, for {}? It was \
+                             requested from a shell, so it waits for you here.",
+                            grant.id,
+                            agent.id,
+                            agent.label,
+                            grant.scope.as_str(),
+                            duration_label(grant.duration_ms)
+                        ),
+                        run: None,
+                        urgent: false,
+                        scope: None,
+                    },
+                    now,
+                )?;
+                ask.decision = Some(
+                    Decision::new(vec![APPROVE_GRANT.into(), DENY_GRANT.into()], None)
+                        .map_err(anyhow::Error::msg)?,
+                );
+                grant.request = Some(ask.id.clone());
+                request = Some(ask);
+            }
+            db.insert_grant(&grant)?;
+            if let Some(ask) = &request {
+                db.insert(ask)?;
+            } else {
+                self.record_grant(db, &directory, &grant, "granted", now)?;
+            }
+            Ok(Granted { grant, request })
+        })
+    }
+
+    /// Ends a grant at once. Only the user can.
+    pub fn revoke(&self, caller: Caller, id: &str) -> Result<Grant> {
+        let live = self.live(&caller);
+        self.store.write(|db| {
+            let directory = db.directory()?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
+            ensure!(actor.agent.is_none(), "Only the user can revoke a grant");
+            let grant = db
+                .grants(None)?
+                .into_iter()
+                .find(|grant| grant.id == id)
+                .with_context(|| format!("Unknown grant {id:?}"))?;
+            let now = (self.clock)();
+            ensure!(
+                db.revoke_grant(&grant.id, now)?,
+                "Grant {id:?} is already revoked"
+            );
+            let grant = Grant {
+                revoked_at: Some(now),
+                ..grant
+            };
+            if let Some(request) = &grant.request {
+                // A pending grant's approval request closes with it.
+                db.answer(request, now)?;
+            }
+            self.record_grant(db, &directory, &grant, "revoked", now)?;
+            Ok(grant)
+        })
+    }
+
+    /// Every grant for the user. An agent sees its own.
+    pub fn grants(&self, caller: Caller) -> Result<Vec<Grant>> {
+        let live = self.live(&caller);
+        self.store.read(|db| {
+            let directory = db.directory()?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
+            db.grants(actor.agent.map(|agent| agent.id.as_str()))
+        })
+    }
+
+    /// Records a grant change in talk history: to the user, and to the agent while it runs.
+    fn record_grant(
+        &self,
+        db: &dyn TalkTransaction,
+        directory: &Directory,
+        grant: &Grant,
+        change: &str,
+        now: u64,
+    ) -> Result<()> {
+        let until = match (change, grant.expires_at()) {
+            ("granted" | "approved", Some(at)) => format!(
+                " It lasts {} and expires at {} (Unix ms) on its own.",
+                duration_label(grant.duration_ms),
+                at
+            ),
+            _ => String::new(),
+        };
+        let body = format!(
+            "Grant {} for agent {}, scope {}, {change}.{until}",
+            grant.id,
+            grant.agent,
+            grant.scope.as_str()
+        );
+        let mut recipients = vec![Recipient::User];
+        if let Some(agent) = directory
+            .agents
+            .iter()
+            .find(|agent| agent.id == grant.agent)
+            && agent.status != AgentStatus::Exited
+            && agent.session.is_some()
+        {
+            recipients.push(Recipient::agent(agent));
+        }
+        for recipient in recipients {
+            let body = if recipient == Recipient::User {
+                body.clone()
+            } else {
+                format!(
+                    "{body} Relay the user's decisions in this scope with \
+                     power talk send <to> --scope {} \"<message>\".",
+                    grant.scope.as_str()
+                )
+            };
+            let message = self.build(
+                db,
+                Outgoing {
+                    box_id: grant.box_id.clone(),
+                    sender: Sender::System,
+                    recipient,
+                    body,
+                    run: None,
+                    urgent: false,
+                    scope: None,
+                },
+                now,
+            )?;
+            db.insert(&message)?;
+        }
+        Ok(())
+    }
+
     pub fn reply(&self, command: Reply) -> Result<Message> {
         validate_body(&command.body)?;
         let live = self.live(&command.caller);
@@ -847,6 +1049,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             let parent = require_message(db, &command.message)?;
             let sender = actor.sender(parent.run.as_deref());
             let now = (self.clock)();
+            let mut grant_request = false;
             // The one choke point for answers: only the user, in the desktop, answers a
             // decision request, once. A shell has the user's authority, but Power cannot
             // confirm that the user wrote its answer.
@@ -862,6 +1065,17 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     command.message.0
                 );
                 db.mark(&[&parent.id], DeliveryChange::Read, now)?;
+                if let Some(grant) = db.grant_for_request(&parent.id)? {
+                    grant_request = true;
+                    if command.body == APPROVE_GRANT {
+                        ensure!(db.approve_grant(&grant.id, now)?, "Grant {:?} was revoked", grant.id);
+                        let approved = Grant { approved_at: Some(now), ..grant };
+                        self.record_grant(db, &directory, &approved, "approved", now)?;
+                    } else {
+                        db.revoke_grant(&grant.id, now)?;
+                        self.record_grant(db, &directory, &grant, "denied", now)?;
+                    }
+                }
             }
             let from_me = parent.sender.has_user_authority() && sender.has_user_authority()
                 || matches!((&parent.sender, &sender), (Sender::Agent(from), Sender::Agent(me)) if from.id == me.id);
@@ -881,6 +1095,8 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 match &parent.sender {
                     Sender::Agent(agent) => Recipient::Agent { id: agent.id.clone(), box_id: agent.box_id.clone() },
                     Sender::User | Sender::Shell => Recipient::User,
+                    // The user's answer to a grant approval stays in the user's history.
+                    Sender::System if grant_request => Recipient::User,
                     Sender::System => bail!("Power messages do not accept replies"),
                 }
             };
@@ -895,7 +1111,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     Recipient::User => parent.box_id,
                 },
                 sender, recipient, body: command.body,
-                run: parent.run, urgent: command.urgent,
+                run: parent.run, urgent: command.urgent, scope: command.scope,
             }, now)?;
             message.thread = parent.thread;
             message.reply_to = Some(parent.id);
@@ -920,8 +1136,25 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 retry.saturating_sub(now).div_ceil(1000)
             );
         }
+        // The one choke point for relayed authority: a message carries a grant only if its
+        // sender holds an active one in the requested scope when Power stamps it. Otherwise
+        // it is a plain peer message.
+        let grant = match (&outgoing.sender, outgoing.scope) {
+            (Sender::Agent(agent), Some(scope)) => db
+                .grants(Some(&agent.id))?
+                .into_iter()
+                .find(|grant| {
+                    grant.scope == scope && grant.box_id == agent.box_id && grant.is_active(now)
+                })
+                .map(|grant| GrantRelay {
+                    id: grant.id,
+                    scope,
+                }),
+            _ => None,
+        };
         let id = (self.new_id)();
         Ok(Message {
+            grant,
             thread: ThreadId(id.clone()),
             id: MessageId(id),
             box_id: outgoing.box_id,
@@ -1265,6 +1498,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::TaskMessenger fo
             run: Some(run.into()),
             body,
             urgent: false,
+            scope: None,
             choices: Vec::new(),
             expires_in: None,
         })?;
@@ -1314,6 +1548,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::DecisionPoster f
                 body: body.into(),
                 run: Some(run.into()),
                 urgent: false,
+                scope: None,
             },
             now,
         )?;
@@ -1330,6 +1565,16 @@ fn ids(batch: &[Queued]) -> Vec<&MessageId> {
 fn require_message(db: &dyn TalkReader, id: &MessageId) -> Result<Message> {
     db.message(id)?
         .with_context(|| format!("Unknown talk message {:?}", id.0))
+}
+
+pub fn duration_label(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        s if s >= 86_400 && s % 86_400 == 0 => format!("{}d", s / 86_400),
+        s if s >= 3_600 && s % 3_600 == 0 => format!("{}h", s / 3_600),
+        s if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
 }
 
 fn validate_body(body: &str) -> Result<()> {

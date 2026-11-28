@@ -24,12 +24,27 @@ pub enum TalkCommand {
         choices: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_in_ms: Option<u64>,
+        /// Relays the user's decision under the sender's grant in this scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
     },
+    /// Grants an agent scoped authority to relay the user's decisions. User only.
+    Grant {
+        agent: String,
+        scope: String,
+        duration_ms: u64,
+    },
+    Revoke {
+        id: String,
+    },
+    Grants,
     Reply {
         id: String,
         recipient_agent: Option<String>,
         body: String,
         urgent: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
     },
     Inbox {
         all: bool,
@@ -89,6 +104,7 @@ pub enum TalkResponse {
     Summary { agents: Vec<TalkAgentSummary> },
     Event { event: TalkEvent },
     Hook { attached: bool },
+    Grants { grants: Vec<TalkGrant> },
     Ok,
 }
 
@@ -114,6 +130,27 @@ pub struct TalkMessage {
     pub urgent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<TalkDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<TalkGrantRelay>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TalkGrantRelay {
+    pub id: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TalkGrant {
+    pub id: String,
+    pub agent: String,
+    pub box_id: String,
+    pub scope: String,
+    pub created_at: u64,
+    pub duration_ms: u64,
+    pub approved_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+    pub request: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

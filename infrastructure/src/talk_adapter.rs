@@ -12,13 +12,13 @@ use application::{
     Application,
     dag::BoxSelection,
     talk::{
-        Caller, HOOK_ATTACH_MS, HookClaim, HookWait, LogFilter, Notifier, Reply, SendMessage,
-        SessionActivity, Talk,
+        Caller, GrantRequest, HOOK_ATTACH_MS, HookClaim, HookWait, LogFilter, Notifier, Reply,
+        SendMessage, SessionActivity, Talk,
     },
 };
 use domain::session::Agent;
 use domain::talk::{
-    Activity, Address, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
+    Activity, Address, GrantScope, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
 };
 use std::{
     io::BufReader,
@@ -149,6 +149,7 @@ pub(crate) fn request(
             urgent,
             choices,
             expires_in_ms,
+            scope,
         } => {
             let target = match (to, &run) {
                 (Some(to), _) => Target::One(Address::from(to.as_str())),
@@ -161,21 +162,46 @@ pub(crate) fn request(
                 run,
                 body,
                 urgent,
+                scope: scope.as_deref().map(parse_scope).transpose()?,
                 choices,
                 expires_in: expires_in_ms,
             })?)
         }
+        TalkCommand::Grant {
+            agent,
+            scope,
+            duration_ms,
+        } => TalkResponse::Grants {
+            grants: vec![
+                talk.grant(GrantRequest {
+                    caller,
+                    agent,
+                    scope: parse_scope(&scope)?,
+                    duration_ms,
+                })?
+                .grant
+                .into(),
+            ],
+        },
+        TalkCommand::Revoke { id } => TalkResponse::Grants {
+            grants: vec![talk.revoke(caller, &id)?.into()],
+        },
+        TalkCommand::Grants => TalkResponse::Grants {
+            grants: talk.grants(caller)?.into_iter().map(Into::into).collect(),
+        },
         TalkCommand::Reply {
             id,
             body,
             urgent,
             recipient_agent,
+            scope,
         } => items(vec![talk.reply(Reply {
             caller,
             message: MessageId(id),
             recipient_agent,
             body,
             urgent,
+            scope: scope.as_deref().map(parse_scope).transpose()?,
         })?]),
         TalkCommand::Inbox { all, peek } => items(talk.inbox(caller, all, peek)?),
         TalkCommand::Show { id, read } => items(talk.show(caller, MessageId(id), read)?),
@@ -240,6 +266,10 @@ pub(crate) fn request(
             unreachable!("Talk watches and hooks use the streaming handler")
         }
     })
+}
+
+fn parse_scope(scope: &str) -> Result<GrantScope> {
+    GrantScope::parse(scope).map_err(anyhow::Error::msg)
 }
 
 fn talk_ok() -> Response {

@@ -9,6 +9,7 @@ use std::sync::{
 #[derive(Clone, Default)]
 struct Rows {
     messages: Vec<Message>,
+    grants: Vec<Grant>,
 }
 
 #[derive(Default)]
@@ -54,6 +55,7 @@ impl TalkReader for Db {
                     label: "pane".into(),
                 },
                 coordinator_session: None,
+                archived: false,
             }],
         })
     }
@@ -123,6 +125,19 @@ impl TalkReader for Db {
     fn events(&self, _: u64, _: Option<&str>) -> Result<Vec<TalkEvent>> {
         unreachable!()
     }
+    fn grants(&self, agent: Option<&str>) -> Result<Vec<Grant>> {
+        Ok(self
+            .grant_rows()
+            .into_iter()
+            .filter(|grant| agent.is_none_or(|agent| grant.agent == agent))
+            .collect())
+    }
+    fn grant_for_request(&self, request: &MessageId) -> Result<Option<Grant>> {
+        Ok(self
+            .grant_rows()
+            .into_iter()
+            .find(|grant| grant.request.as_ref() == Some(request)))
+    }
     fn decisions(&self, all: bool, now: u64) -> Result<Vec<Message>> {
         Ok(self
             .0
@@ -138,6 +153,12 @@ impl TalkReader for Db {
             })
             .cloned()
             .collect())
+    }
+}
+
+impl Db {
+    fn grant_rows(&self) -> Vec<Grant> {
+        self.0.lock().unwrap().grants.clone()
     }
 }
 
@@ -169,6 +190,32 @@ impl TalkTransaction for Db {
             }
         }
         Ok(false)
+    }
+    fn insert_grant(&self, grant: &Grant) -> Result<()> {
+        self.0.lock().unwrap().grants.push(grant.clone());
+        Ok(())
+    }
+    fn approve_grant(&self, id: &str, at: u64) -> Result<bool> {
+        let mut rows = self.0.lock().unwrap();
+        let grant = rows.grants.iter_mut().find(|grant| grant.id == id);
+        Ok(match grant {
+            Some(grant) if grant.approved_at.is_none() && grant.revoked_at.is_none() => {
+                grant.approved_at = Some(at);
+                true
+            }
+            _ => false,
+        })
+    }
+    fn revoke_grant(&self, id: &str, at: u64) -> Result<bool> {
+        let mut rows = self.0.lock().unwrap();
+        let grant = rows.grants.iter_mut().find(|grant| grant.id == id);
+        Ok(match grant {
+            Some(grant) if grant.revoked_at.is_none() => {
+                grant.revoked_at = Some(at);
+                true
+            }
+            _ => false,
+        })
     }
 }
 
@@ -253,6 +300,7 @@ fn send(
             run: None,
             body: body.into(),
             urgent: false,
+            scope: None,
             choices: Vec::new(),
             expires_in: None,
         })?
@@ -271,6 +319,7 @@ fn reply(
         recipient_agent: None,
         body: body.into(),
         urgent: false,
+        scope: None,
     })
 }
 
@@ -287,6 +336,7 @@ fn queued_peer_and_user_messages_follow_delivery_and_read_rules() -> Result<()> 
             body: body.into(),
             urgent,
             choices: Vec::new(),
+            scope: None,
             expires_in: None,
         })
     };
@@ -326,6 +376,7 @@ fn queued_peer_and_user_messages_follow_delivery_and_read_rules() -> Result<()> 
         recipient_agent: None,
         body: "reply".into(),
         urgent: false,
+        scope: None,
     })?;
     assert_eq!(reply.thread, peer.thread);
     assert_eq!(reply.reply_to, Some(peer.id));
@@ -472,6 +523,7 @@ fn only_the_user_answers_a_decision_request_and_only_once() -> Result<()> {
             run: None,
             body: "Ship it?".into(),
             urgent: false,
+            scope: None,
             choices: choices.iter().map(|c| (*c).into()).collect(),
             expires_in: Some(60_000),
         })
@@ -492,6 +544,7 @@ fn only_the_user_answers_a_decision_request_and_only_once() -> Result<()> {
             recipient_agent: None,
             body: "Approve".into(),
             urgent: false,
+            scope: None,
         })
     };
     let peer = answer(Some("b-session")).unwrap_err();
@@ -504,6 +557,7 @@ fn only_the_user_answers_a_decision_request_and_only_once() -> Result<()> {
             recipient_agent: None,
             body: "Approve".into(),
             urgent: false,
+            scope: None,
         })
         .unwrap_err();
     assert!(format!("{shell:#}").contains("Only the user"));
@@ -534,6 +588,7 @@ fn the_first_turn_start_reserves_the_hook_path_for_urgent_messages() -> Result<(
         run: None,
         body: "now".into(),
         urgent: true,
+        scope: None,
         choices: Vec::new(),
         expires_in: None,
     })?;
@@ -654,5 +709,101 @@ fn a_late_confirmation_never_changes_a_newer_turn() -> Result<()> {
     assert_eq!(terminal.activity.lock().unwrap().hook, HookState::Ready);
     assert!(!lease.stale());
     assert!(talk.hook_attached(&b)?);
+    Ok(())
+}
+
+fn scoped_send(
+    talk: &Talk<Db, Arc<Terminal>, Arc<Terminal>>,
+    scope: Option<GrantScope>,
+) -> Result<Message> {
+    Ok(talk
+        .send(SendMessage {
+            caller: caller(Some("a-session")),
+            target: Target::One(Address::Agent("b".into())),
+            run: None,
+            body: "Cap reviews at 2 rounds".into(),
+            urgent: false,
+            scope,
+            choices: Vec::new(),
+            expires_in: None,
+        })?
+        .remove(0))
+}
+
+#[test]
+fn only_the_user_grants_and_relays_carry_a_grant_only_inside_its_scope() -> Result<()> {
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = talk(&store, &terminal);
+    let request = |caller, scope| GrantRequest {
+        caller,
+        agent: "a".into(),
+        scope,
+        duration_ms: 60_000,
+    };
+    let error = talk
+        .grant(request(caller(Some("b-session")), GrantScope::DagPolicy))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("Only the user"), "{error:#}");
+    assert!(store.grant_rows().is_empty());
+
+    // A grant from the user's shell waits for the desktop.
+    let pending = talk.grant(request(caller(None), GrantScope::DagPolicy))?;
+    assert_eq!(pending.grant.state(20_000), "pending");
+    let ask = pending.request.unwrap();
+    assert!(ask.decision.is_some() && ask.recipient == Recipient::User);
+    assert_eq!(scoped_send(&talk, Some(GrantScope::DagPolicy))?.grant, None);
+    // The shell cannot approve its own grant.
+    let approve = |desktop| {
+        talk.reply(Reply {
+            caller: Caller {
+                session: None,
+                box_id: Some("box".into()),
+                desktop,
+            },
+            message: ask.id.clone(),
+            recipient_agent: None,
+            body: APPROVE_GRANT.into(),
+            urgent: false,
+            scope: None,
+        })
+    };
+    assert!(approve(false).is_err());
+    approve(true)?;
+    let relayed = scoped_send(&talk, Some(GrantScope::DagPolicy))?;
+    assert_eq!(
+        relayed.grant,
+        Some(GrantRelay {
+            id: pending.grant.id.clone(),
+            scope: GrantScope::DagPolicy
+        })
+    );
+    assert!(domain::talk::envelope(&relayed).contains(&format!(
+        "Relayed with user grant {}, scope dag-policy",
+        pending.grant.id
+    )));
+    assert_eq!(scoped_send(&talk, Some(GrantScope::DagMerge))?.grant, None);
+    assert_eq!(scoped_send(&talk, None)?.grant, None);
+
+    // An agent cannot revoke, the user can, at once.
+    assert!(
+        talk.revoke(caller(Some("a-session")), &pending.grant.id)
+            .is_err()
+    );
+    talk.revoke(caller(None), &pending.grant.id)?;
+    assert_eq!(scoped_send(&talk, Some(GrantScope::DagPolicy))?.grant, None);
+    // Grant changes are recorded in talk history, for the user and the agent.
+    let history: Vec<_> = store
+        .0
+        .lock()
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| m.sender == Sender::System && m.decision.is_none())
+        .map(|m| m.body.clone())
+        .collect();
+    assert!(history.iter().any(|body| body.contains("approved")));
+    assert!(history.iter().any(|body| body.contains("revoked")));
     Ok(())
 }
