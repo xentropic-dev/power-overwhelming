@@ -55,6 +55,20 @@ pub enum TalkCommand {
     },
     Summary,
     Watch,
+    /// A Stop hook reports the turn end. The daemon answers `Messages` with what the hook
+    /// may hand over, then waits for `HookEmitted` before marking them read and answering
+    /// `Ok`. A hook that closes the connection first returns them to the queue. With
+    /// nothing to hand over it answers `Ok` alone.
+    HookStop,
+    /// A waiting hook. Streams keepalive `Ok` responses while it waits, then sends
+    /// `Messages` and takes `HookEmitted` as for `HookStop`. The connection ends without
+    /// messages once a later turn or waiter replaced it.
+    HookWait,
+    /// Whether the session's waiting hook is attached for the current turn.
+    HookStatus,
+    /// A turn-start hook. Reports the turn busy and registers the session for hook
+    /// delivery from its first turn.
+    HookStart,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -64,7 +78,14 @@ pub enum TalkResponse {
     Reply { message: Option<Box<TalkMessage>> },
     Summary { agents: Vec<TalkAgentSummary> },
     Event { event: TalkEvent },
+    Hook { attached: bool },
     Ok,
+}
+
+/// A hook's confirmation that it emitted the messages it received to the agent.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HookEmitted {
+    pub emitted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
