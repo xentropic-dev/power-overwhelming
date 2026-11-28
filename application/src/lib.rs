@@ -143,6 +143,11 @@ pub trait TerminalRuntime: Send + Sync {
     fn resolve_agent(&self, handle: &Self::Handle) -> Option<Agent> {
         self.agent(handle)
     }
+    /// Whether process `pid` runs inside the session. False when the terminal cannot
+    /// tell, so a caller is never trusted by default.
+    fn owns_process(&self, _handle: &Self::Handle, _pid: u32) -> bool {
+        false
+    }
 }
 
 struct Live<H> {
@@ -220,6 +225,12 @@ impl<T: TerminalRuntime> Application<T> {
         {
             sessions.remove(id);
         }
+    }
+
+    /// Whether process `pid` runs inside live session `id`.
+    pub fn session_owns_process(&self, id: &str, pid: u32) -> bool {
+        self.terminal(id)
+            .is_ok_and(|terminal| self.runtime.owns_process(&terminal, pid))
     }
 
     /// Whether a live terminal runs session `id`.

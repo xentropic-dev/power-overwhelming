@@ -7,7 +7,6 @@ use application::talk::LogFilter;
 use domain::talk::{Message, MessageId, Recipient, Sender, envelope};
 use gpui::{prelude::*, *};
 use infrastructure::{client::talk, theme::Colors};
-use std::collections::HashSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
@@ -37,16 +36,17 @@ impl Query {
         let caller = caller(self.box_id.clone());
         if let Some(id) = &self.expanded {
             talk::show(caller, id.clone(), true)
+        } else if self.target == Target::User {
+            talk::desktop_inbox(self.box_id.clone(), now_ms())
         } else {
             let messages = talk::log(
                 caller,
                 LogFilter {
                     agent: self.target.agent().map(str::to_owned),
-                    to_user: self.target == Target::User,
                     ..LogFilter::default()
                 },
             )?;
-            let mut threads = HashSet::new();
+            let mut threads = std::collections::HashSet::new();
             Ok(messages
                 .into_iter()
                 .filter(|message| threads.insert(message.thread.clone()))
@@ -81,11 +81,7 @@ impl Send {
 }
 
 pub fn caller(box_id: String) -> talk::Caller {
-    talk::Caller {
-        box_sel: Some(box_id),
-        session: None,
-        desktop: true,
-    }
+    talk::Caller::desktop(box_id)
 }
 
 pub struct TalkDialog {
@@ -132,13 +128,20 @@ impl TalkDialog {
         }
     }
 
-    pub fn apply(&mut self, query: &Query, result: Result<Vec<Message>>) {
+    /// Shows a load's result as of `now`. A request can expire while the load runs, so
+    /// the user inbox is ordered again at `now`, the same instant `next_expiry` takes.
+    pub fn apply(&mut self, query: &Query, result: Result<Vec<Message>>, now: u64) {
         if self.query() != *query {
             return;
         }
         self.loading = false;
         match result {
             Ok(rows) => {
+                let rows = if self.expanded.is_none() && self.target == Target::User {
+                    domain::talk::open_decisions_first(rows, now)
+                } else {
+                    rows
+                };
                 self.error = None;
                 if self.expanded.is_some() {
                     let previous = self
@@ -216,6 +219,42 @@ impl TalkDialog {
             return false;
         }
         true
+    }
+
+    /// The open decision request under the selection in the thread list, if any.
+    fn selected_decision(&self) -> Option<&Message> {
+        if self.expanded.is_some() || self.draft.is_some() {
+            return None;
+        }
+        self.threads
+            .get(self.selected_thread)
+            .filter(|message| answerable(message, now_ms()))
+    }
+
+    /// When the next request open at `now` expires, so the list refreshes then. Pass the
+    /// `now` the list was last applied at, so both agree on which requests are open.
+    pub fn next_expiry(&self, now: u64) -> Option<u64> {
+        self.threads
+            .iter()
+            .filter(|message| answerable(message, now))
+            .filter_map(|message| message.decision.as_ref()?.expires_at)
+            .min()
+    }
+
+    /// Answers the selected decision request with its `index`th choice.
+    pub fn answer(&mut self, index: usize) -> Option<Send> {
+        let message = self.selected_decision()?;
+        let choice = message.decision.as_ref()?.choices.get(index)?.clone();
+        Some(Send {
+            box_id: self.box_id.clone(),
+            agent: None,
+            reply_to: Some(message.id.clone()),
+            body: choice,
+        })
+    }
+
+    pub fn answered(&mut self, result: Result<()>) {
+        self.error = result.err().map(|error| format!("{error:#}"));
     }
 
     pub fn compose(&mut self, reply: bool, id: u64, focus: FocusHandle) -> bool {
@@ -313,6 +352,7 @@ impl TalkDialog {
             Target::Agent { label, .. } => format!("Talk with {label}"),
             Target::User => "Your inbox".into(),
         };
+        let now = now_ms();
         let mut actions = Vec::new();
         let mut action = |scope, command, description| {
             if !keymap.keys(scope, command).is_empty() {
@@ -334,6 +374,11 @@ impl TalkDialog {
             Command::PickerCancel,
             if expanded { "back" } else { "close" },
         );
+        if let Some(decision) = self.selected_decision().and_then(|m| m.decision.as_ref()) {
+            for (index, choice) in decision.choices.iter().enumerate().rev() {
+                actions.insert(0, format!("{} {choice}", index + 1));
+            }
+        }
         let status = self.error.as_deref().or({
             if self.loading {
                 Some("Loading messages…")
@@ -392,9 +437,34 @@ impl TalkDialog {
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
                             .children(messages.iter().enumerate().map(|(index, message)| {
+                                let open = !expanded && answerable(message, now);
+                                let section = (!expanded)
+                                    .then(|| {
+                                        let previous = index
+                                            .checked_sub(1)
+                                            .and_then(|i| messages.get(i))
+                                            .is_some_and(|m| answerable(m, now));
+                                        if open && index == 0 {
+                                            Some("Open decisions")
+                                        } else if !open && previous {
+                                            Some("History")
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .flatten();
                                 div()
                                     .px_3()
                                     .py_2()
+                                    .when_some(section, |row, label| {
+                                        row.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(colors.muted))
+                                                .child(label),
+                                        )
+                                    })
                                     .when(index == selected, |row| row.bg(rgb(colors.raised)))
                                     .child(
                                         div()
@@ -431,6 +501,19 @@ impl TalkDialog {
     }
 }
 
+fn answerable(message: &Message, now: u64) -> bool {
+    message.is_open_decision(now)
+}
+
+/// The choice a key answers: only an unmodified digit from 1, so no chord commits one.
+pub fn choice_index(keystroke: &Keystroke) -> Option<usize> {
+    if keystroke.modifiers.modified() {
+        return None;
+    }
+    let digit = keystroke.key.parse::<usize>().ok()?;
+    (1..=9).contains(&digit).then(|| digit - 1)
+}
+
 fn metadata(message: &Message) -> String {
     let sender = match &message.sender {
         Sender::Agent(agent) => &agent.id,
@@ -462,5 +545,120 @@ fn metadata(message: &Message) -> String {
                 .to_string()
         })
         .unwrap_or_default();
-    format!("{sender} → {recipient} · {time} · {state}")
+    let state = match &message.decision {
+        Some(decision) if decision.answered_at.is_some() => "Decision answered",
+        Some(decision) if !decision.is_open(now_ms()) => "Decision expired",
+        Some(_) => "Decision open",
+        None => state,
+    };
+    let from_box = match &message.sender {
+        Sender::Agent(agent) => {
+            let run = agent
+                .run
+                .as_deref()
+                .map(|run| format!(" · run {run}"))
+                .unwrap_or_default();
+            format!(" · {} · box {}{run}", agent.role, agent.box_id)
+        }
+        _ => String::new(),
+    };
+    format!("{sender} → {recipient}{from_box} · {time} · {state}")
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{answerable, choice_index};
+    use domain::talk::{
+        Decision, Delivery, Message, MessageId, Recipient, Sender, ThreadId, open_decisions_first,
+    };
+    use gpui::Keystroke;
+
+    fn message(id: &str, decision: Option<Decision>) -> Message {
+        Message {
+            id: MessageId(id.into()),
+            box_id: "box".into(),
+            sender: Sender::Shell,
+            recipient: Recipient::User,
+            body: id.into(),
+            thread: ThreadId(id.into()),
+            reply_to: None,
+            broadcast: None,
+            run: None,
+            created_at: 0,
+            delivery: Delivery::default(),
+            urgent: false,
+            decision,
+        }
+    }
+
+    fn decision(expires_at: Option<u64>, answered_at: Option<u64>) -> Option<Decision> {
+        Some(Decision {
+            choices: vec!["Yes".into(), "No".into()],
+            expires_at,
+            answered_at,
+        })
+    }
+
+    #[test]
+    fn only_open_requests_lead_the_list_and_closed_ones_join_the_history() {
+        let rows = vec![
+            message("plain", None),
+            message("expired", decision(Some(10), None)),
+            message("answered", decision(None, Some(5))),
+            message("open", decision(Some(100), None)),
+        ];
+        let ids = |rows: &[Message]| rows.iter().map(|m| m.id.0.clone()).collect::<Vec<_>>();
+        let sorted = open_decisions_first(rows.clone(), 50);
+        assert_eq!(ids(&sorted), ["open", "plain", "expired", "answered"]);
+        assert!(answerable(&sorted[0], 50));
+        assert!(!answerable(&sorted[2], 50));
+        // At its deadline the last open request closes too.
+        let later = open_decisions_first(rows, 100);
+        assert_eq!(ids(&later), ["plain", "expired", "answered", "open"]);
+        assert!(later.iter().all(|m| !answerable(m, 100)));
+    }
+
+    #[gpui::test]
+    fn a_request_that_expires_during_a_load_joins_the_history_when_applied(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{TalkDialog, Target};
+        let focus = cx.update(|cx| cx.focus_handle());
+        let mut dialog = TalkDialog::new(1, "box".into(), Target::User, focus);
+        let query = dialog.query();
+        // The load captured both as open at 50, so they arrive in the open order.
+        let loaded = open_decisions_first(
+            vec![
+                message("plain", None),
+                message("soon", decision(Some(60), None)),
+                message("later", decision(Some(500), None)),
+            ],
+            50,
+        );
+        assert_eq!(loaded[0].id.0, "soon");
+        // "soon" expires before the result is applied at 70.
+        dialog.apply(&query, Ok(loaded), 70);
+        let ids: Vec<_> = dialog.threads.iter().map(|m| m.id.0.as_str()).collect();
+        assert_eq!(ids, ["later", "soon", "plain"]);
+        // The timer comes from the same instant: the request still open at 70.
+        assert_eq!(dialog.next_expiry(70), Some(500));
+    }
+
+    #[test]
+    fn only_an_unmodified_digit_picks_a_choice() {
+        let key = |text: &str| Keystroke::parse(text).unwrap();
+        assert_eq!(choice_index(&key("1")), Some(0));
+        assert_eq!(choice_index(&key("9")), Some(8));
+        assert_eq!(choice_index(&key("0")), None);
+        assert_eq!(choice_index(&key("a")), None);
+        for chord in ["ctrl-1", "alt-2", "shift-3", "super-1", "ctrl-shift-1"] {
+            assert_eq!(choice_index(&key(chord)), None, "{chord}");
+        }
+    }
 }

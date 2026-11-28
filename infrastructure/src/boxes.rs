@@ -153,6 +153,47 @@ impl BoxRegistry for BoxesFile {
     }
 }
 
+/// The lock the desktop holds while it owns the box layout.
+pub(crate) fn layout_lock() -> Result<PathBuf> {
+    Ok(state_directory()?.join("boxes.lock"))
+}
+
+/// Whether process `pid` holds the layout lock, which only the running desktop does. The
+/// kernel reports lock owners, so a process cannot claim the lock without taking it.
+pub(crate) fn holds_layout_lock(pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(lock) = layout_lock().and_then(|path| Ok(fs::metadata(path)?)) else {
+        return false;
+    };
+    let device = lock.dev();
+    let (major, minor) = (libc::major(device), libc::minor(device));
+    let file = format!("{major:02x}:{minor:02x}:{}", lock.ino());
+    fs::read_to_string("/proc/locks").is_ok_and(|locks| {
+        locks
+            .lines()
+            .filter(|line| !line.contains("->"))
+            .any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                matches!(
+                    fields[..],
+                    [_, "FLOCK", _, "WRITE", owner, held, ..]
+                        if owner.parse() == Ok(pid) && same_file(held, &file)
+                )
+            })
+    })
+}
+
+/// `/proc/locks` pads device numbers to two hex digits, but a wider number has more.
+fn same_file(held: &str, file: &str) -> bool {
+    let parse = |id: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = id.split(':');
+        let major = u64::from_str_radix(parts.next()?, 16).ok()?;
+        let minor = u64::from_str_radix(parts.next()?, 16).ok()?;
+        Some((major, minor, parts.next()?.parse().ok()?))
+    };
+    parse(held).is_some_and(|held| parse(file) == Some(held))
+}
+
 pub struct Registry {
     file: PathBuf,
     // Hold the lock while the window owns the layout so concurrent launches cannot overwrite it.
@@ -171,7 +212,7 @@ impl Registry {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(directory.join("boxes.lock"))?;
+            .open(layout_lock()?)?;
         FileExt::try_lock_exclusive(&lock)
             .context("Another Power desktop is using the box layout")?;
         let file = directory.join("boxes.json");

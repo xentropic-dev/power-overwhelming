@@ -147,6 +147,8 @@ pub(crate) fn request(
             run,
             body,
             urgent,
+            choices,
+            expires_in_ms,
         } => {
             let target = match (to, &run) {
                 (Some(to), _) => Target::One(Address::from(to.as_str())),
@@ -159,6 +161,8 @@ pub(crate) fn request(
                 run,
                 body,
                 urgent,
+                choices,
+                expires_in: expires_in_ms,
             })?)
         }
         TalkCommand::Reply {
@@ -224,6 +228,7 @@ pub(crate) fn request(
         TalkCommand::Summary => TalkResponse::Summary {
             agents: talk.summary(caller)?.into_iter().map(Into::into).collect(),
         },
+        TalkCommand::Decisions { all } => items(talk.decisions(caller, all)?),
         TalkCommand::HookStart => {
             talk.hook_turn_start(&caller)?;
             TalkResponse::Ok

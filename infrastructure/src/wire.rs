@@ -285,7 +285,13 @@ pub fn socket_path() -> PathBuf {
 /// `ECONNREFUSED` while the socket exists are retried for a few seconds. Nothing has been
 /// sent yet, so retrying cannot apply a request twice.
 pub fn connect() -> Result<UnixStream> {
-    connect_to(&socket_path(), std::time::Duration::from_secs(10))
+    connect_at(None)
+}
+
+/// Connects to the daemon at `socket`, or the environment's when `None`.
+pub fn connect_at(socket: Option<&std::path::Path>) -> Result<UnixStream> {
+    let path = socket.map_or_else(socket_path, std::path::Path::to_path_buf);
+    connect_to(&path, std::time::Duration::from_secs(10))
 }
 
 fn connect_to(path: &std::path::Path, patience: std::time::Duration) -> Result<UnixStream> {
@@ -527,7 +533,12 @@ fn is_timeout(error: &anyhow::Error) -> bool {
 }
 
 pub fn request(message: &Request) -> Result<Response> {
-    let mut socket = connect()?;
+    request_at(None, message)
+}
+
+/// Like `request`, against the daemon at `socket` rather than the environment's.
+pub fn request_at(socket: Option<&std::path::Path>, message: &Request) -> Result<Response> {
+    let mut socket = connect_at(socket)?;
     let timeout = Some(std::time::Duration::from_secs(30));
     socket.set_read_timeout(timeout)?;
     socket.set_write_timeout(timeout)?;
@@ -1321,6 +1332,14 @@ pub enum DagRequest {
         status: ReportStatus,
         summary: String,
     },
+    /// Reports needs-input and asks the user the summary as a decision request, atomically.
+    ReportDecision {
+        run: String,
+        task: String,
+        attempt: String,
+        summary: String,
+        choices: Vec<String>,
+    },
     /// Events with `seq > since`. Blocks up to `wait_ms` when none match yet.
     Events {
         run: String,
@@ -1408,6 +1427,9 @@ pub enum DagResponse {
     Reported {
         applied: bool,
         reason: Option<String>,
+    },
+    DecisionRequested {
+        message: talk::TalkMessage,
     },
     TaskEdited {
         run: String,

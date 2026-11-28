@@ -1,8 +1,8 @@
 use anyhow::Result;
 use domain::session::Agent;
 use domain::talk::{
-    Activity, AgentTalkSummary, Directory, HookState, Message, MessageId, NoticePolicy, Queued,
-    Recipient, Sender, Target, ThreadId,
+    Activity, AgentTalkSummary, Decision, Directory, HookState, Message, MessageId, NoticePolicy,
+    Queued, Recipient, Sender, Target, ThreadId,
 };
 use std::{
     collections::HashMap,
@@ -31,6 +31,9 @@ pub trait TalkReader {
     fn thread(&self, id: &ThreadId) -> Result<Vec<Message>>;
     fn log(&self, filter: &LogFilter) -> Result<Vec<Message>>;
     fn recent_sends(&self, sender: &Sender, recipient: &Recipient, since: u64) -> Result<Vec<u64>>;
+    /// Decision requests to the user from every box, oldest first. Unless `all`, only those
+    /// still open at `now`.
+    fn decisions(&self, all: bool, now: u64) -> Result<Vec<Message>>;
     fn cursor(&self) -> Result<u64>;
     fn events(&self, after: u64, box_id: Option<&str>) -> Result<Vec<TalkEvent>>;
 }
@@ -38,6 +41,8 @@ pub trait TalkReader {
 pub trait TalkTransaction: TalkReader {
     fn insert(&self, message: &Message) -> Result<()>;
     fn mark(&self, messages: &[&MessageId], change: DeliveryChange, at: u64) -> Result<()>;
+    /// Closes an open decision request. Returns false if it was already answered.
+    fn answer(&self, request: &MessageId, at: u64) -> Result<bool>;
 }
 
 pub trait SessionActivity: Send + Sync {
@@ -103,6 +108,10 @@ pub struct SendMessage {
     pub run: Option<String>,
     pub body: String,
     pub urgent: bool,
+    /// Non-empty for a decision request, which goes to the user.
+    pub choices: Vec<String>,
+    /// How long a decision request stays open, in milliseconds.
+    pub expires_in: Option<u64>,
 }
 
 pub struct Reply {
@@ -753,6 +762,22 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
 
     pub fn send(&self, command: SendMessage) -> Result<Vec<Message>> {
         validate_body(&command.body)?;
+        let decision = if command.choices.is_empty() {
+            ensure!(
+                command.expires_in.is_none(),
+                "Only a decision request with choices expires"
+            );
+            None
+        } else {
+            ensure!(
+                command.target == Target::One(Address::User),
+                "Decision requests go to the user"
+            );
+            let expires_at = command
+                .expires_in
+                .map(|ms| (self.clock)().saturating_add(ms));
+            Some(Decision::new(command.choices.clone(), expires_at).map_err(anyhow::Error::msg)?)
+        };
         let live = self.live(&command.caller);
         self.store.write(|db| {
             let directory = db.directory()?;
@@ -805,6 +830,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 };
                 let mut message = self.build(db, outgoing, now)?;
                 message.broadcast = broadcast.as_ref().map(|(_, id)| id.clone());
+                message.decision = decision.clone();
                 db.insert(&message)?;
                 messages.push(message);
             }
@@ -820,6 +846,23 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             let actor = self.actor(&command.caller, &directory, live.as_ref())?;
             let parent = require_message(db, &command.message)?;
             let sender = actor.sender(parent.run.as_deref());
+            let now = (self.clock)();
+            // The one choke point for answers: only the user, in the desktop, answers a
+            // decision request, once. A shell has the user's authority, but Power cannot
+            // confirm that the user wrote its answer.
+            if let Some(decision) = &parent.decision {
+                ensure!(
+                    sender.is_user_authored(),
+                    "Only the user can answer decision request {:?}",
+                    command.message.0
+                );
+                ensure!(
+                    decision.is_open(now) && db.answer(&parent.id, now)?,
+                    "Decision request {:?} is already answered or expired",
+                    command.message.0
+                );
+                db.mark(&[&parent.id], DeliveryChange::Read, now)?;
+            }
             let from_me = parent.sender.has_user_authority() && sender.has_user_authority()
                 || matches!((&parent.sender, &sender), (Sender::Agent(from), Sender::Agent(me)) if from.id == me.id);
             ensure!(
@@ -853,7 +896,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 },
                 sender, recipient, body: command.body,
                 run: parent.run, urgent: command.urgent,
-            }, (self.clock)())?;
+            }, now)?;
             message.thread = parent.thread;
             message.reply_to = Some(parent.id);
             db.insert(&message)?;
@@ -889,6 +932,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             urgent: outgoing.urgent,
             reply_to: None,
             broadcast: None,
+            decision: None,
             created_at: now,
             delivery: Delivery {
                 queued_at: now,
@@ -1051,6 +1095,20 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         })
     }
 
+    /// Decision requests to the user across every box. Unless `all`, only open ones.
+    pub fn decisions(&self, caller: Caller, all: bool) -> Result<Vec<Message>> {
+        let live = self.live(&caller);
+        self.store.read(|db| {
+            let directory = db.directory()?;
+            let actor = self.actor(&caller, &directory, live.as_ref())?;
+            ensure!(
+                actor.agent.is_none(),
+                "Decision requests are answered by the user"
+            );
+            db.decisions(all, (self.clock)())
+        })
+    }
+
     pub fn summary(&self, caller: Caller) -> Result<Vec<AgentTalkSummary>> {
         let live = self.live(&caller);
         self.store.read(|db| {
@@ -1207,12 +1265,61 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::TaskMessenger fo
             run: Some(run.into()),
             body,
             urgent: false,
+            choices: Vec::new(),
+            expires_in: None,
         })?;
         messages
             .into_iter()
             .next()
             .map(|message| message.id.0)
             .context("Talk queued no message for the worker")
+    }
+}
+
+impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::DecisionPoster for Talk<S, A, N> {
+    fn check_decision(&self, body: &str, choices: &[String]) -> Result<()> {
+        validate_body(body)?;
+        Decision::new(choices.to_vec(), None).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    fn post_decision(
+        &self,
+        db: &dyn TalkTransaction,
+        agent: &str,
+        run: &str,
+        body: &str,
+        choices: Vec<String>,
+    ) -> Result<Message> {
+        self.check_decision(body, &choices)?;
+        let directory = db.directory()?;
+        let worker = directory
+            .agents
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .with_context(|| format!("Unknown worker {agent:?}"))?;
+        let actor = Actor {
+            agent: Some(worker),
+            box_id: Some(&worker.box_id),
+            desktop: false,
+            directory: &directory,
+        };
+        let now = (self.clock)();
+        let mut message = self.build(
+            db,
+            Outgoing {
+                box_id: worker.box_id.clone(),
+                sender: actor.sender(Some(run)),
+                recipient: Recipient::User,
+                body: body.into(),
+                run: Some(run.into()),
+                urgent: false,
+            },
+            now,
+        )?;
+        message.decision = Some(Decision::new(choices, None).map_err(anyhow::Error::msg)?);
+        db.insert(&message)?;
+        Ok(message)
     }
 }
 

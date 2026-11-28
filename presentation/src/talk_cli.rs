@@ -46,6 +46,26 @@ enum Action {
         #[command(flatten)]
         input: InputOptions,
     },
+    /// Ask the user a question with fixed answers. It appears in the user inbox of every box.
+    Ask {
+        /// Recipient (only `user`) followed by the question. Use - for stdin.
+        #[arg(value_name = "USER_AND_QUESTION")]
+        words: Vec<String>,
+        /// Comma-separated answers, such as "Approve,Deny".
+        #[arg(long, value_delimiter = ',', required = true)]
+        choices: Vec<String>,
+        /// Close the request unanswered after this many seconds.
+        #[arg(long, value_name = "SECS")]
+        expires: Option<u64>,
+        #[command(flatten)]
+        input: InputOptions,
+    },
+    /// List decision requests to the user from every box.
+    #[command(hide = true)]
+    Decisions {
+        #[arg(long)]
+        all: bool,
+    },
     /// Reply in the thread containing a message.
     Reply {
         id: String,
@@ -119,6 +139,7 @@ pub fn run(args: TalkArgs) -> Result<()> {
         session: super::caller_session(),
         box_sel: args.box_sel,
         desktop: false,
+        socket: None,
     };
     let json = args.json;
     if !matches!(
@@ -140,6 +161,25 @@ pub fn run(args: TalkArgs) -> Result<()> {
             let messages = talk::send(caller.clone(), to, run, body, urgent)?;
             sent(caller, messages, input.wait, input.timeout, json)
         }
+        Action::Ask {
+            words,
+            choices,
+            expires,
+            input,
+        } => {
+            let mut words = words.into_iter();
+            ensure!(
+                words.next().as_deref() == Some("user"),
+                "Decision requests go to the user: power talk ask user --choices A,B <question>"
+            );
+            let body = body(words.collect(), input.file)?;
+            let expires = expires
+                .map(|secs| secs.checked_mul(1000).context("Expiry is too large"))
+                .transpose()?;
+            let message = talk::ask(caller.clone(), body, choices, expires)?;
+            sent(caller, vec![message], input.wait, input.timeout, json)
+        }
+        Action::Decisions { all } => print_messages(talk::decisions(caller, all)?, json, false),
         Action::Reply { id, words, input } => {
             let body = body(words, input.file)?;
             let message = talk::reply(caller.clone(), MessageId(id), body, None)?;

@@ -2,15 +2,66 @@ use crate::wire::{self, Request, Response, talk::*};
 use anyhow::{Context, Result, bail};
 use application::talk::{LogFilter, TalkEvent as Event, TalkEventKind as EventKind};
 use domain::talk::{
-    AgentRef, AgentTalkSummary, Delivery, Message, MessageId, Recipient, Sender, ThreadId,
+    AgentRef, AgentTalkSummary, Decision, Delivery, Message, MessageId, Recipient, Sender, ThreadId,
 };
-use std::{io::BufReader, os::unix::net::UnixStream, time::Duration};
+use std::{io::BufReader, os::unix::net::UnixStream, path::PathBuf, time::Duration};
 
 #[derive(Clone, Default)]
 pub struct Caller {
     pub session: Option<String>,
     pub box_sel: Option<String>,
+    /// Claims the desktop. The daemon acts on it only when it verifies that the calling
+    /// process is the desktop, which holds the box layout lock. Otherwise the caller is
+    /// the user's shell.
     pub desktop: bool,
+    /// The daemon socket, when not the environment's.
+    pub socket: Option<PathBuf>,
+}
+
+impl Caller {
+    /// The desktop, acting for the user in `box_id`.
+    pub fn desktop(box_id: String) -> Self {
+        Self {
+            session: None,
+            box_sel: Some(box_id),
+            desktop: true,
+            socket: None,
+        }
+    }
+
+    /// The same caller, against the daemon at `socket`.
+    pub fn at_socket(self, socket: PathBuf) -> Self {
+        Self {
+            socket: Some(socket),
+            ..self
+        }
+    }
+}
+
+/// The desktop's user inbox for `box_id`: one row per thread, led by the decision requests
+/// from every box that are still open at `now`. Closed requests stay in the history.
+pub fn desktop_inbox(box_id: String, now: u64) -> Result<Vec<Message>> {
+    user_inbox(Caller::desktop(box_id), now)
+}
+
+/// The user inbox as `caller` sees it. See `desktop_inbox`.
+pub fn user_inbox(caller: Caller, now: u64) -> Result<Vec<Message>> {
+    let messages = log(
+        caller.clone(),
+        LogFilter {
+            to_user: true,
+            ..LogFilter::default()
+        },
+    )?;
+    let mut threads = std::collections::HashSet::new();
+    // Every box's requests, closed ones too, so an answered or expired request from
+    // another box stays in the history.
+    let rows = decisions(caller, true)?
+        .into_iter()
+        .chain(messages)
+        .filter(|message| threads.insert(message.thread.clone()))
+        .collect();
+    Ok(domain::talk::open_decisions_first(rows, now))
 }
 
 fn request(caller: Caller, command: TalkCommand) -> Request {
@@ -32,8 +83,13 @@ fn decode(response: Response) -> Result<TalkResponse> {
     }
 }
 
+fn send_request(caller: Caller, command: TalkCommand) -> Result<Response> {
+    let socket = caller.socket.clone();
+    wire::request_at(socket.as_deref(), &request(caller, command))
+}
+
 fn messages(caller: Caller, command: TalkCommand) -> Result<Vec<Message>> {
-    match decode(wire::request(&request(caller, command))?)? {
+    match decode(send_request(caller, command)?)? {
         TalkResponse::Messages { messages } => Ok(messages.into_iter().map(Into::into).collect()),
         _ => bail!("Unexpected talk response"),
     }
@@ -53,8 +109,37 @@ pub fn send(
             run,
             body,
             urgent,
+            choices: Vec::new(),
+            expires_in_ms: None,
         },
     )
+}
+
+/// Posts a decision request to the user inbox.
+pub fn ask(
+    caller: Caller,
+    body: String,
+    choices: Vec<String>,
+    expires_in_ms: Option<u64>,
+) -> Result<Message> {
+    messages(
+        caller,
+        TalkCommand::Send {
+            to: Some("user".into()),
+            run: None,
+            body,
+            urgent: false,
+            choices,
+            expires_in_ms,
+        },
+    )?
+    .pop()
+    .context("Daemon queued no decision request")
+}
+
+/// Decision requests to the user from every box. Unless `all`, only open ones.
+pub fn decisions(caller: Caller, all: bool) -> Result<Vec<Message>> {
+    messages(caller, TalkCommand::Decisions { all })
 }
 
 pub fn reply(
@@ -77,7 +162,7 @@ pub fn reply(
 }
 
 pub fn summary(caller: Caller) -> Result<Vec<AgentTalkSummary>> {
-    match decode(wire::request(&request(caller, TalkCommand::Summary))?)? {
+    match decode(send_request(caller, TalkCommand::Summary)?)? {
         TalkResponse::Summary { agents } => Ok(agents.into_iter().map(Into::into).collect()),
         _ => bail!("Unexpected talk response"),
     }
@@ -104,10 +189,10 @@ pub fn log(caller: Caller, filter: LogFilter) -> Result<Vec<Message>> {
 }
 
 pub fn turn(caller: Caller, ready: bool, ready_only: bool) -> Result<()> {
-    match decode(wire::request(&request(
+    match decode(send_request(
         caller,
         TalkCommand::Turn { ready, ready_only },
-    ))?)? {
+    )?)? {
         TalkResponse::Ok => Ok(()),
         _ => bail!("Unexpected talk response"),
     }
@@ -154,7 +239,7 @@ fn connect(
     command: TalkCommand,
     timeout: Duration,
 ) -> Result<BufReader<UnixStream>> {
-    let mut socket = wire::connect()?;
+    let mut socket = wire::connect_at(caller.socket.as_deref())?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
     wire::send(&mut socket, &request(caller, command))?;
@@ -200,6 +285,11 @@ impl From<Message> for TalkMessage {
                 read_at: delivery.read_at,
             },
             urgent: message.urgent,
+            decision: message.decision.map(|d| TalkDecision {
+                choices: d.choices,
+                expires_at: d.expires_at,
+                answered_at: d.answered_at,
+            }),
         }
     }
 }
@@ -245,6 +335,11 @@ impl From<TalkMessage> for Message {
                 read_at: delivery.read_at,
             },
             urgent: message.urgent,
+            decision: message.decision.map(|d| Decision {
+                choices: d.choices,
+                expires_at: d.expires_at,
+                answered_at: d.answered_at,
+            }),
         }
     }
 }
@@ -305,7 +400,7 @@ impl From<TalkAgentSummary> for AgentTalkSummary {
 
 /// Reports a turn start from the provider's turn-start hook.
 pub fn hook_start(caller: Caller) -> Result<()> {
-    match decode(wire::request(&request(caller, TalkCommand::HookStart))?)? {
+    match decode(send_request(caller, TalkCommand::HookStart)?)? {
         TalkResponse::Ok => Ok(()),
         _ => bail!("Unexpected talk response"),
     }
@@ -351,7 +446,7 @@ pub fn hook(
 
 /// Whether the session's waiting hook is attached for its current turn.
 pub fn hook_attached(caller: Caller) -> Result<bool> {
-    match decode(wire::request(&request(caller, TalkCommand::HookStatus))?)? {
+    match decode(send_request(caller, TalkCommand::HookStatus)?)? {
         TalkResponse::Hook { attached } => Ok(attached),
         _ => bail!("Unexpected talk response"),
     }

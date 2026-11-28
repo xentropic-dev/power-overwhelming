@@ -1836,3 +1836,426 @@ fn edit_task_tells_the_running_worker_without_a_restart() {
     assert_eq!(events[0]["task"], "a");
     assert_eq!(events[0]["attempt"].as_str(), fixture.a.attempt.as_deref());
 }
+
+fn task_state(fixture: &Fixture, task: &str) -> String {
+    let shown = json(
+        power(fixture.path(), None)
+            .args(["dag", "show", &fixture.run.id])
+            .output()
+            .unwrap(),
+    );
+    let tasks = shown["run"]["tasks"].as_array().unwrap();
+    let task = tasks.iter().find(|t| t["id"] == task).unwrap();
+    task["state"].as_str().unwrap().to_owned()
+}
+
+fn report_choices(
+    fixture: &Fixture,
+    worker: &ManagedAgent,
+    attempt: &str,
+    choices: &str,
+) -> Output {
+    power(fixture.path(), Some(worker))
+        .args([
+            "dag",
+            "report",
+            "needs-input",
+            "--summary",
+            "Ship it?",
+            "--run",
+            &fixture.run.id,
+            "--task",
+            worker.task.as_deref().unwrap(),
+            "--attempt",
+            attempt,
+            "--choices",
+            choices,
+        ])
+        .output()
+        .unwrap()
+}
+
+/// Holds the sandbox's box layout lock, as the running desktop does, so the daemon
+/// verifies this process as the desktop.
+fn hold_desktop_lock(path: &Path) -> fs::File {
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.join("state/boxes.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+/// The desktop's caller for `box_id`, against the sandbox daemon.
+fn desktop(path: &Path, box_id: &str) -> infrastructure::client::talk::Caller {
+    infrastructure::client::talk::Caller::desktop(box_id.into()).at_socket(path.join("power.sock"))
+}
+
+/// Has `worker` report needs-input with `choices` from inside its own session, and
+/// returns whether the report succeeded, with its stderr.
+fn report_from_session(
+    path: &Path,
+    worker: &ManagedAgent,
+    task: &str,
+    attempt: &str,
+    choices: &str,
+) -> (bool, String) {
+    let name = worker.task.as_deref().unwrap();
+    let status = path.join(format!("report-{name}.status"));
+    let _ = fs::remove_file(&status);
+    input(
+        path,
+        worker,
+        format!("report-choices {task} {attempt} {choices}\n").as_bytes(),
+    );
+    let code = poll("in-session report", || fs::read_to_string(&status).ok());
+    (
+        code.trim() == "0",
+        file(path, &format!("report-{name}.err")),
+    )
+}
+
+#[test]
+fn a_command_worker_asks_through_needs_input_and_the_desktop_answers_from_another_box() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let worker = &fixture.b;
+    let attempt = worker.attempt.clone().unwrap();
+    let open = |box_id: &str| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        infrastructure::client::talk::user_inbox(desktop(path, box_id), now).unwrap()
+    };
+    let decisions = || messages(talk(path, None, &["decisions", "--all", "--json"]));
+
+    // Rejected inputs change nothing: no report and no request.
+    for (attempt, choices) in [
+        ("not-an-attempt", "Approve,Deny"),
+        (attempt.as_str(), "A,A"),
+    ] {
+        let (ok, _) = report_from_session(path, worker, "b", attempt, choices);
+        assert!(!ok);
+        assert_eq!(task_state(&fixture, "b"), "working");
+        assert!(decisions().is_empty());
+    }
+    let wrong = power(path, Some(worker))
+        .args([
+            "dag",
+            "report",
+            "success",
+            "--summary",
+            "x",
+            "--choices",
+            "A",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+
+    // Only the attempt's own worker asks in its name. Another worker naming b's
+    // attempt, or a shell outside every session, is refused and changes nothing.
+    let (ok, error) = report_from_session(path, &fixture.a, "b", &attempt, "A,B");
+    assert!(!ok);
+    assert!(error.contains("Only the worker"), "{error}");
+    let outside = report_choices(&fixture, worker, &attempt, "A,B");
+    assert!(!outside.status.success());
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("Only the worker"));
+    assert_eq!(task_state(&fixture, "b"), "working");
+    assert!(decisions().is_empty());
+
+    // The accepted report and its request commit together, bound to the reported attempt.
+    let (ok, error) = report_from_session(path, worker, "b", &attempt, "Approve,Deny");
+    assert!(ok, "{error}");
+    let asked: Value = serde_json::from_str(&file(path, "report-b.out")).unwrap();
+    let request = asked["message"].clone();
+    assert_eq!(task_state(&fixture, "b"), "needs_input");
+    assert_eq!(request["run"], fixture.run.id.as_str());
+    assert_eq!(request["sender"]["id"], worker.id.as_str());
+    assert_eq!(request["sender"]["role"], "worker on task b");
+    assert_eq!(request["decision"]["choices"][0], "Approve");
+
+    // Neither a peer nor a shell can answer it.
+    let peer = talk(
+        path,
+        Some(&fixture.a),
+        &["reply", field(&request, "id"), "Approve"],
+    );
+    assert!(
+        String::from_utf8_lossy(&peer.stderr).contains("Only the user"),
+        "{peer:?}"
+    );
+    let shell = talk(path, None, &["reply", field(&request, "id"), "Approve"]);
+    assert!(
+        String::from_utf8_lossy(&shell.stderr).contains("Only the user"),
+        "{shell:?}"
+    );
+
+    // Nor can a process that only claims to be the desktop: the daemon verifies it.
+    let forged = infrastructure::client::talk::reply(
+        desktop(path, REMOTE_BOX),
+        domain::talk::MessageId(field(&request, "id").into()),
+        "Approve".into(),
+        None,
+    );
+    assert!(format!("{:#}", forged.unwrap_err()).contains("Only the user"));
+    assert!(decisions()[0]["decision"]["answered_at"].is_null());
+    assert_eq!(task_state(&fixture, "b"), "needs_input");
+
+    // From here this process holds the layout lock, as the desktop does.
+    let _desktop = hold_desktop_lock(path);
+
+    // The desktop inbox of another box leads with it.
+    let inbox = open(REMOTE_BOX);
+    assert_eq!(inbox[0].id.0, field(&request, "id"));
+    assert_eq!(inbox[0].run.as_deref(), Some(fixture.run.id.as_str()));
+
+    // A request that expires leaves the open section for the history.
+    let expiring = messages(talk(
+        path,
+        Some(&fixture.a),
+        &[
+            "ask",
+            "user",
+            "--choices",
+            "Now,Later",
+            "--expires",
+            "1",
+            "Soon?",
+            "--json",
+        ],
+    ))
+    .remove(0);
+    assert!(
+        open(REMOTE_BOX)[..2]
+            .iter()
+            .any(|m| m.id.0 == field(&expiring, "id"))
+    );
+    thread::sleep(Duration::from_millis(1_100));
+    let inbox = open(REMOTE_BOX);
+    let position = inbox
+        .iter()
+        .position(|m| m.id.0 == field(&expiring, "id"))
+        .unwrap();
+    assert!(position > 0, "an expired request is not open");
+    assert_eq!(inbox[0].id.0, field(&request, "id"));
+    let caller = desktop(path, REMOTE_BOX);
+    let late = infrastructure::client::talk::reply(
+        caller.clone(),
+        inbox[position].id.clone(),
+        "Now".into(),
+        None,
+    );
+    assert!(format!("{:#}", late.unwrap_err()).contains("expired"));
+
+    // The desktop answers the remote request the way the dialog does.
+    let answer =
+        infrastructure::client::talk::reply(caller, inbox[0].id.clone(), "Approve".into(), None)
+            .unwrap();
+    assert_eq!(answer.sender, domain::talk::Sender::User);
+    let printed = success(talk(path, Some(worker), &["inbox"]));
+    assert!(printed.contains("Approve"), "{printed}");
+    let inbox = open(REMOTE_BOX);
+    // Nothing is open any more: the answered and the expired requests are history.
+    assert!(inbox.iter().all(|m| {
+        !m.decision
+            .as_ref()
+            .is_some_and(|d| d.answered_at.is_none() && d.expires_at.is_none())
+    }));
+    assert!(
+        inbox
+            .iter()
+            .any(|m| m.thread.0 == field(&request, "thread"))
+    );
+    assert_eq!(
+        decisions()
+            .iter()
+            .filter(|m| m["decision"]["answered_at"].is_u64())
+            .count(),
+        1
+    );
+
+    // A superseded attempt is stale. Task a fails and is retried, then a's first
+    // worker, still in its session during the finish grace, asks with its old attempt.
+    let old = fixture.a.attempt.clone().unwrap();
+    success(
+        power(path, Some(&fixture.a))
+            .args(["dag", "report", "failed", "--summary", "retry me"])
+            .args(["--run", &fixture.run.id, "--task", "a", "--attempt", &old])
+            .output()
+            .unwrap(),
+    );
+    let retried = power(path, Some(&fixture.coordinator))
+        .args([
+            "dag",
+            "dispatch",
+            &fixture.run.id,
+            "a",
+            "--retry",
+            "--provider",
+            "command",
+            "--worktree",
+        ])
+        .arg(path.join("a"))
+        .arg("--")
+        .arg(path.join("worker.sh"))
+        .output()
+        .unwrap();
+    let current: ManagedAgent = serde_json::from_value(json(retried)["agent"].take()).unwrap();
+    let current = current.attempt.unwrap();
+    assert_ne!(current, old);
+    assert_eq!(task_state(&fixture, "a"), "working");
+    let before = decisions().len();
+    let (ok, error) = report_from_session(path, &fixture.a, "a", &old, "A,B");
+    assert!(!ok);
+    assert!(error.contains("stale attempt"), "{error}");
+    assert_eq!(decisions().len(), before, "a stale attempt asks nothing");
+    let shown = json(
+        power(path, None)
+            .args(["dag", "show", &fixture.run.id])
+            .output()
+            .unwrap(),
+    );
+    let task = shown["run"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "a")
+        .unwrap()
+        .clone();
+    assert_eq!(task["state"], "working");
+    assert_eq!(task["current_attempt"], current.as_str());
+    let attempt = task["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == current.as_str())
+        .unwrap();
+    assert_eq!(attempt["state"], "active");
+    assert!(attempt["blocker"].is_null());
+}
+
+#[test]
+fn the_user_answers_decision_requests_from_every_box_and_peers_cannot() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let local = sandbox.launch("a", BOX);
+    let remote = sandbox.launch("remote", REMOTE_BOX);
+    let ask = |agent: &ManagedAgent, question: &str| {
+        let sent = messages(talk(
+            path,
+            Some(agent),
+            &[
+                "ask",
+                "user",
+                "--choices",
+                "Approve,Deny",
+                question,
+                "--json",
+            ],
+        ));
+        sent[0].clone()
+    };
+    let request = ask(&local, "Ship it?");
+    let other = ask(&remote, "Start early?");
+    assert_eq!(request["decision"]["choices"][1], "Deny");
+    assert!(
+        !talk(path, Some(&local), &["ask", "a", "--choices", "A", "x"])
+            .status
+            .success()
+    );
+
+    // One inbox view lists open requests from both boxes.
+    let open = messages(talk(path, None, &["decisions", "--json"]));
+    let ids: Vec<_> = open.iter().map(|m| field(m, "id")).collect();
+    assert_eq!(ids, [field(&request, "id"), field(&other, "id")]);
+    assert_eq!(open[1]["sender"]["box_id"], REMOTE_BOX);
+
+    // A waiter blocks on the answer.
+    let waiter = {
+        let path = path.to_owned();
+        let local = local.clone();
+        let (thread, id) = (
+            field(&request, "thread").to_owned(),
+            field(&request, "id").to_owned(),
+        );
+        thread::spawn(move || {
+            json(talk(
+                &path,
+                Some(&local),
+                &[
+                    "wait",
+                    &thread,
+                    "--reply-to",
+                    &id,
+                    "--timeout",
+                    "20",
+                    "--json",
+                ],
+            ))
+        })
+    };
+
+    // A peer cannot answer.
+    let peer = talk(
+        path,
+        Some(&remote),
+        &["reply", field(&request, "id"), "Approve"],
+    );
+    assert!(!peer.status.success());
+    assert!(String::from_utf8_lossy(&peer.stderr).contains("Only the user"));
+
+    // The desktop answers the way the talk dialog does. A claim alone is not enough:
+    // the daemon answers as the desktop only for the process holding the layout lock.
+    let claim = || {
+        let mut socket = UnixStream::connect(path.join("power.sock")).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(
+            socket,
+            "{}",
+            serde_json::json!({"request": "talk", "talk": {
+                "command": "reply", "box_sel": BOX, "desktop": true,
+                "id": field(&request, "id"), "recipient_agent": null,
+                "body": "Approve", "urgent": false,
+            }})
+        )
+        .unwrap();
+        socket_response(&mut BufReader::new(socket))
+    };
+    let forged = claim();
+    assert!(
+        forged["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Only the user")),
+        "{forged}"
+    );
+    assert_eq!(
+        messages(talk(path, None, &["decisions", "--json"])).len(),
+        2,
+        "a forged answer closes nothing"
+    );
+    let _desktop = hold_desktop_lock(path);
+    let answered = claim();
+    assert_eq!(
+        answered["talk"]["messages"][0]["sender"]["kind"], "user",
+        "{answered}"
+    );
+
+    let reply = waiter.join().unwrap();
+    assert_eq!(reply["reply"]["sender"]["kind"], "user");
+    assert_eq!(reply["reply"]["body"], "Approve");
+    let envelope = success(talk(path, Some(&local), &["inbox"]));
+    assert!(envelope.contains("Message from the user."), "{envelope}");
+
+    // Answered requests leave the open list but stay in the history.
+    let open = messages(talk(path, None, &["decisions", "--json"]));
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0]["id"], other["id"]);
+    let all = messages(talk(path, None, &["decisions", "--all", "--json"]));
+    assert!(all[0]["decision"]["answered_at"].is_u64());
+}

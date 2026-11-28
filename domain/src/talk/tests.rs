@@ -152,6 +152,7 @@ fn message() -> Message {
         created_at: 0,
         delivery: Delivery::default(),
         urgent: false,
+        decision: None,
     }
 }
 
@@ -441,6 +442,22 @@ fn notify_only_submission_holds_notices_until_the_turn_end_report() {
         ..submitted
     };
     assert_eq!(policy.decide(ended, false, false, &msg, 1_000_000), Notify);
+}
+
+#[test]
+fn decisions_validate_choices_and_close_when_answered_or_expired() {
+    assert!(Decision::new(Vec::new(), None).is_err());
+    assert!(Decision::new(vec!["A".into(), "A".into()], None).is_err());
+    assert!(Decision::new(vec![" ".into()], None).is_err());
+    let mut decision = Decision::new(vec!["Approve".into(), "Deny".into()], Some(10)).unwrap();
+    assert!(decision.is_open(9));
+    assert!(!decision.is_open(10));
+    decision.expires_at = None;
+    decision.answered_at = Some(3);
+    assert!(!decision.is_open(4));
+    let mut msg = message();
+    msg.decision = Some(decision);
+    assert!(envelope(&msg).contains("Choices: Approve, Deny"));
 }
 
 #[test]

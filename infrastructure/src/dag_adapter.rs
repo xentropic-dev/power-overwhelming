@@ -9,16 +9,18 @@ use crate::{
 use anyhow::{Context, Result};
 use application::dag::{
     BoxRegistry, BoxSelection, DagApplication, Dispatch, DispatchOutcome, EditDelivery, EditTask,
-    EventScope, PlanTask, StartAgent,
+    EventScope, PlanTask, ReportDecision, StartAgent,
 };
 use std::{os::unix::net::UnixStream, time::Duration};
 
 pub(crate) type DaemonDag = DagApplication<PtyRuntime, SqliteDagStore, BoxesFile, IconFiles>;
 
+/// `peer` is the calling process, as the socket's credentials report it.
 pub(crate) fn request(
     application: &DaemonDag,
     talk: &DaemonTalk,
     request: DagRequest,
+    peer: Option<u32>,
 ) -> Result<DagResponse> {
     use DagResponse as Reply;
     let response = match request {
@@ -285,6 +287,27 @@ pub(crate) fn request(
                 reason: result.reason,
             }
         }
+        DagRequest::ReportDecision {
+            run,
+            task,
+            attempt,
+            summary,
+            choices,
+        } => Reply::DecisionRequested {
+            message: application
+                .report_decision(
+                    ReportDecision {
+                        run,
+                        task,
+                        attempt,
+                        summary,
+                        choices,
+                        caller_pid: peer,
+                    },
+                    talk,
+                )?
+                .into(),
+        },
         DagRequest::Events {
             run,
             since,

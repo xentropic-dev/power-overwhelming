@@ -719,6 +719,8 @@ struct FakeTerminal {
     paused: Mutex<BTreeSet<usize>>,
     /// Slows each pause or resume, in milliseconds, so concurrent transitions overlap.
     pause_millis: AtomicU64,
+    /// The one process every live session owns, standing in for its worker.
+    worker_pid: Mutex<Option<u32>>,
 }
 
 impl TerminalRuntime for FakeTerminal {
@@ -766,6 +768,10 @@ impl TerminalRuntime for FakeTerminal {
 
     fn agent(&self, _: &Self::Handle) -> Option<Agent> {
         None
+    }
+
+    fn owns_process(&self, handle: &Self::Handle, pid: u32) -> bool {
+        handle.load(Ordering::Acquire) && *self.worker_pid.lock().unwrap() == Some(pid)
     }
 
     fn reclaim(&self, session: &str) -> Result<()> {
@@ -4928,5 +4934,187 @@ fn a_failed_queue_write_at_restart_keeps_the_worker_for_a_later_handoff() -> Res
         find_task(&snapshot, "a")?.attempts[0].state,
         AttemptState::Interrupted
     );
+    Ok(())
+}
+
+/// The memory DAG store with no talk store: a poster here writes nothing to talk.
+impl JointStore for MemoryStore {
+    fn write_joint<V>(
+        &self,
+        operation: impl FnOnce(&dyn DagTransaction, &dyn crate::talk::TalkTransaction) -> Result<V>,
+    ) -> Result<V> {
+        self.write(|db| operation(db, &NoTalk))
+    }
+}
+
+struct NoTalk;
+
+impl crate::talk::TalkReader for NoTalk {
+    fn directory(&self) -> Result<domain::talk::Directory> {
+        unreachable!()
+    }
+    fn message(&self, _: &domain::talk::MessageId) -> Result<Option<domain::talk::Message>> {
+        unreachable!()
+    }
+    fn inbox(
+        &self,
+        _: &domain::talk::Recipient,
+        _: Option<&str>,
+        _: bool,
+    ) -> Result<Vec<domain::talk::Message>> {
+        unreachable!()
+    }
+    fn summary(&self, _: &str) -> Result<Vec<domain::talk::AgentTalkSummary>> {
+        unreachable!()
+    }
+    fn pending_agents(&self, _: u64) -> Result<Vec<String>> {
+        unreachable!()
+    }
+    fn queued(&self, _: &domain::talk::Recipient, _: &str) -> Result<Vec<domain::talk::Queued>> {
+        unreachable!()
+    }
+    fn agent(&self, _: &str) -> Result<ManagedAgent> {
+        unreachable!()
+    }
+    fn thread(&self, _: &domain::talk::ThreadId) -> Result<Vec<domain::talk::Message>> {
+        unreachable!()
+    }
+    fn log(&self, _: &crate::talk::LogFilter) -> Result<Vec<domain::talk::Message>> {
+        unreachable!()
+    }
+    fn recent_sends(
+        &self,
+        _: &domain::talk::Sender,
+        _: &domain::talk::Recipient,
+        _: u64,
+    ) -> Result<Vec<u64>> {
+        unreachable!()
+    }
+    fn decisions(&self, _: bool, _: u64) -> Result<Vec<domain::talk::Message>> {
+        unreachable!()
+    }
+    fn cursor(&self) -> Result<u64> {
+        unreachable!()
+    }
+    fn events(&self, _: u64, _: Option<&str>) -> Result<Vec<crate::talk::TalkEvent>> {
+        unreachable!()
+    }
+}
+
+impl crate::talk::TalkTransaction for NoTalk {
+    fn insert(&self, _: &domain::talk::Message) -> Result<()> {
+        unreachable!()
+    }
+    fn mark(
+        &self,
+        _: &[&domain::talk::MessageId],
+        _: crate::talk::DeliveryChange,
+        _: u64,
+    ) -> Result<()> {
+        unreachable!()
+    }
+    fn answer(&self, _: &domain::talk::MessageId, _: u64) -> Result<bool> {
+        unreachable!()
+    }
+}
+
+/// Fails the post, or records who it came from.
+struct Poster {
+    fail: bool,
+    posted: Mutex<Vec<(String, String)>>,
+}
+
+impl DecisionPoster for Poster {
+    fn check_decision(&self, _: &str, choices: &[String]) -> Result<()> {
+        ensure!(!choices.is_empty(), "no choices");
+        Ok(())
+    }
+    fn post_decision(
+        &self,
+        _: &dyn crate::talk::TalkTransaction,
+        agent: &str,
+        run: &str,
+        body: &str,
+        _: Vec<String>,
+    ) -> Result<domain::talk::Message> {
+        ensure!(!self.fail, "inbox is full");
+        self.posted.lock().unwrap().push((agent.into(), run.into()));
+        Ok(domain::talk::Message {
+            id: domain::talk::MessageId("ask".into()),
+            box_id: "box".into(),
+            sender: domain::talk::Sender::System,
+            recipient: domain::talk::Recipient::User,
+            body: body.into(),
+            thread: domain::talk::ThreadId("ask".into()),
+            reply_to: None,
+            broadcast: None,
+            run: Some(run.into()),
+            created_at: 0,
+            delivery: domain::talk::Delivery::default(),
+            urgent: false,
+            decision: None,
+        })
+    }
+}
+
+#[test]
+fn a_needs_input_decision_commits_with_its_report_or_not_at_all() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let attempt = started.attempt.id.clone();
+    let ask_as = |pid: u32, attempt: &str, choices: &[&str], fail: bool| {
+        let poster = Poster {
+            fail,
+            posted: Mutex::new(Vec::new()),
+        };
+        let result = dag.report_decision(
+            ReportDecision {
+                run: run.clone(),
+                task: "work".into(),
+                attempt: attempt.into(),
+                summary: "Ship it?".into(),
+                choices: choices.iter().map(|c| (*c).into()).collect(),
+                caller_pid: Some(pid),
+            },
+            &poster,
+        );
+        (result, poster.posted.into_inner().unwrap())
+    };
+    let ask = |attempt: &str, choices: &[&str], fail: bool| ask_as(7, attempt, choices, fail);
+    let state = || dag.run(&run).map(|run| run.tasks[0].state);
+
+    // Only a process in the attempt's session may ask in its worker's name.
+    let (result, posted) = ask(&attempt, &["Yes"], false);
+    assert!(format!("{:#}", result.unwrap_err()).contains("Only the worker"));
+    assert!(posted.is_empty());
+    *dag.application.runtime.worker_pid.lock().unwrap() = Some(7);
+    let (result, posted) = ask_as(8, &attempt, &["Yes"], false);
+    assert!(format!("{:#}", result.unwrap_err()).contains("Only the worker"));
+    assert!(posted.is_empty());
+    assert_eq!(state()?, TaskState::Working);
+
+    // Invalid choices or a failed post leave the attempt working.
+    let (result, posted) = ask(&attempt, &[], false);
+    assert!(result.is_err() && posted.is_empty());
+    let (result, _) = ask(&attempt, &["Yes"], true);
+    assert!(format!("{:#}", result.unwrap_err()).contains("inbox is full"));
+    assert_eq!(state()?, TaskState::Working);
+    assert!(dag.run(&run)?.tasks[0].attempts[0].blocker.is_none());
+
+    // An unknown attempt is rejected and posts nothing.
+    let (result, posted) = ask("other", &["Yes"], false);
+    assert!(result.is_err() && posted.is_empty());
+
+    // The accepted report posts as the reported attempt's worker, in its run.
+    let (result, posted) = ask(&attempt, &["Yes"], false);
+    result?;
+    assert_eq!(posted, [(started.agent.id.clone(), run.clone())]);
+    assert_eq!(state()?, TaskState::NeedsInput);
+
+    // A finished attempt cannot ask again.
+    dag.report(&run, "work", &attempt, ReportStatus::Success, "done")?;
+    let (result, posted) = ask(&attempt, &["Yes"], false);
+    assert!(format!("{:#}", result.unwrap_err()).contains("did not apply"));
+    assert!(posted.is_empty());
     Ok(())
 }

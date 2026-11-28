@@ -764,6 +764,10 @@ enum DagAction {
         task: Option<String>,
         #[arg(long)]
         attempt: Option<String>,
+        /// With needs-input, also post the summary to the user inbox as a decision request
+        /// with these comma-separated answers. Wait with `power talk wait <thread>`.
+        #[arg(long, value_delimiter = ',')]
+        choices: Vec<String>,
     },
     Events(EventArgs),
     Wait {
@@ -1372,8 +1376,32 @@ fn run_dag(command: DagAction) -> Result<()> {
             run,
             task,
             attempt,
+            choices,
         } => {
             report_conversation();
+            if !choices.is_empty() {
+                anyhow::ensure!(
+                    matches!(status, ReportChoice::NeedsInput),
+                    "--choices is only for needs-input"
+                );
+                // One daemon request: the report and the decision request commit together.
+                let request = DagRequest::ReportDecision {
+                    run: report_arg(run, "POWER_RUN", "run")?,
+                    task: report_arg(task, "POWER_TASK", "task")?,
+                    attempt: report_arg(attempt, "POWER_ATTEMPT", "attempt")?,
+                    summary,
+                    choices,
+                };
+                let DagResponse::DecisionRequested { message } = client::dag(request, timeout)?
+                else {
+                    anyhow::bail!("Unexpected daemon response");
+                };
+                eprintln!(
+                    "Asked the user {} · thread {}. Wait with: power talk wait {} --reply-to {}",
+                    message.id, message.thread, message.thread, message.id
+                );
+                return print_json(json!({"applied": true, "message": message}));
+            }
             DagRequest::Report {
                 run: report_arg(run, "POWER_RUN", "run")?,
                 task: report_arg(task, "POWER_TASK", "task")?,

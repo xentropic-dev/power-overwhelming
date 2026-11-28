@@ -34,7 +34,11 @@ impl Workspace {
                 thread::sleep(Duration::from_secs(2));
             }
         });
+        let tick = tx.clone();
         cx.spawn_in(window, async move |app, cx| {
+            // Refreshes the dialog when its next open decision request expires, since
+            // nothing else changes then. Replacing it cancels the previous timer.
+            let mut expiry: Option<Task<()>> = None;
             while rx.recv().await.is_ok() {
                 let Ok((scope, query)) = app.update(cx, |workspace, _| {
                     (
@@ -58,33 +62,47 @@ impl Workspace {
                         (summary, messages)
                     })
                     .await;
-                if app
-                    .update(cx, |workspace, cx| {
-                        if let Some((scope, Ok(agents))) = update.0
-                            && workspace.summary_scope().as_ref() == Some(&scope)
-                        {
-                            let agents = agents
-                                .into_iter()
-                                .map(|agent| (agent.agent.clone(), agent))
-                                .collect();
-                            if let Some(dag) = &mut workspace.dag {
-                                dag.talk = agents;
-                            } else if let Some(picker) = &mut workspace.picker {
-                                picker.agent_talk = agents;
-                            }
+                let Ok(next) = app.update(cx, |workspace, cx| {
+                    // One instant orders the list and schedules its next expiry.
+                    let now = talk_dialog::now_ms();
+                    if let Some((scope, Ok(agents))) = update.0
+                        && workspace.summary_scope().as_ref() == Some(&scope)
+                    {
+                        let agents = agents
+                            .into_iter()
+                            .map(|agent| (agent.agent.clone(), agent))
+                            .collect();
+                        if let Some(dag) = &mut workspace.dag {
+                            dag.talk = agents;
+                        } else if let Some(picker) = &mut workspace.picker {
+                            picker.agent_talk = agents;
                         }
-                        if let Some((query, result)) = update.1
-                            && let Some(dialog) = &mut workspace.talk
-                        {
-                            dialog.apply(&query, result);
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
+                    }
+                    if let Some((query, result)) = update.1
+                        && let Some(dialog) = &mut workspace.talk
+                    {
+                        dialog.apply(&query, result, now);
+                    }
+                    cx.notify();
+                    let next = workspace
+                        .talk
+                        .as_ref()
+                        .and_then(|dialog| dialog.next_expiry(now));
+                    next.map(|at| (at, now))
+                }) else {
                     break;
-                }
+                };
+                expiry = next.map(|(at, now)| {
+                    let wait = Duration::from_millis(at.saturating_sub(now) + 50);
+                    let tick = tick.clone();
+                    let timer = cx.background_executor().timer(wait);
+                    cx.background_executor().spawn(async move {
+                        timer.await;
+                        let _ = tick.try_send(());
+                    })
+                });
             }
+            drop(expiry);
         })
         .detach();
         tx
@@ -179,6 +197,13 @@ impl Workspace {
                         let _ = self.talk_refresh.try_send(());
                     }
                 }
+                None if !event.is_held && dialog.draft.is_none() => {
+                    // Unmodified digit keys answer the selected open decision request.
+                    let index = talk_dialog::choice_index(&event.keystroke);
+                    if let Some(send) = index.and_then(|index| dialog.answer(index)) {
+                        self.send_answer(send, window, cx);
+                    }
+                }
                 Some(command @ (Command::TalkCompose | Command::TalkReply)) if !event.is_held => {
                     let focus = cx.focus_handle();
                     let id = self.next_id();
@@ -192,6 +217,28 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn send_answer(
+        &mut self,
+        send: talk_dialog::Send,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sent = cx
+            .background_executor()
+            .spawn(async move { send.execute() });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = sent.await;
+            let _ = app.update(cx, |workspace, cx| {
+                if let Some(dialog) = &mut workspace.talk {
+                    dialog.answered(result);
+                    let _ = workspace.talk_refresh.try_send(());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn send_talk(&mut self, window: &mut Window, cx: &mut Context<Self>) {

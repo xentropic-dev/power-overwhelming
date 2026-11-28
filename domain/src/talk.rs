@@ -37,6 +37,12 @@ impl Sender {
     pub fn has_user_authority(&self) -> bool {
         matches!(self, Self::User | Self::Shell)
     }
+
+    /// Power confirmed that the user wrote it, through the desktop. A shell has the user's
+    /// authority but not this, so it cannot answer a decision request.
+    pub fn is_user_authored(&self) -> bool {
+        matches!(self, Self::User)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +92,67 @@ pub struct Message {
     pub created_at: u64,
     pub delivery: Delivery,
     pub urgent: bool,
+    /// Set on a decision request to the user.
+    pub decision: Option<Decision>,
+}
+
+pub const MAX_CHOICES: usize = 9;
+pub const MAX_CHOICE_BYTES: usize = 64;
+
+/// A question to the user with fixed answers. Only a reply the user wrote in the desktop
+/// answers it, once, before it expires.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Decision {
+    pub choices: Vec<String>,
+    pub expires_at: Option<u64>,
+    pub answered_at: Option<u64>,
+}
+
+impl Decision {
+    /// Checks the answers an asker offers.
+    pub fn new(choices: Vec<String>, expires_at: Option<u64>) -> Result<Self, String> {
+        if choices.is_empty() || choices.len() > MAX_CHOICES {
+            return Err(format!("Offer between 1 and {MAX_CHOICES} choices"));
+        }
+        for (index, choice) in choices.iter().enumerate() {
+            if choice.trim().is_empty() || choice.len() > MAX_CHOICE_BYTES {
+                return Err(format!(
+                    "Each choice needs 1 to {MAX_CHOICE_BYTES} bytes of text"
+                ));
+            }
+            if choices[..index].contains(choice) {
+                return Err(format!("Choice {choice:?} is listed twice"));
+            }
+        }
+        Ok(Self {
+            choices,
+            expires_at,
+            answered_at: None,
+        })
+    }
+
+    pub fn is_open(&self, now: u64) -> bool {
+        self.answered_at.is_none() && self.expires_at.is_none_or(|at| at > now)
+    }
+}
+
+impl Message {
+    /// A decision request the user can answer at `now`: neither answered nor expired.
+    pub fn is_open_decision(&self, now: u64) -> bool {
+        self.decision
+            .as_ref()
+            .is_some_and(|decision| decision.is_open(now))
+    }
+}
+
+/// Puts the decision requests still open at `now` first. Answered and expired ones stay in
+/// the history with every other message, in their order.
+pub fn open_decisions_first(messages: Vec<Message>, now: u64) -> Vec<Message> {
+    let (mut open, history): (Vec<_>, Vec<_>) = messages
+        .into_iter()
+        .partition(|message| message.is_open_decision(now));
+    open.extend(history);
+    open
 }
 
 /// The delivery metadata of an unread message, without its body.
@@ -395,6 +462,17 @@ pub fn envelope(message: &Message) -> String {
         framed.push('\n');
         framed.push_str(QUOTE);
         framed.push_str(&escape_controls(line));
+    }
+    if let Some(decision) = &message.decision {
+        let choices: Vec<_> = decision
+            .choices
+            .iter()
+            .map(|c| escape_controls(c))
+            .collect();
+        framed.push_str(&format!(
+            "\nDecision request. Choices: {}. Only the user can answer it.",
+            choices.join(", ")
+        ));
     }
     framed
 }
