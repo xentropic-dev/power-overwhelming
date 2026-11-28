@@ -613,6 +613,13 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 .map(Into::into)
                 .collect(),
         }),
+        Request::ListWithAttempts => Ok(Response::SessionListings {
+            sessions: application
+                .list_session_listings()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }),
         Request::Worktrees { directory } => Ok(Response::Worktrees {
             worktrees: application.list_worktrees(&directory)?,
         }),

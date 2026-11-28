@@ -331,12 +331,20 @@ fn main() -> Result<()> {
             client::ensure_daemon()?;
             match command {
                 SessionAction::List => {
-                    for session in client::list_sessions()? {
+                    // One snapshot that never waits on the DAG store, so a
+                    // dispatch in progress neither blanks nor stalls the listing.
+                    for listing in client::list_session_listings()? {
+                        let session = listing.session;
+                        let attempt = listing
+                            .attempt
+                            .map(|attempt| attempt.label())
+                            .unwrap_or_default();
                         println!(
-                            "{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}",
                             session.id,
                             session.agent.name(),
-                            session.worktree.display()
+                            session.worktree.display(),
+                            attempt
                         );
                     }
                 }
@@ -1604,6 +1612,7 @@ fn same_file(a: &str, b: &std::path::Path) -> bool {
 /// How long `restart-check` waits for the daemon to list its workers.
 const RESTART_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The DAG attempt a session's agent works on, as `run/task#attempt`, or empty.
 fn protocol_agents(
     box_sel: Option<String>,
     include_finished: bool,

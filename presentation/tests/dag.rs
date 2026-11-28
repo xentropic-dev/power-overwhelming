@@ -762,7 +762,7 @@ exec /bin/sh "${POWER_SOCKET%/*}/worker.sh" "$@"
         String::from_utf8(sessions.stdout)
             .unwrap()
             .lines()
-            .any(|line| line == format!("{}\tfixture-agent\t{worktree}", session.trim()))
+            .any(|line| line == format!("{}\tfixture-agent\t{worktree}\t", session.trim()))
     );
 
     let run = fixture.create_run();
@@ -2219,6 +2219,15 @@ fn a_failed_reclaim_keeps_the_agent_running_until_a_retry_ends_its_scope() {
     let run = fixture.create_run().id;
     let (_, agent, _, helper) = dispatch_escape(&fixture, &run, "escape-stay");
     let session = agent.session.clone().unwrap();
+    let listed = fixture.command(&["session", "list"]);
+    let attempt = format!("\t{run}/escape-stay#{}", agent.attempt.clone().unwrap());
+    assert!(
+        String::from_utf8(listed.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with(&session) && line.ends_with(&attempt)),
+        "session list does not name the worker's attempt"
+    );
     fixture.wait_for_state(&run, "escape-stay", TaskState::Completed);
     let kills: Vec<_> = scope_dirs(fixture.root(), &session)
         .into_iter()
