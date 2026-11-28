@@ -8,7 +8,9 @@
 //! Helpers an agent starts with itself, such as MCP servers, do not count. A command
 //! counts while it is alive, however quiet: a test waiting on a timer or a build
 //! waiting on a lock still runs. A helper started later counts too, which can only
-//! hide a stall, never report a false one.
+//! hide a stall, never report a false one. The talk waiter Power's Claude Code hook
+//! keeps running while the agent idles carries a marker and never counts, nor does a
+//! shell that only runs it.
 
 use crate::terminal::PtyRuntime;
 use application::{Application, dag::WorkerProbe};
@@ -94,6 +96,8 @@ struct Process {
     cgroup: String,
     /// The `POWER_SESSION` it started with.
     session: Option<String>,
+    /// It is Power's talk waiter, which waits for messages and does no work.
+    waiter: bool,
 }
 
 #[derive(Default)]
@@ -190,8 +194,44 @@ impl Processes {
     /// Whether a command the worker of `session` started is alive: an owned process
     /// below the worker with a shell between them, or below a worker that is a shell,
     /// or one that left the worker's tree, such as a command reparented to init.
+    /// Talk waiters, their descendants, and the shells between them and the worker that
+    /// run nothing else.
+    fn waiters(&self, owned: &BTreeSet<u32>) -> BTreeSet<u32> {
+        let mut idle: BTreeSet<u32> = owned
+            .iter()
+            .copied()
+            .filter(|pid| self.0[pid].waiter)
+            .collect();
+        loop {
+            let before = idle.len();
+            for (pid, process) in &self.0 {
+                if owned.contains(pid) && idle.contains(&process.parent) {
+                    idle.insert(*pid);
+                }
+            }
+            for pid in owned {
+                let process = &self.0[pid];
+                let mut children = self.0.iter().filter(|(_, child)| child.parent == *pid);
+                if process.shell
+                    && !idle.contains(pid)
+                    && owned.contains(&process.parent)
+                    && children.clone().next().is_some()
+                    && children.all(|(child, _)| idle.contains(child))
+                {
+                    idle.insert(*pid);
+                }
+            }
+            if idle.len() == before {
+                return idle;
+            }
+        }
+    }
+
     fn commands_running(&self, session: &str, scopes: &[String]) -> bool {
-        let owned = self.owned(session, scopes);
+        let mut owned = self.owned(session, scopes);
+        for pid in self.waiters(&owned) {
+            owned.remove(&pid);
+        }
         // Owned processes whose parent is not owned. The oldest is the worker; any
         // other detached from it.
         let roots: Vec<u32> = owned
@@ -280,14 +320,15 @@ fn read(pid: u32) -> Option<Process> {
                 .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
         })
         .unwrap_or_default();
-    let session = fs::read(format!("/proc/{pid}/environ"))
-        .ok()
-        .and_then(|environ| {
-            environ.split(|byte| *byte == 0).find_map(|item| {
-                let value = item.strip_prefix(b"POWER_SESSION=")?;
-                String::from_utf8(value.to_vec()).ok()
-            })
-        });
+    let environ = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    let session = environ.split(|byte| *byte == 0).find_map(|item| {
+        let value = item.strip_prefix(b"POWER_SESSION=")?;
+        String::from_utf8(value.to_vec()).ok()
+    });
+    let marker = format!("{}=1", crate::shell::TALK_WAITER_ENV);
+    let waiter = environ
+        .split(|byte| *byte == 0)
+        .any(|item| item == marker.as_bytes());
     Some(Process {
         parent,
         started,
@@ -295,6 +336,7 @@ fn read(pid: u32) -> Option<Process> {
         command: COMMANDS.contains(&name),
         cgroup,
         session,
+        waiter,
     })
 }
 
@@ -310,7 +352,39 @@ mod tests {
             command: COMMANDS.contains(&name),
             cgroup: String::new(),
             session: session.map(Into::into),
+            waiter: false,
         }
+    }
+
+    #[test]
+    fn a_worker_with_only_a_talk_waiter_is_still_stalled() {
+        // claude (10), started at 0, idles a minute later with its hook's shell (11)
+        // running the talk waiter (12), and the waiter's own child (13).
+        let late = 60 * clock_ticks();
+        let mut processes = Processes(BTreeMap::from([
+            (1, process(0, "systemd", None)),
+            (10, process(1, "claude", Some("s"))),
+        ]));
+        let mut shell = process(10, "sh", Some("s"));
+        shell.started = late;
+        processes.0.insert(11, shell);
+        let mut waiter = process(11, "power", Some("s"));
+        waiter.started = late;
+        waiter.waiter = true;
+        processes.0.insert(12, waiter);
+        let mut child = process(12, "power", Some("s"));
+        child.started = late;
+        processes.0.insert(13, child);
+        assert!(!processes.commands_running("s", &[]));
+        // Without the marker, the same late process counts as a command.
+        processes.0.get_mut(&12).unwrap().waiter = false;
+        assert!(processes.commands_running("s", &[]));
+        // A real command alongside the waiter still counts.
+        processes.0.get_mut(&12).unwrap().waiter = true;
+        let mut cargo = process(11, "cargo", Some("s"));
+        cargo.started = late;
+        processes.0.insert(14, cargo);
+        assert!(processes.commands_running("s", &[]));
     }
 
     #[test]

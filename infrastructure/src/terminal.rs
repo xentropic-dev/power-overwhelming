@@ -2240,16 +2240,96 @@ fn process_agent(process: &Path, profiles: &dyn AgentProfileRegistry) -> Option<
     let cmdline = String::from_utf8_lossy(&cmdline);
     let mut args = cmdline.split('\0').filter(|arg| !arg.is_empty());
     let program = args.next()?;
+    let cwd = fs::read_link(process.join("cwd")).ok();
     // Interpreters such as `node /usr/bin/codex` carry the agent in the next argument.
-    let program = if matches!(
+    let interpreted = matches!(
         program_name(program),
         "node" | "bun" | "deno" | "sh" | "bash" | "dash" | "zsh" | "python" | "python3"
-    ) {
-        args.find(|arg| !arg.starts_with('-'))?
+    );
+    let (program, executable) = if interpreted {
+        let script = args.find(|arg| !arg.starts_with('-'))?;
+        let path = Path::new(script);
+        // Without the CWD a relative script can still match by name below.
+        let path = if path.is_relative() {
+            cwd.as_ref().map(|cwd| cwd.join(path))
+        } else {
+            Some(path.to_owned())
+        };
+        (script, path.and_then(|path| path.canonicalize().ok()))
     } else {
-        program
+        (program, fs::read_link(process.join("exe")).ok())
     };
-    agent_for_program(program, profiles)
+    if let Some(agent) = agent_for_program(program, profiles) {
+        return Some(agent);
+    }
+    // A wrapper or symlink on PATH can start a binary under another name, such as
+    // `~/.jcode/builds/versions/1.1.2/jcode-linux-x86_64.bin`. Profile commands are
+    // resolved the way the process's own shell would, with its PATH and CWD.
+    let executable = executable?;
+    let path = process_path(process).or_else(|| std::env::var_os("PATH"));
+    profiles
+        .profiles()
+        .iter()
+        .find(|profile| {
+            resolve_command(&profile.command, path.clone(), cwd.as_deref()).is_some_and(|target| {
+                installed_build_of(program, &executable, &profile.command, &target)
+            })
+        })
+        .map(|profile| Agent::Coding(profile.id.clone()))
+}
+
+/// Whether `executable`, started as `program`, is the install the profile `command`
+/// resolves to at `target`. It is when it is the target itself, or when its name or
+/// versions layout names the command and it sits beside the target, as a launcher's
+/// versioned build or a newer version in the same versions folder does.
+fn installed_build_of(program: &str, executable: &Path, command: &str, target: &Path) -> bool {
+    if executable == target {
+        return true;
+    }
+    let command = program_name(command);
+    let named = [program, &executable.to_string_lossy()]
+        .into_iter()
+        .any(|program| {
+            let name = program_name(program);
+            name == command
+                || versioned_build_of(name, command)
+                || versions_owner(program) == Some(command)
+        });
+    // Sharing a general-purpose directory such as `bin` is no evidence. The executable
+    // must sit in the same versioned install as the target, possibly at another version
+    // after a launcher such as `builds/stable` was repointed while it ran.
+    named
+        && executable
+            .parent()
+            .and_then(versions_root)
+            .is_some_and(|root| target.parent().and_then(versions_root) == Some(root))
+}
+
+/// The `versions` folder of a versioned install that `dir` is, or a version of.
+fn versions_root(dir: &Path) -> Option<&Path> {
+    if dir.file_name()? == "versions" {
+        return Some(dir);
+    }
+    let parent = dir.parent()?;
+    (parent.file_name()? == "versions" && is_version(dir.file_name()?.to_str()?)).then_some(parent)
+}
+
+/// The PATH a process started with.
+fn process_path(process: &Path) -> Option<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let environ = fs::read(process.join("environ")).ok()?;
+    environ
+        .split(|&byte| byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"PATH="))
+        .map(|path| OsStr::from_bytes(path).to_owned())
+}
+
+/// The file a profile command runs once PATH and symlinks are resolved.
+fn resolve_command(command: &str, path: Option<OsString>, cwd: Option<&Path>) -> Option<PathBuf> {
+    crate::cgroup::find_program(OsStr::new(command), path, cwd)?
+        .canonicalize()
+        .ok()
 }
 
 fn process_model(pid: u32, agent: &Agent) -> Option<String> {
@@ -2280,6 +2360,59 @@ fn program_name(arg: &str) -> &str {
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
         .unwrap_or(name)
+}
+
+/// Whether `name` is a versioned build of `command`: the command followed by platform
+/// and version parts, as in `jcode-linux-x86_64.bin` or `claude-2.0.1-darwin-arm64`.
+fn versioned_build_of(name: &str, command: &str) -> bool {
+    let name = [".bin", ".exe"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    let Some(rest) = name
+        .strip_prefix(command)
+        .and_then(|rest| rest.strip_prefix('-').or_else(|| rest.strip_prefix('_')))
+    else {
+        return false;
+    };
+    !rest.is_empty() && rest.split(['-', '_']).all(is_platform_or_version)
+}
+
+fn is_platform_or_version(part: &str) -> bool {
+    matches!(
+        part,
+        "linux"
+            | "darwin"
+            | "macos"
+            | "windows"
+            | "x86"
+            | "x64"
+            | "amd64"
+            | "arm64"
+            | "aarch64"
+            | "armv7"
+            | "musl"
+            | "gnu"
+            | "unknown"
+            | "apple"
+            | "pc"
+            | "64"
+    ) || is_version(part.strip_prefix('v').unwrap_or(part))
+}
+
+fn is_version(part: &str) -> bool {
+    !part.is_empty()
+        && part.starts_with(|c: char| c.is_ascii_digit())
+        && part.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// The agent a program under a versions folder belongs to, such as `claude` for
+/// `~/.local/share/claude/versions/2.0.1`, whose file name is only a version.
+fn versions_owner(program: &str) -> Option<&str> {
+    let mut parts = program.rsplit('/');
+    let version = parts.next()?;
+    (is_version(version) && parts.next()? == "versions").then_some(())?;
+    parts.next()
 }
 
 fn agent_for_program(program: &str, profiles: &dyn AgentProfileRegistry) -> Option<Agent> {
@@ -2904,6 +3037,139 @@ mod tests {
             Some(Agent::Coding("codex".into()))
         );
         assert_eq!(agent_for_program("vim", &profiles), None);
+    }
+
+    #[test]
+    fn recognizes_versioned_builds_only_beside_the_profile_install() {
+        let target = Path::new("/home/u/.jcode/builds/versions/1.1.2/jcode");
+        let bin = Path::new("/home/u/.jcode/builds/versions/1.1.2/jcode-linux-x86_64.bin");
+        assert!(installed_build_of(
+            &bin.to_string_lossy(),
+            bin,
+            "jcode",
+            target
+        ));
+        assert!(installed_build_of("anything", target, "jcode", target));
+        let claude = Path::new("/home/u/.local/share/claude/versions/2.0.2");
+        let installed = Path::new("/home/u/.local/share/claude/versions/2.0.1");
+        assert!(installed_build_of(
+            &claude.to_string_lossy(),
+            claude,
+            "claude",
+            installed
+        ));
+        // A running build stays recognized after `stable` moves to a newer version.
+        let upgraded = Path::new("/home/u/.jcode/builds/versions/1.1.3/jcode");
+        assert!(installed_build_of("jcode", target, "jcode", upgraded));
+        assert!(installed_build_of(
+            &bin.to_string_lossy(),
+            bin,
+            "jcode",
+            upgraded
+        ));
+        // Names and layouts that fit the patterns but sit elsewhere are not the agent.
+        for (program, command, target) in [
+            // An unrelated build beside the profile's command in a shared bin folder.
+            ("/usr/local/bin/codex-64", "codex", "/usr/local/bin/codex"),
+            (
+                "/home/u/.jcode/builds/versions/1.1.2/jcode",
+                "jcode",
+                "/home/v/.jcode/builds/versions/1.1.3/jcode",
+            ),
+            ("/opt/x/codex-64", "codex", "/usr/lib/codex/codex"),
+            (
+                "/tmp/unrelated/claude/versions/2.0.1",
+                "claude",
+                installed.to_str().unwrap(),
+            ),
+            (
+                "/opt/jcode-linux-x86_64.bin",
+                "jcode",
+                target.to_str().unwrap(),
+            ),
+            (
+                "/home/u/.jcode/builds/versions/1.1.2/helper",
+                "jcode",
+                target.to_str().unwrap(),
+            ),
+        ] {
+            assert!(
+                !installed_build_of(program, Path::new(program), command, Path::new(target)),
+                "{program}"
+            );
+        }
+        // A file name alone never names an agent.
+        let profiles = crate::agents::AgentProfiles::default();
+        for program in [
+            "codex-64",
+            "jcode-linux-x86_64.bin",
+            "/x/claude/versions/2.0.1",
+        ] {
+            assert_eq!(agent_for_program(program, &profiles), None, "{program}");
+        }
+    }
+
+    #[test]
+    fn versioned_names_need_platform_or_version_parts() {
+        assert!(versioned_build_of("jcode-linux-x86_64.bin", "jcode"));
+        assert!(versioned_build_of("jcode-v1.1.2-darwin-arm64", "jcode"));
+        for name in ["jcodex", "jcode-helper", "jcode-linux-helper.bin", "jcode-"] {
+            assert!(!versioned_build_of(name, "jcode"), "{name}");
+        }
+        assert_eq!(versions_owner("/a/claude/versions/2.0.1"), Some("claude"));
+        assert_eq!(versions_owner("/a/claude/releases/2.0.1"), None);
+    }
+
+    #[test]
+    fn a_relative_script_matches_by_name_without_a_readable_cwd() -> Result<()> {
+        let proc = tempfile::tempdir()?;
+        fs::write(proc.path().join("cmdline"), "python3\0./jcode\0")?;
+        assert_eq!(
+            process_agent(proc.path(), &crate::agents::AgentProfiles::default()),
+            Some(Agent::Coding("jcode".into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_commands_resolve_in_the_process_environment() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let root = root.path().canonicalize()?;
+        let builds = root.join("builds");
+        fs::create_dir(&builds)?;
+        let build = builds.join("agent-build-7");
+        fs::write(&build, "")?;
+        fs::set_permissions(&build, Permissions::from_mode(0o755))?;
+        let bin = root.join("bin");
+        fs::create_dir(&bin)?;
+        std::os::unix::fs::symlink(&build, bin.join("jcode"))?;
+        let process = root.join("proc");
+        fs::create_dir(&process)?;
+        fs::write(process.join("cmdline"), "agent-build-7\0")?;
+        std::os::unix::fs::symlink(&build, process.join("exe"))?;
+        std::os::unix::fs::symlink(&root, process.join("cwd"))?;
+        let profiles = crate::agents::AgentProfiles::default();
+        assert_eq!(process_agent(&process, &profiles), None);
+        fs::write(
+            process.join("environ"),
+            format!("A=1\0PATH={}\0", bin.display()),
+        )?;
+        assert_eq!(
+            process_agent(&process, &profiles),
+            Some(Agent::Coding("jcode".into()))
+        );
+        // A relative profile command resolves from the process's directory.
+        fs::remove_file(process.join("environ"))?;
+        let mut custom = crate::agents::AgentProfiles::default();
+        let mut profile = custom.0[0].clone();
+        profile.id = "custom".into();
+        profile.command = "bin/jcode".into();
+        custom.0 = vec![profile];
+        assert_eq!(
+            process_agent(&process, &custom),
+            Some(Agent::Coding("custom".into()))
+        );
+        Ok(())
     }
 
     #[test]

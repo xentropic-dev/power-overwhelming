@@ -284,6 +284,10 @@ The bar omits segments with unavailable fields. Set `power_bar.enabled = false` 
 
 To add template fields, put components implementing the [status fields interface](infrastructure/wit/status-bar.wit) in the `status-plugins` folder next to `config.lua`, or set `POWER_STATUS_PLUGIN_DIR` before starting the desktop. With the optional plugin host built, Power-bar reads their values as `{custom.name}`. Values defined in `power_bar.params` take precedence.
 
+### Talk delivery through Claude Code hooks
+
+When Power launches Claude Code, its `--settings` also add Stop hooks that run `power talk hook stop` and, in the background with `asyncRewake`, `power talk hook wait`. They hand unread talk messages to the agent when a turn ends or while it sits idle, so nobody has to switch tabs or press Enter. If you pass `--settings` yourself, add the same entries to keep this. Without them, or if a hook fails, Power types its usual `[power talk]` notice into the terminal. A message is marked read only after a hook emitted it. If Power never hears a turn end, a busy session with no output for `talk.busy_stale` seconds (default 60) counts as idle again. The background waiter carries `POWER_TALK_WAITER=1`, so DAG stall detection ignores it.
+
 ### Report models from provider callbacks
 
 When Power launches Claude Code through shell integration, it passes `--settings` with a status line that runs `power session model --json` for that launch. If any managed, user, project, or local Claude Code setting already defines a `statusLine`, or you pass `--settings` yourself, use the manual setup below.
