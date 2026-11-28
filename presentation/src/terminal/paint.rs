@@ -235,14 +235,18 @@ impl Render for TerminalView {
                             let grid = metrics.snap(bounds.origin);
                             let paint_images = |layer: ImageLayer, window: &mut Window| {
                                 for image in images.iter().filter(|image| image.layer == layer) {
-                                    let at = image.bounds + grid;
-                                    let _ = window.paint_image(
-                                        at,
-                                        Corners::default(),
-                                        image.image.clone(),
-                                        0,
-                                        false,
-                                    );
+                                    let clip = ContentMask {
+                                        bounds: image.clip + grid,
+                                    };
+                                    window.with_content_mask(Some(clip), |window| {
+                                        let _ = window.paint_image(
+                                            image.bounds + grid,
+                                            Corners::default(),
+                                            image.image.clone(),
+                                            0,
+                                            false,
+                                        );
+                                    });
                                 }
                             };
                             paint_images(ImageLayer::BelowBackground, window);

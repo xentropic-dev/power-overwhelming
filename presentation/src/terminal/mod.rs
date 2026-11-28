@@ -196,6 +196,7 @@ pub struct TerminalView {
     commands: async_channel::Sender<TerminalControl>,
     _follow: Task<()>,
     _focus_changes: [Subscription; 3],
+    _release: Subscription,
 }
 
 impl TerminalView {
@@ -284,7 +285,15 @@ impl TerminalView {
             .expect("apply bundled terminal palette");
         let held_frame = hold::Captured::default();
         let contrast = Rc::new(std::cell::Cell::new(settings.minimum_contrast));
-        configure(&mut terminal, &settings, &held_frame, &contrast);
+        let images = Rc::<std::cell::RefCell<images::ImageCache>>::default();
+        configure(&mut terminal, &settings, &held_frame, &contrast, &images);
+        // Detaching or ending a tab drops the view without another paint; its uploads
+        // would otherwise stay in the window's atlas.
+        let release = cx.on_release(|view: &mut Self, cx| {
+            for image in view.images.borrow_mut().drain() {
+                cx.drop_image(image, None);
+            }
+        });
         Self {
             session,
             focus,
@@ -317,12 +326,13 @@ impl TerminalView {
             render_hold_generation: 0,
             held_frame,
             contrast,
-            images: Rc::default(),
+            images,
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             typing: Typing::new(hold),
             commands,
             _follow: follow,
             _focus_changes: focus_changes,
+            _release: release,
         }
     }
 
@@ -571,7 +581,13 @@ impl TerminalView {
     }
 
     fn configure_terminal(&self, terminal: &mut Terminal) {
-        configure(terminal, &self.settings, &self.held_frame, &self.contrast);
+        configure(
+            terminal,
+            &self.settings,
+            &self.held_frame,
+            &self.contrast,
+            &self.images,
+        );
     }
 
     /// Records the grid's bounds, inside the padding, and resizes the PTY to the cells that
@@ -620,13 +636,19 @@ fn configure(
     settings: &TerminalSettings,
     held_frame: &hold::Captured,
     contrast: &Rc<std::cell::Cell<f32>>,
+    images: &Rc<std::cell::RefCell<images::ImageCache>>,
 ) {
     terminal.set_clipboard_write_policy(clipboard_policy(settings));
     client::limit_scrollback(terminal).expect("set terminal scrollback limits");
     terminal
         .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
         .expect("set terminal clipboard size limit");
-    hold::install(terminal, held_frame.clone(), contrast.clone());
+    hold::install(
+        terminal,
+        held_frame.clone(),
+        contrast.clone(),
+        images.clone(),
+    );
     // The mirror stores and draws the images the program sends.
     infrastructure::kitty::enable(terminal).expect("enable Kitty graphics");
 }
@@ -866,6 +888,64 @@ mod gesture_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A workspace whose tab can close, as detaching or ending one does.
+    struct Closable(Option<Entity<TerminalView>>);
+
+    impl Render for Closable {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().children(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn closing_a_tab_releases_its_image_uploads(cx: &mut TestAppContext) {
+        use base64::Engine;
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let session = Session {
+                id: "image-teardown".into(),
+                worktree: std::env::temp_dir(),
+                agent: Agent::Shell,
+            };
+            let (commands, _) = async_channel::unbounded();
+            let (_, events) = async_channel::unbounded();
+            Closable(Some(cx.new(|cx| {
+                TerminalView::with_transport(
+                    session,
+                    infrastructure::theme::default_scheme(),
+                    TerminalSettings::default(),
+                    InputHold::default(),
+                    commands,
+                    events,
+                    window,
+                    cx,
+                )
+            })))
+        });
+        cx.run_until_parked();
+        let view = host.read_with(cx, |host, _| host.0.clone().unwrap());
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![9u8; 4 * 4 * 4]);
+        // Placements need the cell's pixel size, which the daemon's geometry carries.
+        view.update(cx, |view, _| view.terminal.resize(20, 5, 8, 16).unwrap());
+        feed(
+            &view,
+            cx,
+            format!("\x1b_Ga=T,f=32,s=4,v=4,i=1,q=2;{data}\x1b\\").as_bytes(),
+        );
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let (placements, images) =
+            view.read_with(cx, |view, _| (view.frame.images.len(), view.images.clone()));
+        assert_eq!(placements, 1, "the frame shows the image");
+        assert_eq!(images.borrow().len(), 1, "the paint uploaded the image");
+        drop(view);
+        host.update(cx, |host, cx| {
+            host.0 = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(images.borrow().len(), 0, "the release dropped every upload");
     }
 
     #[gpui::test]

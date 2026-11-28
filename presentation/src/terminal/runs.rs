@@ -552,6 +552,10 @@ fn row_decorations(row: &[RunCell], ops: &mut Vec<RowOp>) {
         } else {
             1
         };
+        // The image draws over a placeholder, so it shows no decorations either.
+        if run.placeholder() {
+            continue;
+        }
         let style = run.cell.style;
         let underline = (style.underline != Underline::None).then(|| {
             let color = run
@@ -833,6 +837,25 @@ mod tests {
         let mut texts = Vec::new();
         row_ops(&row, &shaping(&font, false, None), monospace(&mut texts));
         assert_eq!(texts, ["a", "z"]);
+    }
+
+    #[test]
+    fn styled_kitty_placeholders_draw_no_underline_or_strikethrough() {
+        let frame =
+            screen("\x1b[4;9ma\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}z".as_bytes());
+        let row = cells(&frame, 0);
+        let font = gpui::font("Test");
+        let mut texts = Vec::new();
+        let ops = row_ops(&row, &shaping(&font, false, None), monospace(&mut texts));
+        assert_eq!(texts, ["a", "z"]);
+        let decorations: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOp::Decoration { from, to, .. } => Some((*from, *to)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decorations, [(0, 1), (3, 4)]);
     }
 
     #[test]

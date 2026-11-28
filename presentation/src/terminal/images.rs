@@ -13,13 +13,16 @@ use gpui::{Bounds, Pixels, Point, RenderImage, Size, point, px, size};
 use image::{Frame, RgbaImage};
 use std::{collections::HashMap, sync::Arc};
 
-/// One cached upload: the image, its pixels' generation and the part of it drawn.
-type Key = (u32, u64, [u32; 4]);
+/// One cached upload: the image and its pixels' generation. Every crop of an image
+/// shares it, so the uploads stay within Ghostty's own storage limit.
+type Key = (u32, u64);
 
-/// An image ready to paint at `bounds`.
+/// An image ready to paint: the whole upload at `bounds`, shown only inside `clip`, the
+/// placement's rectangle, so a crop costs no upload of its own.
 pub(super) struct Placed {
     pub(super) layer: ImageLayer,
     pub(super) bounds: Bounds<Pixels>,
+    pub(super) clip: Bounds<Pixels>,
     pub(super) image: Arc<RenderImage>,
 }
 
@@ -30,6 +33,20 @@ pub(super) struct ImageCache {
 }
 
 impl ImageCache {
+    /// Uploads what `placements` show and isn't cached yet, from the terminal as it
+    /// stands. Synchronized output calls this when its hold begins, so the held frame keeps
+    /// pixels that a deletion or retransmission later in the same write would take away.
+    pub(super) fn prepare(&mut self, terminal: &Terminal, placements: &[ImagePlacement]) {
+        for p in placements {
+            let key = (p.image_id, p.image_generation);
+            if !self.images.contains_key(&key)
+                && let Some(image) = upload(terminal, key)
+            {
+                self.images.insert(key, image);
+            }
+        }
+    }
+
     /// The placements to paint, origin at the grid's top-left, plus the uploads no
     /// placement uses anymore, which the window should release.
     ///
@@ -46,23 +63,24 @@ impl ImageCache {
         let mut placed = Vec::with_capacity(placements.len());
         let mut used = HashMap::with_capacity(placements.len());
         for p in placements {
-            let key = (
-                p.image_id,
-                p.image_generation,
-                [p.source_x, p.source_y, p.source_width, p.source_height],
-            );
+            let key = (p.image_id, p.image_generation);
             let image = match self.images.remove(&key).or_else(|| used.get(&key).cloned()) {
                 Some(image) => image,
-                None => match upload(terminal, p.image_id, key.2) {
+                None => match upload(terminal, key) {
                     Some(image) => image,
                     None => continue,
                 },
             };
             used.insert(key, image.clone());
             let [x, y, width, height] = geometry(p, cell, sx, sy);
+            let clip = Bounds::new(grid + point(px(x), px(y)), size(px(width), px(height)));
+            let Some(bounds) = uncropped(p, &image, clip) else {
+                continue;
+            };
             placed.push(Placed {
                 layer: p.layer,
-                bounds: Bounds::new(grid + point(px(x), px(y)), size(px(width), px(height))),
+                bounds,
+                clip,
                 image,
             });
         }
@@ -71,6 +89,37 @@ impl ImageCache {
             .collect();
         (placed, evicted)
     }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.images.len()
+    }
+
+    /// Every upload, for the window to release when the view goes away.
+    pub(super) fn drain(&mut self) -> Vec<Arc<RenderImage>> {
+        self.images.drain().map(|(_, image)| image).collect()
+    }
+}
+
+/// Where the whole image goes so that its source rectangle lands on `clip`.
+fn uncropped(
+    p: &ImagePlacement,
+    image: &RenderImage,
+    clip: Bounds<Pixels>,
+) -> Option<Bounds<Pixels>> {
+    let full = image.size(0);
+    let (iw, ih) = (full.width.0 as u32, full.height.0 as u32);
+    let sw = p.source_width.min(iw.saturating_sub(p.source_x));
+    let sh = p.source_height.min(ih.saturating_sub(p.source_y));
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let kx = f32::from(clip.size.width) / sw as f32;
+    let ky = f32::from(clip.size.height) / sh as f32;
+    Some(Bounds::new(
+        clip.origin - point(px(p.source_x as f32 * kx), px(p.source_y as f32 * ky)),
+        size(px(iw as f32 * kx), px(ih as f32 * ky)),
+    ))
 }
 
 /// Logical pixels per device pixel of the terminal's cell, horizontally and vertically.
@@ -99,16 +148,21 @@ fn geometry(p: &ImagePlacement, cell: Size<Pixels>, sx: f32, sy: f32) -> [f32; 4
     ]
 }
 
-fn upload(terminal: &Terminal, id: u32, source: [u32; 4]) -> Option<Arc<RenderImage>> {
+/// The stored image, whole, if it still holds the pixels of `generation`.
+fn upload(terminal: &Terminal, (id, generation): Key) -> Option<Arc<RenderImage>> {
     let graphics = terminal.kitty_graphics().ok()?;
     let image = graphics.image(id)?;
+    // A retransmission under the same id must not paint under the old generation.
+    if image.generation().ok()? != generation {
+        return None;
+    }
     let (width, height) = (image.width().ok()?, image.height().ok()?);
     let (w, h, bgra) = crop_bgra(
         image.data().ok()?,
         image.format().ok()?,
         width,
         height,
-        source,
+        [0, 0, width, height],
     )?;
     let frame = Frame::new(RgbaImage::from_raw(w, h, bgra)?);
     Some(Arc::new(RenderImage::new(vec![frame])))
@@ -254,6 +308,149 @@ mod tests {
         assert_eq!(evicted.len(), 1);
         assert!(Arc::ptr_eq(&evicted[0], &first));
         assert!(placed.iter().all(|p| !Arc::ptr_eq(&p.image, &first)));
+    }
+
+    #[test]
+    fn crops_of_one_image_share_a_single_upload() {
+        let mut terminal = terminal();
+        transmit(&mut terminal, 5, 9);
+        // Many distinct, nearly full-size crops, each in its own cell.
+        for (n, x) in (0..8).enumerate() {
+            terminal.vt_write(
+                format!(
+                    "\x1b[{};1H\x1b_Ga=p,i=5,p={},x={x},y={x},w={},h={},c=1,r=1,q=2\x1b\\",
+                    n % 5 + 1,
+                    n + 1,
+                    16 - x,
+                    32 - x
+                )
+                .as_bytes(),
+            );
+        }
+        let placements = images(&terminal, &mut RenderState::new().unwrap());
+        assert_eq!(placements.len(), 8);
+        let mut cache = ImageCache::default();
+        let cell = size(px(8.), px(16.));
+        let (placed, _) = cache.place(&terminal, &placements, point(px(0.), px(0.)), cell);
+        assert_eq!(placed.len(), 8);
+        assert!(
+            placed
+                .iter()
+                .all(|p| Arc::ptr_eq(&p.image, &placed[0].image))
+        );
+        // One upload of the stored image's size, however many crops show it.
+        assert_eq!(cache.images.len(), 1);
+        let bytes: usize = cache
+            .images
+            .values()
+            .map(|image| image.as_bytes(0).unwrap().len())
+            .sum();
+        assert_eq!(bytes, 16 * 32 * 4);
+        // The crop is a clip: x=3,y=3 shifts the whole image up and left of its cell.
+        let crop = placed
+            .iter()
+            .zip(&placements)
+            .find(|(_, p)| p.source_x == 3)
+            .unwrap()
+            .0;
+        assert_eq!(crop.clip.size, size(px(8.), px(16.)));
+        assert!(crop.bounds.origin.x < crop.clip.origin.x);
+        assert!(crop.bounds.contains(&crop.clip.origin));
+        assert_eq!(cache.drain().len(), 1);
+        assert!(cache.images.is_empty());
+    }
+
+    /// The held frame and cache after one write that places a new image, starts
+    /// synchronized output and then does `after` to it.
+    fn held_after(after: &[u8]) -> (Terminal, Vec<Placed>) {
+        use std::{cell::RefCell, rc::Rc};
+        let mut terminal = terminal();
+        let captured = crate::terminal::hold::Captured::default();
+        let cache = Rc::new(RefCell::new(ImageCache::default()));
+        crate::terminal::hold::install(
+            &mut terminal,
+            captured.clone(),
+            Rc::new(std::cell::Cell::new(1.)),
+            cache.clone(),
+        );
+        transmit(&mut terminal, 6, 200);
+        let mut chunk = b"\x1b_Ga=p,i=6,q=2\x1b\\\x1b[?2026h".to_vec();
+        chunk.extend_from_slice(after);
+        terminal.vt_write(&chunk);
+        let (_, frame) = captured.borrow_mut().take().unwrap();
+        assert_eq!(frame.images.len(), 1);
+        let (placed, _) = cache.borrow_mut().place(
+            &terminal,
+            &frame.images,
+            point(px(0.), px(0.)),
+            size(px(8.), px(16.)),
+        );
+        (terminal, placed)
+    }
+
+    fn first_pixel(placed: &[Placed]) -> u8 {
+        placed[0].image.as_bytes(0).unwrap()[0]
+    }
+
+    #[test]
+    fn a_hold_keeps_an_image_deleted_later_in_the_same_write() {
+        let (_, placed) = held_after(b"\x1b_Ga=d,d=I,i=6,q=2\x1b\\AFTER HOLD");
+        assert_eq!(placed.len(), 1);
+        assert_eq!(first_pixel(&placed), 200);
+    }
+
+    #[test]
+    fn a_hold_keeps_the_old_pixels_of_an_image_retransmitted_in_the_same_write() {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 16 * 32 * 4]);
+        let (_, placed) =
+            held_after(format!("\x1b_Ga=t,f=32,s=16,v=32,i=6,q=2;{data}\x1b\\").as_bytes());
+        assert_eq!(placed.len(), 1);
+        assert_eq!(first_pixel(&placed), 200);
+    }
+
+    #[test]
+    fn a_stale_generation_never_uploads_the_replacement() {
+        let mut terminal = terminal();
+        transmit(&mut terminal, 8, 1);
+        terminal.vt_write(b"\x1b_Ga=p,i=8,q=2\x1b\\");
+        let old = images(&terminal, &mut RenderState::new().unwrap());
+        transmit(&mut terminal, 8, 2);
+        let (placed, _) = ImageCache::default().place(
+            &terminal,
+            &old,
+            point(px(0.), px(0.)),
+            size(px(8.), px(16.)),
+        );
+        assert!(placed.is_empty());
+    }
+
+    #[test]
+    fn live_reattach_snapshot_keeps_images() {
+        // `Command::Attach` sends `snapshot::encode` of the daemon's terminal; the GUI
+        // decodes it into its mirror. Only a daemon restart, which replays the scrollback
+        // text, loses images.
+        let mut daemon = terminal();
+        transmit(&mut daemon, 9, 42);
+        daemon.vt_write(b"\x1b[2;2H\x1b_Ga=p,i=9,q=2\x1b\\");
+        let bytes = ghostty_vt::snapshot::encode(&daemon).unwrap();
+        let mut mirror = ghostty_vt::snapshot::Decoder::from_slice(&bytes)
+            .decode()
+            .unwrap();
+        infrastructure::kitty::enable(&mut mirror).unwrap();
+        let placements = images(&mirror, &mut RenderState::new().unwrap());
+        assert_eq!(placements.len(), 1);
+        assert_eq!(
+            (placements[0].viewport_col, placements[0].viewport_row),
+            (1, 1)
+        );
+        let (placed, _) = ImageCache::default().place(
+            &mirror,
+            &placements,
+            point(px(0.), px(0.)),
+            size(px(8.), px(16.)),
+        );
+        assert_eq!(first_pixel(&placed), 42);
     }
 
     #[test]
