@@ -122,6 +122,17 @@ impl Typing {
         )
     }
 
+    /// `count` Up or Down arrow presses, as a wheel scrolls a full-screen program that
+    /// doesn't track the mouse.
+    pub fn arrows(&mut self, terminal: &Terminal, up: bool, count: usize) -> Vec<u8> {
+        let mut encoder = KeyEncoder {
+            encoder: &mut self.encoder,
+            terminal,
+        };
+        let press = encoder.arrow(up);
+        press.repeat(count)
+    }
+
     /// Text an input method committed, or `None` while Power holds the keyboard.
     pub fn commit(&mut self, text: &str) -> Option<Vec<u8>> {
         self.marked = None;
@@ -201,6 +212,15 @@ mod tests {
         typing
             .key_up(t, &stroke(text, None))
             .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    #[test]
+    fn wheel_arrows_follow_cursor_key_mode() {
+        let mut typing = Typing::new(InputHold::default());
+        let normal = terminal("");
+        assert_eq!(typing.arrows(&normal, true, 2), b"\x1b[A\x1b[A");
+        let application = terminal("\x1b[?1h");
+        assert_eq!(typing.arrows(&application, false, 1), b"\x1bOB");
     }
 
     #[test]
