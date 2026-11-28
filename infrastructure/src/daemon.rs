@@ -125,6 +125,7 @@ pub fn serve(
     let store = SqliteDagStore::open().context("Open DAG store")?;
     let terminal_application = Arc::new(OnceLock::<Weak<Application<PtyRuntime>>>::new());
     let foreground_application = terminal_application.clone();
+    let labels_application = terminal_application.clone();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let terminal_dag = Arc::new(OnceLock::<Weak<DaemonDag>>::new());
     let exit_dag = terminal_dag.clone();
@@ -156,9 +157,15 @@ pub fn serve(
                 }
                 Ok(())
             }),
-            on_foreground_changed: Arc::new(move |session, agent, conversation, cwd| {
+            on_foreground_changed: Arc::new(move |session, agent, conversation, cwd, labels| {
                 if let Some(application) = foreground_application.get().and_then(Weak::upgrade) {
-                    application.record_foreground(session, agent, conversation, cwd)?;
+                    application.record_foreground(session, agent, conversation, cwd, labels)?;
+                }
+                Ok(())
+            }),
+            on_labels_changed: Arc::new(move |session, labels| {
+                if let Some(application) = labels_application.get().and_then(Weak::upgrade) {
+                    application.record_labels(session, labels)?;
                 }
                 Ok(())
             }),
@@ -625,12 +632,15 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             session,
             agent,
             conversation,
+            fresh,
+            resumed,
         } => {
             ensure!(
                 !agent.is_empty()
-                    && !conversation.is_empty()
                     && crate::terminal::valid_metadata(&agent)
-                    && crate::terminal::valid_metadata(&conversation),
+                    && conversation.as_deref().is_none_or(|conversation| {
+                        !conversation.is_empty() && crate::terminal::valid_metadata(conversation)
+                    }),
                 "Conversation IDs must be at most 120 characters on one line"
             );
             let (send, receive) = mpsc::sync_channel(1);
@@ -640,6 +650,8 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                     pid: wire::peer_pid(socket)?,
                     agent: Agent::Coding(agent.into()),
                     conversation,
+                    fresh,
+                    resumed,
                     reply: send,
                 })?;
             ensure!(

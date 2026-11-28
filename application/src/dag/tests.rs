@@ -2016,8 +2016,14 @@ impl SessionStore for UndeletableSessions {
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&crate::Labels>,
     ) -> Result<()> {
-        self.0.update_foreground(id, foreground, conversation, cwd)
+        self.0
+            .update_foreground(id, foreground, conversation, cwd, labels)
+    }
+
+    fn update_labels(&self, id: &str, labels: &crate::Labels) -> Result<()> {
+        self.0.update_labels(id, labels)
     }
 
     fn remove(&self, _: &str) -> Result<()> {
@@ -2092,9 +2098,14 @@ impl SessionStore for BlockedSessions {
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&crate::Labels>,
     ) -> Result<()> {
         self.records
-            .update_foreground(id, foreground, conversation, cwd)
+            .update_foreground(id, foreground, conversation, cwd, labels)
+    }
+
+    fn update_labels(&self, id: &str, labels: &crate::Labels) -> Result<()> {
+        self.records.update_labels(id, labels)
     }
 
     fn remove(&self, id: &str) -> Result<()> {
@@ -3856,9 +3867,14 @@ impl SessionStore for FlakySessions {
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&crate::Labels>,
     ) -> Result<()> {
         self.records
-            .update_foreground(id, foreground, conversation, cwd)
+            .update_foreground(id, foreground, conversation, cwd, labels)
+    }
+
+    fn update_labels(&self, id: &str, labels: &crate::Labels) -> Result<()> {
+        self.records.update_labels(id, labels)
     }
 
     fn remove(&self, id: &str) -> Result<()> {
