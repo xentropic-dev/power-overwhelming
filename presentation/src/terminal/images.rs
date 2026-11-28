@@ -30,6 +30,9 @@ pub(super) struct Placed {
 #[derive(Default)]
 pub(super) struct ImageCache {
     images: HashMap<Key, Arc<RenderImage>>,
+    /// Pixels captured when the latest hold began and not painted yet. Each hold
+    /// replaces them, so holds without a paint between them keep only the last capture.
+    held: HashMap<Key, Arc<RenderImage>>,
 }
 
 impl ImageCache {
@@ -37,12 +40,14 @@ impl ImageCache {
     /// stands. Synchronized output calls this when its hold begins, so the held frame keeps
     /// pixels that a deletion or retransmission later in the same write would take away.
     pub(super) fn prepare(&mut self, terminal: &Terminal, placements: &[ImagePlacement]) {
+        let mut previous = std::mem::take(&mut self.held);
         for p in placements {
             let key = (p.image_id, p.image_generation);
-            if !self.images.contains_key(&key)
-                && let Some(image) = upload(terminal, key)
-            {
-                self.images.insert(key, image);
+            if self.images.contains_key(&key) || self.held.contains_key(&key) {
+                continue;
+            }
+            if let Some(image) = previous.remove(&key).or_else(|| upload(terminal, key)) {
+                self.held.insert(key, image);
             }
         }
     }
@@ -64,7 +69,12 @@ impl ImageCache {
         let mut used = HashMap::with_capacity(placements.len());
         for p in placements {
             let key = (p.image_id, p.image_generation);
-            let image = match self.images.remove(&key).or_else(|| used.get(&key).cloned()) {
+            let image = match self
+                .images
+                .remove(&key)
+                .or_else(|| self.held.remove(&key))
+                .or_else(|| used.get(&key).cloned())
+            {
                 Some(image) => image,
                 None => match upload(terminal, key) {
                     Some(image) => image,
@@ -84,6 +94,8 @@ impl ImageCache {
                 image,
             });
         }
+        // Captures this paint didn't show were never uploaded to the window.
+        self.held.clear();
         let evicted = std::mem::replace(&mut self.images, used)
             .into_values()
             .collect();
@@ -92,11 +104,12 @@ impl ImageCache {
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.images.len()
+        self.images.len() + self.held.len()
     }
 
     /// Every upload, for the window to release when the view goes away.
     pub(super) fn drain(&mut self) -> Vec<Arc<RenderImage>> {
+        self.held.clear();
         self.images.drain().map(|(_, image)| image).collect()
     }
 }
@@ -386,6 +399,52 @@ mod tests {
             size(px(8.), px(16.)),
         );
         (terminal, placed)
+    }
+
+    #[test]
+    fn repeated_holds_without_a_paint_keep_only_the_last_capture() {
+        use base64::Engine;
+        use std::{cell::RefCell, rc::Rc};
+        let mut terminal = terminal();
+        let captured = crate::terminal::hold::Captured::default();
+        let cache = Rc::new(RefCell::new(ImageCache::default()));
+        crate::terminal::hold::install(
+            &mut terminal,
+            captured.clone(),
+            Rc::new(std::cell::Cell::new(1.)),
+            cache.clone(),
+        );
+        terminal.vt_write(b"\x1b_Ga=p,i=6,q=2\x1b\\");
+        for byte in 1..=20u8 {
+            // Retransmit under the same id, hold, then retransmit again in the same write.
+            transmit(&mut terminal, 6, byte);
+            terminal.vt_write(b"\x1b_Ga=p,i=6,q=2\x1b\\\x1b[?2026h");
+            let data = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 16 * 32 * 4]);
+            terminal.vt_write(format!("\x1b_Ga=t,f=32,s=16,v=32,i=6,q=2;{data}\x1b\\").as_bytes());
+            terminal.vt_write(b"\x1b[?2026l");
+            let bytes: usize = cache
+                .borrow()
+                .held
+                .values()
+                .chain(cache.borrow().images.values())
+                .map(|image| image.as_bytes(0).unwrap().len())
+                .sum();
+            assert_eq!(bytes, 16 * 32 * 4);
+        }
+        // A last hold whose image the same write deletes still paints its capture.
+        transmit(&mut terminal, 6, 99);
+        terminal.vt_write(b"\x1b_Ga=p,i=6,q=2\x1b\\\x1b[?2026h\x1b_Ga=d,d=I,i=6,q=2\x1b\\");
+        assert_eq!(cache.borrow().len(), 1);
+        let (_, frame) = captured.borrow_mut().take().unwrap();
+        let (placed, evicted) = cache.borrow_mut().place(
+            &terminal,
+            &frame.images,
+            point(px(0.), px(0.)),
+            size(px(8.), px(16.)),
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(first_pixel(&placed), 99);
+        assert_eq!(cache.borrow().len(), 1);
     }
 
     fn first_pixel(placed: &[Placed]) -> u8 {
