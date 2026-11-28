@@ -4,7 +4,7 @@ use super::{
     CellMetrics, TerminalView, bench, cell_metrics,
     frame::{CellPosition, Row},
     ime::Preedit,
-    input::register_mouse_exit,
+    input::{SCROLLBAR_WIDTH, register_mouse_drag, register_mouse_exit},
     links::{LinkAction, link_action},
     runs::{FAINT_OPACITY, RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
     sprites,
@@ -168,11 +168,14 @@ impl Render for TerminalView {
         let block_font = terminal_font.clone();
         let hovered = self.hovered_span(window.modifiers());
         let pressed = self.pressed_span();
-        let selection = self.selection_range().filter(|_| pressed.is_none());
+        let selection = self.selection.filter(|_| pressed.is_none());
         let ligatures = self.settings.ligatures;
         let bold_weight = FontWeight(f32::from(self.settings.font_weight_bold));
         let revision = self.paint_revision;
         let hovering = hovered.is_some();
+        let scrollbar = self
+            .scrollbar()
+            .map(|(track, thumb)| (track, thumb, self.scrollbar_grab.is_some()));
         div()
             .id("terminal")
             .relative()
@@ -186,9 +189,19 @@ impl Render for TerminalView {
             .on_key_up(cx.listener(Self::key_up))
             .on_hover(cx.listener(Self::hover))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(Self::mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(Self::mouse_down),
+            )
+            .on_mouse_move(cx.listener(Self::hover_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up_out))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::middle_down))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(
                 canvas(
@@ -198,6 +211,7 @@ impl Render for TerminalView {
                     move |bounds, (), window, cx| {
                         bench::count(&bench::GRID);
                         register_mouse_exit(pointer_owner.clone(), window);
+                        register_mouse_drag(pointer_owner.clone(), window);
                         // While focused, input methods type into this terminal.
                         window.handle_input(
                             &focus,
@@ -421,6 +435,24 @@ impl Render for TerminalView {
                 .right(pad)
                 .bottom(pad),
             )
+            .when_some(scrollbar, |this, (_, thumb, dragging)| {
+                // Window coordinates, made relative to the view's top left via the grid.
+                let origin = self.grid.bounds.origin - point(pad, pad);
+                this.child(
+                    div()
+                        .absolute()
+                        .left(thumb.origin.x - origin.x + px(2.))
+                        .top(thumb.origin.y - origin.y)
+                        .w(SCROLLBAR_WIDTH - px(4.))
+                        .h(thumb.size.height)
+                        .rounded(px(3.))
+                        .bg(Hsla::from(rgb(colors.foreground)).opacity(if dragging {
+                            0.5
+                        } else {
+                            0.3
+                        })),
+                )
+            })
             .children(self.hints.iter().enumerate().map(|(index, (position, _))| {
                 div()
                     .absolute()

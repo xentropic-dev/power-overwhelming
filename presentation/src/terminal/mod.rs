@@ -12,6 +12,7 @@ mod links;
 mod metrics;
 mod paint;
 mod runs;
+mod scroll;
 mod selection;
 mod sprites;
 mod typing;
@@ -24,6 +25,7 @@ pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
 use self::frame::{CellPosition, Frame};
 use self::grid::PtyGrid;
+pub use self::input::ScrollTarget;
 pub use self::typing::InputHold;
 use self::typing::Typing;
 use crate::settings::TerminalSettings;
@@ -157,14 +159,27 @@ pub struct TerminalView {
     frame: Rc<Frame>,
     typed_at: Option<Instant>,
     paint_revision: u64,
+    /// The terminal's selection in viewport cells, as last painted.
     selection: Option<(CellPosition, CellPosition)>,
+    selector: selection::Selector,
+    /// The pointer while a selection drag runs, for autoscroll ticks.
+    select_pointer: Option<Point<Pixels>>,
+    _autoscroll: Option<Task<()>>,
+    /// Where the press on `pressed_link` landed.
+    press_cell: Option<CellPosition>,
     pointer: Option<Point<Pixels>>,
     pressed_link: Option<Arc<str>>,
     /// Numbered link labels shown while the user picks a link by keyboard.
     hints: Vec<(CellPosition, Arc<str>)>,
     hint_footer: Option<String>,
-    dragging: bool,
-    reporting_mouse: bool,
+    /// Buttons whose press went to the program, so their motion and release go too.
+    buttons: Vec<MouseButton>,
+    /// The last mouse report sent, as motion, so motion within one cell isn't repeated.
+    last_mouse_report: Vec<u8>,
+    /// Fractions of a line or column the wheel moved that haven't scrolled yet.
+    scrolled: Point<f32>,
+    /// Where in the scrollbar thumb a drag holds it, while one is in progress.
+    scrollbar_grab: Option<f32>,
     exited: bool,
     status: Option<String>,
     render_held: bool,
@@ -209,6 +224,22 @@ impl TerminalView {
                 |event| tx.send_blocking(event).is_ok(),
             );
         });
+        Self::with_transport(session, scheme, settings, hold, commands, rx, window, cx)
+    }
+
+    /// Builds the view over a given command sink and event source, starting no
+    /// daemon-client threads.
+    #[allow(clippy::too_many_arguments)]
+    fn with_transport(
+        session: Session,
+        scheme: &'static Scheme,
+        settings: TerminalSettings,
+        hold: InputHold,
+        commands: async_channel::Sender<TerminalControl>,
+        rx: async_channel::Receiver<TerminalEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let follow = cx.spawn_in(window, async move |view, cx| {
             while let Ok(first) = rx.recv().await {
                 let deadline = Instant::now() + OUTPUT_TURN;
@@ -265,12 +296,18 @@ impl TerminalView {
             typed_at: None,
             paint_revision: 0,
             selection: None,
+            selector: selection::Selector::new(),
+            select_pointer: None,
+            _autoscroll: None,
+            press_cell: None,
             pointer: None,
             pressed_link: None,
             hints: Vec::new(),
             hint_footer: None,
-            dragging: false,
-            reporting_mouse: false,
+            buttons: Vec::new(),
+            last_mouse_report: Vec::new(),
+            scrolled: Point::default(),
+            scrollbar_grab: None,
             exited: false,
             status: None,
             render_held: false,
@@ -373,7 +410,8 @@ impl TerminalView {
                     }
                     self.exited = exited;
                     self.status = None;
-                    self.selection = None;
+                    // The gesture tracks cells of the terminal it replaced.
+                    self.selector.reset(&previous);
                     self.metadata = SessionMetadata::default();
                     let title = shown_title(&title).into_owned();
                     cx.emit(TerminalTitleChanged(title));
@@ -470,6 +508,13 @@ impl TerminalView {
         if self.render_held {
             return false;
         }
+        let selection = selection::viewport_range(&self.terminal);
+        let moved = selection != self.selection;
+        self.selection = selection;
+        moved | self.refresh_frame()
+    }
+
+    fn refresh_frame(&mut self) -> bool {
         match self.frame.update_with(
             &mut self.renderer,
             &self.terminal,
@@ -573,6 +618,7 @@ fn configure(
     contrast: &Rc<std::cell::Cell<f32>>,
 ) {
     terminal.set_clipboard_write_policy(clipboard_policy(settings));
+    client::limit_scrollback(terminal).expect("set terminal scrollback limits");
     terminal
         .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
         .expect("set terminal clipboard size limit");
@@ -717,5 +763,157 @@ mod font_tests {
             faces,
             [(false, false), (true, false), (false, true), (true, true)]
         );
+    }
+}
+
+/// Gestures driven through a headless GPUI window: real hitbox, capture-phase moves,
+/// mouse-tracking routing and the clipboard path.
+#[cfg(test)]
+mod gesture_tests {
+    use super::{TerminalView, typing::InputHold};
+    use crate::settings::TerminalSettings;
+    use domain::session::{Agent, Session};
+    use gpui::{
+        AppContext, Bounds, Context, Entity, IntoElement, Modifiers, MouseButton, ParentElement,
+        Pixels, Point, Render, Styled, TestAppContext, VisualTestContext, Window, div, point, px,
+    };
+    use infrastructure::client::TerminalControl;
+
+    /// Lays the terminal out as the workspace does, in a full-size flex column.
+    struct Host(Entity<TerminalView>);
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().child(self.0.clone())
+        }
+    }
+
+    fn open(cx: &mut TestAppContext) -> (Entity<TerminalView>, &mut VisualTestContext) {
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let session = Session {
+                id: "gesture-test".into(),
+                worktree: std::env::temp_dir(),
+                agent: Agent::Shell,
+            };
+            let settings = TerminalSettings {
+                copy_on_select: true,
+                ..TerminalSettings::default()
+            };
+            // In-memory transport: no daemon client, so the view runs on what the test feeds it.
+            let (commands, _) = async_channel::unbounded();
+            let (_, events) = async_channel::unbounded();
+            Host(cx.new(|cx| {
+                TerminalView::with_transport(
+                    session,
+                    infrastructure::theme::default_scheme(),
+                    settings,
+                    InputHold::default(),
+                    commands,
+                    events,
+                    window,
+                    cx,
+                )
+            }))
+        });
+        cx.run_until_parked();
+        let view = host.read_with(cx, |host, _| host.0.clone());
+        (view, cx)
+    }
+
+    /// Writes program output and takes a fresh frame, then a requests receiver that
+    /// sees what the view sends to the program.
+    fn feed(
+        view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+        bytes: &[u8],
+    ) -> async_channel::Receiver<TerminalControl> {
+        let (tx, rx) = async_channel::unbounded();
+        view.update(cx, |view, cx| {
+            view.commands = tx;
+            view.terminal.vt_write(bytes);
+            view.refresh();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        rx
+    }
+
+    fn bounds(view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        view.read_with(cx, |view, _| view.grid.bounds)
+    }
+
+    fn cell(
+        view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+        row: f32,
+        col: f32,
+    ) -> Point<Pixels> {
+        let (bounds, size) =
+            view.read_with(cx, |view, _| (view.grid.bounds, view.grid.metrics.size));
+        bounds.origin + point(size.width * (col + 0.5), size.height * (row + 0.5))
+    }
+
+    fn inputs(rx: &async_channel::Receiver<TerminalControl>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|control| match control {
+                TerminalControl::Input(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn drag_past_the_grid_keeps_selecting_and_copies(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"alpha beta\r\ngamma delta");
+        let none = Modifiers::none();
+        let start = cell(&view, cx, 0., 0.);
+        cx.simulate_mouse_down(start, MouseButton::Left, none);
+        let inside = cell(&view, cx, 1., 2.);
+        cx.simulate_mouse_move(inside, MouseButton::Left, none);
+        // Past the bottom-right of the terminal: only capture-phase delivery sees this.
+        let outside = bounds(&view, cx).bottom_right() + point(px(40.), px(40.));
+        cx.simulate_mouse_move(outside, MouseButton::Left, none);
+        let selected = view.read_with(cx, |view, _| super::selection::text(&view.terminal));
+        assert_eq!(selected.as_deref(), Some("alpha beta\ngamma delta"));
+        cx.simulate_mouse_up(outside, MouseButton::Left, none);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("alpha beta\ngamma delta"));
+        assert!(!view.read_with(cx, |view, _| view.selector.selecting));
+    }
+
+    #[gpui::test]
+    fn tracked_mouse_goes_to_the_program_with_paired_releases(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        // Normal tracking with SGR encoding.
+        feed(&view, cx, b"text\x1b[?1000h\x1b[?1006h");
+        let none = Modifiers::none();
+        let at = cell(&view, cx, 0., 1.);
+        let outside = bounds(&view, cx).bottom_right() + point(px(40.), px(40.));
+        let rx = feed(&view, cx, b"");
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_up(outside, MouseButton::Left, none);
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(outside, MouseButton::Middle, none);
+        let sent = inputs(&rx);
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        assert!(
+            sent[0].starts_with("\x1b[<0;") && sent[0].ends_with('M'),
+            "{sent:?}"
+        );
+        assert!(
+            sent[1].starts_with("\x1b[<0;") && sent[1].ends_with('m'),
+            "{sent:?}"
+        );
+        assert!(
+            sent[2].starts_with("\x1b[<1;") && sent[2].ends_with('M'),
+            "{sent:?}"
+        );
+        assert!(
+            sent[3].starts_with("\x1b[<1;") && sent[3].ends_with('m'),
+            "{sent:?}"
+        );
+        let selected = view.read_with(cx, |view, _| super::selection::text(&view.terminal));
+        assert_eq!(selected, None, "a tracked click doesn't select");
     }
 }

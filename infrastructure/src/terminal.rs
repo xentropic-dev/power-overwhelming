@@ -1101,8 +1101,9 @@ fn terminal_actor(
     let mut terminal = Terminal::new(Options {
         cols: geometry.cols,
         rows: geometry.rows,
-        ..Options::default()
+        max_scrollback: crate::client::SCROLLBACK_MAX_BYTES,
     })?;
+    crate::client::limit_scrollback(&mut terminal)?;
     // A snapshot taken while saving an alternate screen may cross a PTY read boundary.
     terminal.set_continuation_max_bytes(CONTINUATION_LIMIT)?;
     let mut scheme = *active_scheme.read().unwrap();

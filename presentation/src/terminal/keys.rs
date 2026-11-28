@@ -188,6 +188,19 @@ pub(super) struct KeyEncoder<'a> {
 }
 
 impl KeyEncoder<'_> {
+    /// An unmodified arrow press, Up or Down, as the program's cursor key mode encodes it.
+    pub fn arrow(&mut self, up: bool) -> Vec<u8> {
+        let key = if up { Key::ArrowUp } else { Key::ArrowDown };
+        self.encode(
+            key,
+            key::Mods::empty(),
+            key::Mods::empty(),
+            None,
+            None,
+            key::Action::Press,
+        )
+    }
+
     fn encode(
         &mut self,
         key: Key,
