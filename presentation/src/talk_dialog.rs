@@ -39,16 +39,23 @@ impl Query {
             talk::show(caller, id.clone(), true)
         } else {
             let messages = talk::log(
-                caller,
+                caller.clone(),
                 LogFilter {
                     agent: self.target.agent().map(str::to_owned),
                     to_user: self.target == Target::User,
                     ..LogFilter::default()
                 },
             )?;
+            // The user inbox leads with open decision requests from every box.
+            let decisions = if self.target == Target::User {
+                talk::decisions(caller, false)?
+            } else {
+                Vec::new()
+            };
             let mut threads = HashSet::new();
-            Ok(messages
+            Ok(decisions
                 .into_iter()
+                .chain(messages)
                 .filter(|message| threads.insert(message.thread.clone()))
                 .collect())
         }
@@ -218,6 +225,35 @@ impl TalkDialog {
         true
     }
 
+    /// The open decision request under the selection in the thread list, if any.
+    fn selected_decision(&self) -> Option<&Message> {
+        if self.expanded.is_some() || self.draft.is_some() {
+            return None;
+        }
+        self.threads.get(self.selected_thread).filter(|message| {
+            message
+                .decision
+                .as_ref()
+                .is_some_and(|d| d.answered_at.is_none())
+        })
+    }
+
+    /// Answers the selected decision request with its `index`th choice.
+    pub fn answer(&mut self, index: usize) -> Option<Send> {
+        let message = self.selected_decision()?;
+        let choice = message.decision.as_ref()?.choices.get(index)?.clone();
+        Some(Send {
+            box_id: self.box_id.clone(),
+            agent: None,
+            reply_to: Some(message.id.clone()),
+            body: choice,
+        })
+    }
+
+    pub fn answered(&mut self, result: Result<()>) {
+        self.error = result.err().map(|error| format!("{error:#}"));
+    }
+
     pub fn compose(&mut self, reply: bool, id: u64, focus: FocusHandle) -> bool {
         if reply {
             let participant = |message: &&Message| {
@@ -334,6 +370,11 @@ impl TalkDialog {
             Command::PickerCancel,
             if expanded { "back" } else { "close" },
         );
+        if let Some(decision) = self.selected_decision().and_then(|m| m.decision.as_ref()) {
+            for (index, choice) in decision.choices.iter().enumerate().rev() {
+                actions.insert(0, format!("{} {choice}", index + 1));
+            }
+        }
         let status = self.error.as_deref().or({
             if self.loading {
                 Some("Loading messages…")
@@ -462,5 +503,28 @@ fn metadata(message: &Message) -> String {
                 .to_string()
         })
         .unwrap_or_default();
-    format!("{sender} → {recipient} · {time} · {state}")
+    let state = match &message.decision {
+        Some(decision) if decision.answered_at.is_some() => "Decision answered",
+        Some(decision) if !decision.is_open(now_ms()) => "Decision expired",
+        Some(_) => "Decision open",
+        None => state,
+    };
+    let from_box = match &message.sender {
+        Sender::Agent(agent) => {
+            let run = agent
+                .run
+                .as_deref()
+                .map(|run| format!(" · run {run}"))
+                .unwrap_or_default();
+            format!(" · {} · box {}{run}", agent.role, agent.box_id)
+        }
+        _ => String::new(),
+    };
+    format!("{sender} → {recipient}{from_box} · {time} · {state}")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }

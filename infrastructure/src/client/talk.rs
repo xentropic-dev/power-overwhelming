@@ -2,7 +2,7 @@ use crate::wire::{self, Request, Response, talk::*};
 use anyhow::{Context, Result, bail};
 use application::talk::{LogFilter, TalkEvent as Event, TalkEventKind as EventKind};
 use domain::talk::{
-    AgentRef, AgentTalkSummary, Delivery, Message, MessageId, Recipient, Sender, ThreadId,
+    AgentRef, AgentTalkSummary, Decision, Delivery, Message, MessageId, Recipient, Sender, ThreadId,
 };
 use std::{io::BufReader, os::unix::net::UnixStream, time::Duration};
 
@@ -53,8 +53,37 @@ pub fn send(
             run,
             body,
             urgent,
+            choices: Vec::new(),
+            expires_in_ms: None,
         },
     )
+}
+
+/// Posts a decision request to the user inbox.
+pub fn ask(
+    caller: Caller,
+    body: String,
+    choices: Vec<String>,
+    expires_in_ms: Option<u64>,
+) -> Result<Message> {
+    messages(
+        caller,
+        TalkCommand::Send {
+            to: Some("user".into()),
+            run: None,
+            body,
+            urgent: false,
+            choices,
+            expires_in_ms,
+        },
+    )?
+    .pop()
+    .context("Daemon queued no decision request")
+}
+
+/// Decision requests to the user from every box. Unless `all`, only open ones.
+pub fn decisions(caller: Caller, all: bool) -> Result<Vec<Message>> {
+    messages(caller, TalkCommand::Decisions { all })
 }
 
 pub fn reply(
@@ -200,6 +229,11 @@ impl From<Message> for TalkMessage {
                 read_at: delivery.read_at,
             },
             urgent: message.urgent,
+            decision: message.decision.map(|d| TalkDecision {
+                choices: d.choices,
+                expires_at: d.expires_at,
+                answered_at: d.answered_at,
+            }),
         }
     }
 }
@@ -245,6 +279,11 @@ impl From<TalkMessage> for Message {
                 read_at: delivery.read_at,
             },
             urgent: message.urgent,
+            decision: message.decision.map(|d| Decision {
+                choices: d.choices,
+                expires_at: d.expires_at,
+                answered_at: d.answered_at,
+            }),
         }
     }
 }

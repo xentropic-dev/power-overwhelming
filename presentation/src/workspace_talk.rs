@@ -179,6 +179,18 @@ impl Workspace {
                         let _ = self.talk_refresh.try_send(());
                     }
                 }
+                None if !event.is_held && dialog.draft.is_none() => {
+                    // Digit keys answer the selected decision request with its choices.
+                    let index = event
+                        .keystroke
+                        .key
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| *n >= 1);
+                    if let Some(send) = index.and_then(|n| dialog.answer(n - 1)) {
+                        self.send_answer(send, window, cx);
+                    }
+                }
                 Some(command @ (Command::TalkCompose | Command::TalkReply)) if !event.is_held => {
                     let focus = cx.focus_handle();
                     let id = self.next_id();
@@ -192,6 +204,28 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    fn send_answer(
+        &mut self,
+        send: talk_dialog::Send,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sent = cx
+            .background_executor()
+            .spawn(async move { send.execute() });
+        cx.spawn_in(window, async move |app, cx| {
+            let result = sent.await;
+            let _ = app.update(cx, |workspace, cx| {
+                if let Some(dialog) = &mut workspace.talk {
+                    dialog.answered(result);
+                    let _ = workspace.talk_refresh.try_send(());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn send_talk(&mut self, window: &mut Window, cx: &mut Context<Self>) {

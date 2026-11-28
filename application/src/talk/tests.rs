@@ -123,6 +123,22 @@ impl TalkReader for Db {
     fn events(&self, _: u64, _: Option<&str>) -> Result<Vec<TalkEvent>> {
         unreachable!()
     }
+    fn decisions(&self, all: bool, now: u64) -> Result<Vec<Message>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| all || decision.is_open(now))
+            })
+            .cloned()
+            .collect())
+    }
 }
 
 impl TalkTransaction for Db {
@@ -141,6 +157,18 @@ impl TalkTransaction for Db {
             }
         }
         Ok(())
+    }
+    fn answer(&self, request: &MessageId, at: u64) -> Result<bool> {
+        for stored in &mut self.0.lock().unwrap().messages {
+            if &stored.id == request
+                && let Some(decision) = &mut stored.decision
+                && decision.answered_at.is_none()
+            {
+                decision.answered_at = Some(at);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -225,6 +253,8 @@ fn send(
             run: None,
             body: body.into(),
             urgent: false,
+            choices: Vec::new(),
+            expires_in: None,
         })?
         .remove(0))
 }
@@ -256,6 +286,8 @@ fn queued_peer_and_user_messages_follow_delivery_and_read_rules() -> Result<()> 
             run: None,
             body: body.into(),
             urgent,
+            choices: Vec::new(),
+            expires_in: None,
         })
     };
     assert!(send(Some("a-session"), "no", true).is_err());
@@ -425,5 +457,50 @@ fn waits_accept_only_a_reply_to_the_requested_message() -> Result<()> {
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn only_the_user_answers_a_decision_request_and_only_once() -> Result<()> {
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = talk(&store, &terminal);
+    let ask = |target, choices: &[&str]| {
+        talk.send(SendMessage {
+            caller: caller(Some("a-session")),
+            target,
+            run: None,
+            body: "Ship it?".into(),
+            urgent: false,
+            choices: choices.iter().map(|c| (*c).into()).collect(),
+            expires_in: Some(60_000),
+        })
+    };
+    assert!(ask(Target::One(Address::Agent("b".into())), &["Approve"]).is_err());
+    assert!(ask(Target::One(Address::User), &[]).is_err());
+    let request = ask(Target::One(Address::User), &["Approve", "Deny"])?.remove(0);
+    assert_eq!(talk.decisions(caller(None), false)?.len(), 1);
+    assert!(talk.decisions(caller(Some("b-session")), false).is_err());
+
+    let answer = |session: Option<&str>| {
+        talk.reply(Reply {
+            caller: Caller {
+                desktop: session.is_none(),
+                ..caller(session)
+            },
+            message: request.id.clone(),
+            recipient_agent: None,
+            body: "Approve".into(),
+            urgent: false,
+        })
+    };
+    let peer = answer(Some("b-session")).unwrap_err();
+    assert!(format!("{peer:#}").contains("Only the user"));
+    let reply = answer(None)?;
+    assert_eq!(reply.sender, Sender::User);
+    assert_eq!(reply.reply_to, Some(request.id.clone()));
+    assert!(answer(None).is_err());
+    assert!(talk.decisions(caller(None), false)?.is_empty());
+    assert_eq!(talk.decisions(caller(None), true)?.len(), 1);
     Ok(())
 }

@@ -19,6 +19,11 @@ pub enum TalkCommand {
         run: Option<String>,
         body: String,
         urgent: bool,
+        /// Makes the message a decision request to the user.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_in_ms: Option<u64>,
     },
     Reply {
         id: String,
@@ -54,6 +59,11 @@ pub enum TalkCommand {
         ready_only: bool,
     },
     Summary,
+    /// Decision requests to the user from every box.
+    Decisions {
+        #[serde(default)]
+        all: bool,
+    },
     Watch,
 }
 
@@ -81,6 +91,15 @@ pub struct TalkMessage {
     pub created_at: u64,
     pub delivery: TalkDelivery,
     pub urgent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<TalkDecision>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TalkDecision {
+    pub choices: Vec<String>,
+    pub expires_at: Option<u64>,
+    pub answered_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

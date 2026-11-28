@@ -1509,3 +1509,108 @@ fn edit_task_tells_the_running_worker_without_a_restart() {
     assert_eq!(events[0]["task"], "a");
     assert_eq!(events[0]["attempt"].as_str(), fixture.a.attempt.as_deref());
 }
+
+#[test]
+fn the_user_answers_decision_requests_from_every_box_and_peers_cannot() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.path();
+    let local = sandbox.launch("a", BOX);
+    let remote = sandbox.launch("remote", REMOTE_BOX);
+    let ask = |agent: &ManagedAgent, question: &str| {
+        let sent = messages(talk(
+            path,
+            Some(agent),
+            &[
+                "ask",
+                "user",
+                "--choices",
+                "Approve,Deny",
+                question,
+                "--json",
+            ],
+        ));
+        sent[0].clone()
+    };
+    let request = ask(&local, "Ship it?");
+    let other = ask(&remote, "Start early?");
+    assert_eq!(request["decision"]["choices"][1], "Deny");
+    assert!(
+        !talk(path, Some(&local), &["ask", "a", "--choices", "A", "x"])
+            .status
+            .success()
+    );
+
+    // One inbox view lists open requests from both boxes.
+    let open = messages(talk(path, None, &["decisions", "--json"]));
+    let ids: Vec<_> = open.iter().map(|m| field(m, "id")).collect();
+    assert_eq!(ids, [field(&request, "id"), field(&other, "id")]);
+    assert_eq!(open[1]["sender"]["box_id"], REMOTE_BOX);
+
+    // A waiter blocks on the answer.
+    let waiter = {
+        let path = path.to_owned();
+        let local = local.clone();
+        let (thread, id) = (
+            field(&request, "thread").to_owned(),
+            field(&request, "id").to_owned(),
+        );
+        thread::spawn(move || {
+            json(talk(
+                &path,
+                Some(&local),
+                &[
+                    "wait",
+                    &thread,
+                    "--reply-to",
+                    &id,
+                    "--timeout",
+                    "20",
+                    "--json",
+                ],
+            ))
+        })
+    };
+
+    // A peer cannot answer.
+    let peer = talk(
+        path,
+        Some(&remote),
+        &["reply", field(&request, "id"), "Approve"],
+    );
+    assert!(!peer.status.success());
+    assert!(String::from_utf8_lossy(&peer.stderr).contains("Only the user"));
+
+    // The desktop answers the way the talk dialog does.
+    let mut socket = UnixStream::connect(path.join("power.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        socket,
+        "{}",
+        serde_json::json!({"request": "talk", "talk": {
+            "command": "reply", "box_sel": BOX, "desktop": true,
+            "id": field(&request, "id"), "recipient_agent": null,
+            "body": "Approve", "urgent": false,
+        }})
+    )
+    .unwrap();
+    let answered = socket_response(&mut BufReader::new(socket));
+    assert_eq!(
+        answered["talk"]["messages"][0]["sender"]["kind"], "user",
+        "{answered}"
+    );
+
+    let reply = waiter.join().unwrap();
+    assert_eq!(reply["reply"]["sender"]["kind"], "user");
+    assert_eq!(reply["reply"]["body"], "Approve");
+    let envelope = success(talk(path, Some(&local), &["inbox"]));
+    assert!(envelope.contains("Message from the user."), "{envelope}");
+
+    // Answered requests leave the open list but stay in the history.
+    let open = messages(talk(path, None, &["decisions", "--json"]));
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0]["id"], other["id"]);
+    let all = messages(talk(path, None, &["decisions", "--all", "--json"]));
+    assert!(all[0]["decision"]["answered_at"].is_u64());
+}

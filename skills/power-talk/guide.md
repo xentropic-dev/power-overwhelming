@@ -92,3 +92,19 @@ state for the session in `POWER_SESSION`.
 The desktop opens an agent's talk dialog with Ctrl+T from the agent tree
 (Ctrl+B, then A). Use Ctrl+N to compose and Ctrl+R to reply. Ctrl+B, then M
 opens the active box's user inbox.
+
+## Asking the user to decide
+
+```sh
+power talk ask user --choices "Approve,Deny" "Cap reviews at 2 rounds for this run?" --wait
+power dag report needs-input --summary "Start task b early?" --choices "Yes,No"
+```
+
+A decision request goes to the user inbox, which lists open requests from
+every box first. The user answers with a digit key for a choice, or Ctrl+R
+for a typed reply. The answer comes back to you as a message from the user,
+with the user's authority. Only the user can answer, and only once. A peer's
+reply to the request is rejected, so an answer in the thread is never forged.
+`--expires <SECS>` closes an unanswered request. Answered and expired
+requests leave the open list and stay in the history. `report needs-input
+--choices` prints the thread and message IDs to pass to `power talk wait`.

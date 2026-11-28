@@ -86,6 +86,48 @@ pub struct Message {
     pub created_at: u64,
     pub delivery: Delivery,
     pub urgent: bool,
+    /// Set on a decision request to the user.
+    pub decision: Option<Decision>,
+}
+
+pub const MAX_CHOICES: usize = 9;
+pub const MAX_CHOICE_BYTES: usize = 64;
+
+/// A question to the user with fixed answers. Only a reply with the user's authority
+/// answers it, once, before it expires.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Decision {
+    pub choices: Vec<String>,
+    pub expires_at: Option<u64>,
+    pub answered_at: Option<u64>,
+}
+
+impl Decision {
+    /// Checks the answers an asker offers.
+    pub fn new(choices: Vec<String>, expires_at: Option<u64>) -> Result<Self, String> {
+        if choices.is_empty() || choices.len() > MAX_CHOICES {
+            return Err(format!("Offer between 1 and {MAX_CHOICES} choices"));
+        }
+        for (index, choice) in choices.iter().enumerate() {
+            if choice.trim().is_empty() || choice.len() > MAX_CHOICE_BYTES {
+                return Err(format!(
+                    "Each choice needs 1 to {MAX_CHOICE_BYTES} bytes of text"
+                ));
+            }
+            if choices[..index].contains(choice) {
+                return Err(format!("Choice {choice:?} is listed twice"));
+            }
+        }
+        Ok(Self {
+            choices,
+            expires_at,
+            answered_at: None,
+        })
+    }
+
+    pub fn is_open(&self, now: u64) -> bool {
+        self.answered_at.is_none() && self.expires_at.is_none_or(|at| at > now)
+    }
 }
 
 /// The delivery metadata of an unread message, without its body.
@@ -394,6 +436,17 @@ pub fn envelope(message: &Message) -> String {
         framed.push('\n');
         framed.push_str(QUOTE);
         framed.push_str(&escape_controls(line));
+    }
+    if let Some(decision) = &message.decision {
+        let choices: Vec<_> = decision
+            .choices
+            .iter()
+            .map(|c| escape_controls(c))
+            .collect();
+        framed.push_str(&format!(
+            "\nDecision request. Choices: {}. Only the user can answer it.",
+            choices.join(", ")
+        ));
     }
     framed
 }

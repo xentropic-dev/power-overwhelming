@@ -6,10 +6,12 @@ use application::talk::{
 };
 use domain::dag::ManagedAgent;
 use domain::talk::{
-    AgentRef, AgentTalkSummary, Delivery, Directory, Message, MessageId, Queued, Recipient, RunRef,
-    Sender, ThreadId,
+    AgentRef, AgentTalkSummary, Decision, Delivery, Directory, Message, MessageId, Queued,
+    Recipient, RunRef, Sender, ThreadId,
 };
-use rusqlite::{Connection, OptionalExtension, Params, Row, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Params, Row, TransactionBehavior, params, types::Type,
+};
 use std::time::Instant;
 
 pub(super) fn migrate(db: &Connection) -> Result<()> {
@@ -43,6 +45,20 @@ pub(super) fn migrate(db: &Connection) -> Result<()> {
     if !has_sender_box {
         // `box_id` is the recipient's box. A peer may write from another one.
         db.execute("ALTER TABLE talk_messages ADD COLUMN sender_box TEXT", [])?;
+    }
+    let has_decision: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('talk_messages')
+             WHERE name = 'decision_choices')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_decision {
+        // A JSON array of choices marks a decision request to the user.
+        db.execute_batch(
+            "ALTER TABLE talk_messages ADD COLUMN decision_choices TEXT;
+             ALTER TABLE talk_messages ADD COLUMN decision_expires_at INTEGER;
+             ALTER TABLE talk_messages ADD COLUMN decision_answered_at INTEGER;",
+        )?;
     }
     Ok(())
 }
@@ -84,7 +100,8 @@ struct TalkDb<'a>(&'a Connection);
 const COLUMNS: &str =
     "id, box_id, sender_kind, sender_agent, sender_provider, sender_role, sender_run,
      recipient_agent, body, thread, reply_to, broadcast, run, created_at, queued_at,
-     notified_at, reminded_at, read_at, urgent, sender_box";
+     notified_at, reminded_at, read_at, urgent, sender_box,
+     decision_choices, decision_expires_at, decision_answered_at";
 
 /// Reads sender and recipient from columns 1–7 of COLUMNS or QUEUED_COLUMNS, and the
 /// sender's box from column `sender_box`. Rows written before it existed share one box.
@@ -154,6 +171,16 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
             read_at: row.get(17)?,
         },
         urgent: row.get(18)?,
+        decision: match row.get::<_, Option<String>>(20)? {
+            Some(choices) => Some(Decision {
+                choices: serde_json::from_str(&choices).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(20, Type::Text, error.into())
+                })?,
+                expires_at: row.get(21)?,
+                answered_at: row.get(22)?,
+            }),
+            None => None,
+        },
     })
 }
 
@@ -350,6 +377,16 @@ impl TalkReader for TalkDb<'_> {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    fn decisions(&self, all: bool, now: u64) -> Result<Vec<Message>> {
+        self.messages(
+            "WHERE decision_choices IS NOT NULL AND recipient_agent IS NULL
+               AND (?1 OR (decision_answered_at IS NULL
+                   AND (decision_expires_at IS NULL OR decision_expires_at > ?2)))
+             ORDER BY rowid",
+            params![all, now],
+        )
+    }
+
     fn cursor(&self) -> Result<u64> {
         Ok(self
             .0
@@ -394,7 +431,7 @@ impl TalkTransaction for TalkDb<'_> {
         self.0.execute(
             &format!(
                 "INSERT INTO talk_messages({COLUMNS}) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
             )"
             ),
             params![
@@ -417,7 +454,14 @@ impl TalkTransaction for TalkDb<'_> {
                 message.delivery.reminded_at,
                 message.delivery.read_at,
                 message.urgent,
-                agent.map(|a| &a.box_id)
+                agent.map(|a| &a.box_id),
+                message
+                    .decision
+                    .as_ref()
+                    .map(|d| serde_json::to_string(&d.choices))
+                    .transpose()?,
+                message.decision.as_ref().and_then(|d| d.expires_at),
+                message.decision.as_ref().and_then(|d| d.answered_at),
             ],
         )?;
         self.event(&message.id, "talk_message")
@@ -438,6 +482,15 @@ impl TalkTransaction for TalkDb<'_> {
             }
         }
         Ok(())
+    }
+
+    fn answer(&self, request: &MessageId, at: u64) -> Result<bool> {
+        let changed = self.0.execute(
+            "UPDATE talk_messages SET decision_answered_at = ?1
+             WHERE id = ?2 AND decision_choices IS NOT NULL AND decision_answered_at IS NULL",
+            params![at, request.0],
+        )?;
+        Ok(changed != 0)
     }
 }
 
@@ -473,6 +526,7 @@ mod tests {
                 ..Delivery::default()
             },
             urgent: false,
+            decision: None,
         };
         store.write(|db| db.insert(&message))?;
         assert!(
