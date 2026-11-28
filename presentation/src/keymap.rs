@@ -96,6 +96,7 @@ pub enum Command {
     TerminalScrollPageDown,
     TerminalScrollTop,
     TerminalScrollBottom,
+    TerminalSelectAll,
     PreviewPrevious,
     PreviewNext,
     PreviewClose,
@@ -362,6 +363,7 @@ const TABLE: &[Entry] = &[
     entry(S::Terminal, "scroll_page_down", C::TerminalScrollPageDown, &["shift-pagedown"], "Scroll the scrollback down a page"),
     entry(S::Terminal, "scroll_top", C::TerminalScrollTop, &["shift-home"], "Scroll to the top of the scrollback"),
     entry(S::Terminal, "scroll_bottom", C::TerminalScrollBottom, &["shift-end"], "Scroll back to the prompt"),
+    entry(S::Terminal, "select_all", C::TerminalSelectAll, &["ctrl-shift-a"], "Select the screen and scrollback"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]

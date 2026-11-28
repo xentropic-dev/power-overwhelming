@@ -3078,6 +3078,10 @@ impl Workspace {
                 Command::TerminalScrollPageDown => view.scroll_history(ScrollTarget::Pages(1), cx),
                 Command::TerminalScrollTop => view.scroll_history(ScrollTarget::Top, cx),
                 Command::TerminalScrollBottom => view.scroll_history(ScrollTarget::Bottom, cx),
+                Command::TerminalSelectAll if !event.is_held => {
+                    view.select_all(cx);
+                    true
+                }
                 _ => true,
             });
             if handled {

@@ -168,7 +168,7 @@ impl Render for TerminalView {
         let block_font = terminal_font.clone();
         let hovered = self.hovered_span(window.modifiers());
         let pressed = self.pressed_span();
-        let selection = self.selection_range().filter(|_| pressed.is_none());
+        let selection = self.selection.filter(|_| pressed.is_none());
         let ligatures = self.settings.ligatures;
         let bold_weight = FontWeight(f32::from(self.settings.font_weight_bold));
         let revision = self.paint_revision;
@@ -190,7 +190,6 @@ impl Render for TerminalView {
             .on_hover(cx.listener(Self::hover))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
-            .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(Self::mouse_down),
@@ -199,9 +198,10 @@ impl Render for TerminalView {
                 MouseButton::Navigate(NavigationDirection::Forward),
                 cx.listener(Self::mouse_down),
             )
-            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_mouse_move(cx.listener(Self::hover_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up_out))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::middle_down))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(
                 canvas(
