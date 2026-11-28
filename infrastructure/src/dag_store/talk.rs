@@ -1,4 +1,4 @@
-use super::{DagDb, SqliteDagStore, run_from_row};
+use super::{DagDb, SqliteDagStore};
 use anyhow::Result;
 use application::dag::DagReader;
 use application::talk::{
@@ -6,8 +6,8 @@ use application::talk::{
 };
 use domain::dag::ManagedAgent;
 use domain::talk::{
-    AgentRef, AgentTalkSummary, Decision, Delivery, Directory, Message, MessageId, Queued,
-    Recipient, RunRef, Sender, ThreadId,
+    AgentRef, AgentTalkSummary, Decision, Delivery, Directory, Grant, GrantRelay, GrantScope,
+    Message, MessageId, Queued, Recipient, RunRef, Sender, ThreadId,
 };
 use rusqlite::{
     Connection, OptionalExtension, Params, Row, TransactionBehavior, params, types::Type,
@@ -34,7 +34,13 @@ pub(super) fn migrate(db: &Connection) -> Result<()> {
              seq INTEGER PRIMARY KEY AUTOINCREMENT, box_id TEXT NOT NULL,
              message TEXT NOT NULL REFERENCES talk_messages(id), kind TEXT NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS talk_events_box ON talk_events(box_id, seq);",
+         CREATE INDEX IF NOT EXISTS talk_events_box ON talk_events(box_id, seq);
+         CREATE TABLE IF NOT EXISTS talk_grants (
+             id TEXT PRIMARY KEY, agent TEXT NOT NULL, box_id TEXT NOT NULL,
+             scope TEXT NOT NULL, created_at INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+             approved_at INTEGER, revoked_at INTEGER, request TEXT
+         );
+         CREATE INDEX IF NOT EXISTS talk_grants_agent ON talk_grants(agent);",
     )?;
     // Each column is checked and added on its own, so a startup interrupted between two
     // additions repairs the rest on the next one.
@@ -45,6 +51,9 @@ pub(super) fn migrate(db: &Connection) -> Result<()> {
         ("decision_choices", "TEXT"),
         ("decision_expires_at", "INTEGER"),
         ("decision_answered_at", "INTEGER"),
+        // The grant a relayed message carried when Power stamped it.
+        ("grant_id", "TEXT"),
+        ("grant_scope", "TEXT"),
     ] {
         add_missing_column(db, column, kind)?;
     }
@@ -119,7 +128,7 @@ const COLUMNS: &str =
     "id, box_id, sender_kind, sender_agent, sender_provider, sender_role, sender_run,
      recipient_agent, body, thread, reply_to, broadcast, run, created_at, queued_at,
      notified_at, reminded_at, read_at, urgent, sender_box,
-     decision_choices, decision_expires_at, decision_answered_at";
+     decision_choices, decision_expires_at, decision_answered_at, grant_id, grant_scope";
 
 /// Reads sender and recipient from columns 1–7 of COLUMNS or QUEUED_COLUMNS, and the
 /// sender's box from column `sender_box`. Rows written before it existed share one box.
@@ -199,6 +208,35 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
             }),
             None => None,
         },
+        grant: match row.get::<_, Option<String>>(23)? {
+            Some(id) => Some(GrantRelay {
+                id,
+                scope: scope_column(row, 24)?,
+            }),
+            None => None,
+        },
+    })
+}
+
+fn scope_column(row: &Row<'_>, index: usize) -> rusqlite::Result<GrantScope> {
+    GrantScope::parse(&row.get::<_, String>(index)?)
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(index, Type::Text, error.into()))
+}
+
+const GRANT_COLUMNS: &str =
+    "id, agent, box_id, scope, created_at, duration_ms, approved_at, revoked_at, request";
+
+fn grant_from_row(row: &Row<'_>) -> rusqlite::Result<Grant> {
+    Ok(Grant {
+        id: row.get(0)?,
+        agent: row.get(1)?,
+        box_id: row.get(2)?,
+        scope: scope_column(row, 3)?,
+        created_at: row.get(4)?,
+        duration_ms: row.get(5)?,
+        approved_at: row.get(6)?,
+        revoked_at: row.get(7)?,
+        request: row.get::<_, Option<String>>(8)?.map(MessageId),
     })
 }
 
@@ -230,23 +268,26 @@ impl TalkDb<'_> {
 
 impl TalkReader for TalkDb<'_> {
     fn directory(&self) -> Result<Directory> {
-        let runs = self
+        let sessions: std::collections::HashMap<String, Option<String>> = self
             .0
-            .prepare(
-                "SELECT id, box_id, title, coordinator, created_at, archived_at, paused_at,
-                        coordinator_session FROM runs",
-            )?
-            .query_map([], |row| Ok((run_from_row(row)?, row.get(7)?)))?
-            .map(|row| {
-                let (run, coordinator_session) = row?;
-                Ok(RunRef {
+            .prepare("SELECT id, coordinator_session FROM runs")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Finished the way the DAG listing decides it: archived, or every task completed.
+        let runs = DagDb(self.0)
+            .list_runs(None)?
+            .into_iter()
+            .map(|mut run| {
+                run.derive_task_states();
+                RunRef {
+                    finished: run.status().is_finished(),
+                    coordinator_session: sessions.get(&run.id).cloned().flatten(),
                     id: run.id,
                     box_id: run.box_id,
                     coordinator: run.coordinator,
-                    coordinator_session,
-                })
+                }
             })
-            .collect::<rusqlite::Result<_>>()?;
+            .collect();
         Ok(Directory {
             agents: DagDb(self.0).list_agents(None)?,
             runs,
@@ -436,6 +477,28 @@ impl TalkReader for TalkDb<'_> {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
+
+    fn grants(&self, agent: Option<&str>) -> Result<Vec<Grant>> {
+        Ok(self
+            .0
+            .prepare(&format!(
+                "SELECT {GRANT_COLUMNS} FROM talk_grants WHERE ?1 IS NULL OR agent = ?1
+                 ORDER BY rowid"
+            ))?
+            .query_map([agent], grant_from_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn grant_for_request(&self, request: &MessageId) -> Result<Option<Grant>> {
+        Ok(self
+            .0
+            .query_row(
+                &format!("SELECT {GRANT_COLUMNS} FROM talk_grants WHERE request = ?1"),
+                [&request.0],
+                grant_from_row,
+            )
+            .optional()?)
+    }
 }
 
 impl TalkTransaction for TalkDb<'_> {
@@ -449,7 +512,7 @@ impl TalkTransaction for TalkDb<'_> {
         self.0.execute(
             &format!(
                 "INSERT INTO talk_messages({COLUMNS}) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
             )"
             ),
             params![
@@ -480,6 +543,8 @@ impl TalkTransaction for TalkDb<'_> {
                     .transpose()?,
                 message.decision.as_ref().and_then(|d| d.expires_at),
                 message.decision.as_ref().and_then(|d| d.answered_at),
+                message.grant.as_ref().map(|g| &g.id),
+                message.grant.as_ref().map(|g| g.scope.as_str()),
             ],
         )?;
         self.event(&message.id, "talk_message")
@@ -510,11 +575,141 @@ impl TalkTransaction for TalkDb<'_> {
         )?;
         Ok(changed != 0)
     }
+
+    fn insert_grant(&self, grant: &Grant) -> Result<()> {
+        self.0.execute(
+            &format!(
+                "INSERT INTO talk_grants({GRANT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            ),
+            params![
+                grant.id,
+                grant.agent,
+                grant.box_id,
+                grant.scope.as_str(),
+                grant.created_at,
+                grant.duration_ms,
+                grant.approved_at,
+                grant.revoked_at,
+                grant.request.as_ref().map(|id| &id.0),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn approve_grant(&self, id: &str, at: u64) -> Result<bool> {
+        Ok(self.0.execute(
+            "UPDATE talk_grants SET approved_at = ?1
+             WHERE id = ?2 AND approved_at IS NULL AND revoked_at IS NULL",
+            params![at, id],
+        )? != 0)
+    }
+
+    fn revoke_grant(&self, id: &str, at: u64) -> Result<bool> {
+        Ok(self.0.execute(
+            "UPDATE talk_grants SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+            params![at, id],
+        )? != 0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_directory_marks_runs_finished_the_way_the_dag_listing_does() -> Result<()> {
+        use application::dag::DagStore;
+        use domain::dag::{
+            AgentState, AgentStatus, Attempt, AttemptState, Coordinator, Provider, Run, TaskSpec,
+        };
+        let file = tempfile::NamedTempFile::new()?;
+        let store = SqliteDagStore::initialize(Connection::open(file.path())?)?;
+        let agent = ManagedAgent {
+            id: "coord".into(),
+            box_id: "box".into(),
+            worktree: "/worktree".into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: Some("session".into()),
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            paused: false,
+            status: AgentStatus::Idle,
+            label: "coord".into(),
+            created_at: 1,
+        };
+        let run = |id: &str| Run {
+            id: id.into(),
+            box_id: "box".into(),
+            title: id.into(),
+            coordinator: Coordinator::Agent {
+                agent: "coord".into(),
+            },
+            created_at: 1,
+            archived_at: None,
+            paused_at: None,
+            tasks: Vec::new(),
+        };
+        let task = TaskSpec {
+            id: "t".into(),
+            title: "t".into(),
+            instructions: String::new(),
+            deps: Vec::new(),
+            provider: None,
+            model: None,
+        };
+        DagStore::write(&store, |db| {
+            db.insert_agent(&agent)?;
+            for id in ["active", "completed", "archived"] {
+                db.insert_run(&run(id))?;
+                db.insert_tasks(id, std::slice::from_ref(&task))?;
+            }
+            db.insert_attempt(
+                "completed",
+                "t",
+                &Attempt {
+                    id: "attempt".into(),
+                    number: 1,
+                    agent: "coord".into(),
+                    session: None,
+                    worktree: "/worktree".into(),
+                    provider: Provider::Command,
+                    model: None,
+                    state: AttemptState::Succeeded,
+                    summary: None,
+                    blocker: None,
+                    detail: None,
+                    started_at: 1,
+                    ended_at: Some(2),
+                    paused: false,
+                    stalled: false,
+                    artifacts: Vec::new(),
+                    explicit_worktree: None,
+                },
+            )?;
+            db.set_run_archived("archived", Some(3))
+        })?;
+        let directory = TalkStore::read(&store, |db| db.directory())?;
+        let finished: Vec<_> = directory
+            .runs
+            .iter()
+            .map(|run| (run.id.as_str(), run.finished))
+            .collect();
+        assert_eq!(
+            finished,
+            [("active", false), ("completed", true), ("archived", true)]
+        );
+        assert!(
+            directory
+                .runs
+                .iter()
+                .all(|run| run.coordinator_session.as_deref() == Some("session"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn opens_pre_talk_database_and_persists_messages_and_events() -> Result<()> {
@@ -545,6 +740,7 @@ mod tests {
             },
             urgent: false,
             decision: None,
+            grant: None,
         };
         store.write(|db| db.insert(&message))?;
         assert!(
@@ -610,6 +806,7 @@ mod tests {
                 expires_at: Some(50),
                 answered_at: None,
             }),
+            grant: None,
         };
         store.write(|db| db.insert(&message))?;
         store.write(|db| {

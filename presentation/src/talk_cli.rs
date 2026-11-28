@@ -2,7 +2,8 @@ use anyhow::{Context, Result, ensure};
 use application::talk::LogFilter;
 use clap::{Args, Subcommand};
 use domain::talk::{
-    MAX_BODY_BYTES, Message, MessageId, Recipient, ThreadId, envelope, hook_reason,
+    Grant, GrantScope, MAX_BODY_BYTES, Message, MessageId, Recipient, ThreadId, envelope,
+    hook_reason,
 };
 use infrastructure::client::{
     self,
@@ -43,9 +44,28 @@ enum Action {
         run: Option<String>,
         #[arg(long)]
         urgent: bool,
+        /// Relay the user's decision under your grant in this scope. Without an active
+        /// grant in it, the message goes as a plain peer message.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
         #[command(flatten)]
         input: InputOptions,
     },
+    /// Grant an agent authority to relay your decisions in one scope, for a limited time.
+    /// Only the user can. From a shell, the grant waits for approval in the desktop inbox.
+    Grant {
+        agent: String,
+        /// dag-policy (review caps, starting or reordering tasks) or dag-merge.
+        #[arg(long, value_name = "SCOPE")]
+        scope: String,
+        /// How long the grant lasts, such as 90s, 30m, 2h or 1d. At most 7 days.
+        #[arg(long, value_name = "DURATION")]
+        expires: String,
+    },
+    /// End a grant at once.
+    Revoke { id: String },
+    /// List grants with their state.
+    Grants,
     /// Ask the user a question with fixed answers. It appears in the user inbox of every box.
     Ask {
         /// Recipient (only `user`) followed by the question. Use - for stdin.
@@ -71,6 +91,9 @@ enum Action {
         id: String,
         #[arg(value_name = "MESSAGE")]
         words: Vec<String>,
+        /// Relay the user's decision under your grant in this scope.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
         #[command(flatten)]
         input: InputOptions,
     },
@@ -154,12 +177,62 @@ pub fn run(args: TalkArgs) -> Result<()> {
             to,
             run,
             urgent,
+            scope,
             input,
         } => {
+            let scope = scope.as_deref().map(parse_scope).transpose()?;
             let (to, words) = recipient_and_body(words, to, run.is_some(), input.file.is_some())?;
             let body = body(words, input.file)?;
-            let messages = talk::send(caller.clone(), to, run, body, urgent)?;
+            let messages = talk::send_scoped(caller.clone(), to, run, body, urgent, scope)?;
             sent(caller, messages, input.wait, input.timeout, json)
+        }
+        Action::Grant {
+            agent,
+            scope,
+            expires,
+        } => {
+            let (grant, request) = talk::grant(
+                caller,
+                agent,
+                parse_scope(&scope)?,
+                parse_duration(&expires)?,
+            )?;
+            if json {
+                return super::print_json(json!({
+                    "grant": talk::grant_json(&grant, now_ms()),
+                    "request": request.into_iter().next().map(talk::json),
+                }));
+            }
+            print_grant(&grant);
+            if grant.approved_at.is_none() {
+                println!(
+                    "Sent from a shell, so it waits for you to approve it in the desktop inbox (Ctrl+B, then M)."
+                );
+            }
+            Ok(())
+        }
+        Action::Revoke { id } => {
+            let grant = talk::revoke(caller, id)?;
+            if json {
+                return super::print_json(json!({"grant": talk::grant_json(&grant, now_ms())}));
+            }
+            print_grant(&grant);
+            Ok(())
+        }
+        Action::Grants => {
+            let grants = talk::grants(caller)?;
+            let now = now_ms();
+            if json {
+                let grants: Vec<_> = grants.iter().map(|g| talk::grant_json(g, now)).collect();
+                return super::print_json(json!({"grants": grants}));
+            }
+            if grants.is_empty() {
+                println!("No grants.");
+            }
+            for grant in &grants {
+                print_grant(grant);
+            }
+            Ok(())
         }
         Action::Ask {
             words,
@@ -180,9 +253,15 @@ pub fn run(args: TalkArgs) -> Result<()> {
             sent(caller, vec![message], input.wait, input.timeout, json)
         }
         Action::Decisions { all } => print_messages(talk::decisions(caller, all)?, json, false),
-        Action::Reply { id, words, input } => {
+        Action::Reply {
+            id,
+            words,
+            scope,
+            input,
+        } => {
+            let scope = scope.as_deref().map(parse_scope).transpose()?;
             let body = body(words, input.file)?;
-            let message = talk::reply(caller.clone(), MessageId(id), body, None)?;
+            let message = talk::reply_scoped(caller.clone(), MessageId(id), body, None, scope)?;
             sent(caller, vec![message], input.wait, input.timeout, json)
         }
         Action::Inbox { peek, all } => print_messages(talk::inbox(caller, all, peek)?, json, false),
@@ -274,6 +353,53 @@ pub fn run(args: TalkArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn parse_scope(scope: &str) -> Result<GrantScope> {
+    GrantScope::parse(scope).map_err(anyhow::Error::msg)
+}
+
+/// Parses 90s, 30m, 2h or 1d into milliseconds.
+fn parse_duration(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number
+        .parse()
+        .with_context(|| format!("Use a duration such as 30m or 2h, not {text:?}"))?;
+    let unit = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => anyhow::bail!("Use a duration such as 30m or 2h, not {text:?}"),
+    };
+    number.checked_mul(unit).context("Duration is too large")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn print_grant(grant: &Grant) {
+    let expires = grant
+        .expires_at()
+        .and_then(|at| chrono::DateTime::from_timestamp_millis(i64::try_from(at).ok()?))
+        .map(|at| format!(" · expires {}", at.to_rfc3339()))
+        .unwrap_or_default();
+    println!(
+        "Grant {} · agent {} · scope {} · {} · {}{expires}",
+        grant.id,
+        grant.agent,
+        grant.scope.as_str(),
+        application::talk::duration_label(grant.duration_ms),
+        grant.state(now_ms()),
+    );
 }
 
 fn report_turn(caller: Caller, ready: bool, from_notify: bool, json: bool) -> Result<()> {
@@ -471,4 +597,18 @@ fn print_messages(messages: Vec<Message>, json: bool, delivery: bool) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn durations_parse_with_a_unit() {
+        assert_eq!(super::parse_duration("90s").unwrap(), 90_000);
+        assert_eq!(super::parse_duration("30m").unwrap(), 1_800_000);
+        assert_eq!(super::parse_duration("2h").unwrap(), 7_200_000);
+        assert_eq!(super::parse_duration("1d").unwrap(), 86_400_000);
+        for bad in ["", "h", "30", "5w", "-1h"] {
+            assert!(super::parse_duration(bad).is_err(), "{bad}");
+        }
+    }
 }

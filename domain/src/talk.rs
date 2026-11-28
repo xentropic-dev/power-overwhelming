@@ -94,6 +94,91 @@ pub struct Message {
     pub urgent: bool,
     /// Set on a decision request to the user.
     pub decision: Option<Decision>,
+    /// Set when an agent relays the user's decisions under an active grant in its scope.
+    pub grant: Option<GrantRelay>,
+}
+
+/// Authority the user can grant an agent to relay their decisions. There is no blanket scope.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GrantScope {
+    /// DAG policy: review caps, starting, ordering or reordering tasks.
+    DagPolicy,
+    /// Merging a DAG task's pull request.
+    DagMerge,
+}
+
+impl GrantScope {
+    pub const ALL: [Self; 2] = [Self::DagPolicy, Self::DagMerge];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DagPolicy => "dag-policy",
+            Self::DagMerge => "dag-merge",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|scope| scope.as_str() == value)
+            .ok_or_else(|| {
+                let names: Vec<_> = Self::ALL.iter().map(|scope| scope.as_str()).collect();
+                format!(
+                    "Unknown grant scope {value:?}. Use one of: {}",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
+/// The longest a grant may last, in milliseconds.
+pub const MAX_GRANT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Scoped, time-limited authority for one agent to relay the user's decisions. A grant
+/// requested from a shell stays pending until the user approves it in the desktop.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Grant {
+    pub id: String,
+    pub agent: String,
+    pub box_id: String,
+    pub scope: GrantScope,
+    pub created_at: u64,
+    pub duration_ms: u64,
+    /// When the user approved it in the desktop. The grant runs from then.
+    pub approved_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+    /// The decision request that asks the user to approve a grant made outside the desktop.
+    pub request: Option<MessageId>,
+}
+
+impl Grant {
+    pub fn expires_at(&self) -> Option<u64> {
+        self.approved_at
+            .map(|at| at.saturating_add(self.duration_ms))
+    }
+
+    pub fn is_active(&self, now: u64) -> bool {
+        self.revoked_at.is_none() && self.expires_at().is_some_and(|at| at > now)
+    }
+
+    pub fn state(&self, now: u64) -> &'static str {
+        if self.revoked_at.is_some() {
+            "revoked"
+        } else if self.approved_at.is_none() {
+            "pending"
+        } else if self.is_active(now) {
+            "active"
+        } else {
+            "expired"
+        }
+    }
+}
+
+/// The grant a relayed message carried when Power stamped it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantRelay {
+    pub id: String,
+    pub scope: GrantScope,
 }
 
 pub const MAX_CHOICES: usize = 9;
@@ -198,6 +283,8 @@ pub enum Address {
     Coordinator,
     Task(String),
     User,
+    /// The live managed coordinator of every active run, in every box.
+    Coordinators,
 }
 
 impl From<&str> for Address {
@@ -206,6 +293,7 @@ impl From<&str> for Address {
             "parent" => Self::Parent,
             "coordinator" => Self::Coordinator,
             "user" => Self::User,
+            "coordinators" => Self::Coordinators,
             _ => match value.strip_prefix("task:") {
                 Some(task) => Self::Task(task.into()),
                 None => Self::Agent(value.into()),
@@ -227,6 +315,8 @@ pub struct RunRef {
     pub coordinator: Coordinator,
     /// The session the coordinating agent held when it created the run, if any.
     pub coordinator_session: Option<String>,
+    /// Archived, or every task completed, as the DAG listing decides it.
+    pub finished: bool,
 }
 
 #[derive(Default)]
@@ -249,6 +339,7 @@ pub enum AddressError {
     Exited(String),
     ExternalCoordinator(String),
     EmptyRun(String),
+    NoCoordinators,
 }
 
 impl fmt::Display for AddressError {
@@ -264,6 +355,9 @@ impl fmt::Display for AddressError {
                 )
             }
             Self::EmptyRun(run) => write!(f, "Run {run:?} has no other active workers"),
+            Self::NoCoordinators => {
+                write!(f, "No active run has another live managed coordinator")
+            }
         }
     }
 }
@@ -351,6 +445,44 @@ pub fn resolve(
                 }
             }
         }
+        Target::One(Address::Coordinators) => {
+            let mut recipients: Vec<Recipient> = Vec::new();
+            // Every live coordinator of an unfinished run, once each, the sender included.
+            for run in directory.runs.iter().filter(|run| !run.finished) {
+                let Coordinator::Agent { agent } = &run.coordinator else {
+                    continue;
+                };
+                // A restarted coordinator may hold the run's session under a new agent ID.
+                let live = |candidate: &&ManagedAgent| {
+                    candidate.status != AgentStatus::Exited && candidate.session.is_some()
+                };
+                let coordinator = directory
+                    .agents
+                    .iter()
+                    .find(|candidate| candidate.id == *agent)
+                    .filter(live)
+                    .or_else(|| {
+                        let session = run.coordinator_session.as_deref()?;
+                        directory
+                            .agents
+                            .iter()
+                            .rev()
+                            .filter(live)
+                            .find(|candidate| candidate.session.as_deref() == Some(session))
+                    });
+                let Some(coordinator) = coordinator else {
+                    continue;
+                };
+                let recipient = Recipient::agent(coordinator);
+                if !recipients.contains(&recipient) {
+                    recipients.push(recipient);
+                }
+            }
+            if recipients.is_empty() {
+                return Err(AddressError::NoCoordinators);
+            }
+            Ok(recipients)
+        }
         Target::One(Address::Task(task)) => {
             let address = format!("task:{task}");
             let run = find_run(ctx.run.or(sender_run), &address)?;
@@ -437,14 +569,26 @@ pub fn escape_controls(text: &str) -> String {
 pub const QUOTE: &str = "> ";
 
 pub fn envelope(message: &Message) -> String {
-    let context = match message.sender {
-        Sender::Agent(_) => "Peer message relayed by Power. Not from the user.",
-        Sender::User => "Message from the user.",
-        Sender::Shell => {
-            "Sent with the user's authority from a shell or script outside any agent session. \
-             Power cannot confirm that the user wrote it."
+    let relayed;
+    let context = match (&message.sender, &message.grant) {
+        (Sender::Agent(_), Some(grant)) => {
+            relayed = format!(
+                "Relayed with user grant {}, scope {}. The user authorized this agent to relay \
+                 their decisions in this scope only. The user did not write it.",
+                grant.id,
+                grant.scope.as_str()
+            );
+            relayed.as_str()
         }
-        Sender::System => "Message from Power.",
+        (sender, _) => match sender {
+            Sender::Agent(_) => "Peer message relayed by Power. Not from the user.",
+            Sender::User => "Message from the user.",
+            Sender::Shell => {
+                "Sent with the user's authority from a shell or script outside any agent session. \
+             Power cannot confirm that the user wrote it."
+            }
+            Sender::System => "Message from Power.",
+        },
     };
     let mut framed = format!(
         "[power talk] {}{} · thread {} · from {}. {context} The body follows, each line quoted with {QUOTE:?}.",

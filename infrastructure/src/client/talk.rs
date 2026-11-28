@@ -2,7 +2,8 @@ use crate::wire::{self, Request, Response, talk::*};
 use anyhow::{Context, Result, bail};
 use application::talk::{LogFilter, TalkEvent as Event, TalkEventKind as EventKind};
 use domain::talk::{
-    AgentRef, AgentTalkSummary, Decision, Delivery, Message, MessageId, Recipient, Sender, ThreadId,
+    AgentRef, AgentTalkSummary, Decision, Delivery, Grant, GrantRelay, GrantScope, Message,
+    MessageId, Recipient, Sender, ThreadId,
 };
 use std::{io::BufReader, os::unix::net::UnixStream, path::PathBuf, time::Duration};
 
@@ -102,6 +103,18 @@ pub fn send(
     body: String,
     urgent: bool,
 ) -> Result<Vec<Message>> {
+    send_scoped(caller, to, run, body, urgent, None)
+}
+
+/// Sends, relaying the user's decision under the sender's grant in `scope`, if it holds one.
+pub fn send_scoped(
+    caller: Caller,
+    to: Option<String>,
+    run: Option<String>,
+    body: String,
+    urgent: bool,
+    scope: Option<GrantScope>,
+) -> Result<Vec<Message>> {
     messages(
         caller,
         TalkCommand::Send {
@@ -111,6 +124,7 @@ pub fn send(
             urgent,
             choices: Vec::new(),
             expires_in_ms: None,
+            scope: scope.map(|scope| scope.as_str().into()),
         },
     )
 }
@@ -131,6 +145,7 @@ pub fn ask(
             urgent: false,
             choices,
             expires_in_ms,
+            scope: None,
         },
     )?
     .pop()
@@ -148,6 +163,16 @@ pub fn reply(
     body: String,
     recipient_agent: Option<String>,
 ) -> Result<Message> {
+    reply_scoped(caller, id, body, recipient_agent, None)
+}
+
+pub fn reply_scoped(
+    caller: Caller,
+    id: MessageId,
+    body: String,
+    recipient_agent: Option<String>,
+    scope: Option<GrantScope>,
+) -> Result<Message> {
     messages(
         caller,
         TalkCommand::Reply {
@@ -155,6 +180,7 @@ pub fn reply(
             body,
             urgent: false,
             recipient_agent,
+            scope: scope.map(|scope| scope.as_str().into()),
         },
     )?
     .pop()
@@ -290,6 +316,10 @@ impl From<Message> for TalkMessage {
                 expires_at: d.expires_at,
                 answered_at: d.answered_at,
             }),
+            grant: message.grant.map(|g| TalkGrantRelay {
+                id: g.id,
+                scope: g.scope.as_str().into(),
+            }),
         }
     }
 }
@@ -339,6 +369,13 @@ impl From<TalkMessage> for Message {
                 choices: d.choices,
                 expires_at: d.expires_at,
                 answered_at: d.answered_at,
+            }),
+            // An unknown scope from a newer daemon reads as no grant, never as one.
+            grant: message.grant.and_then(|g| {
+                Some(GrantRelay {
+                    id: g.id,
+                    scope: GrantScope::parse(&g.scope).ok()?,
+                })
             }),
         }
     }
@@ -450,4 +487,87 @@ pub fn hook_attached(caller: Caller) -> Result<bool> {
         TalkResponse::Hook { attached } => Ok(attached),
         _ => bail!("Unexpected talk response"),
     }
+}
+
+impl From<Grant> for TalkGrant {
+    fn from(grant: Grant) -> Self {
+        Self {
+            id: grant.id,
+            agent: grant.agent,
+            box_id: grant.box_id,
+            scope: grant.scope.as_str().into(),
+            created_at: grant.created_at,
+            duration_ms: grant.duration_ms,
+            approved_at: grant.approved_at,
+            revoked_at: grant.revoked_at,
+            request: grant.request.map(|id| id.0),
+        }
+    }
+}
+
+impl TryFrom<TalkGrant> for Grant {
+    type Error = anyhow::Error;
+
+    fn try_from(grant: TalkGrant) -> Result<Self> {
+        Ok(Self {
+            id: grant.id,
+            agent: grant.agent,
+            box_id: grant.box_id,
+            scope: GrantScope::parse(&grant.scope).map_err(anyhow::Error::msg)?,
+            created_at: grant.created_at,
+            duration_ms: grant.duration_ms,
+            approved_at: grant.approved_at,
+            revoked_at: grant.revoked_at,
+            request: grant.request.map(MessageId),
+        })
+    }
+}
+
+fn grant_list(caller: Caller, command: TalkCommand) -> Result<Vec<Grant>> {
+    match decode(send_request(caller, command)?)? {
+        TalkResponse::Grants { grants } => grants.into_iter().map(Grant::try_from).collect(),
+        _ => bail!("Unexpected talk response"),
+    }
+}
+
+/// Grants `agent` authority to relay the user's decisions in `scope`. Returns the grant
+/// and, from a shell, the decision request asking the user to approve it in the desktop.
+pub fn grant(
+    caller: Caller,
+    agent: String,
+    scope: GrantScope,
+    duration_ms: u64,
+) -> Result<(Grant, Vec<Message>)> {
+    let mut grants = grant_list(
+        caller.clone(),
+        TalkCommand::Grant {
+            agent,
+            scope: scope.as_str().into(),
+            duration_ms,
+        },
+    )?;
+    let grant = grants.pop().context("Power returned no grant")?;
+    let request = match &grant.request {
+        Some(id) => show(caller, id.clone(), false)?,
+        None => Vec::new(),
+    };
+    Ok((grant, request))
+}
+
+pub fn revoke(caller: Caller, id: String) -> Result<Grant> {
+    grant_list(caller, TalkCommand::Revoke { id })?
+        .pop()
+        .context("Power returned no grant")
+}
+
+pub fn grants(caller: Caller) -> Result<Vec<Grant>> {
+    grant_list(caller, TalkCommand::Grants)
+}
+
+pub fn grant_json(grant: &Grant, now: u64) -> serde_json::Value {
+    let mut value =
+        serde_json::to_value(TalkGrant::from(grant.clone())).expect("talk DTO is serializable");
+    value["state"] = grant.state(now).into();
+    value["expires_at"] = grant.expires_at().into();
+    value
 }

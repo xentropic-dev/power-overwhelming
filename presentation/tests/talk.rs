@@ -219,8 +219,16 @@ impl Sandbox {
         self.launch_profile("fixture", name, box_id)
     }
 
+    /// Starts a fixture agent named `name` in `box_id` against the sandbox at `path`.
+    fn launch_in(path: &Path, name: &str, box_id: &str) -> ManagedAgent {
+        Self::launch_profile_in(path, "fixture", name, box_id)
+    }
+
     fn launch_profile(&self, provider: &str, name: &str, box_id: &str) -> ManagedAgent {
-        let path = self.root.path();
+        Self::launch_profile_in(self.root.path(), provider, name, box_id)
+    }
+
+    fn launch_profile_in(path: &Path, provider: &str, name: &str, box_id: &str) -> ManagedAgent {
         let mut launch = power(path, None);
         launch
             .args([
@@ -2258,4 +2266,262 @@ fn the_user_answers_decision_requests_from_every_box_and_peers_cannot() {
     assert_eq!(open[0]["id"], other["id"]);
     let all = messages(talk(path, None, &["decisions", "--all", "--json"]));
     assert!(all[0]["decision"]["answered_at"].is_u64());
+}
+
+/// Runs `power talk ARGS` from inside `agent`'s own terminal session, so the daemon sees a
+/// process that the session owns. `claim` is the POWER_SESSION it sends: `"-"` keeps the
+/// agent's own, `"none"` drops it, and anything else claims that session instead. Words in
+/// `args` must not contain spaces. Returns whether it succeeded, with stdout and stderr.
+fn talk_in_session(
+    path: &Path,
+    agent: &ManagedAgent,
+    key: &str,
+    claim: &str,
+    args: &[&str],
+) -> (bool, String, String) {
+    let status = path.join(format!("talk-{key}.status"));
+    let _ = fs::remove_file(&status);
+    input(
+        path,
+        agent,
+        format!("talk-as {key} {claim} {}\n", args.join(" ")).as_bytes(),
+    );
+    let code = poll("in-session talk", || fs::read_to_string(&status).ok());
+    (
+        code.trim() == "0",
+        file(path, &format!("talk-{key}.out")),
+        file(path, &format!("talk-{key}.err")),
+    )
+}
+
+#[test]
+fn a_granted_relay_reaches_every_coordinator_within_its_scope_until_expiry_or_revoke() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    let worker = &fixture.a;
+    // A second run in another box, with its own coordinator.
+    let remote = Sandbox::launch_in(path, "remote-coordinator", REMOTE_BOX);
+    json(
+        power(path, Some(&remote))
+            .args(["dag", "create", "--title", "Remote"])
+            .output()
+            .unwrap(),
+    );
+    // A completed run whose coordinator is still live is not an active run.
+    let finished = Sandbox::launch_in(path, "remote-worker", REMOTE_BOX);
+    let done: Run = serde_json::from_value(
+        json(
+            power(path, Some(&finished))
+                .args(["dag", "create", "--title", "Done"])
+                .output()
+                .unwrap(),
+        )["run"]
+            .take(),
+    )
+    .unwrap();
+    json(
+        power(path, None)
+            .args([
+                "dag", "add-task", &done.id, "--id", "only", "--title", "only",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let dispatched = json(
+        power(path, Some(&finished))
+            .args(["dag", "dispatch", &done.id, "only", "--provider", "command"])
+            .arg("--worktree")
+            .arg(path.join("remote"))
+            .arg("--")
+            .arg(path.join("worker.sh"))
+            .output()
+            .unwrap(),
+    );
+    let only: ManagedAgent = serde_json::from_value(dispatched["agent"].clone()).unwrap();
+    poll("finished-run worker startup", || {
+        path.join("ready-only").exists().then_some(())
+    });
+    let mut report = power(path, Some(&only));
+    report
+        .env("POWER_RUN", &done.id)
+        .env("POWER_TASK", "only")
+        .env("POWER_ATTEMPT", only.attempt.as_ref().unwrap());
+    success(
+        report
+            .args(["dag", "report", "success", "--summary", "done"])
+            .output()
+            .unwrap(),
+    );
+
+    // An agent cannot grant, not even to itself, from its own session or by leaving its
+    // session out, which never passes as the user's shell.
+    let grant_args = [
+        "grant",
+        worker.id.as_str(),
+        "--scope",
+        "dag-policy",
+        "--expires",
+        "1h",
+    ];
+    for (key, claim) in [("own", "-"), ("bare", "none")] {
+        let (ok, _, err) = talk_in_session(path, worker, key, claim, &grant_args);
+        assert!(!ok && err.contains("Only the user"), "{claim}: {err}");
+    }
+    // A grant from the user's shell waits for the desktop.
+    let mut pending_args = grant_args.to_vec();
+    pending_args.push("--json");
+    let pending = json(fixture.talk(None, &pending_args));
+    assert_eq!(pending["grant"]["state"], "pending");
+
+    // The worker relays from inside its own command session.
+    let relay = |key: &str, claim: &str, scope: &str| {
+        let mut args = vec!["send", "coordinators", "Cap-reviews-at-2", "--json"];
+        if !scope.is_empty() {
+            args.extend(["--scope", scope]);
+        }
+        let (ok, out, err) = talk_in_session(path, worker, key, claim, &args);
+        assert!(ok, "{err}");
+        serde_json::from_str::<Value>(&out).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let recipients = |sent: &[Value]| {
+        let mut to: Vec<_> = sent
+            .iter()
+            .map(|m| m["recipient"]["id"].as_str().unwrap().to_owned())
+            .collect();
+        to.sort();
+        to
+    };
+    let unstamped = |sent: &[Value]| sent.iter().all(|m| m["grant"].is_null());
+    assert!(unstamped(&relay("pending", "-", "dag-policy")));
+
+    // A long grant, so the positive and scope checks never race its expiry.
+    let _desktop = hold_desktop_lock(path);
+    let caller = || desktop(path, BOX);
+    let (grant, _) = infrastructure::client::talk::grant(
+        caller(),
+        worker.id.clone(),
+        domain::talk::GrantScope::DagPolicy,
+        3_600_000,
+    )
+    .unwrap();
+    assert!(grant.approved_at.is_some());
+
+    // Within scope: every live coordinator of an active run gets the grant envelope, and
+    // the completed run's coordinator does not.
+    let sent = relay("granted", "-", "dag-policy");
+    let mut expected = vec![fixture.coordinator.id.clone(), remote.id.clone()];
+    expected.sort();
+    assert_eq!(recipients(&sent), expected);
+    for message in &sent {
+        assert_eq!(message["grant"]["id"], grant.id.as_str());
+        assert_eq!(message["grant"]["scope"], "dag-policy");
+    }
+    let inbox = success(fixture.talk(Some(&remote), &["inbox"]));
+    assert!(
+        inbox.contains(&format!(
+            "Relayed with user grant {}, scope dag-policy",
+            grant.id
+        )),
+        "{inbox}"
+    );
+    // Outside the scope, or without one, it is a plain peer message.
+    for scope in ["dag-merge", ""] {
+        assert!(unstamped(&relay(&format!("scope{scope}"), "-", scope)));
+    }
+    let inbox = success(fixture.talk(Some(&remote), &["inbox"]));
+    assert!(inbox.contains("Peer message relayed by Power"), "{inbox}");
+
+    // The grant follows the verified process, never a claimed session. Mismatched: a
+    // process outside any session, or another worker's, claims the granted session.
+    // Missing: the worker leaves its session out and sends as an unverified shell.
+    let claimed = fixture.messages(
+        Some(worker),
+        &[
+            "send",
+            "coordinators",
+            "claimed",
+            "--scope",
+            "dag-policy",
+            "--json",
+        ],
+    );
+    assert!(unstamped(&claimed));
+    assert_eq!(claimed[0]["sender"]["id"], worker.id.as_str());
+    let (ok, out, err) = talk_in_session(
+        path,
+        &fixture.b,
+        "mismatched",
+        worker.session.as_deref().unwrap(),
+        &[
+            "send",
+            "coordinators",
+            "borrowed",
+            "--scope",
+            "dag-policy",
+            "--json",
+        ],
+    );
+    assert!(ok, "{err}");
+    let borrowed: Value = serde_json::from_str(&out).unwrap();
+    let borrowed = borrowed["messages"].as_array().unwrap();
+    assert!(unstamped(borrowed));
+    assert_eq!(borrowed[0]["sender"]["id"], worker.id.as_str());
+    let bare = relay("missing", "none", "dag-policy");
+    assert!(unstamped(&bare));
+    assert_eq!(bare[0]["sender"]["kind"], "shell");
+
+    // A coordinator of an active run that sends to coordinators reaches itself too.
+    let (ok, out, err) = talk_in_session(
+        path,
+        &fixture.coordinator,
+        "coordinator",
+        "-",
+        &["send", "coordinators", "From-a-coordinator", "--json"],
+    );
+    assert!(ok, "{err}");
+    let from_coordinator: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        recipients(from_coordinator["messages"].as_array().unwrap()),
+        expected
+    );
+
+    // Only the verified user revokes: not the agent, nor the agent without its session.
+    for (key, claim) in [("revoke-own", "-"), ("revoke-bare", "none")] {
+        let (ok, _, err) = talk_in_session(path, worker, key, claim, &["revoke", &grant.id]);
+        assert!(!ok && err.contains("Only the user"), "{claim}: {err}");
+    }
+    // Revoke takes effect at once.
+    success(fixture.talk(None, &["revoke", &grant.id]));
+    assert!(unstamped(&relay("revoked", "-", "dag-policy")));
+
+    // A separate short grant expires on its own. Only its eventual state is checked, so
+    // timing under load cannot break the checks above.
+    let (short, _) = infrastructure::client::talk::grant(
+        caller(),
+        worker.id.clone(),
+        domain::talk::GrantScope::DagPolicy,
+        1_000,
+    )
+    .unwrap();
+    let states = || -> Vec<String> {
+        json(fixture.talk(None, &["grants", "--json"]))["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["state"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    poll("short grant expiry", || {
+        (states() == ["pending", "revoked", "expired"]).then_some(())
+    });
+    assert!(unstamped(&relay("expired", "-", "dag-policy")));
+    assert!(short.approved_at.is_some());
+
+    // Grants are recorded in talk history.
+    let worker_log = success(fixture.talk(Some(worker), &["inbox", "--all"]));
+    assert!(worker_log.contains("granted"), "{worker_log}");
+    assert!(worker_log.contains("revoked"), "{worker_log}");
 }

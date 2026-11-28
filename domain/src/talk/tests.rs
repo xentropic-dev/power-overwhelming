@@ -41,6 +41,7 @@ fn directory() -> Directory {
                 agent: "coord".into(),
             },
             coordinator_session: None,
+            finished: false,
         }],
     }
 }
@@ -153,6 +154,7 @@ fn message() -> Message {
         delivery: Delivery::default(),
         urgent: false,
         decision: None,
+        grant: None,
     }
 }
 
@@ -523,5 +525,77 @@ fn a_stale_busy_report_falls_back_to_quiet_and_urgent_envelopes_say_so() {
             .next()
             .unwrap()
             .contains("· urgent")
+    );
+}
+
+#[test]
+fn grants_run_from_approval_until_expiry_or_revocation() {
+    let mut grant = Grant {
+        id: "g".into(),
+        agent: "coord".into(),
+        box_id: "box".into(),
+        scope: GrantScope::DagPolicy,
+        created_at: 0,
+        duration_ms: 100,
+        approved_at: None,
+        revoked_at: None,
+        request: None,
+    };
+    assert!(!grant.is_active(0));
+    assert_eq!(grant.state(0), "pending");
+    grant.approved_at = Some(10);
+    assert!(grant.is_active(109));
+    assert!(!grant.is_active(110));
+    assert_eq!(grant.state(110), "expired");
+    grant.revoked_at = Some(20);
+    assert!(!grant.is_active(15));
+    assert_eq!(GrantScope::parse("dag-merge"), Ok(GrantScope::DagMerge));
+    assert!(GrantScope::parse("all").is_err());
+}
+
+#[test]
+fn coordinators_reach_every_live_coordinator_of_an_unfinished_run_once() {
+    let mut dir = directory();
+    dir.agents
+        .push(agent("coord-2", "remote", None, AgentStatus::Idle));
+    dir.agents
+        .push(agent("gone", "remote", None, AgentStatus::Exited));
+    for (id, coordinator, finished) in [
+        ("run-2", "coord-2", false),
+        ("run-3", "coord", false),
+        ("run-4", "gone", false),
+        // Finished (completed or archived), though its coordinator is still live.
+        ("run-5", "other", true),
+    ] {
+        dir.runs.push(RunRef {
+            id: id.into(),
+            box_id: "remote".into(),
+            coordinator: Coordinator::Agent {
+                agent: coordinator.into(),
+            },
+            coordinator_session: None,
+            finished,
+        });
+    }
+    let target = Target::One(Address::from("coordinators"));
+    let ctx = |agent| SenderContext {
+        agent,
+        box_id: None,
+        run: None,
+    };
+    assert_eq!(
+        resolve(ctx(None), &target, &dir),
+        Ok(vec![
+            Recipient::agent(&dir.agents[0]),
+            Recipient::agent(&dir.agents[5])
+        ])
+    );
+    // A coordinator that sends is itself a live coordinator of an active run.
+    assert_eq!(
+        resolve(ctx(Some(&dir.agents[0])), &target, &dir),
+        Ok(vec![
+            Recipient::agent(&dir.agents[0]),
+            Recipient::agent(&dir.agents[5])
+        ])
     );
 }

@@ -12,13 +12,13 @@ use application::{
     Application,
     dag::BoxSelection,
     talk::{
-        Caller, HOOK_ATTACH_MS, HookClaim, HookWait, LogFilter, Notifier, Reply, SendMessage,
-        SessionActivity, Talk,
+        Caller, GrantRequest, HOOK_ATTACH_MS, HookClaim, HookWait, LogFilter, Notifier, Reply,
+        SendMessage, SessionActivity, Talk,
     },
 };
 use domain::session::Agent;
 use domain::talk::{
-    Activity, Address, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
+    Activity, Address, GrantScope, HookState, Message, MessageId, NoticePolicy, Target, ThreadId,
 };
 use std::{
     io::BufReader,
@@ -96,12 +96,30 @@ pub(crate) fn start(
     talk
 }
 
+/// Whether the daemon can vouch for the caller: the socket peer's process runs inside the
+/// claimed session, or, for a caller without one, inside no Power session. This is the one
+/// choke point for grant authority. A session field alone is only a claim.
+fn verified(dag: &DaemonDag, session: Option<&str>, peer: Option<u32>) -> bool {
+    let Some(pid) = peer else {
+        return false;
+    };
+    match session {
+        Some(session) => dag.session_owns_process(session, pid),
+        None => !dag
+            .list_sessions()
+            .iter()
+            .any(|session| dag.session_owns_process(&session.id, pid)),
+    }
+}
+
 fn caller(
     dag: &DaemonDag,
     session: Option<String>,
     selector: Option<String>,
     desktop: bool,
+    peer: Option<u32>,
 ) -> Result<Caller> {
+    let verified = verified(dag, session.as_deref(), peer);
     let box_id = if selector.is_some() {
         dag.box_for(BoxSelection {
             selector,
@@ -123,6 +141,7 @@ fn caller(
         session,
         box_id,
         desktop,
+        verified,
     })
 }
 
@@ -130,6 +149,7 @@ pub(crate) fn request(
     talk: &DaemonTalk,
     dag: &DaemonDag,
     request: TalkRequest,
+    peer: Option<u32>,
 ) -> Result<TalkResponse> {
     if let Some(session) = &request.session
         && !matches!(request.command, TalkCommand::Turn { .. })
@@ -137,7 +157,7 @@ pub(crate) fn request(
         // A coding session is a peer, never the user, even without a managed-agent row.
         dag.register_coding_session(session)?;
     }
-    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
+    let caller = caller(dag, request.session, request.box_sel, request.desktop, peer)?;
     let items = |messages: Vec<Message>| TalkResponse::Messages {
         messages: messages.into_iter().map(Into::into).collect(),
     };
@@ -149,6 +169,7 @@ pub(crate) fn request(
             urgent,
             choices,
             expires_in_ms,
+            scope,
         } => {
             let target = match (to, &run) {
                 (Some(to), _) => Target::One(Address::from(to.as_str())),
@@ -161,21 +182,46 @@ pub(crate) fn request(
                 run,
                 body,
                 urgent,
+                scope: scope.as_deref().map(parse_scope).transpose()?,
                 choices,
                 expires_in: expires_in_ms,
             })?)
         }
+        TalkCommand::Grant {
+            agent,
+            scope,
+            duration_ms,
+        } => TalkResponse::Grants {
+            grants: vec![
+                talk.grant(GrantRequest {
+                    caller,
+                    agent,
+                    scope: parse_scope(&scope)?,
+                    duration_ms,
+                })?
+                .grant
+                .into(),
+            ],
+        },
+        TalkCommand::Revoke { id } => TalkResponse::Grants {
+            grants: vec![talk.revoke(caller, &id)?.into()],
+        },
+        TalkCommand::Grants => TalkResponse::Grants {
+            grants: talk.grants(caller)?.into_iter().map(Into::into).collect(),
+        },
         TalkCommand::Reply {
             id,
             body,
             urgent,
             recipient_agent,
+            scope,
         } => items(vec![talk.reply(Reply {
             caller,
             message: MessageId(id),
             recipient_agent,
             body,
             urgent,
+            scope: scope.as_deref().map(parse_scope).transpose()?,
         })?]),
         TalkCommand::Inbox { all, peek } => items(talk.inbox(caller, all, peek)?),
         TalkCommand::Show { id, read } => items(talk.show(caller, MessageId(id), read)?),
@@ -242,6 +288,10 @@ pub(crate) fn request(
     })
 }
 
+fn parse_scope(scope: &str) -> Result<GrantScope> {
+    GrantScope::parse(scope).map_err(anyhow::Error::msg)
+}
+
 fn talk_ok() -> Response {
     Response::Talk {
         talk: TalkResponse::Ok,
@@ -274,7 +324,13 @@ pub(crate) fn hook_stop(
     request: TalkRequest,
     mut socket: &UnixStream,
 ) -> Result<()> {
-    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
+    let caller = caller(
+        dag,
+        request.session,
+        request.box_sel,
+        request.desktop,
+        wire::peer_pid(socket).ok(),
+    )?;
     match talk.hook_turn_end(&caller)? {
         Some(claim) => hand_over(talk, claim, socket),
         None => wire::send(&mut socket, &talk_ok()),
@@ -290,7 +346,13 @@ pub(crate) fn hook_wait(
     request: TalkRequest,
     mut socket: &UnixStream,
 ) -> Result<()> {
-    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
+    let caller = caller(
+        dag,
+        request.session,
+        request.box_sel,
+        request.desktop,
+        wire::peer_pid(socket).ok(),
+    )?;
     let deadline = Instant::now() + Duration::from_millis(HOOK_ATTACH_MS);
     let Some(lease) = talk.attach_hook(&caller, deadline)? else {
         return Ok(());
@@ -311,7 +373,13 @@ pub(crate) fn watch(
     request: TalkRequest,
     mut socket: &UnixStream,
 ) -> Result<()> {
-    let caller = caller(dag, request.session, request.box_sel, request.desktop)?;
+    let caller = caller(
+        dag,
+        request.session,
+        request.box_sel,
+        request.desktop,
+        wire::peer_pid(socket).ok(),
+    )?;
     let mut cursor = talk.cursor()?;
     wire::send(
         &mut socket,

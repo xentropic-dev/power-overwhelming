@@ -4999,6 +4999,15 @@ impl crate::talk::TalkReader for NoTalk {
     fn events(&self, _: u64, _: Option<&str>) -> Result<Vec<crate::talk::TalkEvent>> {
         unreachable!()
     }
+    fn grants(&self, _: Option<&str>) -> Result<Vec<domain::talk::Grant>> {
+        Ok(Vec::new())
+    }
+    fn grant_for_request(
+        &self,
+        _: &domain::talk::MessageId,
+    ) -> Result<Option<domain::talk::Grant>> {
+        Ok(None)
+    }
 }
 
 impl crate::talk::TalkTransaction for NoTalk {
@@ -5014,6 +5023,15 @@ impl crate::talk::TalkTransaction for NoTalk {
         unreachable!()
     }
     fn answer(&self, _: &domain::talk::MessageId, _: u64) -> Result<bool> {
+        unreachable!()
+    }
+    fn insert_grant(&self, _: &domain::talk::Grant) -> Result<()> {
+        unreachable!()
+    }
+    fn approve_grant(&self, _: &str, _: u64) -> Result<bool> {
+        unreachable!()
+    }
+    fn revoke_grant(&self, _: &str, _: u64) -> Result<bool> {
         unreachable!()
     }
 }
@@ -5053,6 +5071,7 @@ impl DecisionPoster for Poster {
             delivery: domain::talk::Delivery::default(),
             urgent: false,
             decision: None,
+            grant: None,
         })
     }
 }
