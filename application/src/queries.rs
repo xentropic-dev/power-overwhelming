@@ -2,7 +2,7 @@ use crate::{Application, TerminalRuntime};
 use anyhow::Result;
 use domain::{
     artifact::{ResolvedArtifact, artifact_id},
-    session::Session,
+    session::{Session, SessionListing},
 };
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,19 @@ impl<T: TerminalRuntime> Application<T> {
             .unwrap()
             .values()
             .map(|live| self.current(live))
+            .collect()
+    }
+
+    /// Every live session with its DAG attempt, read under one lock.
+    pub fn list_session_listings(&self) -> Vec<SessionListing> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|live| SessionListing {
+                session: self.current(live),
+                attempt: live.attempt.clone(),
+            })
             .collect()
     }
 

@@ -2,7 +2,7 @@ use crate::{Application, Live, SessionRecord, TerminalRuntime};
 use anyhow::{Context, Result, ensure};
 use domain::{
     artifact::{ArtifactRecord, ResolvedArtifact, URI_PREFIX},
-    session::{Agent, Session},
+    session::{Agent, Session, SessionAttempt},
 };
 use std::{
     ffi::OsString,
@@ -123,11 +123,18 @@ impl<T: TerminalRuntime> Application<T> {
             Agent::Shell => None,
             Agent::Coding(id) => Some(self.agents.resolve(id)?),
         };
+        let attempt = SessionAttempt::from_env(options.env.iter().filter_map(|(name, value)| {
+            Some((
+                name.to_str()?,
+                value.as_deref().and_then(|value| value.to_str()),
+            ))
+        }));
         let terminal = self.runtime.start(&session, options, profile)?;
         sessions.insert(
             session.id.clone(),
             Live {
                 session: session.clone(),
+                attempt,
                 terminal,
             },
         );

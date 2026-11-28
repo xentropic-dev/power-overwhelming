@@ -54,6 +54,21 @@ pub struct Session {
     pub agent: Agent,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct SessionAttempt {
+    pub run: Option<String>,
+    pub task: Option<String>,
+    pub attempt: String,
+}
+
+/// A live session with its DAG attempt, read in one daemon snapshot.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionListing {
+    #[serde(flatten)]
+    pub session: Session,
+    pub attempt: Option<SessionAttempt>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct SessionMetadata {
     pub task: Option<String>,
@@ -91,6 +106,8 @@ pub enum Target {
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     List,
+    /// Live sessions with their DAG attempts. Never waits on the DAG store.
+    ListWithAttempts,
     SetColorScheme {
         name: String,
     },
@@ -178,6 +195,9 @@ pub enum Response {
     },
     Sessions {
         sessions: Vec<Session>,
+    },
+    SessionListings {
+        sessions: Vec<SessionListing>,
     },
     Worktrees {
         worktrees: Vec<PathBuf>,
@@ -552,6 +572,44 @@ impl From<session::Session> for Session {
             id: value.id,
             worktree: value.worktree,
             agent: value.agent.into(),
+        }
+    }
+}
+
+impl From<session::SessionAttempt> for SessionAttempt {
+    fn from(value: session::SessionAttempt) -> Self {
+        Self {
+            run: value.run,
+            task: value.task,
+            attempt: value.attempt,
+        }
+    }
+}
+
+impl From<SessionAttempt> for session::SessionAttempt {
+    fn from(value: SessionAttempt) -> Self {
+        Self {
+            run: value.run,
+            task: value.task,
+            attempt: value.attempt,
+        }
+    }
+}
+
+impl From<session::SessionListing> for SessionListing {
+    fn from(value: session::SessionListing) -> Self {
+        Self {
+            session: value.session.into(),
+            attempt: value.attempt.map(Into::into),
+        }
+    }
+}
+
+impl From<SessionListing> for session::SessionListing {
+    fn from(value: SessionListing) -> Self {
+        Self {
+            session: value.session.into(),
+            attempt: value.attempt.map(Into::into),
         }
     }
 }
