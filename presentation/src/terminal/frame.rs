@@ -10,8 +10,8 @@ use anyhow::Result;
 use ghostty_vt::{
     Error, Terminal,
     render::{
-        CellIterator, Colors, CursorVisualStyle, Dirty, RenderState, RowId, RowIteration,
-        RowIterator,
+        CellIterator, Colors, CursorVisualStyle, Dirty, ImageIterator, ImagePlacement, RenderState,
+        RowId, RowIteration, RowIterator, Snapshot,
     },
     screen::CellWide,
     style::{Style, StyleColor, Underline},
@@ -73,6 +73,9 @@ pub(super) struct Frame {
     /// window there.
     pub(super) ime_cursor: Option<CellPosition>,
     pub(super) colors: Option<Colors>,
+    /// Kitty graphics placements with something to draw, in drawing order (layer, then z).
+    pub(super) images: Rc<Vec<ImagePlacement>>,
+    images_generation: u64,
     cols: u16,
     minimum_contrast: f32,
 }
@@ -116,12 +119,21 @@ impl Frame {
         let dirty = state.dirty()?;
         let cols = state.cols()?;
         let height = usize::from(state.rows()?);
+        let images_generation = state.image_placements_generation()?;
+        let images = if images_generation == self.images_generation {
+            Rc::clone(&self.images)
+        } else {
+            Rc::new(image_placements(&state)?)
+        };
         let full = dirty == Dirty::Full
             || self.colors.as_ref() != Some(&colors)
             || self.cols != cols
             || self.minimum_contrast != minimum_contrast;
         if !full && dirty == Dirty::Clean && self.rows.len() == height {
-            if self.cursor == cursor && self.ime_cursor == ime_cursor {
+            if self.cursor == cursor
+                && self.ime_cursor == ime_cursor
+                && images_generation == self.images_generation
+            {
                 return Ok(None);
             }
             return Ok(Some(Self {
@@ -129,6 +141,8 @@ impl Frame {
                 cursor,
                 ime_cursor,
                 colors: Some(colors),
+                images,
+                images_generation,
                 cols,
                 minimum_contrast,
             }));
@@ -173,10 +187,25 @@ impl Frame {
             cursor,
             ime_cursor,
             colors: Some(colors),
+            images,
+            images_generation,
             cols,
             minimum_contrast,
         }))
     }
+}
+
+/// The snapshot's Kitty placements, bottom first. Ghostty resolves direct placements and
+/// Unicode placeholder runs alike into viewport cells and pixel rectangles.
+fn image_placements(state: &Snapshot<'_>) -> Result<Vec<ImagePlacement>> {
+    let mut iterator = ImageIterator::new()?;
+    let mut source = iterator.update(state)?;
+    let mut placements = Vec::new();
+    while let Some(placement) = source.next() {
+        placements.push(placement?);
+    }
+    placements.sort_by_key(|placement| (placement.layer, placement.z));
+    Ok(placements)
 }
 
 fn read_row<'s>(
