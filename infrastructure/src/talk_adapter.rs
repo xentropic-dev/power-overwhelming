@@ -224,6 +224,10 @@ pub(crate) fn request(
         TalkCommand::Summary => TalkResponse::Summary {
             agents: talk.summary(caller)?.into_iter().map(Into::into).collect(),
         },
+        TalkCommand::HookStart => {
+            talk.hook_turn_start(&caller)?;
+            TalkResponse::Ok
+        }
         TalkCommand::HookStatus => TalkResponse::Hook {
             attached: talk.hook_attached(&caller)?,
         },

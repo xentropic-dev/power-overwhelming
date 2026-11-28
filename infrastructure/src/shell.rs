@@ -377,7 +377,7 @@ fn callback_args(
                     { "type": "command", "command": TALK_WAITER_COMMAND,
                       "asyncRewake": true, "timeout": HOOK_WAIT_SECONDS },
                 ] }],
-                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "power talk busy" }] }],
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "power talk hook start" }] }],
             }));
         }
         if !settings.is_empty() {
@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(wait["asyncRewake"], true);
         assert_eq!(
             settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-            "power talk busy"
+            "power talk hook start"
         );
         let (args, _) = callback_args(claude, &[], || true, || false);
         let settings: serde_json::Value = serde_json::from_str(args[1].to_str().unwrap())?;

@@ -99,6 +99,8 @@ enum HookEvent {
     Wait,
     /// Prints whether the session's waiting hook is attached.
     Status,
+    /// Claude Code UserPromptSubmit hook. Reports the turn start.
+    Start,
 }
 
 #[derive(Args)]
@@ -182,6 +184,15 @@ pub fn run(args: TalkArgs) -> Result<()> {
             report_turn(caller, true, from_notify, json)
         }
         Action::Busy => report_turn(caller, false, false, json),
+        Action::Hook(HookEvent::Start) => {
+            let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+            // A failed report must never block the prompt, so it never exits 2.
+            if let Err(error) = talk::hook_start(caller.clone()) {
+                eprintln!("Power talk hook failed. {error:#}");
+                let _ = talk::turn(caller, false, false);
+            }
+            Ok(())
+        }
         Action::Hook(HookEvent::Status) => {
             let attached = talk::hook_attached(caller)?;
             super::print_json(json!({"attached": attached}))
@@ -210,11 +221,14 @@ pub fn run(args: TalkArgs) -> Result<()> {
                 Ok(_) => {}
                 Err(error) => {
                     eprintln!("Power talk hook failed. {error:#}");
-                    // Still report the turn end so terminal notices can deliver. If Power
-                    // is unreachable, the unreported turn end goes stale instead.
-                    if !wait {
-                        let _ = talk::turn(caller, true, false);
+                    // A failed waiter exits non-zero but never 2, which would wake the agent
+                    // with no messages. What it did not emit stays queued for notices.
+                    if wait {
+                        std::process::exit(1);
                     }
+                    // Still report the turn end so terminal notices can deliver. If Power
+                    // is unreachable, the waiter reports it once its attach wait runs out.
+                    let _ = talk::turn(caller, true, false);
                 }
             }
             Ok(())

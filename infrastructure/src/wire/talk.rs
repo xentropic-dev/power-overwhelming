@@ -66,6 +66,9 @@ pub enum TalkCommand {
     HookWait,
     /// Whether the session's waiting hook is attached for the current turn.
     HookStatus,
+    /// A turn-start hook. Reports the turn busy and registers the session for hook
+    /// delivery from its first turn.
+    HookStart,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

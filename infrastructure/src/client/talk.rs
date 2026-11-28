@@ -303,9 +303,19 @@ impl From<TalkAgentSummary> for AgentTalkSummary {
     }
 }
 
+/// Reports a turn start from the provider's turn-start hook.
+pub fn hook_start(caller: Caller) -> Result<()> {
+    match decode(wire::request(&request(caller, TalkCommand::HookStart))?)? {
+        TalkResponse::Ok => Ok(()),
+        _ => bail!("Unexpected talk response"),
+    }
+}
+
 /// Runs a turn hook against the daemon. `emit` hands the messages to the agent, and only
-/// after it succeeds does the hook confirm them, so the daemon marks them read. A hook that
-/// fails or dies before confirming leaves them queued. Returns whether it emitted any.
+/// after it succeeds does the hook confirm them. A hook that fails or dies before
+/// confirming leaves them queued. Returns whether it emitted any. Once `emit` succeeded the
+/// agent gets the messages however the confirmation goes, so a lost reply still returns
+/// true: the daemon either recorded the handover or still holds the messages unread.
 pub fn hook(
     caller: Caller,
     wait: bool,
@@ -325,11 +335,13 @@ pub fn hook(
             TalkResponse::Messages { messages } => {
                 let messages: Vec<Message> = messages.into_iter().map(Into::into).collect();
                 emit(&messages)?;
-                wire::send(socket.get_mut(), &HookEmitted { emitted: true })?;
-                match wire::receive(&mut socket)?.map(decode).transpose()? {
-                    Some(TalkResponse::Ok) => return Ok(true),
-                    _ => bail!("Power did not record the hook's delivery"),
+                let recorded = wire::send(socket.get_mut(), &HookEmitted { emitted: true })
+                    .and_then(|()| wire::receive(&mut socket))
+                    .and_then(|reply| reply.map(decode).transpose());
+                if !matches!(recorded, Ok(Some(TalkResponse::Ok))) {
+                    eprintln!("Power did not confirm recording the hook's delivery");
                 }
+                return Ok(true);
             }
             _ => bail!("Unexpected talk hook response"),
         }
