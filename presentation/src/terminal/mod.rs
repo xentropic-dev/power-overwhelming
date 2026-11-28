@@ -2,6 +2,7 @@
 //! `src/terminal.rs` (Apache-2.0).
 
 pub(crate) mod bench;
+mod find;
 mod frame;
 mod grid;
 mod hold;
@@ -12,6 +13,7 @@ mod links;
 mod metrics;
 mod paint;
 mod runs;
+mod scroll;
 mod selection;
 mod sprites;
 mod typing;
@@ -24,6 +26,7 @@ pub use self::metrics::{CellMetrics, TerminalFont, cell_metrics, column_width};
 
 use self::frame::{CellPosition, Frame};
 use self::grid::PtyGrid;
+pub use self::input::ScrollTarget;
 pub use self::typing::InputHold;
 use self::typing::Typing;
 use crate::settings::TerminalSettings;
@@ -157,14 +160,33 @@ pub struct TerminalView {
     frame: Rc<Frame>,
     typed_at: Option<Instant>,
     paint_revision: u64,
+    /// The terminal's selection in viewport cells, as last painted.
     selection: Option<(CellPosition, CellPosition)>,
+    selector: selection::Selector,
+    /// The pointer while a selection drag runs, for autoscroll ticks.
+    select_pointer: Option<Point<Pixels>>,
+    _autoscroll: Option<Task<()>>,
+    /// Where the press on `pressed_link` landed.
+    press_cell: Option<CellPosition>,
     pointer: Option<Point<Pixels>>,
     pressed_link: Option<Arc<str>>,
     /// Numbered link labels shown while the user picks a link by keyboard.
     hints: Vec<(CellPosition, Arc<str>)>,
     hint_footer: Option<String>,
-    dragging: bool,
-    reporting_mouse: bool,
+    finder: find::Finder,
+    /// Whether a pump of the running search is scheduled.
+    find_pumping: bool,
+    /// Whether a composition the find bar owned was cut off by its closing, so the input
+    /// method's commit for it goes nowhere.
+    find_orphan: bool,
+    /// Buttons whose press went to the program, so their motion and release go too.
+    buttons: Vec<MouseButton>,
+    /// The last mouse report sent, as motion, so motion within one cell isn't repeated.
+    last_mouse_report: Vec<u8>,
+    /// Fractions of a line or column the wheel moved that haven't scrolled yet.
+    scrolled: Point<f32>,
+    /// Where in the scrollbar thumb a drag holds it, while one is in progress.
+    scrollbar_grab: Option<f32>,
     exited: bool,
     status: Option<String>,
     render_held: bool,
@@ -209,6 +231,22 @@ impl TerminalView {
                 |event| tx.send_blocking(event).is_ok(),
             );
         });
+        Self::with_transport(session, scheme, settings, hold, commands, rx, window, cx)
+    }
+
+    /// Builds the view over a given command sink and event source, starting no
+    /// daemon-client threads.
+    #[allow(clippy::too_many_arguments)]
+    fn with_transport(
+        session: Session,
+        scheme: &'static Scheme,
+        settings: TerminalSettings,
+        hold: InputHold,
+        commands: async_channel::Sender<TerminalControl>,
+        rx: async_channel::Receiver<TerminalEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let follow = cx.spawn_in(window, async move |view, cx| {
             while let Ok(first) = rx.recv().await {
                 let deadline = Instant::now() + OUTPUT_TURN;
@@ -265,12 +303,21 @@ impl TerminalView {
             typed_at: None,
             paint_revision: 0,
             selection: None,
+            selector: selection::Selector::new(),
+            select_pointer: None,
+            _autoscroll: None,
+            press_cell: None,
             pointer: None,
             pressed_link: None,
             hints: Vec::new(),
             hint_footer: None,
-            dragging: false,
-            reporting_mouse: false,
+            finder: find::Finder::default(),
+            find_pumping: false,
+            find_orphan: false,
+            buttons: Vec::new(),
+            last_mouse_report: Vec::new(),
+            scrolled: Point::default(),
+            scrollbar_grab: None,
             exited: false,
             status: None,
             render_held: false,
@@ -373,7 +420,9 @@ impl TerminalView {
                     }
                     self.exited = exited;
                     self.status = None;
-                    self.selection = None;
+                    // The gesture tracks cells of the terminal it replaced.
+                    self.selector.reset(&previous);
+                    self.finder.rebind(&self.terminal);
                     self.metadata = SessionMetadata::default();
                     let title = shown_title(&title).into_owned();
                     cx.emit(TerminalTitleChanged(title));
@@ -470,6 +519,18 @@ impl TerminalView {
         if self.render_held {
             return false;
         }
+        let selection = selection::viewport_range(&self.terminal);
+        let mut moved = selection != self.selection;
+        self.selection = selection;
+        if self.finder.is_open() {
+            let spans = self.finder.spans().to_vec();
+            self.finder.pump(&self.terminal);
+            moved |= spans != self.finder.spans();
+        }
+        moved | self.refresh_frame()
+    }
+
+    fn refresh_frame(&mut self) -> bool {
         match self.frame.update_with(
             &mut self.renderer,
             &self.terminal,
@@ -573,6 +634,7 @@ fn configure(
     contrast: &Rc<std::cell::Cell<f32>>,
 ) {
     terminal.set_clipboard_write_policy(clipboard_policy(settings));
+    client::limit_scrollback(terminal).expect("set terminal scrollback limits");
     terminal
         .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
         .expect("set terminal clipboard size limit");
@@ -717,5 +779,275 @@ mod font_tests {
             faces,
             [(false, false), (true, false), (false, true), (true, true)]
         );
+    }
+}
+
+/// Gestures driven through a headless GPUI window: real hitbox, capture-phase moves,
+/// mouse-tracking routing and the clipboard path.
+#[cfg(test)]
+mod gesture_tests {
+    use super::{TerminalView, typing::InputHold};
+    use crate::settings::TerminalSettings;
+    use domain::session::{Agent, Session};
+    use gpui::{
+        AppContext, Bounds, Context, Entity, IntoElement, Modifiers, MouseButton, ParentElement,
+        Pixels, Point, Render, Styled, TestAppContext, VisualTestContext, Window, div, point, px,
+    };
+    use infrastructure::client::TerminalControl;
+
+    /// Lays the terminal out as the workspace does, in a full-size flex column.
+    struct Host(Entity<TerminalView>);
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().flex().flex_col().child(self.0.clone())
+        }
+    }
+
+    fn open(cx: &mut TestAppContext) -> (Entity<TerminalView>, &mut VisualTestContext) {
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let session = Session {
+                id: "gesture-test".into(),
+                worktree: std::env::temp_dir(),
+                agent: Agent::Shell,
+            };
+            let settings = TerminalSettings {
+                copy_on_select: true,
+                ..TerminalSettings::default()
+            };
+            // In-memory transport: no daemon client, so the view runs on what the test feeds it.
+            let (commands, _) = async_channel::unbounded();
+            let (_, events) = async_channel::unbounded();
+            Host(cx.new(|cx| {
+                TerminalView::with_transport(
+                    session,
+                    infrastructure::theme::default_scheme(),
+                    settings,
+                    InputHold::default(),
+                    commands,
+                    events,
+                    window,
+                    cx,
+                )
+            }))
+        });
+        cx.run_until_parked();
+        let view = host.read_with(cx, |host, _| host.0.clone());
+        (view, cx)
+    }
+
+    /// Writes program output and takes a fresh frame, then a requests receiver that
+    /// sees what the view sends to the program.
+    fn feed(
+        view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+        bytes: &[u8],
+    ) -> async_channel::Receiver<TerminalControl> {
+        let (tx, rx) = async_channel::unbounded();
+        view.update(cx, |view, cx| {
+            view.commands = tx;
+            view.terminal.vt_write(bytes);
+            view.refresh();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        rx
+    }
+
+    fn bounds(view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        view.read_with(cx, |view, _| view.grid.bounds)
+    }
+
+    fn cell(
+        view: &Entity<TerminalView>,
+        cx: &mut VisualTestContext,
+        row: f32,
+        col: f32,
+    ) -> Point<Pixels> {
+        let (bounds, size) =
+            view.read_with(cx, |view, _| (view.grid.bounds, view.grid.metrics.size));
+        bounds.origin + point(size.width * (col + 0.5), size.height * (row + 0.5))
+    }
+
+    fn inputs(rx: &async_channel::Receiver<TerminalControl>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|control| match control {
+                TerminalControl::Input(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn drag_past_the_grid_keeps_selecting_and_copies(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"alpha beta\r\ngamma delta");
+        let none = Modifiers::none();
+        let start = cell(&view, cx, 0., 0.);
+        cx.simulate_mouse_down(start, MouseButton::Left, none);
+        let inside = cell(&view, cx, 1., 2.);
+        cx.simulate_mouse_move(inside, MouseButton::Left, none);
+        // Past the bottom-right of the terminal: only capture-phase delivery sees this.
+        let outside = bounds(&view, cx).bottom_right() + point(px(40.), px(40.));
+        cx.simulate_mouse_move(outside, MouseButton::Left, none);
+        let selected = view.read_with(cx, |view, _| super::selection::text(&view.terminal));
+        assert_eq!(selected.as_deref(), Some("alpha beta\ngamma delta"));
+        cx.simulate_mouse_up(outside, MouseButton::Left, none);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("alpha beta\ngamma delta"));
+        assert!(!view.read_with(cx, |view, _| view.selector.selecting));
+    }
+
+    #[gpui::test]
+    fn tracked_mouse_goes_to_the_program_with_paired_releases(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        // Normal tracking with SGR encoding.
+        feed(&view, cx, b"text\x1b[?1000h\x1b[?1006h");
+        let none = Modifiers::none();
+        let at = cell(&view, cx, 0., 1.);
+        let outside = bounds(&view, cx).bottom_right() + point(px(40.), px(40.));
+        let rx = feed(&view, cx, b"");
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_up(outside, MouseButton::Left, none);
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(outside, MouseButton::Middle, none);
+        let sent = inputs(&rx);
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        assert!(
+            sent[0].starts_with("\x1b[<0;") && sent[0].ends_with('M'),
+            "{sent:?}"
+        );
+        assert!(
+            sent[1].starts_with("\x1b[<0;") && sent[1].ends_with('m'),
+            "{sent:?}"
+        );
+        assert!(
+            sent[2].starts_with("\x1b[<1;") && sent[2].ends_with('M'),
+            "{sent:?}"
+        );
+        assert!(
+            sent[3].starts_with("\x1b[<1;") && sent[3].ends_with('m'),
+            "{sent:?}"
+        );
+        let selected = view.read_with(cx, |view, _| super::selection::text(&view.terminal));
+        assert_eq!(selected, None, "a tracked click doesn't select");
+    }
+
+    #[gpui::test]
+    fn the_find_query_never_reaches_the_program(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"needle one\r\nneedle two");
+        view.update(cx, |view, cx| view.open_find(cx));
+        let rx = feed(&view, cx, b"");
+        // A raw keystroke the workspace didn't take goes nowhere while the bar is open.
+        cx.simulate_keystrokes("z");
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            // Text the platform types, and an input method's commit, use the input handler.
+            view.replace_text_in_range(None, "nee", window, cx);
+            view.replace_and_mark_text_in_range(None, "d", None, window, cx);
+            assert!(
+                view.find_bar().unwrap().0.ends_with('d'),
+                "composition shows in the bar"
+            );
+            view.replace_text_in_range(None, "d", window, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("le\n".into()));
+        view.update(cx, |view, cx| view.find_paste(cx));
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        let query = view.read_with(cx, |view, _| view.finder.query().to_owned());
+        assert_eq!(query, "needle");
+        // Once closed, typing goes to the program again.
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.close_find(cx);
+            view.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(inputs(&rx), vec!["x".to_owned()]);
+    }
+
+    #[gpui::test]
+    fn the_find_bar_keeps_the_mouse_from_the_terminal(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"text\x1b[?1000h\x1b[?1006h");
+        view.update(cx, |view, cx| view.open_find(cx));
+        cx.run_until_parked();
+        let rx = feed(&view, cx, b"");
+        let none = Modifiers::none();
+        // Over the bar, near the top right of the terminal.
+        let bar = bounds(&view, cx).top_right() + point(px(-200.), px(14.));
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            cx.simulate_mouse_down(bar, button, none);
+            cx.simulate_mouse_up(bar, button, none);
+        }
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: bar,
+            delta: gpui::ScrollDelta::Lines(point(0., 3.)),
+            ..Default::default()
+        });
+        assert_eq!(
+            inputs(&rx),
+            Vec::<String>::new(),
+            "the bar takes its own presses"
+        );
+        // Below the bar the program still hears the mouse.
+        let at = cell(&view, cx, 3., 1.);
+        cx.simulate_mouse_down(at, MouseButton::Left, none);
+        cx.simulate_mouse_up(at, MouseButton::Left, none);
+        assert_eq!(inputs(&rx).len(), 2);
+        assert!(view.read_with(cx, |view, _| view.finding()));
+    }
+
+    #[gpui::test]
+    fn middle_click_pastes_primary_into_the_find_query(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        feed(&view, cx, b"needle");
+        view.update(cx, |view, cx| view.open_find(cx));
+        cx.run_until_parked();
+        let rx = feed(&view, cx, b"");
+        cx.update(|_, cx| cx.write_to_primary(gpui::ClipboardItem::new_string("needle".into())));
+        let none = Modifiers::none();
+        let at = cell(&view, cx, 3., 1.);
+        cx.simulate_mouse_down(at, MouseButton::Middle, none);
+        cx.simulate_mouse_up(at, MouseButton::Middle, none);
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        let query = view.read_with(cx, |view, _| view.finder.query().to_owned());
+        assert_eq!(query, "needle");
+    }
+
+    #[gpui::test]
+    fn closing_find_drops_its_pending_composition(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        view.update(cx, |view, cx| view.open_find(cx));
+        let rx = feed(&view, cx, b"");
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_and_mark_text_in_range(None, "に", None, window, cx);
+        });
+        cx.run_until_parked();
+        // The bar's close control, at its right end.
+        let close = bounds(&view, cx).top_right() + point(px(-16.), px(14.));
+        cx.simulate_click(close, Modifiers::none());
+        assert!(
+            !view.read_with(cx, |view, _| view.finding()),
+            "Close closes"
+        );
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_text_in_range(None, "日", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(inputs(&rx), Vec::<String>::new());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.typing.marked().map(str::to_owned)),
+            None
+        );
+        view.update_in(cx, |view, window, cx| {
+            use gpui::EntityInputHandler;
+            view.replace_text_in_range(None, "x", window, cx);
+        });
+        assert_eq!(inputs(&rx), vec!["x".to_owned()]);
     }
 }

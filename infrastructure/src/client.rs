@@ -1,6 +1,17 @@
 pub mod talk;
 
 pub use crate::wire::SessionMetadata;
+
+/// Scrollback every terminal keeps, client and daemon alike: 10,000 lines, at most 10 MB.
+pub const SCROLLBACK_MAX_LINES: usize = 10_000;
+pub const SCROLLBACK_MAX_BYTES: usize = 10_000_000;
+
+/// Caps `terminal`'s scrollback at [`SCROLLBACK_MAX_LINES`] and [`SCROLLBACK_MAX_BYTES`].
+pub fn limit_scrollback(terminal: &mut ghostty_vt::Terminal) -> ghostty_vt::error::Result<()> {
+    terminal.set_scrollback_max_bytes(Some(SCROLLBACK_MAX_BYTES))?;
+    terminal.set_scrollback_max_lines(Some(SCROLLBACK_MAX_LINES))?;
+    Ok(())
+}
 use crate::wire::{self, Request, Response};
 use anyhow::{Context, Result, bail};
 use application::{PublishArtifact, RecentArtifact, ResolveArtifact, StartSession};
@@ -90,12 +101,21 @@ pub fn overview() -> Result<domain::overview::Overview> {
     }
 }
 
-/// Reports the conversation an agent wrapper is about to start, so a restore can resume it.
-pub fn set_conversation(session: String, agent: String, conversation: String) -> Result<()> {
+/// Reports that an agent wrapper is about to start the agent, and the conversation when it
+/// is known, so a restore can resume it and identify the agent that owns its labels.
+pub fn set_conversation(
+    session: String,
+    agent: String,
+    conversation: Option<String>,
+    fresh: bool,
+    resumed: bool,
+) -> Result<()> {
     expect_ok(&Request::SetConversation {
         session,
         agent,
         conversation,
+        fresh,
+        resumed,
     })
 }
 

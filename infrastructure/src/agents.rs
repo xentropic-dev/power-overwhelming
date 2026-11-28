@@ -236,6 +236,14 @@ fn resume(assign: &[&str], resume: &[&str], resume_last: &[&str], conflicts: &[&
         assign: strings(assign),
         resume: strings(resume),
         resume_last: strings(resume_last),
+        // A forked resume opens a new conversation, not the one it names.
+        forks: strings(
+            &conflicts
+                .iter()
+                .copied()
+                .filter(|flag| *flag == "--fork-session")
+                .collect::<Vec<_>>(),
+        ),
         conflicts: strings(conflicts),
     }
 }

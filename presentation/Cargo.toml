@@ -41,6 +41,8 @@ pkg-config = "0.3"
 [dev-dependencies]
 rusqlite = { version = "0.33", features = ["bundled"] }
 base64 = "0.22"
+# A headless window to drive terminal gestures end to end.
+gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "test-support"] }
 
 # GPUI's Linux shaper, to shape terminal runs in tests without a window.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -1,6 +1,8 @@
 use crate::wire;
 use anyhow::{Context, Result};
-use application::{ArtifactStore, RecentArtifact, SessionArtifact, SessionRecord, SessionStore};
+use application::{
+    ArtifactStore, Labels, RecentArtifact, SessionArtifact, SessionRecord, SessionStore,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     artifact::{ArtifactRecord, ResolvedArtifact, URI_PREFIX},
@@ -151,6 +153,27 @@ impl SqliteSessions {
                 conversation TEXT, cwd BLOB, created INTEGER NOT NULL DEFAULT (unixepoch())
             );",
         )?;
+        // Older databases predate the reported labels.
+        for column in ["task", "model", "model_reported"] {
+            let present: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                db.execute(
+                    &format!(
+                        "ALTER TABLE sessions ADD COLUMN {column} {}",
+                        if column == "model_reported" {
+                            "INTEGER NOT NULL DEFAULT 0"
+                        } else {
+                            "TEXT"
+                        }
+                    ),
+                    [],
+                )?;
+            }
+        }
         Ok(Self(Mutex::new(db)))
     }
 }
@@ -175,12 +198,16 @@ impl SessionStore for SqliteSessions {
             .collect();
         // Keep the original rowid when saving an existing session.
         self.0.lock().unwrap().execute(
-            "INSERT INTO sessions (id, worktree, agent, args, env, foreground, conversation, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO sessions
+                (id, worktree, agent, args, env, foreground, conversation, cwd,
+                 task, model, model_reported)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 worktree = excluded.worktree, agent = excluded.agent, args = excluded.args,
                 env = excluded.env, foreground = excluded.foreground,
-                conversation = excluded.conversation, cwd = excluded.cwd",
+                conversation = excluded.conversation, cwd = excluded.cwd,
+                task = excluded.task, model = excluded.model,
+                model_reported = excluded.model_reported",
             params![
                 record.id,
                 path_bytes(&record.worktree),
@@ -190,7 +217,18 @@ impl SessionStore for SqliteSessions {
                 record.foreground.as_str(),
                 record.conversation,
                 record.cwd.as_deref().map(path_bytes),
+                record.labels.task,
+                record.labels.model,
+                record.labels.model_reported,
             ],
+        )?;
+        Ok(())
+    }
+
+    fn update_labels(&self, id: &str, labels: &Labels) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE sessions SET task = ?2, model = ?3, model_reported = ?4 WHERE id = ?1",
+            params![id, labels.task, labels.model, labels.model_reported],
         )?;
         Ok(())
     }
@@ -201,11 +239,31 @@ impl SessionStore for SqliteSessions {
         foreground: &Agent,
         conversation: Option<&str>,
         cwd: Option<&Path>,
+        labels: Option<&Labels>,
     ) -> Result<()> {
-        self.0.lock().unwrap().execute(
-            "UPDATE sessions SET foreground = ?2, conversation = ?3, cwd = ?4 WHERE id = ?1",
-            params![id, foreground.as_str(), conversation, cwd.map(path_bytes)],
-        )?;
+        let db = self.0.lock().unwrap();
+        let (foreground, cwd) = (foreground.as_str(), cwd.map(path_bytes));
+        // One statement, so the saved agent and its labels never come from different owners.
+        match labels {
+            Some(labels) => db.execute(
+                "UPDATE sessions SET foreground = ?2, conversation = ?3, cwd = ?4,
+                    task = ?5, model = ?6, model_reported = ?7
+                 WHERE id = ?1",
+                params![
+                    id,
+                    foreground,
+                    conversation,
+                    cwd,
+                    labels.task,
+                    labels.model,
+                    labels.model_reported
+                ],
+            )?,
+            None => db.execute(
+                "UPDATE sessions SET foreground = ?2, conversation = ?3, cwd = ?4 WHERE id = ?1",
+                params![id, foreground, conversation, cwd],
+            )?,
+        };
         Ok(())
     }
 
@@ -220,7 +278,8 @@ impl SessionStore for SqliteSessions {
     fn list(&self) -> Result<Vec<SessionRecord>> {
         let db = self.0.lock().unwrap();
         let mut statement = db.prepare(
-            "SELECT id, worktree, agent, args, env, foreground, conversation, cwd
+            "SELECT id, worktree, agent, args, env, foreground, conversation, cwd, task, model,
+                    model_reported
              FROM sessions ORDER BY rowid",
         )?;
         let mut rows = statement.query([])?;
@@ -255,6 +314,11 @@ fn read_session(row: &Row<'_>) -> Result<SessionRecord> {
         foreground: session_agent(row.get(5)?)?,
         conversation: row.get(6)?,
         cwd: row.get::<_, Option<Vec<u8>>>(7)?.map(path_from_bytes),
+        labels: Labels {
+            task: row.get(8)?,
+            model: row.get(9)?,
+            model_reported: row.get(10)?,
+        },
     })
 }
 
@@ -386,6 +450,11 @@ mod tests {
             foreground: Agent::Coding("custom".into()),
             conversation: Some("conversation-id".to_owned()),
             cwd: Some("/repo/subdir".into()),
+            labels: Labels {
+                task: Some("Fix the build".to_owned()),
+                model: Some("opus".to_owned()),
+                model_reported: true,
+            },
         }
     }
 
@@ -424,14 +493,68 @@ mod tests {
             &record.foreground,
             record.conversation.as_deref(),
             record.cwd.as_deref(),
+            None,
         )?;
+        // Without labels the saved ones are kept.
         assert_eq!(store.list()?, [record.clone()]);
 
-        store.update_foreground(&record.id, &Agent::Shell, None, None)?;
+        store.update_foreground(
+            &record.id,
+            &Agent::Shell,
+            None,
+            None,
+            Some(&Labels::default()),
+        )?;
         record.foreground = Agent::Shell;
         record.conversation = None;
         record.cwd = None;
+        record.labels = Labels::default();
         assert_eq!(store.list()?, [record]);
+        Ok(())
+    }
+
+    #[test]
+    fn updates_and_clears_labels() -> Result<()> {
+        let store = SqliteSessions::open_in_memory()?;
+        let mut record = session("id");
+        store.save(&record)?;
+        let cleared = Labels {
+            task: Some("New task".to_owned()),
+            model: None,
+            model_reported: true,
+        };
+        store.update_labels("id", &cleared)?;
+        record.labels = cleared;
+        assert_eq!(store.list()?, [record]);
+        Ok(())
+    }
+
+    #[test]
+    fn loads_records_saved_before_labels_existed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("sessions.sqlite3");
+        let db = Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, worktree BLOB NOT NULL, agent TEXT NOT NULL,
+                args TEXT NOT NULL, env TEXT NOT NULL, foreground TEXT NOT NULL,
+                conversation TEXT, cwd BLOB, created INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            INSERT INTO sessions (id, worktree, agent, args, env, foreground)
+                VALUES ('old', x'2f72', 'shell', '[]', '[]', 'shell');",
+        )?;
+        drop(db);
+        let store = SqliteSessions::open_at(directory.path())?;
+        let records = store.list()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].labels, Labels::default());
+        let labels = Labels {
+            task: Some("t".into()),
+            model: Some("m".into()),
+            model_reported: true,
+        };
+        store.update_labels("old", &labels)?;
+        assert_eq!(store.list()?[0].labels, labels);
         Ok(())
     }
 
@@ -444,7 +567,7 @@ mod tests {
 
         store.remove("id")?;
         store.remove("id")?;
-        store.update_foreground("id", &Agent::Shell, None, None)?;
+        store.update_foreground("id", &Agent::Shell, None, None, None)?;
         assert_eq!(store.list()?, [other]);
         Ok(())
     }

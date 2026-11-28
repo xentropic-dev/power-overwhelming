@@ -411,9 +411,12 @@ read -r finish
             let mut attached = request(&socket, json!({"request":"subscribe", "session":session}));
             loop {
                 let message = event(&mut attached);
+                // A restored shell shows the saved task until the resumed agent reports.
                 if let Some(reported) = message["metadata"]["task"].as_str() {
-                    assert_eq!(reported, task, "{shell:?}");
-                    break;
+                    assert!(!reported.starts_with("unexpected"), "{shell:?}: {reported}");
+                    if reported == task {
+                        break;
+                    }
                 }
             }
             let listed = event(&mut request(&socket, json!({"request":"list"})));

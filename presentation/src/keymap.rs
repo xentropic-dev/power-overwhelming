@@ -90,6 +90,17 @@ pub enum Command {
     TerminalZoomReset,
     TerminalCopy,
     TerminalPaste,
+    TerminalScrollLineUp,
+    TerminalScrollLineDown,
+    TerminalScrollPageUp,
+    TerminalScrollPageDown,
+    TerminalScrollTop,
+    TerminalScrollBottom,
+    TerminalSelectAll,
+    Find,
+    FindNext,
+    FindPrev,
+    FindClose,
     PreviewPrevious,
     PreviewNext,
     PreviewClose,
@@ -145,6 +156,8 @@ pub enum Scope {
     Hints,
     /// While a terminal has focus and no prefix is pending. Other keys go to the program.
     Terminal,
+    /// While a terminal's find bar is open. Other keys edit the query.
+    Find,
 }
 
 impl Scope {
@@ -163,6 +176,7 @@ impl Scope {
             Self::Preview => "preview",
             Self::Hints => "hints",
             Self::Terminal => "terminal",
+            Self::Find => "find",
         }
     }
 }
@@ -350,6 +364,17 @@ const TABLE: &[Entry] = &[
     entry(S::Hints, "cancel", C::HintCancel, &["escape"], "Hide the numbers"),
     entry(S::Terminal, "copy", C::TerminalCopy, &["ctrl-shift-c"], "Copy the selection"),
     entry(S::Terminal, "paste", C::TerminalPaste, &["ctrl-shift-v"], "Paste, bracketed if the program asks"),
+    entry(S::Terminal, "scroll_line_up", C::TerminalScrollLineUp, &["ctrl-shift-up"], "Scroll the scrollback up a line"),
+    entry(S::Terminal, "scroll_line_down", C::TerminalScrollLineDown, &["ctrl-shift-down"], "Scroll the scrollback down a line"),
+    entry(S::Terminal, "scroll_page_up", C::TerminalScrollPageUp, &["shift-pageup"], "Scroll the scrollback up a page"),
+    entry(S::Terminal, "scroll_page_down", C::TerminalScrollPageDown, &["shift-pagedown"], "Scroll the scrollback down a page"),
+    entry(S::Terminal, "scroll_top", C::TerminalScrollTop, &["shift-home"], "Scroll to the top of the scrollback"),
+    entry(S::Terminal, "scroll_bottom", C::TerminalScrollBottom, &["shift-end"], "Scroll back to the prompt"),
+    entry(S::Terminal, "select_all", C::TerminalSelectAll, &["ctrl-shift-a"], "Select the screen and scrollback"),
+    entry(S::Terminal, "find", C::Find, &["ctrl-shift-f"], "Find in the terminal and its scrollback"),
+    entry(S::Find, "next", C::FindNext, &["enter", "f3"], "Next match, toward older output"),
+    entry(S::Find, "previous", C::FindPrev, &["shift-enter", "shift-f3"], "Previous match, toward newer output"),
+    entry(S::Find, "close", C::FindClose, &["escape"], "Close the find bar"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -745,6 +770,7 @@ impl Keymap {
                 Scope::Panel => format!("In panels such as the dashboard: {keys}"),
                 Scope::Preview => format!("In the preview pane: {keys}"),
                 Scope::Terminal => format!("In the terminal: {keys}"),
+                Scope::Find => format!("In the find bar: {keys}"),
                 Scope::Hints if !tab_prefix.is_empty() && !open_links.is_empty() => {
                     format!("{hints} {keys}")
                 }
@@ -812,6 +838,23 @@ mod tests {
         ] {
             assert_eq!(keymap.command(Scope::Preview, &stroke(key)), Some(command));
         }
+    }
+
+    #[test]
+    fn terminal_scrolling_is_commands() {
+        let keymap = Keymap::default();
+        for (key, command) in [
+            ("ctrl-shift-up", C::TerminalScrollLineUp),
+            ("ctrl-shift-down", C::TerminalScrollLineDown),
+            ("shift-pageup", C::TerminalScrollPageUp),
+            ("shift-pagedown", C::TerminalScrollPageDown),
+            ("shift-home", C::TerminalScrollTop),
+            ("shift-end", C::TerminalScrollBottom),
+        ] {
+            assert_eq!(keymap.command(Scope::Terminal, &stroke(key)), Some(command));
+        }
+        // Unshifted paging stays with the program.
+        assert_eq!(keymap.command(Scope::Terminal, &stroke("pageup")), None);
     }
 
     #[test]

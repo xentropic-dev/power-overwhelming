@@ -18,7 +18,8 @@ pub struct RestoredSession {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Restore {
     pub restored: Vec<RestoredSession>,
-    /// Sessions left unrestored because what an earlier daemon left of them still runs.
+    /// Sessions left unrestored because what an earlier daemon left of them still runs,
+    /// or because the caller kept them.
     pub deferred: Vec<String>,
 }
 
@@ -30,11 +31,14 @@ pub enum RestoreChoice {
     Resume(Option<String>),
     /// Forget the record without relaunching. The reason is logged.
     Forget(&'static str),
+    /// Keep the record without relaunching, and report the session as deferred, so
+    /// the caller can finish its handoff later. The reason is logged.
+    Keep(&'static str),
 }
 
 /// What to do with one saved session on daemon start.
 enum Plan {
-    Launch(SessionOptions),
+    Launch(Box<SessionOptions>),
     /// Forget the record. The reason is logged.
     Drop(&'static str),
 }
@@ -69,20 +73,42 @@ impl<T: TerminalRuntime> Application<T> {
         &self,
         choose: impl Fn(&str) -> RestoreChoice,
     ) -> Result<Restore> {
-        let mut restored = Vec::new();
-        let mut deferred = Vec::new();
+        let unreclaimed = self.reclaim_saved()?;
+        self.restore_reclaimed(&unreclaimed, choose)
+    }
+
+    /// Ends what an earlier daemon left of every saved session, before anything is
+    /// relaunched, and returns the sessions where something may still run. Every
+    /// reclaim finishes first, so a caller can count what still runs before it admits
+    /// any relaunch.
+    pub fn reclaim_saved(&self) -> Result<Vec<String>> {
+        let mut unreclaimed = Vec::new();
         for record in self.records.list()? {
             // Anything an earlier daemon left of the session ends first, whether it
             // is relaunched or forgotten, so a finished worker's teardown that the
             // restart interrupted still completes.
-            let reclaimed = self.runtime.reclaim(&record.id);
-            if let Err(error) = &reclaimed {
+            if let Err(error) = self.runtime.reclaim(&record.id) {
                 eprintln!(
                     "Could not end what an earlier daemon left of session {}. {error:#}",
                     record.id
                 );
+                unreclaimed.push(record.id);
             }
-            if reclaimed.is_err() {
+        }
+        Ok(unreclaimed)
+    }
+
+    /// The second half of `restore_sessions_deferring`, once `reclaim_saved` ran. The
+    /// sessions in `unreclaimed` keep their records and are never relaunched.
+    pub fn restore_reclaimed(
+        &self,
+        unreclaimed: &[String],
+        choose: impl Fn(&str) -> RestoreChoice,
+    ) -> Result<Restore> {
+        let mut restored = Vec::new();
+        let mut deferred = Vec::new();
+        for record in self.records.list()? {
+            if unreclaimed.contains(&record.id) {
                 // The record is how a later start or retry finds what still runs.
                 eprintln!(
                     "Keeping session {} unrestored until what still runs of it ends.",
@@ -94,6 +120,11 @@ impl<T: TerminalRuntime> Application<T> {
             let plan = match choose(&record.id) {
                 RestoreChoice::Resume(continuation) => self.restore_plan(&record, continuation),
                 RestoreChoice::Forget(reason) => Ok(Plan::Drop(reason)),
+                RestoreChoice::Keep(reason) => {
+                    eprintln!("Keeping session {} unrestored: {reason}.", record.id);
+                    deferred.push(record.id);
+                    continue;
+                }
             };
             let options = match plan {
                 Ok(Plan::Launch(options)) => options,
@@ -115,7 +146,7 @@ impl<T: TerminalRuntime> Application<T> {
                 agent: record.agent.clone(),
             };
             let prompted = options.initial_prompt.is_some();
-            match self.launch(session, options) {
+            match self.launch(session, *options) {
                 Ok(_) => restored.push(RestoredSession {
                     id: record.id,
                     prompted,
@@ -174,6 +205,7 @@ impl<T: TerminalRuntime> Application<T> {
                             options.resume = Some(ResumeCommand {
                                 program: profile.id.as_str().to_owned(),
                                 args,
+                                conversation: record.conversation.clone(),
                                 fallback,
                             })
                         }
@@ -186,7 +218,46 @@ impl<T: TerminalRuntime> Application<T> {
                 }
             }
         }
-        Ok(Plan::Launch(options))
+        // Labels belong to the conversation that reported them. Only a resume pinned to
+        // that conversation's ID continues it. `--last`, `--continue`, no resume at all,
+        // or a fresh start may open any other conversation, so the labels are dropped,
+        // from the record too, so no later restore brings them back either.
+        if self.pinned(record) {
+            options.labels = record.labels.clone();
+        } else if record.labels != crate::Labels::default()
+            && let Err(error) = self
+                .records
+                .update_labels(&record.id, &crate::Labels::default())
+        {
+            eprintln!("Could not clear labels of session {}. {error:#}", record.id);
+        }
+        Ok(Plan::Launch(Box::new(options)))
+    }
+}
+
+impl<R: TerminalRuntime> Application<R> {
+    /// Whether restoring `record` resumes the very conversation that saved its labels.
+    fn pinned(&self, record: &SessionRecord) -> bool {
+        let agent = match &record.agent {
+            Agent::Coding(id) => id,
+            Agent::Shell => match &record.foreground {
+                Agent::Coding(id) if record.args.is_empty() => id,
+                _ => return false,
+            },
+        };
+        record.conversation.is_some()
+            && self
+                .agents
+                .resolve(agent)
+                .ok()
+                .and_then(|profile| profile.resume.as_ref())
+                // Only an `{id}` argument selects the saved conversation itself.
+                .is_some_and(|resume| {
+                    resume.resume.iter().any(|arg| arg.contains("{id}"))
+                        // A forked launch opened a new conversation. A record saved
+                        // before forks were told apart names its parent instead.
+                        && !resume.forks(&record.args)
+                })
     }
 }
 
@@ -206,9 +277,9 @@ fn restart_args(
 mod tests {
     use super::RestoreChoice;
     use crate::{
-        Application, ArtifactStore, BranchStatus, CreatedWorktree, MemorySessions, RecentArtifact,
-        ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession, TerminalRuntime,
-        Workspace, WorktreeStatus, agents::AgentProfileRegistry,
+        Application, ArtifactStore, BranchStatus, CreatedWorktree, Labels, MemorySessions,
+        RecentArtifact, ResumeCommand, SessionOptions, SessionRecord, SessionStore, StartSession,
+        TerminalRuntime, Workspace, WorktreeStatus, agents::AgentProfileRegistry,
     };
     use anyhow::{Result, bail};
     use domain::{
@@ -345,12 +416,19 @@ mod tests {
             resume: vec!["--resume".into(), "{id}".into()],
             resume_last: vec!["--continue".into()],
             conflicts: vec!["--resume".into()],
+            forks: vec!["--fork-session".into()],
         };
         let codex = Resume {
             resume_last: vec!["resume".into(), "--last".into()],
             ..Resume::default()
         };
+        // A custom profile whose resume never names the conversation.
+        let last = Resume {
+            resume: vec!["resume".into(), "--last".into()],
+            ..Resume::default()
+        };
         let profiles = vec![
+            profile("last", Some(last)),
             profile("claude", Some(claude)),
             profile("codex", Some(codex)),
             profile("plain", None),
@@ -380,6 +458,7 @@ mod tests {
             foreground: agent,
             conversation: None,
             cwd: None,
+            labels: Labels::default(),
         }
     }
 
@@ -520,6 +599,7 @@ mod tests {
                         resume: Some(ResumeCommand {
                             program: "claude".into(),
                             args: os(&["--resume", "conv-2"]),
+                            conversation: Some("conv-2".into()),
                             fallback: Some(os(&["--session-id", "conv-2"])),
                         }),
                         ..SessionOptions::default()
@@ -693,17 +773,23 @@ mod tests {
             .iter()
             .map(|(_, options)| options.resume.clone().unwrap())
             .collect();
-        let resume = |program: &str, args: &[&str], fallback: Option<&[&str]>| ResumeCommand {
-            program: program.into(),
-            args: os(args),
-            fallback: fallback.map(os),
+        let resume = |program: &str,
+                      args: &[&str],
+                      conversation: Option<&str>,
+                      fallback: Option<&[&str]>| {
+            ResumeCommand {
+                program: program.into(),
+                args: os(args),
+                conversation: conversation.map(Into::into),
+                fallback: fallback.map(os),
+            }
         };
         assert_eq!(
             resumes,
             [
-                resume("codex", &["resume", "--last"], Some(&[])),
-                resume("claude", &["--continue"], Some(&[])),
-                resume("plain", &[], None),
+                resume("codex", &["resume", "--last"], Some("ignored"), Some(&[])),
+                resume("claude", &["--continue"], None, Some(&[])),
+                resume("plain", &[], Some("conv"), None),
             ]
         );
         Ok(())
@@ -722,11 +808,168 @@ mod tests {
             &coding("claude"),
             Some("conv"),
             Some(Path::new("/repo/sub")),
+            None,
         )?;
         let saved = &store.list()?[0];
         assert_eq!(saved.foreground, coding("claude"));
         assert_eq!(saved.conversation.as_deref(), Some("conv"));
         assert_eq!(saved.cwd.as_deref(), Some(Path::new("/repo/sub")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_forked_launch_is_never_restored_as_a_pinned_resume() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let store = Arc::new(MemorySessions::default());
+        let saved = Labels {
+            task: Some("Fork task".into()),
+            model: Some("model".into()),
+            model_reported: true,
+        };
+        // A record from before forks were told apart names the parent conversation.
+        let mut fork = record(
+            "fork",
+            worktree.path(),
+            coding("claude"),
+            &["--resume", "parent", "--fork-session", "--model", "opus"],
+        );
+        fork.conversation = Some("parent".into());
+        fork.labels = saved.clone();
+        store.save(&fork)?;
+        // Positive control: the same launch without the fork keeps its labels.
+        let mut pinned = record(
+            "pinned",
+            worktree.path(),
+            coding("claude"),
+            &["--resume", "parent", "--model", "opus"],
+        );
+        pinned.conversation = Some("parent".into());
+        pinned.labels = saved.clone();
+        store.save(&pinned)?;
+        let (application, starts) = app(store.clone());
+        application.restore_sessions()?;
+
+        let starts = starts.0.lock().unwrap();
+        let options = |id: &str| &starts.iter().find(|(s, _)| s.id == id).unwrap().1;
+        // The restore resumes the saved conversation itself and never forks again.
+        assert_eq!(
+            options("fork").args,
+            os(&["--resume", "parent", "--model", "opus"])
+        );
+        assert_eq!(
+            options("fork").fallback_args,
+            Some(os(&["--session-id", "parent", "--model", "opus"]))
+        );
+        assert_eq!(options("fork").labels, Labels::default());
+        assert_eq!(options("pinned").labels, saved);
+        let records = store.list()?;
+        let labels = |id: &str| records.iter().find(|r| r.id == id).unwrap().labels.clone();
+        assert_eq!(labels("fork"), Labels::default());
+        assert_eq!(labels("pinned"), saved);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_labels_return_only_with_a_resume_pinned_to_their_conversation() -> Result<()> {
+        let worktree = tempfile::tempdir()?;
+        let root = worktree.path();
+        let store = Arc::new(MemorySessions::default());
+        let saved = Labels {
+            task: Some("Task".into()),
+            model: Some("model".into()),
+            model_reported: true,
+        };
+        // (id, launched agent, foreground agent, conversation, whether the labels return)
+        let cases = [
+            (
+                "managed-pinned",
+                coding("claude"),
+                coding("claude"),
+                Some("c"),
+                true,
+            ),
+            (
+                "managed-unknown",
+                coding("claude"),
+                coding("claude"),
+                None,
+                false,
+            ),
+            (
+                "managed-last",
+                coding("codex"),
+                coding("codex"),
+                Some("c"),
+                false,
+            ),
+            (
+                "managed-custom-last",
+                coding("last"),
+                coding("last"),
+                Some("c"),
+                false,
+            ),
+            (
+                "managed-no-resume",
+                coding("plain"),
+                coding("plain"),
+                Some("c"),
+                false,
+            ),
+            (
+                "shell-pinned",
+                Agent::Shell,
+                coding("claude"),
+                Some("c"),
+                true,
+            ),
+            ("shell-unknown", Agent::Shell, coding("claude"), None, false),
+            (
+                "shell-last",
+                Agent::Shell,
+                coding("codex"),
+                Some("c"),
+                false,
+            ),
+            (
+                "shell-custom-last",
+                Agent::Shell,
+                coding("last"),
+                Some("c"),
+                false,
+            ),
+            (
+                "shell-no-resume",
+                Agent::Shell,
+                coding("plain"),
+                Some("c"),
+                false,
+            ),
+            ("shell-bare", Agent::Shell, Agent::Shell, Some("c"), false),
+        ];
+        for (id, agent, foreground, conversation, _) in &cases {
+            let mut record = record(id, root, agent.clone(), &[]);
+            record.foreground = foreground.clone();
+            record.conversation = conversation.map(Into::into);
+            record.labels = saved.clone();
+            store.save(&record)?;
+        }
+        let (application, starts) = app(store.clone());
+        application.restore_sessions()?;
+
+        let starts = starts.0.lock().unwrap();
+        for (id, .., kept) in &cases {
+            let expected = if *kept {
+                saved.clone()
+            } else {
+                Labels::default()
+            };
+            let (_, options) = starts.iter().find(|(s, _)| s.id == *id).unwrap();
+            assert_eq!(options.labels, expected, "{id}");
+            // The record drops them too, so no later restore brings them back.
+            let record = store.list()?.into_iter().find(|r| r.id == *id).unwrap();
+            assert_eq!(record.labels, expected, "{id}");
+        }
         Ok(())
     }
 }

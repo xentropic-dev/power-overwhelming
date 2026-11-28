@@ -10,7 +10,7 @@ pub mod skill_install;
 pub mod skills;
 
 pub use commands::{
-    ArtifactPublished, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
+    ArtifactPublished, Labels, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
 };
 pub use queries::ResolveArtifact;
 pub use restore::{RestoreChoice, RestoredSession};
@@ -191,6 +191,15 @@ impl<T: TerminalRuntime> Application<T> {
     pub fn forget_session(&self, id: &str) -> Result<()> {
         self.sessions.lock().unwrap().remove(id);
         self.records.remove(id)
+    }
+
+    /// The durable record of session `id`, if any.
+    pub fn session_record(&self, id: &str) -> Result<Option<SessionRecord>> {
+        Ok(self
+            .records
+            .list()?
+            .into_iter()
+            .find(|record| record.id == id))
     }
 
     /// Whether a durable record of session `id` remains.
