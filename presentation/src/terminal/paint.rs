@@ -148,9 +148,11 @@ impl Render for TerminalView {
         let background = ink.map_or(colors.background, |c| packed(c.background));
         let cursor_color = ink.and_then(|c| c.cursor).map_or(colors.cursor, packed);
         let foreground = ink.map_or(colors.foreground, |c| packed(c.foreground));
+        // While finding, the composition shows in the find bar instead.
         let preedit = self
             .typing
             .marked()
+            .filter(|_| !self.finding())
             .map(str::to_owned)
             .zip(self.frame.ime_cursor)
             .map(|(text, at)| Preedit {
@@ -488,12 +490,27 @@ impl Render for TerminalView {
                     .child((index + 1).to_string())
             }))
             .when_some(find_bar, |this, (query, label)| {
+                let control = |id: &'static str, glyph: &'static str| {
+                    div()
+                        .id(id)
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| {
+                            style
+                                .bg(rgb(colors.accent))
+                                .text_color(rgb(colors.background))
+                        })
+                        .child(glyph)
+                };
+                let (previous, next, close) = (cx.entity(), cx.entity(), cx.entity());
                 this.child(
                     div()
+                        .id("find-bar")
                         .absolute()
                         .top_1()
                         .right_2()
-                        .w(px(320.))
+                        .w(px(360.))
                         .flex()
                         .gap_2()
                         .items_center()
@@ -505,6 +522,9 @@ impl Render for TerminalView {
                         .bg(rgb(colors.raised))
                         .text_color(rgb(colors.foreground))
                         .text_xs()
+                        // The bar is its own control: presses, wheel turns and moves over it
+                        // never reach the terminal or the program behind it.
+                        .occlude()
                         .child(div().text_color(rgb(colors.accent)).child("Find"))
                         .child(
                             div()
@@ -513,7 +533,23 @@ impl Render for TerminalView {
                                 .whitespace_nowrap()
                                 .child(format!("{query}\u{2502}")),
                         )
-                        .child(label),
+                        .child(label)
+                        .child(
+                            control("find-previous", "\u{2191}").on_click(move |_, _, cx| {
+                                previous.update(cx, |view, cx| view.find_step(true, cx))
+                            }),
+                        )
+                        .child(control("find-next", "\u{2193}").on_click(move |_, _, cx| {
+                            next.update(cx, |view, cx| view.find_step(false, cx))
+                        }))
+                        .child(
+                            control("find-close", "\u{2715}").on_click(move |_, window, cx| {
+                                close.update(cx, |view, cx| {
+                                    view.close_find(cx);
+                                    view.focus.focus(window);
+                                })
+                            }),
+                        ),
                 )
             })
             .when_some(self.hint_footer.clone(), |this, footer| {

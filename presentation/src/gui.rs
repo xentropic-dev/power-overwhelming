@@ -3068,6 +3068,11 @@ impl Workspace {
                 Some(Command::FindPrev) => view.find_step(true, cx),
                 Some(Command::FindClose) => view.close_find(cx),
                 Some(Command::Find) => view.open_find(cx),
+                _ if self.keymap.command(Scope::Terminal, stroke)
+                    == Some(Command::TerminalPaste) =>
+                {
+                    view.find_paste(cx)
+                }
                 _ => {
                     if !view.find_key(stroke, cx)
                         && let Some(Command::TerminalCopy) =

@@ -77,6 +77,8 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         match self.typing.commit(text) {
+            // While the find bar is open it owns text input; nothing reaches the program.
+            Some(_) if self.finding() => self.find_insert(text, cx),
             Some(bytes) => self.keyboard_input(bytes, cx),
             None => cx.notify(),
         }

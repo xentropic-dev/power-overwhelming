@@ -59,10 +59,33 @@ impl TerminalView {
         true
     }
 
+    /// Text pasted or committed by an input method into the find bar.
+    pub fn find_insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text = query_text(text);
+        if text.is_empty() {
+            return;
+        }
+        let query = format!("{}{text}", self.finder.query());
+        self.finder.set_query(&self.terminal, query);
+        self.after_find(cx);
+    }
+
+    /// Pastes the clipboard into the query rather than to the program.
+    pub fn find_paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.find_insert(&text, cx);
+        }
+    }
+
     pub(super) fn find_bar(&self) -> Option<(String, String)> {
-        self.finder
-            .is_open()
-            .then(|| (self.finder.query().to_owned(), self.finder.label()))
+        self.finder.is_open().then(|| {
+            // An input method's composition shows after the query, where it will land.
+            let marked = self.typing.marked().unwrap_or("");
+            (
+                format!("{}{marked}", self.finder.query()),
+                self.finder.label(),
+            )
+        })
     }
 
     pub(super) fn find_spans(&self) -> &[Span] {
@@ -298,6 +321,19 @@ impl Finder {
     }
 }
 
+/// Pasted text as query text: line breaks and tabs become spaces, other controls go.
+fn query_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\r' | '\n' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
 /// The query after a key typed into the find bar, or `None` when the key doesn't edit it.
 pub(super) fn edit(
     query: &str,
@@ -422,5 +458,10 @@ mod tests {
         assert_eq!(edit("ab", "backspace", None, true).as_deref(), Some(""));
         assert_eq!(edit("ab", "c", Some("c"), true), None);
         assert_eq!(edit("ab", "left", None, false), None);
+    }
+
+    #[test]
+    fn pasted_text_becomes_one_line() {
+        assert_eq!(query_text("a\r\nb\tc\x1b\n"), "a  b c");
     }
 }
