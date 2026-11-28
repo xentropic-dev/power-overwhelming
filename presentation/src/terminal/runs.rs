@@ -256,17 +256,27 @@ pub(super) struct RunCell<'a> {
     pub(super) fade: Option<Hsla>,
 }
 
+/// The Kitty graphics Unicode placeholder character.
+const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+
 impl RunCell<'_> {
     fn blank(&self) -> bool {
         matches!(self.cell.wide, CellWide::SpacerTail | CellWide::SpacerHead)
             || self.cell.style.invisible
             || self.cell.text.trim().is_empty()
+            || self.placeholder()
+    }
+
+    /// A Kitty Unicode placeholder stands in for an image cell; the image draws there.
+    fn placeholder(&self) -> bool {
+        self.cell.text.starts_with(KITTY_PLACEHOLDER)
     }
 
     /// Whether `other` can join a run that this cell starts.
     fn joins(&self, other: &Self, ligatures: bool) -> bool {
         other.cell.wide == CellWide::Narrow
             && sprite_char(&other.cell.text).is_none()
+            && other.placeholder() == self.placeholder()
             && other.fg == self.fg
             && other.fade == self.fade
             && look(other.cell.style) == look(self.cell.style)
@@ -808,6 +818,16 @@ mod tests {
     #[test]
     fn concealed_text_draws_nothing() {
         let frame = screen(b"a\x1b[8mBC\x1b[0mz");
+        let row = cells(&frame, 0);
+        let font = gpui::font("Test");
+        let mut texts = Vec::new();
+        row_ops(&row, &shaping(&font, false, None), monospace(&mut texts));
+        assert_eq!(texts, ["a", "z"]);
+    }
+
+    #[test]
+    fn kitty_placeholders_draw_no_glyph() {
+        let frame = screen("a\u{10EEEE}\u{0305}\u{0305}z".as_bytes());
         let row = cells(&frame, 0);
         let font = gpui::font("Test");
         let mut texts = Vec::new();

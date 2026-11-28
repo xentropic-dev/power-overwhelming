@@ -1109,6 +1109,8 @@ fn terminal_actor(
     let mut scheme = *active_scheme.read().unwrap();
     scheme.apply_to(&mut terminal)?;
     terminal.set_xtversion(Some("Power Overwhelming".into()));
+    // The daemon's terminal answers the program's graphics queries and acks.
+    crate::kitty::enable(&mut terminal)?;
     terminal.resize(
         geometry.cols,
         geometry.rows,

@@ -9,7 +9,10 @@ use super::{
     runs::{FAINT_OPACITY, RowOp, RunCell, SYMBOLS_FAMILY, Shaping, row_ops},
     sprites,
 };
-use ghostty_vt::{render::CursorVisualStyle, screen::CellWide};
+use ghostty_vt::{
+    render::{CursorVisualStyle, ImageLayer},
+    screen::CellWide,
+};
 use gpui::{prelude::*, *};
 use infrastructure::theme::{Scheme, blend};
 use std::{ops::Range, rc::Rc};
@@ -173,6 +176,13 @@ impl Render for TerminalView {
         let bold_weight = FontWeight(f32::from(self.settings.font_weight_bold));
         let revision = self.paint_revision;
         let hovering = hovered.is_some();
+        // Positions from the grid origin, which only the paint knows.
+        let (images, evicted) = self.images.borrow_mut().place(
+            &self.terminal,
+            &frame.images,
+            Point::default(),
+            cell_size,
+        );
         let scrollbar = self
             .scrollbar()
             .map(|(track, thumb)| (track, thumb, self.scrollbar_grab.is_some()));
@@ -218,8 +228,24 @@ impl Render for TerminalView {
                             ElementInputHandler::new(bounds, input_owner.clone()),
                             cx,
                         );
+                        for image in evicted {
+                            let _ = window.drop_image(image);
+                        }
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
                             let grid = metrics.snap(bounds.origin);
+                            let paint_images = |layer: ImageLayer, window: &mut Window| {
+                                for image in images.iter().filter(|image| image.layer == layer) {
+                                    let at = image.bounds + grid;
+                                    let _ = window.paint_image(
+                                        at,
+                                        Corners::default(),
+                                        image.image.clone(),
+                                        0,
+                                        false,
+                                    );
+                                }
+                            };
+                            paint_images(ImageLayer::BelowBackground, window);
                             let text_system = window.text_system().clone();
                             let symbols = text_system.resolve_font(&font(SYMBOLS_FAMILY));
                             let primary = text_system.resolve_font(&terminal_font);
@@ -281,6 +307,7 @@ impl Render for TerminalView {
                                     }
                                 }
                             }
+                            paint_images(ImageLayer::BelowText, window);
                             for (row, drawing) in rows.iter().enumerate() {
                                 let selected = &drawing.highlights.selected;
                                 if !selected.is_empty() {
@@ -358,6 +385,7 @@ impl Render for TerminalView {
                                     }
                                 }
                             }
+                            paint_images(ImageLayer::AboveText, window);
                             if let Some(cursor) = &frame.cursor {
                                 let CellPosition { row, column } = cursor.position;
                                 let origin = metrics.cell_origin(grid, row, column);

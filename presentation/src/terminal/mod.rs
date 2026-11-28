@@ -5,6 +5,7 @@ pub(crate) mod bench;
 mod frame;
 mod grid;
 mod hold;
+mod images;
 mod ime;
 mod input;
 mod keys;
@@ -187,6 +188,8 @@ pub struct TerminalView {
     /// The frame captured inside `vt_write` when synchronized output last began.
     held_frame: hold::Captured,
     contrast: Rc<std::cell::Cell<f32>>,
+    /// Kitty images uploaded for painting, keyed by generation.
+    images: Rc<std::cell::RefCell<images::ImageCache>>,
     mouse: mouse::Encoder,
     /// Keys, input methods and focus as the program hears them.
     typing: Typing,
@@ -314,6 +317,7 @@ impl TerminalView {
             render_hold_generation: 0,
             held_frame,
             contrast,
+            images: Rc::default(),
             mouse: mouse::Encoder::new().expect("allocate mouse encoder"),
             typing: Typing::new(hold),
             commands,
@@ -623,6 +627,8 @@ fn configure(
         .set_clipboard_write_max_bytes(Some(MAX_CLIPBOARD_WRITE))
         .expect("set terminal clipboard size limit");
     hold::install(terminal, held_frame.clone(), contrast.clone());
+    // The mirror stores and draws the images the program sends.
+    infrastructure::kitty::enable(terminal).expect("enable Kitty graphics");
 }
 
 #[cfg(test)]

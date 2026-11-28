@@ -7,6 +7,7 @@ pub mod client;
 #[cfg(feature = "lua-config")]
 pub mod config;
 pub mod daemon;
+pub mod kitty;
 pub mod notify;
 pub mod plugins;
 
