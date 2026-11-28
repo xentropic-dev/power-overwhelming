@@ -3057,6 +3057,35 @@ impl Workspace {
         }
 
         if self.prefix.is_none()
+            && let Some(tab) = self.active_view().and_then(|id| self.terminals.get(&id))
+            && tab.view.read(cx).finding()
+            && tab.view.read(cx).focus.is_focused(window)
+        {
+            cx.stop_propagation();
+            let command = self.keymap.command(Scope::Find, stroke);
+            tab.view.update(cx, |view, cx| match command {
+                Some(Command::FindNext) => view.find_step(false, cx),
+                Some(Command::FindPrev) => view.find_step(true, cx),
+                Some(Command::FindClose) => view.close_find(cx),
+                Some(Command::Find) => view.open_find(cx),
+                _ if self.keymap.command(Scope::Terminal, stroke)
+                    == Some(Command::TerminalPaste) =>
+                {
+                    view.find_paste(cx)
+                }
+                _ => {
+                    if !view.find_key(stroke, cx)
+                        && let Some(Command::TerminalCopy) =
+                            self.keymap.command(Scope::Terminal, stroke)
+                    {
+                        view.copy(cx);
+                    }
+                }
+            });
+            return;
+        }
+
+        if self.prefix.is_none()
             && let Some(command) = self.keymap.command(Scope::Terminal, stroke)
             && let Some(tab) = self.active_view().and_then(|id| self.terminals.get(&id))
             && tab.view.read(cx).focus.is_focused(window)
@@ -3080,6 +3109,10 @@ impl Workspace {
                 Command::TerminalScrollBottom => view.scroll_history(ScrollTarget::Bottom, cx),
                 Command::TerminalSelectAll if !event.is_held => {
                     view.select_all(cx);
+                    true
+                }
+                Command::Find if !event.is_held => {
+                    view.open_find(cx);
                     true
                 }
                 _ => true,

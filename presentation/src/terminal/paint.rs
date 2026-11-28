@@ -151,9 +151,11 @@ impl Render for TerminalView {
         let background = ink.map_or(colors.background, |c| packed(c.background));
         let cursor_color = ink.and_then(|c| c.cursor).map_or(colors.cursor, packed);
         let foreground = ink.map_or(colors.foreground, |c| packed(c.foreground));
+        // While finding, the composition shows in the find bar instead.
         let preedit = self
             .typing
             .marked()
+            .filter(|_| !self.finding())
             .map(str::to_owned)
             .zip(self.frame.ime_cursor)
             .map(|(text, at)| Preedit {
@@ -183,6 +185,9 @@ impl Render for TerminalView {
             Point::default(),
             cell_size,
         );
+        let find_spans = self.find_spans().to_vec();
+        let find_color = Hsla::from(rgb(colors.accent));
+        let find_bar = self.find_bar();
         let scrollbar = self
             .scrollbar()
             .map(|(track, thumb)| (track, thumb, self.scrollbar_grab.is_some()));
@@ -312,6 +317,22 @@ impl Render for TerminalView {
                                 }
                             }
                             paint_images(ImageLayer::BelowText, window);
+                            // Matches sit on the cell backgrounds, under the glyphs and
+                            // the selection; the current match is stronger.
+                            for selected in [false, true] {
+                                for found in find_spans.iter().filter(|s| s.selected == selected) {
+                                    let width =
+                                        frame.rows.get(found.row).map_or(0, |r| r.cells.len());
+                                    let end = found.columns.end.min(width);
+                                    if found.columns.start < end {
+                                        let opacity = if selected { 0.55 } else { 0.28 };
+                                        window.paint_quad(fill(
+                                            span(found.row, found.columns.start, end),
+                                            find_color.opacity(opacity),
+                                        ));
+                                    }
+                                }
+                            }
                             for (row, drawing) in rows.iter().enumerate() {
                                 let selected = &drawing.highlights.selected;
                                 if !selected.is_empty() {
@@ -500,6 +521,69 @@ impl Render for TerminalView {
                     .font_weight(FontWeight::BOLD)
                     .child((index + 1).to_string())
             }))
+            .when_some(find_bar, |this, (query, label)| {
+                let control = |id: &'static str, glyph: &'static str| {
+                    div()
+                        .id(id)
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| {
+                            style
+                                .bg(rgb(colors.accent))
+                                .text_color(rgb(colors.background))
+                        })
+                        .child(glyph)
+                };
+                let (previous, next, close) = (cx.entity(), cx.entity(), cx.entity());
+                this.child(
+                    div()
+                        .id("find-bar")
+                        .absolute()
+                        .top_1()
+                        .right_2()
+                        .w(px(360.))
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(colors.accent))
+                        .bg(rgb(colors.raised))
+                        .text_color(rgb(colors.foreground))
+                        .text_xs()
+                        // The bar is its own control: presses, wheel turns and moves over it
+                        // never reach the terminal or the program behind it.
+                        .occlude()
+                        .child(div().text_color(rgb(colors.accent)).child("Find"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(format!("{query}\u{2502}")),
+                        )
+                        .child(label)
+                        .child(
+                            control("find-previous", "\u{2191}").on_click(move |_, _, cx| {
+                                previous.update(cx, |view, cx| view.find_step(true, cx))
+                            }),
+                        )
+                        .child(control("find-next", "\u{2193}").on_click(move |_, _, cx| {
+                            next.update(cx, |view, cx| view.find_step(false, cx))
+                        }))
+                        .child(
+                            control("find-close", "\u{2715}").on_click(move |_, window, cx| {
+                                close.update(cx, |view, cx| {
+                                    view.close_find(cx);
+                                    view.focus.focus(window);
+                                })
+                            }),
+                        ),
+                )
+            })
             .when_some(self.hint_footer.clone(), |this, footer| {
                 this.child(
                     div()
