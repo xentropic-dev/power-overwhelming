@@ -147,6 +147,8 @@ pub trait TerminalRuntime: Send + Sync {
 
 struct Live<H> {
     session: Session,
+    /// The DAG attempt from the launch environment, so a listing needs no DAG lock.
+    attempt: Option<domain::session::SessionAttempt>,
     terminal: H,
 }
 

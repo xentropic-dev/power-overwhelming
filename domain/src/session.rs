@@ -62,3 +62,46 @@ impl Default for Geometry {
         }
     }
 }
+
+/// The DAG attempt a dispatched worker session runs, fixed at launch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionAttempt {
+    pub run: Option<String>,
+    pub task: Option<String>,
+    pub attempt: String,
+}
+
+impl SessionAttempt {
+    /// Reads the attempt from a worker's launch environment.
+    pub fn from_env<'a>(env: impl IntoIterator<Item = (&'a str, Option<&'a str>)>) -> Option<Self> {
+        let (mut run, mut task, mut attempt) = (None, None, None);
+        for (name, value) in env {
+            let slot = match name {
+                "POWER_RUN" => &mut run,
+                "POWER_TASK" => &mut task,
+                "POWER_ATTEMPT" => &mut attempt,
+                _ => continue,
+            };
+            *slot = value.filter(|value| !value.is_empty()).map(str::to_owned);
+        }
+        Some(Self {
+            run,
+            task,
+            attempt: attempt?,
+        })
+    }
+
+    pub fn label(&self) -> String {
+        match (&self.run, &self.task) {
+            (Some(run), Some(task)) => format!("{run}/{task}#{}", self.attempt),
+            _ => self.attempt.clone(),
+        }
+    }
+}
+
+/// A live session with the DAG attempt it runs, read in one snapshot.
+#[derive(Clone, Debug)]
+pub struct SessionListing {
+    pub session: Session,
+    pub attempt: Option<SessionAttempt>,
+}

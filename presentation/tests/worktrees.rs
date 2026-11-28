@@ -771,3 +771,73 @@ fn an_immediate_dispatch_with_a_missing_base_records_a_failed_attempt() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["attempt"], attempts[0]["id"], "{events:?}");
 }
+
+#[test]
+fn session_list_stays_responsive_and_labeled_while_a_dispatch_creates_a_worktree() {
+    let fixture = Fixture::new();
+    let run_id = fixture.external_run("7");
+    for task in ["running", "blocked"] {
+        fixture.add_task(&run_id, task, &[]);
+    }
+    let running = fixture.spawn(&run_id, "running", "running", "exec sleep 60");
+    let session = running["agent"]["session"].as_str().unwrap().to_owned();
+    let label = format!(
+        "\t{run_id}/running#{}",
+        running["attempt"]["id"].as_str().unwrap()
+    );
+
+    // Hold the next dispatch inside `git worktree add`, which runs under the DAG store lock.
+    let root = fixture.temp.path();
+    let (started, release) = (root.join("hook.started"), root.join("hook.release"));
+    let hook = fixture.repo.join(".git/hooks/post-checkout");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile ! test -e '{}'; do sleep 0.05; done\n",
+            started.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut blocked = fixture
+        .worker("dispatch", &run_id, "blocked")
+        .args(["--worktree", "new", "--branch", "blocked", "--base", "main"])
+        .args(["--", "/bin/sh", "-ec", "exec sleep 60"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("the dispatch to enter its checkout hook", || {
+        started.exists().then_some(())
+    });
+
+    let begun = Instant::now();
+    let listed = run(fixture.command().args(["session", "list"]));
+    let elapsed = begun.elapsed();
+    fs::write(&release, []).unwrap();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "session list waited {elapsed:?} on the dispatch"
+    );
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.starts_with(&session) && line.ends_with(&label)),
+        "{listed}"
+    );
+
+    let dispatched: Value = serde_json::from_reader(blocked.stdout.take().unwrap()).unwrap();
+    assert!(blocked.wait().unwrap().success());
+    let second = dispatched["agent"]["session"].as_str().unwrap();
+    let label = format!(
+        "\t{run_id}/blocked#{}",
+        dispatched["attempt"]["id"].as_str().unwrap()
+    );
+    let listed = run(fixture.command().args(["session", "list"]));
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.starts_with(second) && line.ends_with(&label)),
+        "{listed}"
+    );
+}

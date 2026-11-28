@@ -18,7 +18,7 @@ use application::{PublishArtifact, RecentArtifact, ResolveArtifact, StartSession
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{
     artifact::{LEGACY_URI_PREFIX, ResolvedArtifact, URI_PREFIX, artifact_id},
-    session::{Agent, Geometry, Session},
+    session::{Agent, Geometry, Session, SessionListing},
 };
 use std::{
     fs::{DirBuilder, OpenOptions},
@@ -36,6 +36,16 @@ use std::{
 pub fn list_sessions() -> Result<Vec<Session>> {
     match wire::request(&Request::List)? {
         Response::Sessions { sessions } => Ok(sessions.into_iter().map(Into::into).collect()),
+        _ => bail!("Unexpected daemon response"),
+    }
+}
+
+/// Live sessions with the DAG attempt each runs, from one daemon snapshot.
+pub fn list_session_listings() -> Result<Vec<SessionListing>> {
+    match wire::request(&Request::ListWithAttempts)? {
+        Response::SessionListings { sessions } => {
+            Ok(sessions.into_iter().map(Into::into).collect())
+        }
         _ => bail!("Unexpected daemon response"),
     }
 }
