@@ -10,7 +10,7 @@ pub mod skill_install;
 pub mod skills;
 
 pub use commands::{
-    ArtifactPublished, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
+    ArtifactPublished, Labels, PublishArtifact, ResumeCommand, SessionOptions, StartSession,
 };
 pub use queries::ResolveArtifact;
 pub use restore::{RestoreChoice, RestoredSession};
