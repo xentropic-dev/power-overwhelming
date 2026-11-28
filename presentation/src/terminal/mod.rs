@@ -2,6 +2,7 @@
 //! `src/terminal.rs` (Apache-2.0).
 
 pub(crate) mod bench;
+mod find;
 mod frame;
 mod grid;
 mod hold;
@@ -170,6 +171,9 @@ pub struct TerminalView {
     /// Numbered link labels shown while the user picks a link by keyboard.
     hints: Vec<(CellPosition, Arc<str>)>,
     hint_footer: Option<String>,
+    finder: find::Finder,
+    /// Whether a pump of the running search is scheduled.
+    find_pumping: bool,
     reporting_mouse: bool,
     /// A middle press went to the program, so its release must too.
     reporting_middle: bool,
@@ -297,6 +301,8 @@ impl TerminalView {
             pressed_link: None,
             hints: Vec::new(),
             hint_footer: None,
+            finder: find::Finder::default(),
+            find_pumping: false,
             reporting_mouse: false,
             reporting_middle: false,
             exited: false,
@@ -403,6 +409,7 @@ impl TerminalView {
                     self.status = None;
                     // The gesture tracks cells of the terminal it replaced.
                     self.selector.reset(&previous);
+                    self.finder.rebind(&self.terminal);
                     self.metadata = SessionMetadata::default();
                     let title = shown_title(&title).into_owned();
                     cx.emit(TerminalTitleChanged(title));
@@ -500,8 +507,13 @@ impl TerminalView {
             return false;
         }
         let selection = selection::viewport_range(&self.terminal);
-        let moved = selection != self.selection;
+        let mut moved = selection != self.selection;
         self.selection = selection;
+        if self.finder.is_open() {
+            let spans = self.finder.spans().to_vec();
+            self.finder.pump(&self.terminal);
+            moved |= spans != self.finder.spans();
+        }
         moved | self.refresh_frame()
     }
 

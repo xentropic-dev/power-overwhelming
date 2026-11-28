@@ -173,6 +173,9 @@ impl Render for TerminalView {
         let bold_weight = FontWeight(f32::from(self.settings.font_weight_bold));
         let revision = self.paint_revision;
         let hovering = hovered.is_some();
+        let find_spans = self.find_spans().to_vec();
+        let find_color = Hsla::from(rgb(colors.accent));
+        let find_bar = self.find_bar();
         div()
             .id("terminal")
             .relative()
@@ -267,6 +270,22 @@ impl Render for TerminalView {
                                 for op in &drawing.ops {
                                     if let RowOp::Background { from, to, color } = op {
                                         window.paint_quad(fill(span(row, *from, *to), *color));
+                                    }
+                                }
+                            }
+                            // Matches sit on the cell backgrounds, under the glyphs and
+                            // the selection; the current match is stronger.
+                            for selected in [false, true] {
+                                for found in find_spans.iter().filter(|s| s.selected == selected) {
+                                    let width =
+                                        frame.rows.get(found.row).map_or(0, |r| r.cells.len());
+                                    let end = found.columns.end.min(width);
+                                    if found.columns.start < end {
+                                        let opacity = if selected { 0.55 } else { 0.28 };
+                                        window.paint_quad(fill(
+                                            span(found.row, found.columns.start, end),
+                                            find_color.opacity(opacity),
+                                        ));
                                     }
                                 }
                             }
@@ -439,6 +458,35 @@ impl Render for TerminalView {
                     .font_weight(FontWeight::BOLD)
                     .child((index + 1).to_string())
             }))
+            .when_some(find_bar, |this, (query, label)| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_1()
+                        .right_2()
+                        .w(px(320.))
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(colors.accent))
+                        .bg(rgb(colors.raised))
+                        .text_color(rgb(colors.foreground))
+                        .text_xs()
+                        .child(div().text_color(rgb(colors.accent)).child("Find"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(format!("{query}\u{2502}")),
+                        )
+                        .child(label),
+                )
+            })
             .when_some(self.hint_footer.clone(), |this, footer| {
                 this.child(
                     div()
