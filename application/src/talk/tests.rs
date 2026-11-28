@@ -55,7 +55,7 @@ impl TalkReader for Db {
                     label: "pane".into(),
                 },
                 coordinator_session: None,
-                archived: false,
+                finished: false,
             }],
         })
     }
@@ -271,6 +271,15 @@ fn caller(session: Option<&str>) -> Caller {
         session: session.map(str::to_owned),
         box_id: Some("box".into()),
         desktop: false,
+        verified: true,
+    }
+}
+
+/// A caller whose session, or lack of one, the daemon could not verify.
+fn unverified(session: Option<&str>) -> Caller {
+    Caller {
+        verified: false,
+        ..caller(session)
     }
 }
 
@@ -716,9 +725,17 @@ fn scoped_send(
     talk: &Talk<Db, Arc<Terminal>, Arc<Terminal>>,
     scope: Option<GrantScope>,
 ) -> Result<Message> {
+    scoped_send_as(talk, caller(Some("a-session")), scope)
+}
+
+fn scoped_send_as(
+    talk: &Talk<Db, Arc<Terminal>, Arc<Terminal>>,
+    caller: Caller,
+    scope: Option<GrantScope>,
+) -> Result<Message> {
     Ok(talk
         .send(SendMessage {
-            caller: caller(Some("a-session")),
+            caller,
             target: Target::One(Address::Agent("b".into())),
             run: None,
             body: "Cap reviews at 2 rounds".into(),
@@ -761,6 +778,7 @@ fn only_the_user_grants_and_relays_carry_a_grant_only_inside_its_scope() -> Resu
                 session: None,
                 box_id: Some("box".into()),
                 desktop,
+                verified: true,
             },
             message: ask.id.clone(),
             recipient_agent: None,
@@ -785,6 +803,23 @@ fn only_the_user_grants_and_relays_carry_a_grant_only_inside_its_scope() -> Resu
     )));
     assert_eq!(scoped_send(&talk, Some(GrantScope::DagMerge))?.grant, None);
     assert_eq!(scoped_send(&talk, None)?.grant, None);
+    // A request that only claims the granted agent's session is never stamped.
+    assert_eq!(
+        scoped_send_as(
+            &talk,
+            unverified(Some("a-session")),
+            Some(GrantScope::DagPolicy)
+        )?
+        .grant,
+        None
+    );
+    // Without verified attribution, a caller without a session is not the user's shell.
+    let error = talk
+        .grant(request(unverified(None), GrantScope::DagPolicy))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("Only the user"), "{error:#}");
+    assert!(talk.revoke(unverified(None), &pending.grant.id).is_err());
 
     // An agent cannot revoke, the user can, at once.
     assert!(

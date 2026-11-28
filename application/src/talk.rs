@@ -109,6 +109,11 @@ pub struct Caller {
     /// The request comes from the desktop rather than a shell. Only a caller without a
     /// session can be the desktop.
     pub desktop: bool,
+    /// The daemon verified who is calling from the socket peer's process: it runs inside
+    /// `session`, or, without a session, inside no Power session at all. Only a verified
+    /// caller gets grant authority, so a client cannot borrow another session's grant or
+    /// pass as the user's shell by leaving its session out.
+    pub verified: bool,
 }
 
 pub struct SendMessage {
@@ -291,6 +296,8 @@ struct Actor<'a> {
     agent: Option<&'a ManagedAgent>,
     box_id: Option<&'a str>,
     desktop: bool,
+    /// See `Caller::verified`.
+    verified: bool,
     directory: &'a Directory,
 }
 
@@ -328,6 +335,7 @@ impl<'a> Actor<'a> {
                 .map(|agent| agent.box_id.as_str())
                 .or(caller.box_id.as_deref()),
             desktop: caller.desktop && caller.session.is_none(),
+            verified: caller.verified,
             directory,
         })
     }
@@ -364,6 +372,12 @@ impl<'a> Actor<'a> {
                 let first = runs.next()?;
                 runs.next().is_none().then_some(first)
             })
+    }
+
+    /// The user, in the desktop or in a shell the daemon verified runs in no Power session.
+    /// A client that leaves its session out never gets the user's grant authority.
+    fn user_verified(&self) -> bool {
+        self.agent.is_none() && (self.desktop || self.verified)
     }
 
     fn sender(&self, run: Option<&str>) -> Sender {
@@ -417,6 +431,8 @@ struct Outgoing {
     run: Option<String>,
     urgent: bool,
     scope: Option<GrantScope>,
+    /// The daemon verified that the sender's process runs in its session.
+    verified: bool,
 }
 
 impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
@@ -858,6 +874,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     run: run.map(str::to_owned),
                     urgent: command.urgent,
                     scope: command.scope,
+                    verified: actor.verified,
                 };
                 let mut message = self.build(db, outgoing, now)?;
                 message.broadcast = broadcast.as_ref().map(|(_, id)| id.clone());
@@ -883,7 +900,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             let actor = self.actor(&command.caller, &directory, live.as_ref())?;
             let sender = actor.sender(None);
             ensure!(
-                sender.has_user_authority(),
+                actor.user_verified(),
                 "Only the user can grant authority. Agents cannot use power talk grant"
             );
             let agent = directory.agent(&command.agent, actor.box_id)?;
@@ -919,6 +936,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                         run: None,
                         urgent: false,
                         scope: None,
+                        verified: false,
                     },
                     now,
                 )?;
@@ -945,7 +963,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
         self.store.write(|db| {
             let directory = db.directory()?;
             let actor = self.actor(&caller, &directory, live.as_ref())?;
-            ensure!(actor.agent.is_none(), "Only the user can revoke a grant");
+            ensure!(actor.user_verified(), "Only the user can revoke a grant");
             let grant = db
                 .grants(None)?
                 .into_iter()
@@ -1032,6 +1050,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                     run: None,
                     urgent: false,
                     scope: None,
+                    verified: false,
                 },
                 now,
             )?;
@@ -1112,6 +1131,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
                 },
                 sender, recipient, body: command.body,
                 run: parent.run, urgent: command.urgent, scope: command.scope,
+                verified: actor.verified,
             }, now)?;
             message.thread = parent.thread;
             message.reply_to = Some(parent.id);
@@ -1137,10 +1157,11 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> Talk<S, A, N> {
             );
         }
         // The one choke point for relayed authority: a message carries a grant only if its
-        // sender holds an active one in the requested scope when Power stamps it. Otherwise
-        // it is a plain peer message.
+        // sender holds an active one in the requested scope when Power stamps it, and the
+        // daemon verified that the request came from the sender's own session. Otherwise it
+        // is a plain peer message.
         let grant = match (&outgoing.sender, outgoing.scope) {
-            (Sender::Agent(agent), Some(scope)) => db
+            (Sender::Agent(agent), Some(scope)) if outgoing.verified => db
                 .grants(Some(&agent.id))?
                 .into_iter()
                 .find(|grant| {
@@ -1493,6 +1514,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::TaskMessenger fo
                 session: caller,
                 box_id: None,
                 desktop: false,
+                verified: false,
             },
             target: Target::One(Address::Agent(agent.into())),
             run: Some(run.into()),
@@ -1536,6 +1558,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::DecisionPoster f
             agent: Some(worker),
             box_id: Some(&worker.box_id),
             desktop: false,
+            verified: false,
             directory: &directory,
         };
         let now = (self.clock)();
@@ -1549,6 +1572,7 @@ impl<S: TalkStore, A: SessionActivity, N: Notifier> crate::dag::DecisionPoster f
                 run: Some(run.into()),
                 urgent: false,
                 scope: None,
+                verified: false,
             },
             now,
         )?;

@@ -789,7 +789,12 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
                 .collect(),
         }),
         Request::Talk { talk } => Ok(Response::Talk {
-            talk: talk_adapter::request(&server.talk, &server.dag, talk)?,
+            talk: talk_adapter::request(
+                &server.talk,
+                &server.dag,
+                talk,
+                wire::peer_pid(socket).ok(),
+            )?,
         }),
         Request::Dag { dag } => {
             let dag =

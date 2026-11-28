@@ -20,6 +20,23 @@ while IFS= read -r line; do
                 "$POWER_BIN" talk reply "$id" 'fixture reply'
             fi
             ;;
+        'talk-as '*)
+            # Runs power talk from inside this worker's session: talk-as KEY SESSION ARGS...
+            # SESSION "-" keeps this worker's POWER_SESSION, "none" drops it, and anything
+            # else claims that session instead.
+            set -- ${line#talk-as }
+            key=$1
+            claim=$2
+            shift 2
+            status=0
+            case $claim in
+                -) "$POWER_BIN" talk "$@" ;;
+                none) env -u POWER_SESSION "$POWER_BIN" talk "$@" ;;
+                *) POWER_SESSION=$claim "$POWER_BIN" talk "$@" ;;
+            esac > "$root/talk-$key.out" 2> "$root/talk-$key.err" || status=$?
+            printf '%s\n' "$status" > "$root/talk-$key.tmp"
+            mv "$root/talk-$key.tmp" "$root/talk-$key.status"
+            ;;
         'report-choices '*)
             # Asks from inside this worker's session: report-choices TASK ATTEMPT CHOICES.
             set -- ${line#report-choices }

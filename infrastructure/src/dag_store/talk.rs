@@ -1,4 +1,4 @@
-use super::{DagDb, SqliteDagStore, run_from_row};
+use super::{DagDb, SqliteDagStore};
 use anyhow::Result;
 use application::dag::DagReader;
 use application::talk::{
@@ -268,24 +268,26 @@ impl TalkDb<'_> {
 
 impl TalkReader for TalkDb<'_> {
     fn directory(&self) -> Result<Directory> {
-        let runs = self
+        let sessions: std::collections::HashMap<String, Option<String>> = self
             .0
-            .prepare(
-                "SELECT id, box_id, title, coordinator, created_at, archived_at, paused_at,
-                        coordinator_session FROM runs",
-            )?
-            .query_map([], |row| Ok((run_from_row(row)?, row.get(7)?)))?
-            .map(|row| {
-                let (run, coordinator_session) = row?;
-                Ok(RunRef {
+            .prepare("SELECT id, coordinator_session FROM runs")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Finished the way the DAG listing decides it: archived, or every task completed.
+        let runs = DagDb(self.0)
+            .list_runs(None)?
+            .into_iter()
+            .map(|mut run| {
+                run.derive_task_states();
+                RunRef {
+                    finished: run.status().is_finished(),
+                    coordinator_session: sessions.get(&run.id).cloned().flatten(),
                     id: run.id,
                     box_id: run.box_id,
                     coordinator: run.coordinator,
-                    coordinator_session,
-                    archived: run.archived_at.is_some(),
-                })
+                }
             })
-            .collect::<rusqlite::Result<_>>()?;
+            .collect();
         Ok(Directory {
             agents: DagDb(self.0).list_agents(None)?,
             runs,
@@ -613,6 +615,101 @@ impl TalkTransaction for TalkDb<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_directory_marks_runs_finished_the_way_the_dag_listing_does() -> Result<()> {
+        use application::dag::DagStore;
+        use domain::dag::{
+            AgentState, AgentStatus, Attempt, AttemptState, Coordinator, Provider, Run, TaskSpec,
+        };
+        let file = tempfile::NamedTempFile::new()?;
+        let store = SqliteDagStore::initialize(Connection::open(file.path())?)?;
+        let agent = ManagedAgent {
+            id: "coord".into(),
+            box_id: "box".into(),
+            worktree: "/worktree".into(),
+            provider: Provider::Command,
+            model: None,
+            parent: None,
+            session: Some("session".into()),
+            run: None,
+            task: None,
+            attempt: None,
+            state: AgentState::Running,
+            paused: false,
+            status: AgentStatus::Idle,
+            label: "coord".into(),
+            created_at: 1,
+        };
+        let run = |id: &str| Run {
+            id: id.into(),
+            box_id: "box".into(),
+            title: id.into(),
+            coordinator: Coordinator::Agent {
+                agent: "coord".into(),
+            },
+            created_at: 1,
+            archived_at: None,
+            paused_at: None,
+            tasks: Vec::new(),
+        };
+        let task = TaskSpec {
+            id: "t".into(),
+            title: "t".into(),
+            instructions: String::new(),
+            deps: Vec::new(),
+            provider: None,
+            model: None,
+        };
+        DagStore::write(&store, |db| {
+            db.insert_agent(&agent)?;
+            for id in ["active", "completed", "archived"] {
+                db.insert_run(&run(id))?;
+                db.insert_tasks(id, std::slice::from_ref(&task))?;
+            }
+            db.insert_attempt(
+                "completed",
+                "t",
+                &Attempt {
+                    id: "attempt".into(),
+                    number: 1,
+                    agent: "coord".into(),
+                    session: None,
+                    worktree: "/worktree".into(),
+                    provider: Provider::Command,
+                    model: None,
+                    state: AttemptState::Succeeded,
+                    summary: None,
+                    blocker: None,
+                    detail: None,
+                    started_at: 1,
+                    ended_at: Some(2),
+                    paused: false,
+                    stalled: false,
+                    artifacts: Vec::new(),
+                    explicit_worktree: None,
+                },
+            )?;
+            db.set_run_archived("archived", Some(3))
+        })?;
+        let directory = TalkStore::read(&store, |db| db.directory())?;
+        let finished: Vec<_> = directory
+            .runs
+            .iter()
+            .map(|run| (run.id.as_str(), run.finished))
+            .collect();
+        assert_eq!(
+            finished,
+            [("active", false), ("completed", true), ("archived", true)]
+        );
+        assert!(
+            directory
+                .runs
+                .iter()
+                .all(|run| run.coordinator_session.as_deref() == Some("session"))
+        );
+        Ok(())
+    }
 
     #[test]
     fn opens_pre_talk_database_and_persists_messages_and_events() -> Result<()> {

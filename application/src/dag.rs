@@ -703,6 +703,11 @@ impl<T: TerminalRuntime, S: DagStore, B: BoxRegistry, I: BoxIcons> DagApplicatio
         self.application.list_sessions()
     }
 
+    /// Whether process `pid` runs inside live session `session`.
+    pub fn session_owns_process(&self, session: &str, pid: u32) -> bool {
+        self.application.session_owns_process(session, pid)
+    }
+
     pub fn select_box(&self, selector: &str) -> Result<String> {
         Ok(select_box(&self.registry.boxes()?, selector)?
             .info

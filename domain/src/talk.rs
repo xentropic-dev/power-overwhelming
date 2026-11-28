@@ -315,7 +315,8 @@ pub struct RunRef {
     pub coordinator: Coordinator,
     /// The session the coordinating agent held when it created the run, if any.
     pub coordinator_session: Option<String>,
-    pub archived: bool,
+    /// Archived, or every task completed, as the DAG listing decides it.
+    pub finished: bool,
 }
 
 #[derive(Default)]
@@ -446,7 +447,8 @@ pub fn resolve(
         }
         Target::One(Address::Coordinators) => {
             let mut recipients: Vec<Recipient> = Vec::new();
-            for run in directory.runs.iter().filter(|run| !run.archived) {
+            // Every live coordinator of an unfinished run, once each, the sender included.
+            for run in directory.runs.iter().filter(|run| !run.finished) {
                 let Coordinator::Agent { agent } = &run.coordinator else {
                     continue;
                 };
@@ -472,9 +474,7 @@ pub fn resolve(
                     continue;
                 };
                 let recipient = Recipient::agent(coordinator);
-                if ctx.agent.is_none_or(|sender| sender.id != coordinator.id)
-                    && !recipients.contains(&recipient)
-                {
+                if !recipients.contains(&recipient) {
                     recipients.push(recipient);
                 }
             }

@@ -41,7 +41,7 @@ fn directory() -> Directory {
                 agent: "coord".into(),
             },
             coordinator_session: None,
-            archived: false,
+            finished: false,
         }],
     }
 }
@@ -554,16 +554,17 @@ fn grants_run_from_approval_until_expiry_or_revocation() {
 }
 
 #[test]
-fn coordinators_reach_every_active_run_once_skipping_the_sender() {
+fn coordinators_reach_every_live_coordinator_of_an_unfinished_run_once() {
     let mut dir = directory();
     dir.agents
         .push(agent("coord-2", "remote", None, AgentStatus::Idle));
     dir.agents
         .push(agent("gone", "remote", None, AgentStatus::Exited));
-    for (id, coordinator, archived) in [
+    for (id, coordinator, finished) in [
         ("run-2", "coord-2", false),
         ("run-3", "coord", false),
         ("run-4", "gone", false),
+        // Finished (completed or archived), though its coordinator is still live.
         ("run-5", "other", true),
     ] {
         dir.runs.push(RunRef {
@@ -573,7 +574,7 @@ fn coordinators_reach_every_active_run_once_skipping_the_sender() {
                 agent: coordinator.into(),
             },
             coordinator_session: None,
-            archived,
+            finished,
         });
     }
     let target = Target::One(Address::from("coordinators"));
@@ -589,8 +590,12 @@ fn coordinators_reach_every_active_run_once_skipping_the_sender() {
             Recipient::agent(&dir.agents[5])
         ])
     );
+    // A coordinator that sends is itself a live coordinator of an active run.
     assert_eq!(
         resolve(ctx(Some(&dir.agents[0])), &target, &dir),
-        Ok(vec![Recipient::agent(&dir.agents[5])])
+        Ok(vec![
+            Recipient::agent(&dir.agents[0]),
+            Recipient::agent(&dir.agents[5])
+        ])
     );
 }
