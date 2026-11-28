@@ -89,6 +89,17 @@ output and input quiet times, set `talk.idle_after` and `talk.user_quiet` in
 and `power talk busy` are hidden commands for provider hooks. They report turn
 state for the session in `POWER_SESSION`.
 
+Claude Code sessions that Power launches get messages without a typed notice.
+Power's Stop hooks (`power talk hook stop` and the background
+`power talk hook wait`) hand unread messages to the agent in their envelopes
+when a turn ends or while it is idle. A message counts as read only after the
+hook emitted it. Urgent messages from the user also arrive through the hook at
+the next turn boundary, marked `urgent` in their envelope. If a hook fails or
+Power is unreachable, the messages stay queued and arrive as a terminal notice
+instead, at the latest once the unreported turn end goes stale
+(`talk.busy_stale`, default 60 seconds of silence). Other providers keep the
+terminal notice.
+
 The desktop opens an agent's talk dialog with Ctrl+T from the agent tree
 (Ctrl+B, then A). Use Ctrl+N to compose and Ctrl+R to reply. Ctrl+B, then M
 opens the active box's user inbox.

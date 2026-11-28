@@ -201,15 +201,17 @@ fn notices_respect_holds_hooks_quiet_and_reminder_limits() {
     let policy = NoticePolicy::default();
     let mut msg = message();
     let idle = Activity::default();
+    let now = REMINDER_AFTER_MS + 20_000;
+    // A busy report this recent is not stale.
     let busy = Activity {
         hook: HookState::Busy,
+        reported_at: now - 1,
         ..idle
     };
     let ready = Activity {
         hook: HookState::Ready,
         ..idle
     };
-    let now = REMINDER_AFTER_MS + 20_000;
     assert_eq!(
         policy.decide(idle, false, false, &msg.queued(), now),
         Notify
@@ -385,6 +387,7 @@ fn turn_reports_separate_from_output_and_keystrokes() {
     );
     let busy = Activity {
         hook: HookState::Busy,
+        reported_at: 999_000,
         ..ready
     };
     assert_eq!(
@@ -455,4 +458,70 @@ fn decisions_validate_choices_and_close_when_answered_or_expired() {
     let mut msg = message();
     msg.decision = Some(decision);
     assert!(envelope(&msg).contains("Choices: Approve, Deny"));
+}
+
+#[test]
+fn hooks_hand_over_only_unannounced_messages_in_their_envelopes() {
+    let peer = message();
+    let idle = Activity::default();
+    assert!(hook_deliverable(&peer.queued(), idle, false));
+    assert!(!hook_deliverable(&peer.queued(), idle, true));
+    for held in [
+        Activity {
+            paused: true,
+            ..idle
+        },
+        Activity {
+            restoring: true,
+            ..idle
+        },
+    ] {
+        assert!(!hook_deliverable(&peer.queued(), held, false));
+    }
+    let mut noticed = peer.clone();
+    noticed.delivery.notified_at = Some(1);
+    assert!(!hook_deliverable(&noticed.queued(), idle, false));
+    let mut user = peer.clone();
+    user.sender = Sender::User;
+    assert!(hook_deliverable(&user.queued(), idle, true));
+    let reason = hook_reason(std::slice::from_ref(&peer));
+    assert!(reason.contains(&envelope(&peer)));
+    assert!(reason.contains("Not from the user"));
+}
+
+#[test]
+fn a_stale_busy_report_falls_back_to_quiet_and_urgent_envelopes_say_so() {
+    use NoticeDecision::*;
+    let policy = NoticePolicy::default();
+    let msg = message().queued();
+    let busy = Activity {
+        hook: HookState::Busy,
+        reported_at: 100_000,
+        ..Activity::default()
+    };
+    let fresh = 100_000 + policy.busy_stale_ms - 1;
+    let stale = 100_000 + policy.busy_stale_ms;
+    assert!(!policy.turn_over(busy, fresh));
+    assert_eq!(
+        policy.decide(busy, false, false, &msg, fresh),
+        Hold(HoldReason::Busy)
+    );
+    assert!(policy.turn_over(busy, stale));
+    assert_eq!(policy.decide(busy, false, false, &msg, stale), Notify);
+    // Output keeps a live turn fresh.
+    let working = Activity {
+        last_output: stale - 1,
+        ..busy
+    };
+    assert!(!policy.busy_stale(working, stale));
+    let mut urgent = message();
+    assert!(!envelope(&urgent).contains("urgent"));
+    urgent.urgent = true;
+    assert!(
+        envelope(&urgent)
+            .lines()
+            .next()
+            .unwrap()
+            .contains("· urgent")
+    );
 }

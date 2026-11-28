@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use application::talk::LogFilter;
 use clap::{Args, Subcommand};
-use domain::talk::{MAX_BODY_BYTES, Message, MessageId, Recipient, ThreadId, envelope};
+use domain::talk::{
+    MAX_BODY_BYTES, Message, MessageId, Recipient, ThreadId, envelope, hook_reason,
+};
 use infrastructure::client::{
     self,
     talk::{self, Caller},
@@ -104,6 +106,21 @@ enum Action {
     Ready { event: Option<String> },
     #[command(hide = true)]
     Busy,
+    /// Provider turn hooks that hand messages to the agent instead of typing a notice.
+    #[command(hide = true, subcommand)]
+    Hook(HookEvent),
+}
+
+#[derive(Clone, Copy, Subcommand)]
+enum HookEvent {
+    /// Claude Code Stop hook. Reports the turn end and blocks the stop with any messages.
+    Stop,
+    /// Claude Code asyncRewake Stop hook. Waits while idle and exits 2 with messages.
+    Wait,
+    /// Prints whether the session's waiting hook is attached.
+    Status,
+    /// Claude Code UserPromptSubmit hook. Reports the turn start.
+    Start,
 }
 
 #[derive(Args)]
@@ -124,7 +141,10 @@ pub fn run(args: TalkArgs) -> Result<()> {
         desktop: false,
     };
     let json = args.json;
-    if !matches!(args.command, Action::Ready { .. } | Action::Busy) {
+    if !matches!(
+        args.command,
+        Action::Ready { .. } | Action::Busy | Action::Hook(_)
+    ) {
         client::ensure_daemon()?;
     }
     match args.command {
@@ -203,6 +223,55 @@ pub fn run(args: TalkArgs) -> Result<()> {
             report_turn(caller, true, from_notify, json)
         }
         Action::Busy => report_turn(caller, false, false, json),
+        Action::Hook(HookEvent::Start) => {
+            let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+            // A failed report must never block the prompt, so it never exits 2.
+            if let Err(error) = talk::hook_start(caller.clone()) {
+                eprintln!("Power talk hook failed. {error:#}");
+                let _ = talk::turn(caller, false, false);
+            }
+            Ok(())
+        }
+        Action::Hook(HookEvent::Status) => {
+            let attached = talk::hook_attached(caller)?;
+            super::print_json(json!({"attached": attached}))
+        }
+        Action::Hook(event) => {
+            // The provider sends the hook's event on stdin. Power needs none of it.
+            let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+            let wait = matches!(event, HookEvent::Wait);
+            // A failed hook must never stop the agent or loop it. Messages it did not
+            // confirm stay queued, and terminal notices take over.
+            let result = talk::hook(caller.clone(), wait, |messages| {
+                let reason = hook_reason(messages);
+                if wait {
+                    let mut stderr = io::stderr().lock();
+                    writeln!(stderr, "{reason}")?;
+                    stderr.flush()?;
+                } else {
+                    let mut stdout = io::stdout().lock();
+                    writeln!(stdout, "{}", json!({"decision": "block", "reason": reason}))?;
+                    stdout.flush()?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(true) if wait => std::process::exit(2),
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("Power talk hook failed. {error:#}");
+                    // A failed waiter exits non-zero but never 2, which would wake the agent
+                    // with no messages. What it did not emit stays queued for notices.
+                    if wait {
+                        std::process::exit(1);
+                    }
+                    // Still report the turn end so terminal notices can deliver. If Power
+                    // is unreachable, the waiter reports it once its attach wait runs out.
+                    let _ = talk::turn(caller, true, false);
+                }
+            }
+            Ok(())
+        }
     }
 }
 

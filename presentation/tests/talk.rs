@@ -133,7 +133,7 @@ impl Sandbox {
             path.join("config/power-overwhelming/config.lua"),
             format!(
                 "dag = {{ min_available_memory = 0 }}\n\
-                 talk = {{ idle_after = 0.015, user_quiet = 0.025 }}\n\
+                 talk = {{ idle_after = 0.015, user_quiet = 0.025, hook_grace = 0.3, busy_stale = 2 }}\n\
                  agents.fixture = {{ command = {:?} }}\n\
                  agents.notify = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n\
                  agents.held = {{ command = {:?}, turn_hook = {{ kind = \"codex_notify\" }} }}\n\
@@ -1429,6 +1429,333 @@ fn a_coding_agent_in_a_shell_tab_is_never_paused_or_stopped_with_the_shell_and_i
     assert!(sessions.contains(&shell), "{sessions}");
     let _ = Command::new("kill").arg(&sibling).status();
     fs::write(path.join("release-sender"), "").unwrap();
+}
+
+/// Matches `hook_grace` and `busy_stale` in the fixture config, with a margin.
+const PAST_GRACE: Duration = Duration::from_millis(600);
+const PAST_STALE: Duration = Duration::from_millis(2_500);
+
+fn hook(path: &Path, agent: &ManagedAgent, event: &str) -> Command {
+    let mut command = power(path, Some(agent));
+    command
+        .args(["talk", "hook", event])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Starts the background waiter and returns once Power reports it attached.
+fn attached_waiter(path: &Path, agent: &ManagedAgent) -> Child {
+    let mut waiter = hook(path, agent, "wait").spawn().unwrap();
+    poll("hook waiter attached", || {
+        assert!(waiter.try_wait().unwrap().is_none(), "Waiter exited early");
+        let status = json(
+            power(path, Some(agent))
+                .args(["talk", "hook", "status"])
+                .output()
+                .unwrap(),
+        );
+        (status["attached"] == true).then_some(())
+    });
+    waiter
+}
+
+/// The waiter's output, killing it and failing if it runs past ten seconds.
+fn bounded(mut child: Child) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Hook waiter did not exit");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn stop_decision(path: &Path, agent: &ManagedAgent) -> Option<Value> {
+    let output = hook(path, agent, "stop").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    (!output.stdout.is_empty()).then(|| serde_json::from_slice(&output.stdout).unwrap())
+}
+
+#[test]
+fn an_idle_hooked_session_gets_messages_from_its_waiting_hook_and_no_notice() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    assert!(stop_decision(path, &fixture.b).is_none());
+    let waiter = attached_waiter(path, &fixture.b);
+    // Past the grace period, only the attached waiter holds notices.
+    thread::sleep(PAST_GRACE);
+    let sent = fixture.messages(
+        Some(&fixture.a),
+        &["send", "task:b", "hooked body", "--json"],
+    );
+    let output = bounded(waiter);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let reason = String::from_utf8(output.stderr).unwrap();
+    assert!(reason.contains(field(&sent[0], "id")));
+    assert!(reason.contains("Not from the user"));
+    assert!(reason.contains("> hooked body"));
+    // The provider runs the woken turn, which consumes the wake, and ends it with no
+    // waiter. Past the grace period the session is plainly idle and eligible for notices.
+    success(hook(path, &fixture.b, "start").output().unwrap());
+    let all = fixture.messages(Some(&fixture.b), &["inbox", "--all", "--peek", "--json"]);
+    assert!(all[0]["delivery"]["read_at"].is_u64());
+    assert!(stop_decision(path, &fixture.b).is_none());
+    thread::sleep(PAST_GRACE);
+    let status = json(hook(path, &fixture.b, "status").output().unwrap());
+    assert_eq!(status["attached"], false);
+    // Nothing re-announces the delivered message.
+    thread::sleep(PAST_GRACE);
+    assert_eq!(notice_count(path, "b"), 0);
+    // A fresh message does get a notice, so the silence above is not a mask.
+    fixture.messages(Some(&fixture.a), &["send", "task:b", "fresh", "--json"]);
+    poll("fresh notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    let unread = fixture.messages(Some(&fixture.b), &["inbox", "--json"]);
+    assert_eq!(unread.len(), 1);
+    assert_eq!(field(&unread[0], "body"), "fresh");
+}
+
+#[test]
+fn an_urgent_message_in_the_first_turn_waits_for_its_stop_hook() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    // The first prompt's turn start. No Stop hook ran before it.
+    success(hook(path, &fixture.b, "start").output().unwrap());
+    let urgent = fixture.messages(
+        None,
+        &[
+            "send",
+            "--box",
+            BOX,
+            &fixture.b.id,
+            "first turn",
+            "--urgent",
+            "--json",
+        ],
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(notice_count(path, "b"), 0);
+    let decision = stop_decision(path, &fixture.b).expect("block decision");
+    assert!(
+        decision["reason"]
+            .as_str()
+            .unwrap()
+            .contains(field(&urgent[0], "id"))
+    );
+    assert_eq!(notice_count(path, "b"), 0);
+}
+
+#[test]
+fn a_quiet_turn_past_the_stale_threshold_still_delivers_through_its_stop_hook() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    success(hook(path, &fixture.b, "start").output().unwrap());
+    // A long, silent tool call: no output, input or report past busy_stale.
+    thread::sleep(PAST_STALE);
+    let sent = fixture.messages(
+        Some(&fixture.a),
+        &["send", "task:b", "after tool", "--json"],
+    );
+    thread::sleep(PAST_GRACE);
+    assert_eq!(notice_count(path, "b"), 0);
+    let decision = stop_decision(path, &fixture.b).expect("block decision");
+    assert!(
+        decision["reason"]
+            .as_str()
+            .unwrap()
+            .contains(field(&sent[0], "id"))
+    );
+    assert_eq!(notice_count(path, "b"), 0);
+}
+
+#[test]
+fn an_async_wake_lost_after_its_acknowledgment_stays_recoverable() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    assert!(stop_decision(path, &fixture.b).is_none());
+    thread::sleep(PAST_GRACE);
+    // A waiter that gets the message, acknowledges it, then dies before reading the reply
+    // and so before it could exit 2 and wake the agent.
+    let mut socket = UnixStream::connect(path.join("power.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    writeln!(
+        socket,
+        "{}",
+        serde_json::json!({
+            "request": "talk",
+            "talk": { "command": "hook_wait", "session": fixture.b.session },
+        })
+    )
+    .unwrap();
+    let mut reader = BufReader::new(socket);
+    assert_eq!(socket_response(&mut reader)["talk"]["kind"], "ok");
+    let sent = fixture.messages(Some(&fixture.a), &["send", "task:b", "lost wake", "--json"]);
+    let handed = loop {
+        let response = socket_response(&mut reader);
+        if response["talk"]["kind"] != "ok" {
+            break response;
+        }
+    };
+    assert_eq!(handed["talk"]["messages"][0]["id"], sent[0]["id"]);
+    writeln!(
+        reader.get_mut(),
+        "{}",
+        serde_json::json!({ "emitted": true })
+    )
+    .unwrap();
+    drop(reader);
+    // The daemon accepted the acknowledgment, but no turn consumed the wake. The message
+    // stays unread, and once the wake had its chance a notice announces it.
+    let unread = fixture.messages(Some(&fixture.b), &["inbox", "--peek", "--json"]);
+    assert_eq!(unread.len(), 1);
+    poll("fallback notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    let inbox = fixture.messages(Some(&fixture.b), &["inbox", "--json"]);
+    assert_eq!(field(&inbox[0], "body"), "lost wake");
+}
+
+#[test]
+fn mid_turn_and_urgent_user_messages_wait_for_the_turn_end_and_stale_waiters_take_none() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    assert!(stop_decision(path, &fixture.b).is_none());
+    // The previous turn's waiter is running when the next turn starts.
+    let stale = attached_waiter(path, &fixture.b);
+    success(fixture.talk(Some(&fixture.b), &["busy"]));
+    let peer = fixture.messages(Some(&fixture.a), &["send", "task:b", "mid turn", "--json"]);
+    let urgent = fixture.messages(
+        None,
+        &[
+            "send",
+            "--box",
+            BOX,
+            &fixture.b.id,
+            "now please",
+            "--urgent",
+            "--json",
+        ],
+    );
+    let output = bounded(stale);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    // A healthy hook delivers even urgent user messages, so no notice is typed mid-turn.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(notice_count(path, "b"), 0);
+    let decision = stop_decision(path, &fixture.b).expect("block decision");
+    assert_eq!(decision["decision"], "block");
+    let reason = decision["reason"].as_str().unwrap();
+    for text in [
+        field(&peer[0], "id"),
+        "> mid turn",
+        field(&urgent[0], "id"),
+        "· urgent",
+        "> now please",
+    ] {
+        assert!(reason.contains(text), "{reason}");
+    }
+    // The next turn end has nothing left, and no notice repeats it once nothing masks one.
+    assert!(stop_decision(path, &fixture.b).is_none());
+    thread::sleep(PAST_GRACE);
+    assert_eq!(notice_count(path, "b"), 0);
+}
+
+#[test]
+fn a_message_announced_by_a_notice_is_never_handed_over_by_a_hook() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    fixture.messages(Some(&fixture.a), &["send", "task:b", "noticed", "--json"]);
+    poll("terminal notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    assert!(stop_decision(path, &fixture.b).is_none());
+    assert_eq!(
+        fixture
+            .messages(Some(&fixture.b), &["inbox", "--peek", "--json"])
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn an_unreachable_stop_hook_hands_its_turn_end_to_the_waiter() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    assert!(stop_decision(path, &fixture.b).is_none());
+    // The previous turn ended well before this one's Stop.
+    thread::sleep(Duration::from_millis(1_200));
+    success(hook(path, &fixture.b, "start").output().unwrap());
+    fixture.messages(Some(&fixture.a), &["send", "task:b", "kept", "--json"]);
+    // A hook that cannot reach the daemon prints nothing, so the agent stops normally.
+    let output = hook(path, &fixture.b, "stop")
+        .env("POWER_SOCKET", path.join("missing.sock"))
+        .output()
+        .unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    // The waiter that Stop started hears no turn end within its attach wait, so it reports
+    // the turn end itself and wakes the agent with the message.
+    let output = bounded(hook(path, &fixture.b, "wait").spawn().unwrap());
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("> kept"));
+    assert_eq!(notice_count(path, "b"), 0);
+}
+
+#[test]
+fn a_killed_waiter_hands_delivery_back_to_notices() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    assert!(stop_decision(path, &fixture.b).is_none());
+    let mut waiter = attached_waiter(path, &fixture.b);
+    waiter.kill().unwrap();
+    waiter.wait().unwrap();
+    thread::sleep(PAST_GRACE);
+    fixture.messages(
+        Some(&fixture.a),
+        &["send", "task:b", "after kill", "--json"],
+    );
+    poll("fallback notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+}
+
+#[test]
+fn a_hook_that_dies_before_emitting_leaves_the_message_unread_and_noticed() {
+    let fixture = Fixture::new();
+    let path = fixture.path();
+    success(fixture.talk(Some(&fixture.b), &["busy"]));
+    let sent = fixture.messages(Some(&fixture.a), &["send", "task:b", "unseen", "--json"]);
+    // A Stop hook gets the message from the daemon and dies before emitting it.
+    let mut socket = UnixStream::connect(path.join("power.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        socket,
+        "{}",
+        serde_json::json!({
+            "request": "talk",
+            "talk": { "command": "hook_stop", "session": fixture.b.session },
+        })
+    )
+    .unwrap();
+    let mut reader = BufReader::new(socket);
+    let handed = socket_response(&mut reader);
+    assert_eq!(handed["talk"]["kind"], "messages", "{handed}");
+    assert_eq!(handed["talk"]["messages"][0]["id"], sent[0]["id"]);
+    drop(reader);
+    poll("fallback notice", || {
+        (notice_count(path, "b") == 1).then_some(())
+    });
+    let inbox = fixture.messages(Some(&fixture.b), &["inbox", "--json"]);
+    assert_eq!(field(&inbox[0], "body"), "unseen");
 }
 
 #[test]

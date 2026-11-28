@@ -504,3 +504,141 @@ fn only_the_user_answers_a_decision_request_and_only_once() -> Result<()> {
     assert_eq!(talk.decisions(caller(None), true)?.len(), 1);
     Ok(())
 }
+
+fn hooked(session: &str) -> Caller {
+    caller(Some(session))
+}
+
+#[test]
+fn the_first_turn_start_reserves_the_hook_path_for_urgent_messages() -> Result<()> {
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = talk(&store, &terminal);
+    // No Stop ever primed the session. Its first turn start registers it.
+    talk.hook_turn_start(&hooked("b-session"))?;
+    talk.send(SendMessage {
+        caller: caller(None),
+        target: Target::One(Address::Agent("b".into())),
+        run: None,
+        body: "now".into(),
+        urgent: true,
+    })?;
+    talk.deliver_pending()?;
+    assert!(terminal.typed.lock().unwrap().is_empty());
+    let claim = talk.hook_turn_end(&hooked("b-session"))?.expect("claim");
+    assert_eq!(claim.messages[0].body, "now");
+    Ok(())
+}
+
+#[test]
+fn a_quiet_running_turn_past_busy_stale_keeps_the_hook_path() -> Result<()> {
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = Talk::new(
+        store.clone(),
+        terminal.clone(),
+        terminal.clone(),
+        NoticePolicy {
+            busy_stale_ms: 1,
+            ..NoticePolicy::default()
+        },
+        || 20_000,
+        uuid,
+    );
+    talk.hook_turn_start(&hooked("b-session"))?;
+    send(&talk, caller(None), "later")?;
+    // The busy report is stale, but no keystroke interrupted the turn: it still runs.
+    talk.deliver_pending()?;
+    assert!(terminal.typed.lock().unwrap().is_empty());
+    // A user interrupt (keystrokes after the turn start, then quiet) hands back to notices.
+    terminal.activity.lock().unwrap().last_input = 1;
+    talk.deliver_pending()?;
+    assert_eq!(terminal.typed.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+fn uuid() -> String {
+    static ID: AtomicU64 = AtomicU64::new(1_000);
+    ID.fetch_add(1, Ordering::Relaxed).to_string()
+}
+
+#[test]
+fn an_async_wake_stays_unread_until_its_turn_starts() -> Result<()> {
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = talk(&store, &terminal);
+    let b = hooked("b-session");
+    assert!(talk.hook_turn_end(&b)?.is_none());
+    let lease = talk.attach_hook(&b, Instant::now())?.expect("lease");
+    let sent = send(&talk, caller(None), "wake")?;
+    let claim = match talk.hook_wait(&lease, &b, Instant::now())? {
+        HookWait::Claimed(claim) => claim,
+        _ => panic!("no claim"),
+    };
+    // The daemon accepts the acknowledgment, then the waiter dies or its reply is lost.
+    talk.hook_confirm(claim)?;
+    drop(lease);
+    let unread = talk.inbox(hooked("b-session"), false, true)?;
+    assert_eq!(unread[0].id, sent.id);
+    assert_eq!(unread[0].delivery.read_at, None);
+    // Nothing claims it twice, and no notice types it while the wake may still land.
+    assert!(talk.hook_turn_end(&b)?.is_none());
+    talk.deliver_pending()?;
+    assert!(terminal.typed.lock().unwrap().is_empty());
+    // The woken turn starts: now the agent has it.
+    talk.hook_turn_start(&b)?;
+    let all = talk.inbox(b, true, true)?;
+    assert_eq!(all[0].delivery.read_at, Some(20_000));
+    Ok(())
+}
+
+#[test]
+fn an_unconsumed_async_wake_returns_to_the_queue() -> Result<()> {
+    static NOW: AtomicU64 = AtomicU64::new(20_000);
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = Talk::new(
+        store.clone(),
+        terminal.clone(),
+        terminal.clone(),
+        NoticePolicy::default(),
+        || NOW.load(Ordering::Relaxed),
+        uuid,
+    );
+    let b = hooked("b-session");
+    talk.hook_turn_end(&b)?;
+    let lease = talk.attach_hook(&b, Instant::now())?.expect("lease");
+    send(&talk, caller(None), "lost")?;
+    let HookWait::Claimed(claim) = talk.hook_wait(&lease, &b, Instant::now())? else {
+        panic!("no claim");
+    };
+    talk.hook_confirm(claim)?;
+    drop(lease);
+    NOW.fetch_add(WAKE_CONSUME_MS, Ordering::Relaxed);
+    talk.deliver_pending()?;
+    assert_eq!(terminal.typed.lock().unwrap().len(), 1);
+    // A later turn start does not mark the returned message read.
+    talk.hook_turn_start(&b)?;
+    assert_eq!(talk.inbox(b, false, true)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_late_confirmation_never_changes_a_newer_turn() -> Result<()> {
+    let store = Arc::new(Db::default());
+    let terminal = Arc::new(Terminal::default());
+    let talk = talk(&store, &terminal);
+    let b = hooked("b-session");
+    talk.hook_turn_start(&b)?;
+    send(&talk, caller(None), "held")?;
+    let claim = talk.hook_turn_end(&b)?.expect("claim");
+    // The claim stays open across the next Busy/Stop pair.
+    talk.hook_turn_start(&b)?;
+    assert!(talk.hook_turn_end(&b)?.is_none());
+    let lease = talk.attach_hook(&b, Instant::now())?.expect("lease");
+    talk.hook_confirm(claim)?;
+    assert_eq!(terminal.activity.lock().unwrap().hook, HookState::Ready);
+    assert!(!lease.stale());
+    assert!(talk.hook_attached(&b)?);
+    Ok(())
+}

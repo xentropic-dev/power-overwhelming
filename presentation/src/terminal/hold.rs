@@ -2,7 +2,7 @@
 //! `src/vt.rs` (Apache-2.0), the frame is captured inside `vt_write` at the moment a hold
 //! begins, so the screen keeps exactly what the program left there, not an older paint.
 
-use super::frame::Frame;
+use super::{frame::Frame, images::ImageCache};
 use ghostty_vt::{Terminal, render::RenderState};
 use std::{
     cell::{Cell, RefCell},
@@ -14,7 +14,15 @@ use std::{
 pub(super) type Captured = Rc<RefCell<Option<(RenderState, Frame)>>>;
 
 /// Captures the frame synchronously whenever the program starts synchronized output.
-pub(super) fn install(terminal: &mut Terminal, captured: Captured, contrast: Rc<Cell<f32>>) {
+///
+/// The images the frame shows upload then too: the rest of the write may delete or
+/// replace them before the held frame paints.
+pub(super) fn install(
+    terminal: &mut Terminal,
+    captured: Captured,
+    contrast: Rc<Cell<f32>>,
+    images: Rc<RefCell<ImageCache>>,
+) {
     terminal.set_render_hold(Some(Box::new(move |terminal, held| {
         if !held {
             return;
@@ -25,6 +33,7 @@ pub(super) fn install(terminal: &mut Terminal, captured: Captured, contrast: Rc<
         if let Ok(Some(frame)) =
             Frame::default().update_with(&mut renderer, terminal, contrast.get())
         {
+            images.borrow_mut().prepare(terminal, &frame.images);
             *captured.borrow_mut() = Some((renderer, frame));
         }
     })));
@@ -53,7 +62,12 @@ mod tests {
         })
         .unwrap();
         let captured = Captured::default();
-        install(&mut terminal, captured.clone(), Rc::new(Cell::new(1.)));
+        install(
+            &mut terminal,
+            captured.clone(),
+            Rc::new(Cell::new(1.)),
+            Rc::default(),
+        );
         let mut renderer = RenderState::new().unwrap();
         terminal.vt_write(b"PREVIOUS");
         let frame = Frame::default()
