@@ -193,6 +193,15 @@ impl<T: TerminalRuntime> Application<T> {
         self.records.remove(id)
     }
 
+    /// The durable record of session `id`, if any.
+    pub fn session_record(&self, id: &str) -> Result<Option<SessionRecord>> {
+        Ok(self
+            .records
+            .list()?
+            .into_iter()
+            .find(|record| record.id == id))
+    }
+
     /// Whether a durable record of session `id` remains.
     pub fn has_record(&self, id: &str) -> Result<bool> {
         Ok(self.records.list()?.iter().any(|record| record.id == id))

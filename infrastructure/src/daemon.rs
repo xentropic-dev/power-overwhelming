@@ -552,7 +552,8 @@ fn handle(mut socket: UnixStream, request: Request, server: &Server) -> Result<(
         return Ok(());
     }
 
-    let is_talk = matches!(&request, Request::Talk { .. });
+    let is_talk = matches!(&request, Request::Talk { .. })
+        || matches!(&request, Request::Dag { dag } if matches!(dag, DagRequest::EditTask { .. }));
     let response =
         handle_request(request, server, &socket).unwrap_or_else(|error| Response::Error {
             message: format!("{error:#}"),
@@ -737,7 +738,7 @@ fn handle_request(request: Request, server: &Server, socket: &UnixStream) -> Res
             talk: talk_adapter::request(&server.talk, &server.dag, talk)?,
         }),
         Request::Dag { dag } => {
-            let dag = dag_adapter::request(&server.dag, dag)?;
+            let dag = dag_adapter::request(&server.dag, &server.talk, dag)?;
             if let DagResponse::BoxIcon { box_id } = &dag {
                 broadcast(&BOX_ICON_WATCHERS, || Response::BoxIconChanged {
                     box_id: box_id.clone(),

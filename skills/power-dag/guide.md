@@ -44,6 +44,22 @@ power dag add-task "$RUN" --id test --title "Run tests" --instructions "Run the 
 power dag add-dep "$RUN" test lint  # test depends on lint
 ```
 
+## Correct a task
+
+`power dag apply` refuses an ID that is already in the run. To change a task's title or instructions after it is applied, use `edit-task`. Pass `--title`, `--instructions`, or `--instructions-file` (a path, or `-` for stdin), alone or together.
+
+```sh
+power dag edit-task "$RUN" test --instructions "Run the workspace tests with --release"
+```
+
+| Task state | Effect |
+| --- | --- |
+| `waiting`, `ready`, `queued` | The next dispatch uses the new text. |
+| `working`, `needs_input` | The running worker gets a power talk message with the new instructions, which replace its earlier ones. It keeps running. |
+| `failed`, `interrupted` | The next `power dag retry` uses the new text. |
+| `completed` | Refused. Add a new task instead. |
+
+The JSON output has the updated `task` and a `delivery`: `none` when nothing is running, `sent` with the `message` ID and the `attempt` it went to, or `failed` with the error. The stored edit stands even when delivery fails. Each edit records a `task_edited` event, which `power dag wait` returns by default.
 To set or change the plan of an existing task, for example to backfill a plan or choose a different model before a retry, use `power dag plan`. It prints the updated run and records a `task_planned` event.
 
 ```sh

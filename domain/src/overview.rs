@@ -200,6 +200,7 @@ mod tests {
             worktree: PathBuf::new(),
             provider: Provider::Command,
             model: None,
+            explicit_worktree: Some(false),
             state,
             summary: None,
             blocker: None,

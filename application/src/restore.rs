@@ -18,7 +18,8 @@ pub struct RestoredSession {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Restore {
     pub restored: Vec<RestoredSession>,
-    /// Sessions left unrestored because what an earlier daemon left of them still runs.
+    /// Sessions left unrestored because what an earlier daemon left of them still runs,
+    /// or because the caller kept them.
     pub deferred: Vec<String>,
 }
 
@@ -30,6 +31,9 @@ pub enum RestoreChoice {
     Resume(Option<String>),
     /// Forget the record without relaunching. The reason is logged.
     Forget(&'static str),
+    /// Keep the record without relaunching, and report the session as deferred, so
+    /// the caller can finish its handoff later. The reason is logged.
+    Keep(&'static str),
 }
 
 /// What to do with one saved session on daemon start.
@@ -69,20 +73,42 @@ impl<T: TerminalRuntime> Application<T> {
         &self,
         choose: impl Fn(&str) -> RestoreChoice,
     ) -> Result<Restore> {
-        let mut restored = Vec::new();
-        let mut deferred = Vec::new();
+        let unreclaimed = self.reclaim_saved()?;
+        self.restore_reclaimed(&unreclaimed, choose)
+    }
+
+    /// Ends what an earlier daemon left of every saved session, before anything is
+    /// relaunched, and returns the sessions where something may still run. Every
+    /// reclaim finishes first, so a caller can count what still runs before it admits
+    /// any relaunch.
+    pub fn reclaim_saved(&self) -> Result<Vec<String>> {
+        let mut unreclaimed = Vec::new();
         for record in self.records.list()? {
             // Anything an earlier daemon left of the session ends first, whether it
             // is relaunched or forgotten, so a finished worker's teardown that the
             // restart interrupted still completes.
-            let reclaimed = self.runtime.reclaim(&record.id);
-            if let Err(error) = &reclaimed {
+            if let Err(error) = self.runtime.reclaim(&record.id) {
                 eprintln!(
                     "Could not end what an earlier daemon left of session {}. {error:#}",
                     record.id
                 );
+                unreclaimed.push(record.id);
             }
-            if reclaimed.is_err() {
+        }
+        Ok(unreclaimed)
+    }
+
+    /// The second half of `restore_sessions_deferring`, once `reclaim_saved` ran. The
+    /// sessions in `unreclaimed` keep their records and are never relaunched.
+    pub fn restore_reclaimed(
+        &self,
+        unreclaimed: &[String],
+        choose: impl Fn(&str) -> RestoreChoice,
+    ) -> Result<Restore> {
+        let mut restored = Vec::new();
+        let mut deferred = Vec::new();
+        for record in self.records.list()? {
+            if unreclaimed.contains(&record.id) {
                 // The record is how a later start or retry finds what still runs.
                 eprintln!(
                     "Keeping session {} unrestored until what still runs of it ends.",
@@ -94,6 +120,11 @@ impl<T: TerminalRuntime> Application<T> {
             let plan = match choose(&record.id) {
                 RestoreChoice::Resume(continuation) => self.restore_plan(&record, continuation),
                 RestoreChoice::Forget(reason) => Ok(Plan::Drop(reason)),
+                RestoreChoice::Keep(reason) => {
+                    eprintln!("Keeping session {} unrestored: {reason}.", record.id);
+                    deferred.push(record.id);
+                    continue;
+                }
             };
             let options = match plan {
                 Ok(Plan::Launch(options)) => options,

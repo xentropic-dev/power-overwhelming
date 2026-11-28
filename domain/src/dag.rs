@@ -240,6 +240,11 @@ pub struct Attempt {
     /// Artifacts published from the attempt's session, in publish order, newest last.
     /// Derived from the artifact store when a run is read; never persisted with the run.
     pub artifacts: Vec<AttemptArtifact>,
+    /// Whether the dispatch named an existing worktree with `--worktree`, rather than
+    /// creating or reusing a Power-managed one. A retry Power starts keeps that mode.
+    /// `None` for an attempt stored before Power recorded the mode, which a retry
+    /// treats as explicit, so it keeps the worktree the attempt ran in.
+    pub explicit_worktree: Option<bool>,
 }
 
 /// An artifact published from an attempt's session.
@@ -335,6 +340,9 @@ pub enum RunEventKind {
     TaskQueued,
     /// A queued dispatch could not be started. The summary has the error.
     QueuedDispatchFailed,
+    /// The coordinator changed the task's title or instructions. The attempt is set when
+    /// a running worker was sent the new instructions.
+    TaskEdited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,6 +575,34 @@ pub fn run_status(states: impl IntoIterator<Item = TaskState>) -> RunStatus {
 pub fn can_dispatch(state: TaskState, retry: bool) -> bool {
     state == TaskState::Ready
         || (retry && matches!(state, TaskState::Failed | TaskState::Interrupted))
+}
+
+/// What editing a task's title or instructions does in its current state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskEdit {
+    /// Only the stored copy changes. The next dispatch or retry uses it.
+    Store,
+    /// The stored copy changes and the running worker is told the new instructions.
+    StoreAndNotify,
+    /// A completed task keeps its record. Add a new task instead.
+    Refused,
+}
+
+pub fn task_edit(state: TaskState) -> TaskEdit {
+    use TaskState as T;
+    match state {
+        // A queued dispatch reads the task when it starts, so it gets the edit too.
+        T::Waiting | T::Ready | T::Queued | T::Failed | T::Interrupted => TaskEdit::Store,
+        // A paused worker keeps its session. The message waits in its inbox and is
+        // the first thing it reads after the resume.
+        T::Working | T::NeedsInput | T::Paused => TaskEdit::StoreAndNotify,
+        T::Completed => TaskEdit::Refused,
+    }
+}
+
+/// Title and instructions must not be blank.
+pub fn valid_task_text(text: &str) -> bool {
+    !text.trim().is_empty()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -849,6 +885,7 @@ mod tests {
             ended_at: None,
             paused,
             stalled: false,
+            explicit_worktree: Some(false),
             artifacts: Vec::new(),
         };
         let run_with = |state, paused| {
@@ -967,6 +1004,21 @@ mod tests {
             validate_batch(&[task("a", &[])], &[task("a", &[])]),
             Err(GraphError::DuplicateTask("a".into()))
         );
+    }
+
+    #[test]
+    fn edits_store_notify_running_workers_and_refuse_completed_tasks() {
+        use TaskState as T;
+        for state in [T::Waiting, T::Ready, T::Queued, T::Failed, T::Interrupted] {
+            assert_eq!(task_edit(state), TaskEdit::Store, "{state:?}");
+        }
+        for state in [T::Working, T::NeedsInput, T::Paused] {
+            assert_eq!(task_edit(state), TaskEdit::StoreAndNotify, "{state:?}");
+        }
+        assert_eq!(task_edit(T::Completed), TaskEdit::Refused);
+        assert!(valid_task_text("Fix it"));
+        assert!(!valid_task_text(""));
+        assert!(!valid_task_text(" \n\t"));
     }
 
     #[test]

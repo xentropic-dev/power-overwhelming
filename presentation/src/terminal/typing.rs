@@ -63,6 +63,11 @@ impl Typing {
         }
     }
 
+    /// Whether the window is active and the terminal holds keyboard focus.
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
     /// The composition to draw, if one is in progress and the terminal owns the keyboard.
     pub fn marked(&self) -> Option<&str> {
         self.marked.as_deref().filter(|_| !self.hold.is_held())
@@ -115,6 +120,17 @@ impl Typing {
             .key(stroke, key::Action::Release)
             .unwrap_or_default(),
         )
+    }
+
+    /// `count` Up or Down arrow presses, as a wheel scrolls a full-screen program that
+    /// doesn't track the mouse.
+    pub fn arrows(&mut self, terminal: &Terminal, up: bool, count: usize) -> Vec<u8> {
+        let mut encoder = KeyEncoder {
+            encoder: &mut self.encoder,
+            terminal,
+        };
+        let press = encoder.arrow(up);
+        press.repeat(count)
     }
 
     /// Text an input method committed, or `None` while Power holds the keyboard.
@@ -196,6 +212,15 @@ mod tests {
         typing
             .key_up(t, &stroke(text, None))
             .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    #[test]
+    fn wheel_arrows_follow_cursor_key_mode() {
+        let mut typing = Typing::new(InputHold::default());
+        let normal = terminal("");
+        assert_eq!(typing.arrows(&normal, true, 2), b"\x1b[A\x1b[A");
+        let application = terminal("\x1b[?1h");
+        assert_eq!(typing.arrows(&application, false, 1), b"\x1bOB");
     }
 
     #[test]
@@ -308,6 +333,19 @@ mod tests {
         assert_eq!(typing.installed(&restored, &again), None);
         assert_eq!(typing.set_focused(&again, false).unwrap(), b"\x1b[O");
         assert_eq!(typing.set_focused(&again, true).unwrap(), b"\x1b[I");
+    }
+
+    #[test]
+    fn window_deactivation_and_reactivation_track_the_cursor_focus() {
+        let t = terminal("");
+        let mut typing = Typing::new(InputHold::default());
+        typing.set_focused(&t, true);
+        assert!(typing.focused());
+        // The window goes inactive while the view keeps its focus handle.
+        typing.set_focused(&t, false);
+        assert!(!typing.focused());
+        typing.set_focused(&t, true);
+        assert!(typing.focused());
     }
 
     #[test]

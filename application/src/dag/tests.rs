@@ -30,6 +30,8 @@ struct Records {
     worktrees: Vec<ManagedWorktree>,
     queued: Vec<QueuedDispatch>,
     stopping: BTreeSet<String>,
+    /// Queue writes fail while set, as a transiently failing database does.
+    fail_queue_writes: bool,
 }
 
 #[derive(Default)]
@@ -143,13 +145,21 @@ impl DagReader for MemoryDb {
     }
 
     fn run(&self, id: &str) -> Result<Run> {
-        self.0
-            .borrow()
+        let records = self.0.borrow();
+        let mut run = records
             .runs
             .iter()
             .find(|run| run.id == id)
             .cloned()
-            .context("Unknown run")
+            .context("Unknown run")?;
+        // An attempt is paused when its agent is, as the SQLite store joins it.
+        for attempt in run.tasks.iter_mut().flat_map(|task| &mut task.attempts) {
+            attempt.paused = records
+                .agents
+                .iter()
+                .any(|agent| agent.id == attempt.agent && agent.paused);
+        }
+        Ok(run)
     }
 
     fn run_box(&self, id: &str) -> Result<String> {
@@ -239,6 +249,7 @@ impl MemoryDb {
 
 impl DagTransaction for MemoryDb {
     fn insert_queued(&self, queued: &QueuedDispatch) -> Result<()> {
+        ensure!(!self.0.borrow().fail_queue_writes, "database is locked");
         ensure!(
             !self
                 .0
@@ -447,6 +458,22 @@ impl DagTransaction for MemoryDb {
         if !deps.iter().any(|id| id == dep) {
             deps.push(dep.into());
         }
+        Ok(())
+    }
+
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()> {
+        let mut records = self.0.borrow_mut();
+        let entry = records
+            .runs
+            .iter_mut()
+            .find(|entry| entry.id == run)
+            .context("Unknown run")?
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task)
+            .context("Unknown task")?;
+        entry.title = title.into();
+        entry.instructions = instructions.into();
         Ok(())
     }
 
@@ -682,6 +709,8 @@ struct FakeTerminal {
     fail_start: AtomicBool,
     /// Reclaims fail while set, as when what an earlier daemon left cannot be ended.
     fail_reclaim: AtomicBool,
+    /// Sessions whose reclaims fail, whatever `fail_reclaim` says.
+    stuck: Mutex<BTreeSet<String>>,
     /// How long each reclaim takes, in milliseconds, as a scope slow to empty does.
     reclaim_millis: AtomicU64,
     /// Reclaims started so far.
@@ -739,8 +768,12 @@ impl TerminalRuntime for FakeTerminal {
         None
     }
 
-    fn reclaim(&self, _: &str) -> Result<()> {
+    fn reclaim(&self, session: &str) -> Result<()> {
         self.reclaims.fetch_add(1, Ordering::AcqRel);
+        ensure!(
+            !self.stuck.lock().unwrap().contains(session),
+            "cgroup.kill: Device or resource busy"
+        );
         thread::sleep(Duration::from_millis(
             self.reclaim_millis.load(Ordering::Acquire),
         ));
@@ -4091,5 +4124,809 @@ fn an_attempt_that_reports_while_it_is_sampled_is_not_flagged_stalled() -> Resul
     );
     assert!(!dag.run(&run)?.tasks[0].attempts[0].stalled);
     *late.lock().unwrap() = None;
+    Ok(())
+}
+
+/// Caller, run, agent and body of one message.
+type SentEdit = (Option<String>, String, String, String);
+
+#[derive(Default)]
+struct FakeMessenger {
+    sent: Mutex<Vec<SentEdit>>,
+    fail: bool,
+}
+
+impl TaskMessenger for FakeMessenger {
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String> {
+        if self.fail {
+            bail!("Talk target is gone");
+        }
+        let mut sent = self.sent.lock().unwrap();
+        sent.push((caller, run.into(), agent.into(), body));
+        Ok(format!("message-{}", sent.len()))
+    }
+}
+
+fn edit(run: &str, task: &str, title: Option<&str>, instructions: Option<&str>) -> EditTask {
+    EditTask {
+        run: run.into(),
+        task: task.into(),
+        title: title.map(str::to_owned),
+        instructions: instructions.map(str::to_owned),
+        caller: Some("coordinator-session".into()),
+    }
+}
+
+fn edit_events(dag: &TestDag, run: &str) -> Result<Vec<RunEvent>> {
+    Ok(dag
+        .events(
+            EventScope::Run(run, &[RunEventKind::TaskEdited]),
+            0,
+            Duration::ZERO,
+        )?
+        .events)
+}
+
+fn agent_dispatch(run: &str, task: &str, retry: bool) -> Dispatch {
+    Dispatch {
+        task: task.into(),
+        provider: Some(Provider::Agent("codex".into())),
+        args: Vec::new(),
+        ..command(run, retry)
+    }
+}
+
+#[test]
+fn editing_a_waiting_or_ready_task_updates_the_next_dispatch_without_a_message() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("later", &["work"])])?;
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(
+        edit(&run, "later", None, Some("Use the new plan")),
+        &messenger,
+    )?;
+    assert_eq!(edited.task.state, TaskState::Waiting);
+    assert_eq!(edited.task.instructions, "Use the new plan");
+    assert_eq!(edited.task.title, "later");
+    assert!(matches!(edited.delivery, EditDelivery::None));
+    let edited = dag.edit_task(edit(&run, "work", Some("Renamed"), None), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::Ready);
+    assert_eq!(edited.task.title, "Renamed");
+    assert_eq!(edited.task.instructions, "Implement work");
+    assert!(messenger.sent.lock().unwrap().is_empty());
+
+    let events = edit_events(&dag, &run)?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].task.as_deref(), Some("later"));
+    assert_eq!(events[0].attempt, None);
+    assert_eq!(events[0].summary.as_deref(), Some("Updated instructions"));
+    assert_eq!(events[1].summary.as_deref(), Some("Updated title"));
+
+    dag.start(agent_dispatch(&run, "work", false))?;
+    let prompt = last_worker_prompt(&dag);
+    assert!(prompt.contains("Task: work — Renamed\n"), "{prompt}");
+    Ok(())
+}
+
+#[test]
+fn editing_a_running_task_messages_its_current_attempt() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(
+        edit(&run, "work", Some("Fix it"), Some("Do it the new way")),
+        &messenger,
+    )?;
+    assert_eq!(edited.task.state, TaskState::Working);
+    let EditDelivery::Sent {
+        agent,
+        attempt,
+        message,
+    } = &edited.delivery
+    else {
+        panic!("Expected a sent message");
+    };
+    assert_eq!(agent, &started.agent.id);
+    assert_eq!(attempt, &started.attempt.id);
+    assert_eq!(message, "message-1");
+    {
+        let sent = messenger.sent.lock().unwrap();
+        let (caller, to_run, to_agent, body) = &sent[0];
+        assert_eq!(caller.as_deref(), Some("coordinator-session"));
+        assert_eq!((to_run, to_agent), (&run, &started.agent.id));
+        assert!(body.contains("replace your earlier instructions"), "{body}");
+        assert!(body.contains("Task: work — Fix it"), "{body}");
+        assert!(body.ends_with("Instructions:\nDo it the new way"), "{body}");
+    }
+    let events = edit_events(&dag, &run)?;
+    assert_eq!(
+        events[0].attempt.as_deref(),
+        Some(started.attempt.id.as_str())
+    );
+    assert_eq!(
+        events[0].summary.as_deref(),
+        Some("Updated title and instructions")
+    );
+
+    // A worker waiting on input is still running, so it is told as well.
+    dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::NeedsInput,
+        "Which way?",
+    )?;
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Second fix")), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::NeedsInput);
+    assert!(matches!(edited.delivery, EditDelivery::Sent { .. }));
+    assert_eq!(messenger.sent.lock().unwrap().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_failed_delivery_keeps_the_stored_edit() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let messenger = FakeMessenger {
+        fail: true,
+        ..FakeMessenger::default()
+    };
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Kept")), &messenger)?;
+    assert!(
+        matches!(&edited.delivery, EditDelivery::Failed { error, .. } if error.contains("gone"))
+    );
+    assert_eq!(dag.run(&run)?.tasks[0].instructions, "Kept");
+    Ok(())
+}
+
+#[test]
+fn editing_a_failed_or_interrupted_task_updates_the_retry_without_a_message() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.add_tasks(&run, &[spec("failing", &[])])?;
+    let interrupted = dag.start(command(&run, false))?;
+    dag.session_exited(
+        interrupted.agent.session.as_deref().unwrap(),
+        "exited",
+        true,
+    )?;
+    let failing = dag.start(Dispatch {
+        task: "failing".into(),
+        ..command(&run, false)
+    })?;
+    dag.report(
+        &run,
+        "failing",
+        &failing.attempt.id,
+        ReportStatus::Failed,
+        "broken",
+    )?;
+    let messenger = FakeMessenger::default();
+    for (task, state) in [
+        ("work", TaskState::Interrupted),
+        ("failing", TaskState::Failed),
+    ] {
+        let edited = dag.edit_task(edit(&run, task, None, Some("Retry this way")), &messenger)?;
+        assert_eq!(edited.task.state, state);
+        assert!(matches!(edited.delivery, EditDelivery::None));
+    }
+    assert!(messenger.sent.lock().unwrap().is_empty());
+    dag.start(agent_dispatch(&run, "failing", true))?;
+    let prompt = last_worker_prompt(&dag);
+    assert!(
+        prompt.contains("Instructions:\nRetry this way\n"),
+        "{prompt}"
+    );
+    Ok(())
+}
+
+#[test]
+fn edits_refuse_completed_tasks_unknown_targets_and_empty_text() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    dag.report(
+        &run,
+        "work",
+        &started.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let messenger = FakeMessenger::default();
+    let before = dag.latest_seq()?;
+    let error = |command| {
+        dag.edit_task(command, &messenger)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap()
+    };
+    assert!(error(edit(&run, "work", Some("New"), None)).contains("Add a new task instead"));
+    assert!(error(edit(&run, "missing", Some("New"), None)).contains("Unknown task"));
+    assert!(error(edit("nope", "work", Some("New"), None)).contains("Unknown run"));
+    assert!(error(edit(&run, "work", Some("  "), None)).contains("title is empty"));
+    assert!(error(edit(&run, "work", None, Some(""))).contains("instructions are empty"));
+    assert!(error(edit(&run, "work", None, None)).contains("Specify --title"));
+    assert_eq!(dag.latest_seq()?, before);
+    assert_eq!(dag.run(&run)?.tasks[0].title, "work");
+    assert!(messenger.sent.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_paused_worker_reads_the_current_instructions_when_it_resumes() -> Result<()> {
+    let (dag, run) = setup()?;
+    let started = dag.start(command(&run, false))?;
+    let session = started.agent.session.clone().unwrap();
+    dag.pause_run(&run)?;
+    assert_eq!(dag.run(&run)?.tasks[0].state, TaskState::Paused);
+    let messenger = FakeMessenger::default();
+    let edited = dag.edit_task(edit(&run, "work", None, Some("Paused fix")), &messenger)?;
+    assert_eq!(edited.task.state, TaskState::Paused);
+    assert!(
+        matches!(&edited.delivery, EditDelivery::Sent { agent, .. } if agent == &started.agent.id)
+    );
+    // The edit leaves the worker paused. Its message waits in the inbox.
+    assert!(terminal_paused(&dag, &session)?);
+    dag.resume_run(&run)?;
+    assert!(!terminal_paused(&dag, &session)?);
+    let task = dag.run(&run)?.tasks[0].clone();
+    assert_eq!(task.state, TaskState::Working);
+    // Same worker and attempt, and the one message it reads matches what is stored.
+    assert_eq!(task.attempts.len(), 1);
+    assert_eq!(
+        task.current_attempt.as_deref(),
+        Some(started.attempt.id.as_str())
+    );
+    let sent = messenger.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].2, started.agent.id);
+    assert!(
+        sent[0].3.ends_with("Instructions:\nPaused fix"),
+        "{}",
+        sent[0].3
+    );
+    Ok(())
+}
+
+/// Holds the first send until the test releases it, and reports when it is inside.
+struct GatedFirstMessenger {
+    inner: FakeMessenger,
+    first: std::sync::Once,
+    entered: Mutex<std::sync::mpsc::Sender<()>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl TaskMessenger for GatedFirstMessenger {
+    fn send_to_worker(
+        &self,
+        caller: Option<String>,
+        run: &str,
+        agent: &str,
+        body: String,
+    ) -> Result<String> {
+        let mut gated = false;
+        self.first.call_once(|| gated = true);
+        if gated {
+            self.entered.lock().unwrap().send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("The test releases the first send");
+        }
+        self.inner.send_to_worker(caller, run, agent, body)
+    }
+}
+
+#[test]
+fn crossed_edits_enqueue_messages_in_commit_order() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let messenger = GatedFirstMessenger {
+        inner: FakeMessenger::default(),
+        first: std::sync::Once::new(),
+        entered: Mutex::new(entered_tx),
+        release: Mutex::new(release_rx),
+    };
+    thread::scope(|scope| {
+        let first =
+            scope.spawn(|| dag.edit_task(edit(&run, "work", None, Some("Plan A")), &messenger));
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Edit A reaches its send");
+        // A has committed and is inside its send, still holding the edit lock.
+        assert!(
+            dag.task_edits.try_lock().is_err(),
+            "The edit lock is held through the send"
+        );
+        let second =
+            scope.spawn(|| dag.edit_task(edit(&run, "work", None, Some("Plan B")), &messenger));
+        assert!(messenger.inner.sent.lock().unwrap().is_empty());
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            first.join().unwrap().unwrap().delivery,
+            EditDelivery::Sent { .. }
+        ));
+        assert!(matches!(
+            second.join().unwrap().unwrap().delivery,
+            EditDelivery::Sent { .. }
+        ));
+    });
+    let stored = dag.run(&run)?.tasks[0].instructions.clone();
+    let sent = messenger.inner.sent.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent[1].3.ends_with(&format!("Instructions:\n{stored}")),
+        "{stored}: {sent:?}"
+    );
+    assert!(sent[0].3.ends_with("Instructions:\nPlan A"), "{sent:?}");
+    Ok(())
+}
+
+#[test]
+fn oversized_titles_or_instructions_still_send_a_bounded_pointer() -> Result<()> {
+    let (dag, run) = setup()?;
+    dag.start(command(&run, false))?;
+    let messenger = FakeMessenger::default();
+    let huge = "x".repeat(17 * 1024);
+    for (title, instructions) in [
+        (Some(huge.as_str()), None),
+        (None, Some(huge.as_str())),
+        (Some(huge.as_str()), Some(huge.as_str())),
+    ] {
+        let edited = dag.edit_task(edit(&run, "work", title, instructions), &messenger)?;
+        assert!(matches!(edited.delivery, EditDelivery::Sent { .. }));
+    }
+    let sent = messenger.sent.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    for (_, _, _, body) in sent.iter() {
+        assert!(body.len() < 1024, "{} bytes", body.len());
+        assert!(!body.contains("xxxx"));
+        assert!(body.contains(&format!("power dag show {run}")), "{body}");
+        assert!(body.contains("(task work)"), "{body}");
+    }
+    Ok(())
+}
+
+/// A DAG whose worker budget allows `max` workers, with `memory` GiB free, and a run
+/// with `tasks` dispatched to coding-agent workers in `worktree`, in order.
+fn budget_restart(
+    workspace: FakeWorkspace,
+    max: usize,
+    min_memory: Option<u64>,
+    memory_gib: u64,
+    tasks: &[&str],
+) -> Result<(TestDag, String, BTreeMap<String, DispatchResult>)> {
+    let application = application_with_workspace(workspace);
+    let caller = application.start_session(StartSession {
+        worktree: "/worktree".into(),
+        agent: Agent::Coding("claude".into()),
+    })?;
+    let memory = FakeMemory::default();
+    memory
+        .0
+        .store(memory_gib * domain::dag::GIB, Ordering::Relaxed);
+    let dag = TestDag::new(
+        application,
+        MemoryStore::default(),
+        FakeRegistry(vec![caller.id.clone()]),
+        FakeIcons::default(),
+    )
+    .with_worktree_root(FakeWorktreeRoot)
+    .with_worker_budget(
+        FixedBudget(WorkerBudget {
+            max_active_workers: Some(max),
+            min_available_memory: min_memory.map(|gib| gib * domain::dag::GIB),
+            ..WorkerBudget::default()
+        }),
+        memory,
+    );
+    let run = dag.create_run(
+        BoxSelection {
+            selector: None,
+            caller: Some(caller.id.clone()),
+        },
+        "Restart".into(),
+        None,
+    )?;
+    dag.add_tasks(
+        &run.id,
+        &tasks.iter().map(|id| spec(id, &[])).collect::<Vec<_>>(),
+    )?;
+    let mut attempts = BTreeMap::new();
+    for task in tasks {
+        let started = dag.start(Dispatch {
+            task: (*task).into(),
+            provider: Some(Provider::Agent("claude".into())),
+            args: vec!["--model".into(), "opus".into()],
+            caller: Some(caller.id.clone()),
+            budget: BudgetMode::Override,
+            ..command(&run.id, false)
+        })?;
+        attempts.insert((*task).to_owned(), started);
+    }
+    Ok((dag, run.id, attempts))
+}
+
+/// Points every saved session at a real directory, so restore can relaunch it.
+fn restorable(dag: &TestDag) -> Result<tempfile::TempDir> {
+    let worktree = tempfile::tempdir()?;
+    for mut record in dag.application.records.list()? {
+        record.worktree = worktree.path().into();
+        dag.application.records.save(&record)?;
+    }
+    Ok(worktree)
+}
+
+fn tasks_in(run: &Run, state: TaskState) -> Vec<String> {
+    run.tasks
+        .iter()
+        .filter(|task| task.state == state)
+        .map(|task| task.id.clone())
+        .collect()
+}
+
+fn session_of(result: &DispatchResult) -> String {
+    result.agent.session.clone().unwrap()
+}
+
+#[test]
+fn restore_admits_waiting_workers_under_the_budget_and_queues_the_overflow_visibly() -> Result<()> {
+    let (dag, run, attempts) =
+        budget_restart(FakeWorkspace::default(), 2, None, 64, &["a", "b", "c"])?;
+    for task in ["a", "b", "c"] {
+        dag.report(
+            &run,
+            task,
+            &attempts[task].attempt.id,
+            ReportStatus::NeedsInput,
+            &format!("question {task}"),
+        )?;
+    }
+    let _worktree = restorable(&dag)?;
+
+    let restored = dag.restore()?;
+
+    // Most recent first, so the earliest dispatch is the one over the budget.
+    let snapshot = dag.run(&run)?;
+    assert_eq!(tasks_in(&snapshot, TaskState::NeedsInput), ["b", "c"]);
+    assert_eq!(tasks_in(&snapshot, TaskState::Queued), ["a"]);
+    assert!(!restored.contains(&session_of(&attempts["a"])));
+    let interrupted = find_task(&snapshot, "a")?.attempts.last().unwrap().clone();
+    assert_eq!(interrupted.state, AttemptState::Interrupted);
+    // The overflowed question stays on record.
+    assert!(
+        interrupted
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("question a")),
+        "{interrupted:?}"
+    );
+    let queued = dag.store.read(|db| db.queued_dispatches())?;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].args, ["--model", "opus"]);
+    assert_eq!(dag.start_queued()?, 0, "A queued task started over budget");
+    Ok(())
+}
+
+#[test]
+fn restore_below_the_memory_floor_queues_waiting_workers_too() -> Result<()> {
+    let (dag, run, attempts) =
+        budget_restart(FakeWorkspace::default(), 4, Some(8), 1, &["a", "b"])?;
+    dag.report(
+        &run,
+        "a",
+        &attempts["a"].attempt.id,
+        ReportStatus::NeedsInput,
+        "question",
+    )?;
+    let _worktree = restorable(&dag)?;
+
+    let restored = dag.restore()?;
+
+    for task in ["a", "b"] {
+        assert!(
+            !restored.contains(&session_of(&attempts[task])),
+            "{restored:?}"
+        );
+    }
+    assert_eq!(tasks_in(&dag.run(&run)?, TaskState::Queued), ["a", "b"]);
+    Ok(())
+}
+
+#[test]
+fn an_over_budget_worker_that_still_runs_keeps_its_slot_until_a_reclaim_ends_it() -> Result<()> {
+    let (dag, run, attempts) = budget_restart(FakeWorkspace::default(), 1, None, 64, &["a", "b"])?;
+    dag.add_tasks(&run, &[spec("c", &[])])?;
+    let _worktree = restorable(&dag)?;
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(true, Ordering::Release);
+
+    dag.restore()?;
+
+    // The older worker is over the budget, but what ran of it could not be ended, so its
+    // attempt stays open and nothing retries it.
+    let snapshot = dag.run(&run)?;
+    let held = find_task(&snapshot, "a")?.attempts.last().unwrap().clone();
+    assert_eq!(held.state, AttemptState::Active);
+    assert_eq!(held.detail.as_deref(), Some(BUDGET_HOLD_DETAIL));
+    assert!(dag.store.read(|db| db.queued_dispatches())?.is_empty());
+    // The newer worker was within the budget, but its tree could not be ended either,
+    // so it is held the same way rather than freed. New work queues and nothing starts.
+    let newer = find_task(&snapshot, "b")?.attempts.last().unwrap().clone();
+    assert_eq!(newer.state, AttemptState::Active);
+    assert_eq!(newer.detail.as_deref(), Some(BUDGET_HOLD_DETAIL));
+    let outcome = dag.dispatch(Dispatch {
+        task: "c".into(),
+        ..command(&run, false)
+    })?;
+    assert!(matches!(outcome, DispatchOutcome::Queued { .. }));
+    assert_eq!(dag.start_queued()?, 0);
+    assert_eq!(find_task(&dag.run(&run)?, "a")?.attempts.len(), 1);
+
+    // Once a reclaim ends one, its task queues to retry, but the other tree still
+    // holds the only slot.
+    dag.application
+        .runtime
+        .fail_reclaim
+        .store(false, Ordering::Release);
+    dag.reclaimed(&session_of(&attempts["a"]))?;
+    let snapshot = dag.run(&run)?;
+    assert_eq!(
+        find_task(&snapshot, "a")?.attempts.last().unwrap().state,
+        AttemptState::Interrupted
+    );
+    assert_eq!(tasks_in(&snapshot, TaskState::Queued), ["a", "c"]);
+    assert_eq!(dag.start_queued()?, 0);
+    // Once both have ended, one worker starts.
+    dag.reclaimed(&session_of(&attempts["b"]))?;
+    assert_eq!(
+        tasks_in(&dag.run(&run)?, TaskState::Queued),
+        ["a", "b", "c"]
+    );
+    assert_eq!(dag.start_queued()?, 1);
+    Ok(())
+}
+
+#[test]
+fn a_queued_restart_retry_keeps_an_explicit_worktree_whose_branch_changed() -> Result<()> {
+    queued_retry_keeps_a_changed_worktree(false)
+}
+
+#[test]
+fn a_queued_restart_retry_keeps_the_worktree_of_a_migrated_attempt_whose_branch_changed()
+-> Result<()> {
+    queued_retry_keeps_a_changed_worktree(true)
+}
+
+/// Dispatches two workers to a Power-managed worktree named with `--worktree`, changes
+/// its branch, and restarts over a budget of one. With `legacy`, the attempts carry no
+/// recorded worktree mode, as rows stored before the schema upgrade do.
+fn queued_retry_keeps_a_changed_worktree(legacy: bool) -> Result<()> {
+    let workspace = FakeWorkspace::default();
+    let (dag, run, _) = budget_restart(workspace.clone(), 1, None, 64, &[])?;
+    dag.add_tasks(&run, &[spec("setup", &[]), spec("a", &[]), spec("b", &[])])?;
+    // A Power-managed worktree that a later dispatch names with --worktree.
+    let created = dag.start(Dispatch {
+        task: "setup".into(),
+        ..new_worktree(&run, "feature", Some("main"))
+    })?;
+    dag.report(
+        &run,
+        "setup",
+        &created.attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    let managed = created.worktree.clone();
+    let mut started = BTreeMap::new();
+    for task in ["a", "b"] {
+        let result = dag.start(Dispatch {
+            task: task.into(),
+            provider: Some(Provider::Agent("claude".into())),
+            args: Vec::new(),
+            budget: BudgetMode::Override,
+            worktree: WorktreeRequest::Existing {
+                path: managed.clone(),
+                allow_main_checkout: false,
+            },
+            ..command(&run, false)
+        })?;
+        assert_eq!(result.attempt.explicit_worktree, Some(true));
+        started.insert(task, result);
+    }
+    if legacy {
+        dag.store.write(|db| {
+            for open in db.open_attempts(None)? {
+                let mut attempt = open.attempt;
+                attempt.explicit_worktree = None;
+                db.update_attempt(&attempt)?;
+            }
+            Ok(())
+        })?;
+    }
+    // The worktree now has another branch checked out, so Power no longer owns it.
+    {
+        let mut git = workspace.0.lock().unwrap();
+        git.branches.insert("feature".into(), None);
+        git.branches.insert("other".into(), Some(managed.clone()));
+    }
+    let _worktree = restorable(&dag)?;
+
+    dag.restore()?;
+    let queued = dag.store.read(|db| db.queued_dispatches())?;
+    assert_eq!(queued.len(), 1);
+    assert!(
+        matches!(&queued[0].worktree, WorktreeRequest::Existing { path, .. } if path == &managed),
+        "{:?}",
+        queued[0].worktree
+    );
+    dag.report(
+        &run,
+        "b",
+        &started["b"].attempt.id,
+        ReportStatus::Success,
+        "done",
+    )?;
+    assert_eq!(dag.start_queued()?, 1);
+    let retry = find_task(&dag.run(&run)?, "a")?
+        .attempts
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(retry.number, 2);
+    assert_eq!(retry.worktree, managed);
+    assert_eq!(retry.explicit_worktree, Some(true));
+    Ok(())
+}
+
+/// Two workers under a budget of one, with the reclaim of `stuck` failing at restart.
+fn restart_with_one_stuck(stuck: &str) -> Result<()> {
+    let (dag, run, attempts) = budget_restart(FakeWorkspace::default(), 1, None, 64, &["a", "b"])?;
+    let _worktree = restorable(&dag)?;
+    let stuck_session = session_of(&attempts[stuck]);
+    dag.application
+        .runtime
+        .stuck
+        .lock()
+        .unwrap()
+        .insert(stuck_session.clone());
+
+    let restored = dag.restore()?;
+
+    // The stuck tree holds the only slot, so nothing relaunches beside it, whichever
+    // order the records are in.
+    for task in ["a", "b"] {
+        assert!(
+            !restored.contains(&session_of(&attempts[task])),
+            "{restored:?}"
+        );
+    }
+    let snapshot = dag.run(&run)?;
+    let held = find_task(&snapshot, stuck)?
+        .attempts
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(held.state, AttemptState::Active);
+    assert_eq!(held.detail.as_deref(), Some(BUDGET_HOLD_DETAIL));
+    assert!(dag.application.has_record(&stuck_session)?);
+    let other = if stuck == "a" { "b" } else { "a" };
+    assert_eq!(tasks_in(&snapshot, TaskState::Queued), [other]);
+    assert_eq!(
+        dag.start_queued()?,
+        0,
+        "a retry started beside the stuck tree"
+    );
+
+    // Once the tree ends, the held task queues too, and one worker starts.
+    dag.application.runtime.stuck.lock().unwrap().clear();
+    dag.reclaimed(&stuck_session)?;
+    assert!(!dag.application.has_record(&stuck_session)?);
+    let snapshot = dag.run(&run)?;
+    assert_eq!(
+        find_task(&snapshot, stuck)?.attempts.last().unwrap().state,
+        AttemptState::Interrupted
+    );
+    let mut queued = tasks_in(&snapshot, TaskState::Queued);
+    queued.sort();
+    assert_eq!(queued, ["a", "b"]);
+    assert_eq!(dag.start_queued()?, 1);
+    Ok(())
+}
+
+#[test]
+fn a_stuck_older_worker_keeps_its_slot_so_the_newer_one_does_not_relaunch() -> Result<()> {
+    restart_with_one_stuck("a")
+}
+
+#[test]
+fn a_stuck_newer_worker_keeps_its_slot_so_the_older_one_does_not_relaunch() -> Result<()> {
+    restart_with_one_stuck("b")
+}
+
+#[test]
+fn a_stop_before_the_reclaim_succeeds_cancels_the_held_retry() -> Result<()> {
+    let (dag, run, attempts) = budget_restart(FakeWorkspace::default(), 1, None, 64, &["a", "b"])?;
+    let _worktree = restorable(&dag)?;
+    let held = session_of(&attempts["a"]);
+    dag.application
+        .runtime
+        .stuck
+        .lock()
+        .unwrap()
+        .insert(held.clone());
+    dag.restore()?;
+    assert_eq!(
+        find_task(&dag.run(&run)?, "a")?.attempts[0]
+            .detail
+            .as_deref(),
+        Some(BUDGET_HOLD_DETAIL)
+    );
+
+    dag.stop_agent(&attempts["a"].agent.id)?;
+    dag.application.runtime.stuck.lock().unwrap().clear();
+    dag.reclaimed(&held)?;
+
+    let snapshot = dag.run(&run)?;
+    let task = find_task(&snapshot, "a")?;
+    assert_eq!(task.attempts.len(), 1);
+    assert_eq!(task.attempts[0].state, AttemptState::Interrupted);
+    assert_eq!(task.attempts[0].detail.as_deref(), Some(STOP_DETAIL));
+    assert!(
+        dag.store
+            .read(|db| db.queued_dispatches())?
+            .iter()
+            .all(|queued| queued.task != "a"),
+        "a stopped worker's retry was queued"
+    );
+    assert!(!dag.application.has_record(&held)?);
+    assert!(!dag.store.read(|db| db.stopping_sessions())?.contains(&held));
+    Ok(())
+}
+
+#[test]
+fn a_failed_queue_write_at_restart_keeps_the_worker_for_a_later_handoff() -> Result<()> {
+    let (dag, run, attempts) = budget_restart(FakeWorkspace::default(), 1, None, 64, &["a", "b"])?;
+    let _worktree = restorable(&dag)?;
+    let over = session_of(&attempts["a"]);
+    dag.store.0.lock().unwrap().fail_queue_writes = true;
+
+    let restored = dag.restore()?;
+
+    assert!(restored.contains(&session_of(&attempts["b"])));
+    assert!(!restored.contains(&over));
+    // Nothing was queued, so the worker keeps its record and its open attempt.
+    assert!(dag.application.has_record(&over)?);
+    let attempt = find_task(&dag.run(&run)?, "a")?.attempts[0].clone();
+    assert_eq!(attempt.state, AttemptState::Active);
+    assert_eq!(attempt.detail.as_deref(), Some(BUDGET_HOLD_DETAIL));
+
+    // A reclaim retry while the store still fails keeps it too.
+    assert!(dag.reclaimed(&over).is_err());
+    assert!(dag.application.has_record(&over)?);
+    assert_eq!(
+        find_task(&dag.run(&run)?, "a")?.attempts[0].state,
+        AttemptState::Active
+    );
+
+    // Once the store recovers, the handoff commits and only then is the record gone.
+    dag.store.0.lock().unwrap().fail_queue_writes = false;
+    dag.reclaimed(&over)?;
+    assert!(!dag.application.has_record(&over)?);
+    let snapshot = dag.run(&run)?;
+    assert_eq!(tasks_in(&snapshot, TaskState::Queued), ["a"]);
+    assert_eq!(
+        find_task(&snapshot, "a")?.attempts[0].state,
+        AttemptState::Interrupted
+    );
     Ok(())
 }

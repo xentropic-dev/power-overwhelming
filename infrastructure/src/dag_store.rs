@@ -147,6 +147,21 @@ impl SqliteDagStore {
         if !has_paused_at {
             db.execute("ALTER TABLE runs ADD COLUMN paused_at INTEGER", [])?;
         }
+        let has_explicit_worktree: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('attempts')
+                 WHERE name = 'explicit_worktree')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_explicit_worktree {
+            // Whether the dispatch named its worktree with `--worktree`, so a retry Power
+            // queues keeps the dispatch's worktree mode. Older attempts stay NULL, since
+            // their mode is unknown, and a retry keeps the worktree they ran in.
+            db.execute(
+                "ALTER TABLE attempts ADD COLUMN explicit_worktree INTEGER",
+                [],
+            )?;
+        }
         talk::migrate(&db)?;
         Ok(Self(Arc::new(Mutex::new(db)), Arc::new(Condvar::new())))
     }
@@ -224,14 +239,14 @@ impl DagDb<'_> {
             self.0,
             "SELECT a.id, a.number, a.agent, g.session, g.worktree, g.provider,
                     a.state, a.summary, a.blocker, a.detail, a.started_at, a.ended_at,
-                    g.model, a.task_id, g.paused
+                    g.model, a.explicit_worktree, a.task_id, g.paused
              FROM attempts a JOIN agents g ON g.id = a.agent
              WHERE a.run_id = ?1 ORDER BY a.number",
             [&run.id],
             |row| {
                 let mut attempt = attempt_from_row(row)?;
-                attempt.paused = row.get(14)?;
-                Ok((row.get(13)?, attempt))
+                attempt.paused = row.get(15)?;
+                Ok((row.get(14)?, attempt))
             },
         )? {
             attempts.entry(task).or_default().push(attempt);
@@ -354,7 +369,7 @@ impl DagReader for DagDb<'_> {
             self.0,
             "SELECT a.id, a.number, a.agent, g.session, g.worktree, g.provider,
                     a.state, a.summary, a.blocker, a.detail, a.started_at, a.ended_at,
-                    g.model, a.run_id, g.box_id, a.task_id
+                    g.model, a.explicit_worktree, a.run_id, g.box_id, a.task_id
              FROM attempts a JOIN agents g ON g.id = a.agent
              WHERE a.state IN ('active', 'needs_input') AND (?1 IS NULL OR g.session = ?1)
              ORDER BY g.rowid",
@@ -362,9 +377,9 @@ impl DagReader for DagDb<'_> {
             |row| {
                 Ok(OpenAttempt {
                     attempt: attempt_from_row(row)?,
-                    run: row.get(13)?,
-                    box_id: row.get(14)?,
-                    task: row.get(15)?,
+                    run: row.get(14)?,
+                    box_id: row.get(15)?,
+                    task: row.get(16)?,
                 })
             },
         )?)
@@ -682,10 +697,20 @@ impl DagTransaction for DagDb<'_> {
         Ok(())
     }
 
+    fn update_task(&self, run: &str, task: &str, title: &str, instructions: &str) -> Result<()> {
+        let updated = self.0.execute(
+            "UPDATE tasks SET title = ?3, instructions = ?4 WHERE run_id = ?1 AND id = ?2",
+            params![run, task, title, instructions],
+        )?;
+        anyhow::ensure!(updated == 1, "Unknown task {task:?} in run {run:?}");
+        Ok(())
+    }
+
     fn insert_attempt(&self, run: &str, task: &str, attempt: &Attempt) -> Result<()> {
         self.0.execute(
-            "INSERT INTO attempts (id, run_id, task_id, number, agent, state, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO attempts (id, run_id, task_id, number, agent, state, started_at,
+                                   explicit_worktree)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 attempt.id,
                 run,
@@ -693,7 +718,8 @@ impl DagTransaction for DagDb<'_> {
                 attempt.number,
                 attempt.agent,
                 enum_name(wire::AttemptState::from(attempt.state))?,
-                attempt.started_at
+                attempt.started_at,
+                attempt.explicit_worktree
             ],
         )?;
         Ok(())
@@ -830,6 +856,7 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
         paused: false,
         stalled: false,
         artifacts: Vec::new(),
+        explicit_worktree: row.get(13)?,
     })
 }
 
@@ -909,7 +936,8 @@ mod tests {
         store.0.lock().unwrap().execute_batch(
             r#"
             DROP TABLE IF EXISTS worktrees;
-            INSERT INTO attempts VALUES
+            INSERT INTO attempts (id, run_id, task_id, number, agent, state, summary,
+                                  blocker, detail, started_at, ended_at) VALUES
                 ('attempt-a', 'run', 'task', 1, 'a', 'failed', NULL, NULL, NULL, 1, 2),
                 ('attempt-b', 'run', 'task', 2, 'b', 'failed', NULL, NULL, NULL, 3, 4),
                 ('attempt-c', 'run', 'task', 3, 'c', 'succeeded', NULL, NULL, NULL, 5, 6);
@@ -933,6 +961,9 @@ mod tests {
             ]) {
                 assert_eq!(attempt.provider, expected);
                 assert_eq!(attempt.model, None);
+                // Stored before the worktree mode was, so the mode is unknown rather
+                // than managed.
+                assert_eq!(attempt.explicit_worktree, None);
                 let agent = db.agent(&attempt.agent)?;
                 assert_eq!(agent.provider, expected);
                 assert_eq!(agent.model, None);

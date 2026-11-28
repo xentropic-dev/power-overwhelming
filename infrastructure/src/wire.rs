@@ -770,6 +770,14 @@ pub struct Attempt {
     /// Artifacts published from the attempt's session, in publish order, newest last.
     #[serde(default)]
     pub artifacts: Vec<AttemptArtifact>,
+    /// Whether the dispatch named an existing worktree with `--worktree`. Absent when
+    /// it did not, or when the attempt predates the record.
+    #[serde(default, skip_serializing_if = "not_explicit")]
+    pub explicit_worktree: Option<bool>,
+}
+
+fn not_explicit(explicit: &Option<bool>) -> bool {
+    *explicit != Some(true)
 }
 
 /// An artifact published from an attempt's session.
@@ -892,6 +900,9 @@ pub enum RunEventKind {
     TaskQueued,
     /// A queued dispatch could not be started. The summary has the error.
     QueuedDispatchFailed,
+    /// The coordinator changed the task's title or instructions. The attempt is set when
+    /// a running worker was sent the new instructions.
+    TaskEdited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -1182,6 +1193,17 @@ pub enum DagRequest {
         task: String,
         dep: String,
     },
+    /// Corrects a task's title or instructions. A running worker is sent the new
+    /// instructions through Talk, as `caller`. A completed task is refused.
+    EditTask {
+        run: String,
+        task: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        instructions: Option<String>,
+        caller: Option<String>,
+    },
     /// Changes a task's planned provider and model. `clear` drops the plan first. A new
     /// `provider` without `model` drops the planned model. An empty `model` clears it.
     PlanTask {
@@ -1265,6 +1287,26 @@ pub enum DagRequest {
     },
 }
 
+/// What `EditTask` told the running worker.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EditDelivery {
+    /// No worker is running. The next dispatch or retry uses the edit.
+    None,
+    /// The worker on `attempt` was sent `message` over Talk.
+    Sent {
+        agent: String,
+        attempt: String,
+        message: String,
+    },
+    /// The edit is stored, but the message could not be sent.
+    Failed {
+        agent: String,
+        attempt: String,
+        error: String,
+    },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DagResponse {
@@ -1308,6 +1350,11 @@ pub enum DagResponse {
     Reported {
         applied: bool,
         reason: Option<String>,
+    },
+    TaskEdited {
+        run: String,
+        task: Task,
+        delivery: EditDelivery,
     },
     Events {
         events: Vec<RunEvent>,
@@ -1440,6 +1487,7 @@ mod dag_dto {
         RunResumed,
         TaskQueued,
         QueuedDispatchFailed,
+        TaskEdited,
     });
 
     struct_dto!(BoxInfo {
@@ -1483,6 +1531,7 @@ mod dag_dto {
         ended_at,
         paused,
         stalled,
+        explicit_worktree,
     } lists { artifacts });
     impl From<dag::AttemptArtifact> for AttemptArtifact {
         fn from(value: dag::AttemptArtifact) -> Self {
